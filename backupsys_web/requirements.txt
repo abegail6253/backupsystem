@@ -1,0 +1,11 @@
+flask>=2.3.0,<4.0
+flask-limiter>=3.5.0
+# flask-limiter storage backends (uncomment if switching from memory://):
+# redis>=4.0.0          # for storage_uri="redis://localhost:6379"
+# pymemcache>=3.5.0     # for storage_uri="memcached://localhost:11211"
+# mongodb>=3.0.0        # for storage_uri="mongodb://localhost:27017"
+watchdog>=3.0.0,<5.0
+Werkzeug>=2.3.0,<4.0
+cryptography>=41.0.0
+python-dotenv>=1.0.0
+psutil>=5.9.0
