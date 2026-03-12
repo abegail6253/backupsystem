@@ -1,0 +1,31 @@
+{
+  "backup_id": "eebc3add147e4b859bd9e48d676c59d6",
+  "watch_id": "w_kkxjf0",
+  "watch_name": "test",
+  "source": "D:\\test",
+  "timestamp": "2026-03-11T13:45:52.975790",
+  "status": "success",
+  "incremental": true,
+  "compressed": false,
+  "compression_ratio": 0.0,
+  "files_copied": 0,
+  "changes": [],
+  "snapshot": {
+    "test2\\test sheet.xlsx": {
+      "hash": "82ee5fea0071aadda096c599387784aa4875462f6016f3ebec95a882eedf08f0",
+      "size": 8821,
+      "mtime": 1773194684.7417743
+    },
+    "test2\\~$test sheet.xlsx": {
+      "hash": "",
+      "size": 165,
+      "mtime": 1773194677.163869
+    }
+  },
+  "duration_s": 0.02,
+  "throughput_mbs": 0.0,
+  "total_size_bytes": 96,
+  "failed_files": [],
+  "cloud_upload": null,
+  "triggered_by": "auto"
+}

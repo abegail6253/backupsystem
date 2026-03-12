@@ -1,0 +1,44 @@
+{
+  "backup_id": "99b1c20183b0461b96ee750283e95ed2",
+  "watch_id": "w_pcqovk",
+  "watch_name": "test",
+  "source": "D:\\test",
+  "timestamp": "2026-03-11T15:33:37.319928",
+  "status": "success",
+  "incremental": true,
+  "compressed": false,
+  "compression_ratio": 0.0,
+  "files_copied": 1,
+  "changes": [
+    {
+      "type": "added",
+      "path": "Abegail_Ombrosa_ACLC_Certification.xlsx",
+      "old_hash": null,
+      "new_hash": "b68adffea2d7de5773945f4a2923b58df5ba6041b47c4bc38d81ff453ee83ad1",
+      "size": 121331
+    }
+  ],
+  "snapshot": {
+    "Abegail_Ombrosa_ACLC_Certification.xlsx": {
+      "hash": "b68adffea2d7de5773945f4a2923b58df5ba6041b47c4bc38d81ff453ee83ad1",
+      "size": 121331,
+      "mtime": 1759993353.2183075
+    },
+    "test2\\Abegail_Ombrosa_ACLC_Certification.xlsx": {
+      "hash": "b68adffea2d7de5773945f4a2923b58df5ba6041b47c4bc38d81ff453ee83ad1",
+      "size": 121331,
+      "mtime": 1759993353.2183075
+    },
+    "test2\\test sheet.xlsx": {
+      "hash": "e507c3ac02a8e0f25ad73dcd8e1e69aea0471ffcb67514d88a5f28e5c6537dd5",
+      "size": 8838,
+      "mtime": 1773214173.8100328
+    }
+  },
+  "duration_s": 0.04,
+  "throughput_mbs": 1.16,
+  "total_size_bytes": 121427,
+  "failed_files": [],
+  "cloud_upload": null,
+  "triggered_by": "auto"
+}

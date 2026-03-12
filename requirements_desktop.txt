@@ -1,0 +1,39 @@
+# Backup System - Desktop App Requirements
+# Install with: pip install -r requirements_desktop.txt
+
+# --- Core backup engine dependencies -----------------------------------------
+watchdog>=3.0.0,<4.0
+cryptography>=41.0.0
+python-dotenv>=1.0.0
+psutil>=5.9.0
+
+# --- Desktop UI ---------------------------------------------------------------
+PyQt5>=5.15.0
+PyQt5-sip>=12.11.0
+
+# --- SFTP / FTPS destination support -----------------------------------------
+paramiko>=3.0.0
+
+# --- SMB / CIFS network share support ----------------------------------------
+# smbprotocol ships both smbprotocol.* (low-level) and smbclient.* (high-level)
+# -- both are used by transport_utils.py and desktop_app.py.
+# On Windows the app uses built-in UNC paths as the primary method;
+# smbprotocol is the fallback for Linux/macOS.
+# Uncomment the line below if you are on Linux/macOS:
+# smbprotocol>=1.0.0
+
+# --- Windows extras (optional but recommended on Windows) --------------------
+# Enables accurate "edited by" file-owner tracking in the change log.
+# Install on Windows with: pip install pywin32>=306
+# pywin32>=306
+
+# --- Cloud backup - Dropbox (optional) ---------------------------------------
+# dropbox>=11.0.0
+
+# --- Cloud backup - Google Drive (optional) ----------------------------------
+# google-auth>=2.0.0
+# google-auth-oauthlib>=1.0.0
+# google-api-python-client>=2.0.0
+
+# --- Packaging to .exe (install separately, not needed at runtime) -----------
+# pyinstaller>=6.0.0

@@ -1,0 +1,20 @@
+{
+  "backup_id": "e96074385a10435ba6d366faec0a8795",
+  "watch_id": "w_pdpfdt",
+  "watch_name": "backups",
+  "source": "D:\\backups",
+  "timestamp": "2026-03-11T11:02:13.951107",
+  "status": "success",
+  "incremental": false,
+  "compressed": false,
+  "compression_ratio": 0.0,
+  "files_copied": 0,
+  "changes": [],
+  "snapshot": {},
+  "duration_s": 0.02,
+  "throughput_mbs": 0.0,
+  "total_size_bytes": 99,
+  "failed_files": [],
+  "cloud_upload": null,
+  "triggered_by": "manual"
+}

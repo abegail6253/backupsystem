@@ -1,0 +1,20 @@
+{
+  "backup_id": "7a3f172ce3484740a7fd6ec13bac552b",
+  "watch_id": "w_mbmflr",
+  "watch_name": "testshare",
+  "source": "//192.168.1.6/testshare",
+  "timestamp": "2026-03-10T16:48:30.398640",
+  "status": "success",
+  "incremental": false,
+  "compressed": false,
+  "compression_ratio": 0.0,
+  "files_copied": 0,
+  "changes": [],
+  "snapshot": {},
+  "duration_s": 0.02,
+  "throughput_mbs": 0.0,
+  "total_size_bytes": 101,
+  "failed_files": [],
+  "cloud_upload": null,
+  "triggered_by": "manual"
+}

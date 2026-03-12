@@ -1,0 +1,45 @@
+# ── Secrets & environment ─────────────────────────────────────────────────────
+.env
+_env
+*.env
+
+# ── Runtime data (generated on first run) ─────────────────────────────────────
+config.json
+backup_queue.json
+history.json
+snapshots/
+logs/
+
+# ── PyInstaller output ────────────────────────────────────────────────────────
+build/
+dist/
+*.spec
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── IDE / OS files ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+.DS_Store
+Thumbs.db
+
+# ── Temp / backup files ───────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.swp
+*~backups/

@@ -1,0 +1,44 @@
+{
+  "backup_id": "3a5778688faf4791b7634208283f2a78",
+  "watch_id": "w_oqiayy",
+  "watch_name": "backups",
+  "source": "D:\\backups",
+  "timestamp": "2026-03-11T15:26:02.259678",
+  "status": "success",
+  "incremental": true,
+  "compressed": false,
+  "compression_ratio": 0.0,
+  "files_copied": 0,
+  "changes": [
+    {
+      "type": "added",
+      "path": "~$test sheet.xlsx",
+      "old_hash": null,
+      "new_hash": "",
+      "size": 165
+    }
+  ],
+  "snapshot": {
+    "test sheet.xlsx": {
+      "hash": "ceb1c66b640d850fa5d7a9bcc2a56f4e58e41102c7153097c6add37956703ddf",
+      "size": 8830,
+      "mtime": 1773213240.4380283
+    },
+    "~$test sheet.xlsx": {
+      "hash": "",
+      "size": 165,
+      "mtime": 1773213957.6775694
+    }
+  },
+  "duration_s": 0.02,
+  "throughput_mbs": 0.0,
+  "total_size_bytes": 99,
+  "failed_files": [
+    {
+      "path": "~$test sheet.xlsx",
+      "reason": "[Errno 13] Permission denied: 'D:\\\\backups\\\\~$test sheet.xlsx'"
+    }
+  ],
+  "cloud_upload": null,
+  "triggered_by": "auto"
+}

@@ -1,0 +1,34 @@
+{
+  "backup_id": "93ac13ce3d0e4c5797a1136f0f16f6fa",
+  "watch_id": "w_mbmflr",
+  "watch_name": "testshare",
+  "source": "//192.168.1.6/testshare",
+  "timestamp": "2026-03-10T16:49:32.272445",
+  "status": "success",
+  "incremental": false,
+  "compressed": false,
+  "compression_ratio": 0.0,
+  "files_copied": 1,
+  "changes": [
+    {
+      "type": "added",
+      "path": "test-backup.txt.docx",
+      "new_hash": "450c70ef89a401ea6503266e72471c170e4f586d7fc43671780e54d27449042d",
+      "size": 6571,
+      "old_hash": null
+    }
+  ],
+  "snapshot": {
+    "test-backup.txt.docx": {
+      "hash": "450c70ef89a401ea6503266e72471c170e4f586d7fc43671780e54d27449042d",
+      "size": 6571,
+      "mtime": 1772765578.7595024
+    }
+  },
+  "duration_s": 0.05,
+  "throughput_mbs": 0.06,
+  "total_size_bytes": 6672,
+  "failed_files": [],
+  "cloud_upload": null,
+  "triggered_by": "manual"
+}
