@@ -2,6 +2,8 @@
 .env
 _env
 *.env
+env
+env.developer
 
 # ── Runtime data (generated on first run) ─────────────────────────────────────
 config.json
@@ -42,4 +44,15 @@ Thumbs.db
 *.tmp
 *.bak
 *.swp
-*~backups/
+*~
+backups/
+.user_cloud_tokens.json
+
+# ── Credentials & tokens ──────────────────────────────────────────────────────
+credentials.json
+token.json
+*.token
+.secret_key
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
