@@ -1463,8 +1463,8 @@ class PasswordDialog(QDialog):
         self.setWindowTitle("Admin Authentication")
         self.setMinimumWidth(360)
         self.setModal(True)
-        self._attempts  = 0       # wrong-password counter
-        self._locked    = False   # True while cooldown is active
+        self._attempts  = 0
+        self._locked    = False
         self._build_ui()
 
     def _build_ui(self):
@@ -1499,9 +1499,16 @@ class PasswordDialog(QDialog):
             self.pw_confirm.setPlaceholderText("Confirm password")
             layout.addWidget(self.pw_confirm)
 
-        self.error_lbl = QLabel("")
+        self.error_lbl = QLabel(" ")
         self.error_lbl.setObjectName("status_err")
         self.error_lbl.setAlignment(Qt.AlignCenter)
+        self.error_lbl.setMinimumHeight(36)
+        self.error_lbl.setStyleSheet(
+            "color: #ffffff; background-color: transparent; "
+            "font-size: 12px; font-weight: 700; "
+            "border-radius: 6px; padding: 6px 12px;"
+        )
+        self.error_lbl.setWordWrap(True)
         layout.addWidget(self.error_lbl)
 
         btn_row = QHBoxLayout()
@@ -1511,43 +1518,87 @@ class PasswordDialog(QDialog):
 
         ok = QPushButton("Confirm" if self.mode == "verify" else "Set Password")
         ok.clicked.connect(self._submit)
-        self.pw_input.returnPressed.connect(self._submit)
+        ok.setAutoDefault(False)
+        ok.setDefault(False)
 
         btn_row.addWidget(cancel)
         btn_row.addWidget(ok)
         layout.addLayout(btn_row)
 
+        if self.mode == "verify":
+            forgot_btn = QPushButton("Forgot password?")
+            forgot_btn.setObjectName("secondary")
+            forgot_btn.setStyleSheet(
+                "border: none; color: #6b7280; font-size: 11px; "
+                "padding: 4px; background: transparent;"
+            )
+            forgot_btn.clicked.connect(self._forgot_password)
+            layout.addWidget(forgot_btn, alignment=Qt.AlignCenter)
+
+    def _forgot_password(self):
+        dlg = PasswordDialog(self, mode="set")
+        if dlg.exec_() == QDialog.Accepted:
+            self.accept()
+
+        # ── Send OTP via API ──────────────────────────────────────────────
+        sending = QMessageBox(self)
+        sending.setWindowTitle("Sending...")
+    def keyPressEvent(self, event):
+        from PyQt5.QtCore import Qt as _Qt
+        if event.key() in (_Qt.Key_Return, _Qt.Key_Enter):
+            self._submit()
+        else:
+            super().keyPressEvent(event)
+
+    def _show_error(self, msg: str):
+        self.error_lbl.setText(msg)
+        self.error_lbl.setStyleSheet(
+            "color: #ffffff; background-color: #dc2626; "
+            "font-size: 12px; font-weight: 700; "
+            "border-radius: 6px; padding: 6px 12px;"
+        )
+        self.error_lbl.setVisible(True)
+        self.error_lbl.repaint()
+
     def _submit(self):
         if self._locked:
-            return  # silently ignore while locked
+            return
         pw = self.pw_input.text()
         if not pw:
-            self.error_lbl.setText("Password cannot be empty")
+            self._show_error("Password cannot be empty")
             return
 
         if self.mode == "set":
             if pw != self.pw_confirm.text():
-                self.error_lbl.setText("Passwords do not match")
+                self._show_error("Passwords do not match")
                 return
             self._save_password(pw)
             self.accept()
         else:
-            if self._verify_password(pw):
+            try:
+                verified = self._verify_password(pw)
+            except Exception:
+                verified = False
+
+            if verified:
                 self.accept()
             else:
                 self._attempts += 1
                 self.pw_input.clear()
-                # Lockout: 30-second cooldown after 5 consecutive failures
+                self.pw_input.setFocus()
                 if self._attempts >= 5:
                     self._locked = True
-                    self.error_lbl.setText("Too many attempts — locked for 30 seconds")
+                    self._show_error("Too many attempts — locked for 30 seconds")
                     self.pw_input.setEnabled(False)
                     QTimer.singleShot(30_000, self._unlock)
                 else:
                     remaining = 5 - self._attempts
-                    self.error_lbl.setText(
-                        f"Incorrect password ({remaining} attempt{'s' if remaining != 1 else ''} left)"
+                    self._show_error(
+                        f"Incorrect password — {remaining} attempt{'s' if remaining != 1 else ''} remaining."
                     )
+                self.raise_()
+                self.activateWindow()
+                self.pw_input.setFocus()
 
     def _unlock(self):
         """Called after the 30-second lockout expires."""
@@ -1592,8 +1643,8 @@ class PasswordDialog(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         stored = s.value(ADMIN_PASS_KEY, "")
         if not stored:
-            # No password set yet → any input grants access
-            return True
+            # No password set yet — require them to set one first
+            return False
         return self._hash_verify(pw, stored)
 
     @staticmethod
@@ -5413,15 +5464,12 @@ class MainWindow(QMainWindow):
 
     def _open_admin(self):
         if not PasswordDialog.has_password():
-            # First time — prompt to set password
-            reply = QMessageBox.question(self, "Set Admin Password",
-                "No admin password is set. Would you like to set one now?\n"
-                "(If you skip, any user can access admin settings)",
-                QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                dlg = PasswordDialog(self, mode="set")
-                if dlg.exec_() != QDialog.Accepted:
-                    return
+            # No password set yet — must set one before accessing admin
+            QMessageBox.information(self, "Set Admin Password",
+                "You need to set an admin password before accessing settings.")
+            dlg = PasswordDialog(self, mode="set")
+            if dlg.exec_() != QDialog.Accepted:
+                return
 
         dlg = PasswordDialog(self, mode="verify")
         if dlg.exec_() != QDialog.Accepted:
