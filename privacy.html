@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BackupSys — Privacy Policy</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500&display=swap');
+
+  :root {
+    --bg: #0f1117;
+    --surface: #181c27;
+    --border: #2a2f3f;
+    --accent: #4f8ef7;
+    --text: #e8eaf0;
+    --muted: #8b90a0;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 300;
+    line-height: 1.8;
+    min-height: 100vh;
+  }
+
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 24px 40px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .logo {
+    font-family: 'DM Serif Display', serif;
+    font-size: 22px;
+    color: var(--accent);
+    letter-spacing: -0.5px;
+  }
+
+  .logo span { color: var(--text); }
+
+  main {
+    max-width: 760px;
+    margin: 60px auto;
+    padding: 0 24px;
+  }
+
+  h1 {
+    font-family: 'DM Serif Display', serif;
+    font-size: 42px;
+    font-weight: 400;
+    letter-spacing: -1px;
+    margin-bottom: 8px;
+  }
+
+  .date {
+    color: var(--muted);
+    font-size: 14px;
+    margin-bottom: 48px;
+  }
+
+  h2 {
+    font-family: 'DM Serif Display', serif;
+    font-size: 22px;
+    font-weight: 400;
+    color: var(--accent);
+    margin: 40px 0 12px;
+  }
+
+  p { color: var(--muted); margin-bottom: 16px; font-size: 15px; }
+
+  ul {
+    color: var(--muted);
+    font-size: 15px;
+    padding-left: 20px;
+    margin-bottom: 16px;
+  }
+
+  ul li { margin-bottom: 6px; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin: 32px 0;
+  }
+
+  .card p { margin: 0; }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  footer {
+    text-align: center;
+    padding: 40px;
+    color: var(--muted);
+    font-size: 13px;
+    border-top: 1px solid var(--border);
+    margin-top: 80px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Backup<span>Sys</span></div>
+</header>
+
+<main>
+  <h1>Privacy Policy</h1>
+  <p class="date">Last updated: March 2026</p>
+
+  <div class="card">
+    <p>BackupSys is a desktop application developed by <strong>Suguro Tech</strong>. We are committed to protecting your privacy. This policy explains what data we handle and how.</p>
+  </div>
+
+  <h2>1. Data We Collect</h2>
+  <p>BackupSys operates primarily on your local machine. We do not collect or store personal data on our servers, with the following exceptions:</p>
+  <ul>
+    <li>Your email address — only if you use the password reset feature, and only temporarily (OTP expires in 5 minutes)</li>
+    <li>No backup file contents are ever sent to or stored on our servers</li>
+  </ul>
+
+  <h2>2. Cloud Storage (Google Drive & Dropbox)</h2>
+  <p>If you choose to connect Google Drive or Dropbox, BackupSys uses OAuth to connect to your personal account. Your files are uploaded directly to your own cloud storage account. BackupSys does not have access to your cloud credentials — only the access tokens stored locally on your machine.</p>
+
+  <h2>3. Local Data</h2>
+  <p>All backup data, configuration, and credentials are stored locally on your PC in your application folder. BackupSys does not transmit this data anywhere without your explicit action.</p>
+
+  <h2>4. Third-Party Services</h2>
+  <ul>
+    <li><strong>Google Drive API</strong> — used only when you explicitly connect your Google account</li>
+    <li><strong>Dropbox API</strong> — used only when you explicitly connect your Dropbox account</li>
+    <li><strong>Railway (API hosting)</strong> — used only for OTP delivery during password reset</li>
+  </ul>
+
+  <h2>5. Data Retention</h2>
+  <p>BackupSys does not retain any user data on its servers. OTP codes used for password reset are stored in memory only and expire within 5 minutes.</p>
+
+  <h2>6. Your Rights</h2>
+  <p>You can disconnect any cloud service at any time from within the app. All local data can be deleted by uninstalling the application.</p>
+
+  <h2>7. Contact</h2>
+  <p>If you have questions about this privacy policy, contact us at: <a href="mailto:27abyombrosa@gmail.com">27abyombrosa@gmail.com</a></p>
+
+</main>
+
+<footer>
+  &copy; 2026 Suguro Tech · BackupSys · <a href="https://github.com/abegail6253/backupsystem">GitHub</a>
+</footer>
+
+</body>
+</html>
