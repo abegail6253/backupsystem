@@ -77,6 +77,21 @@ class BackupThrottler:
                 self.last_time  = time.time()
 
 
+def _chunked_copy(src: str, dst: str, throttler=None, chunk_size: int = 256 * 1024):
+    """Copy src to dst in chunks, throttling between each chunk if throttler is set."""
+    import shutil as _shutil
+    with open(src, 'rb') as f_in, open(dst, 'wb') as f_out:
+        while True:
+            chunk = f_in.read(chunk_size)
+            if not chunk:
+                break
+            f_out.write(chunk)
+            if throttler:
+                throttler.throttle(len(chunk))
+    # Preserve metadata (timestamps etc.) like shutil.copy2
+    _shutil.copystat(src, dst)
+
+
 # ─── Path helpers ─────────────────────────────────────────────────────────────
 
 def _fix_path(path: str) -> str:
@@ -899,7 +914,7 @@ def run_backup(
                     with open(source, 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
                         shutil.copyfileobj(f_in, f_out)
                 else:
-                    shutil.copy2(source, backup_dir / src_path.name)
+                    _chunked_copy(source, str(backup_dir / src_path.name), throttler=throttler)
                     if hash_file(str(source)) != hash_file(str(backup_dir / src_path.name)):
                         logger.warning(f"⚠ Integrity mismatch for {src_path.name} — file may have changed during backup")
                         result["failed_files"].append({
@@ -962,7 +977,7 @@ def run_backup(
                         with open(str(src_file), 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
                             shutil.copyfileobj(f_in, f_out)
                     else:
-                        shutil.copy2(str(src_file), str(dest_file))
+                        _chunked_copy(str(src_file), str(dest_file), throttler=throttler)
                         if hash_file(str(src_file)) != hash_file(str(dest_file)):
                             logger.warning(
                                 f"⚠ Integrity mismatch for {entry['path']} — file may have changed during backup"
@@ -971,12 +986,6 @@ def run_backup(
                                 "ok": False, "path": entry["path"],
                                 "reason": "Hash mismatch — file modified during backup",
                             }
-
-                    if throttler:
-                        try:
-                            throttler.throttle(entry.get("size", 0))
-                        except Exception:
-                            pass
 
                     return {"ok": True, "path": entry["path"]}
 
