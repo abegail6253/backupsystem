@@ -1,6 +1,7 @@
 import os
 import uuid
 import shutil
+import gzip
 import hashlib
 import json
 import time
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional encryption support
 try:
@@ -41,27 +43,38 @@ MAX_EDIT_BYTES   = 5 * 1024 * 1024   # 5 MB – files larger than this refuse to
 FERNET_WARN_BYTES = 50  * 1024 * 1024  # 50 MB – warn about in-memory encryption
 FERNET_MAX_BYTES  = 200 * 1024 * 1024  # 200 MB – hard limit; Fernet loads the full file into RAM
 
+# Max files copied in parallel within a single backup run.
+# 0 = use this constant (default).  Override per-call via run_backup(parallel_workers=N).
+# 1 = sequential (useful for single-spindle HDDs or debugging).
+MAX_COPY_WORKERS: int = min(8, os.cpu_count() or 4)
+
 
 class BackupThrottler:
-    """Limit backup I/O to prevent system overload."""
+    """Limit backup I/O to prevent system overload.  Thread-safe."""
+
     def __init__(self, max_mbps: float = 100.0):
         self.max_bytes_per_sec = int(max_mbps * 1024 * 1024)
-        self.last_time = time.time()
+        self._lock      = threading.Lock()  # FIX: protects shared state for parallel copies
+        self.last_time  = time.time()
         self.bytes_sent = 0
 
     def throttle(self, bytes_copied: int):
-        """Call after copying each file."""
+        """Call after copying each file.  Safe to call from multiple threads."""
         if self.max_bytes_per_sec <= 0:
             return  # unlimited — skip throttling entirely
-        self.bytes_sent += bytes_copied
-        elapsed = time.time() - self.last_time
-        if elapsed < 1.0:
-            expected_wait = (self.bytes_sent / self.max_bytes_per_sec) - elapsed
-            if expected_wait > 0:
-                time.sleep(expected_wait)
-        else:
-            self.bytes_sent = bytes_copied  # carry over what was just added
-            self.last_time = time.time()
+
+        with self._lock:                         # FIX: lock around all shared state
+            self.bytes_sent += bytes_copied
+            elapsed = time.time() - self.last_time
+
+            if elapsed < 1.0:
+                expected_wait = (self.bytes_sent / self.max_bytes_per_sec) - elapsed
+                if expected_wait > 0:
+                    time.sleep(expected_wait)
+            else:
+                # FIX: reset to 0, not bytes_copied — start a fresh accounting window
+                self.bytes_sent = 0
+                self.last_time  = time.time()
 
 
 # ─── Path helpers ─────────────────────────────────────────────────────────────
@@ -197,10 +210,7 @@ def build_snapshot(
     - Windows: uses thread timeout
     """
 
-    import os
-    import signal
-    import threading
-    from pathlib import Path
+    import signal  # os, threading, Path are already module-level imports
 
     path = _fix_path(path)
     root = Path(path)
@@ -782,15 +792,20 @@ def run_backup(
     throttler=None,
     cloud_config: Optional[Dict] = None,
     triggered_by: Optional[str] = None,
+    parallel_workers: int = 0,  # 0 = use MAX_COPY_WORKERS, 1 = sequential, N = exactly N threads
 ) -> dict:
     """
     Execute a backup from source → destination.
     progress_cb(copied, total, current_file) is called after each file copy.
     Tracks failed files for reporting.
     Cloud upload result is persisted in MANIFEST.json and returned in result dict.
+
+    parallel_workers:
+        0  → use MAX_COPY_WORKERS (recommended default)
+        1  → sequential copy, old behaviour (use for single-spindle HDDs or debugging)
+        N  → exactly N concurrent file-copy threads
     """
-    import gzip
-    import shutil as _sh
+    # gzip and shutil are now module-level imports
 
     started = time.time()
     ts      = datetime.now().isoformat()
@@ -882,7 +897,7 @@ def run_backup(
                 elif compress:
                     dest_gz = backup_dir / (src_path.name + '.gz')
                     with open(source, 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
-                        _sh.copyfileobj(f_in, f_out)
+                        shutil.copyfileobj(f_in, f_out)
                 else:
                     shutil.copy2(source, backup_dir / src_path.name)
                     if hash_file(str(source)) != hash_file(str(backup_dir / src_path.name)):
@@ -904,72 +919,111 @@ def run_backup(
                 except Exception:
                     pass
 
-        # ── Directory source ───────────────────────────────
+        # ── Directory source (PARALLEL) ────────────────────────────────────
         else:
+            _workers = parallel_workers if parallel_workers > 0 else MAX_COPY_WORKERS
+
+            # Thread-safe counters — mutable container so closures can write back
+            _lock_state = threading.Lock()
+            _copied_ref = [0]   # [int] — wraps int so the closure can mutate it
+
+            # Pre-create ALL destination directories before spawning threads.
+            # Prevents a race condition on Windows where two threads try to
+            # mkdir() the same path simultaneously and one raises OSError.
             for entry in files_to_copy:
-                src_file  = src_path / entry["path"]
+                (backup_dir / entry["path"]).parent.mkdir(parents=True, exist_ok=True)
+
+            def _copy_one(entry: dict) -> dict:
+                """Copy a single file.  Runs inside a ThreadPoolExecutor thread."""
+                src_file  = src_path  / entry["path"]
                 dest_file = backup_dir / entry["path"]
-                dest_file.parent.mkdir(parents=True, exist_ok=True)
 
-                if src_file.exists():
+                if not src_file.exists():
+                    return {"ok": False, "path": entry["path"], "reason": "source file vanished before copy"}
+
+                # Low-disk check: sample every 20 completions from any thread
+                with _lock_state:
+                    local_copied = _copied_ref[0]
+                if local_copied % 20 == 0:
                     try:
-                        # Periodic low-disk check every 5 files
-                        if copied % 5 == 0:
-                            try:
-                                free = shutil.disk_usage(destination).free
-                                if free < 100 * 1024 * 1024:
-                                    raise OSError(f"Critical: Only {_human_size(free)} free at destination")
-                            except OSError:
-                                raise
-                            except Exception:
-                                pass
-
-                        if encrypt_key and CRYPTO_AVAILABLE:
-                            _encrypt_file(str(src_file), str(dest_file), encrypt_key)
-                        elif compress:
-                            dest_gz = Path(str(dest_file) + '.gz')
-                            dest_gz.parent.mkdir(parents=True, exist_ok=True)
-                            with open(str(src_file), 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
-                                _sh.copyfileobj(f_in, f_out)
-                            dest_file = dest_gz
-                        else:
-                            shutil.copy2(str(src_file), str(dest_file))
-                            if hash_file(str(src_file)) != hash_file(str(dest_file)):
-                                logger.warning(f"⚠ Integrity mismatch for {entry['path']} — file may have changed during backup")
-                                result["failed_files"].append({
-                                    "path": entry["path"],
-                                    "reason": "Hash mismatch — file modified during backup"
-                                })
-                                continue
-
-                        # Throttle if requested
-                        if throttler:
-                            try:
-                                throttler.throttle(entry.get("size", 0))
-                            except Exception:
-                                pass
-
-                        copied += 1
-
-                    except (PermissionError, OSError) as e:
-                        logger.warning(f"⚠ Skipped {entry['path']}: {e}")
-                        result["failed_files"].append({
-                            "path": entry["path"],
-                            "reason": str(e)
-                        })
-
-                if progress_cb:
-                    try:
-                        pct = int(copied / max(total, 1) * 100) if total > 0 else 0
-                        if pct % 10 == 0 and copied > 0:
-                            logger.info(f"📦 {watch_name}: {pct}% ({copied}/{total} files)")
-                        progress_cb(copied, total or 1, entry["path"])
-                    except InterruptedError:
+                        free = shutil.disk_usage(destination).free
+                        if free < 100 * 1024 * 1024:
+                            raise OSError(f"Critical: only {_human_size(free)} free at destination")
+                    except OSError:
                         raise
                     except Exception:
                         pass
 
-            # Write .DELETED markers
+                try:
+                    if encrypt_key and CRYPTO_AVAILABLE:
+                        _encrypt_file(str(src_file), str(dest_file), encrypt_key)
+                    elif compress:
+                        dest_gz = Path(str(dest_file) + '.gz')
+                        with open(str(src_file), 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                    else:
+                        shutil.copy2(str(src_file), str(dest_file))
+                        if hash_file(str(src_file)) != hash_file(str(dest_file)):
+                            logger.warning(
+                                f"⚠ Integrity mismatch for {entry['path']} — file may have changed during backup"
+                            )
+                            return {
+                                "ok": False, "path": entry["path"],
+                                "reason": "Hash mismatch — file modified during backup",
+                            }
+
+                    if throttler:
+                        try:
+                            throttler.throttle(entry.get("size", 0))
+                        except Exception:
+                            pass
+
+                    return {"ok": True, "path": entry["path"]}
+
+                except (PermissionError, OSError) as e:
+                    logger.warning(f"⚠ Skipped {entry['path']}: {e}")
+                    return {"ok": False, "path": entry["path"], "reason": str(e)}
+
+            # ── Submit all files to the thread pool ───────────────────────────
+            with ThreadPoolExecutor(max_workers=_workers) as pool:
+                futures = {pool.submit(_copy_one, e): e for e in files_to_copy}
+
+                for fut in as_completed(futures):
+                    try:
+                        res = fut.result()
+                    except InterruptedError:
+                        # User cancelled — abort remaining futures cleanly
+                        for f in futures:
+                            f.cancel()
+                        raise
+                    except Exception as ex:
+                        entry = futures[fut]
+                        res = {"ok": False, "path": entry["path"], "reason": str(ex)}
+
+                    with _lock_state:
+                        if res["ok"]:
+                            _copied_ref[0] += 1
+                        else:
+                            result["failed_files"].append(
+                                {"path": res["path"], "reason": res.get("reason", "unknown")}
+                            )
+
+                        # Progress callback — must be inside the lock so pct is coherent
+                        if progress_cb:
+                            try:
+                                c   = _copied_ref[0]
+                                pct = int(c / max(total, 1) * 100) if total > 0 else 0
+                                if pct % 10 == 0 and c > 0:
+                                    logger.info(f"📦 {watch_name}: {pct}% ({c}/{total} files)")
+                                progress_cb(c, total or 1, res["path"])
+                            except InterruptedError:
+                                raise
+                            except Exception:
+                                pass
+
+            copied = _copied_ref[0]
+
+            # Write .DELETED markers (unchanged logic)
             for c in changes:
                 if c["type"] == "deleted":
                     marker = backup_dir / (c["path"] + ".DELETED")
