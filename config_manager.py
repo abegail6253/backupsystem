@@ -340,7 +340,7 @@ def save(cfg: dict):
 def _snapshot_path(watch_id: str, dest_type: str = "") -> Path:
     """Return the snapshot file path for a given watch + destination type.
 
-    Each destination gets its own snapshot so that SFTP, GDrive, and Dropbox
+    Each destination gets its own snapshot so that SFTP and GDrive
     each independently track what they have backed up.  A watch that has never
     backed up to a particular destination will find no snapshot file and will
     therefore perform a full backup to that destination on the first run.
@@ -353,7 +353,7 @@ def _snapshot_path(watch_id: str, dest_type: str = "") -> Path:
 
 
 def save_snapshot(watch_id: str, snapshot: dict, dest_type: str = ""):
-    """Save snapshot keyed by watch_id + dest_type (e.g. 'sftp', 'gdrive', 'dropbox')."""
+    """Save snapshot keyed by watch_id + dest_type (e.g. 'sftp', 'gdrive')."""
     try:
         SNAPSHOTS_DIR.mkdir(exist_ok=True)
         path = _snapshot_path(watch_id, dest_type)

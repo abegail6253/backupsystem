@@ -1,7 +1,6 @@
 import os
 import uuid
 import shutil
-import gzip
 import hashlib
 import json
 import time
@@ -13,7 +12,6 @@ logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional encryption support
 try:
@@ -43,53 +41,27 @@ MAX_EDIT_BYTES   = 5 * 1024 * 1024   # 5 MB – files larger than this refuse to
 FERNET_WARN_BYTES = 50  * 1024 * 1024  # 50 MB – warn about in-memory encryption
 FERNET_MAX_BYTES  = 200 * 1024 * 1024  # 200 MB – hard limit; Fernet loads the full file into RAM
 
-# Max files copied in parallel within a single backup run.
-# 0 = use this constant (default).  Override per-call via run_backup(parallel_workers=N).
-# 1 = sequential (useful for single-spindle HDDs or debugging).
-MAX_COPY_WORKERS: int = min(8, os.cpu_count() or 4)
-
 
 class BackupThrottler:
-    """Limit backup I/O to prevent system overload.  Thread-safe."""
-
+    """Limit backup I/O to prevent system overload."""
     def __init__(self, max_mbps: float = 100.0):
         self.max_bytes_per_sec = int(max_mbps * 1024 * 1024)
-        self._lock      = threading.Lock()  # FIX: protects shared state for parallel copies
-        self.last_time  = time.time()
+        self.last_time = time.time()
         self.bytes_sent = 0
 
     def throttle(self, bytes_copied: int):
-        """Call after copying each file.  Safe to call from multiple threads."""
+        """Call after copying each file."""
         if self.max_bytes_per_sec <= 0:
             return  # unlimited — skip throttling entirely
-
-        with self._lock:                         # FIX: lock around all shared state
-            self.bytes_sent += bytes_copied
-            elapsed = time.time() - self.last_time
-
-            if elapsed < 1.0:
-                expected_wait = (self.bytes_sent / self.max_bytes_per_sec) - elapsed
-                if expected_wait > 0:
-                    time.sleep(expected_wait)
-            else:
-                # FIX: reset to 0, not bytes_copied — start a fresh accounting window
-                self.bytes_sent = 0
-                self.last_time  = time.time()
-
-
-def _chunked_copy(src: str, dst: str, throttler=None, chunk_size: int = 256 * 1024):
-    """Copy src to dst in chunks, throttling between each chunk if throttler is set."""
-    import shutil as _shutil
-    with open(src, 'rb') as f_in, open(dst, 'wb') as f_out:
-        while True:
-            chunk = f_in.read(chunk_size)
-            if not chunk:
-                break
-            f_out.write(chunk)
-            if throttler:
-                throttler.throttle(len(chunk))
-    # Preserve metadata (timestamps etc.) like shutil.copy2
-    _shutil.copystat(src, dst)
+        self.bytes_sent += bytes_copied
+        elapsed = time.time() - self.last_time
+        if elapsed < 1.0:
+            expected_wait = (self.bytes_sent / self.max_bytes_per_sec) - elapsed
+            if expected_wait > 0:
+                time.sleep(expected_wait)
+        else:
+            self.bytes_sent = bytes_copied  # carry over what was just added
+            self.last_time = time.time()
 
 
 # ─── Path helpers ─────────────────────────────────────────────────────────────
@@ -225,7 +197,10 @@ def build_snapshot(
     - Windows: uses thread timeout
     """
 
-    import signal  # os, threading, Path are already module-level imports
+    import os
+    import signal
+    import threading
+    from pathlib import Path
 
     path = _fix_path(path)
     root = Path(path)
@@ -622,83 +597,6 @@ def _decrypt_file(src_path: str, dest_path: str, key: str) -> None:
             f.write(plaintext)
     except Exception as e:
         raise RuntimeError(f"Decryption failed for {Path(src_path).name}: {e}")
-
-        
-
-def upload_to_dropbox(local_dir: str, cloud_config: dict) -> dict:
-    """Upload backup folder to Dropbox, preserving subfolder structure."""
-    try:
-        import dropbox
-        from dropbox.files import WriteMode, CommitInfo, UploadSessionCursor
-    except ImportError:
-        return {"ok": False, "error": "dropbox not installed — run: pip install dropbox"}
-
-    CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB
-
-    try:
-        token       = cloud_config["access_token"]
-        remote_path = cloud_config.get("remote_path", "/backupsys").rstrip("/")
-        dbx         = dropbox.Dropbox(token)
-        ld          = Path(local_dir)
-        uploaded    = 0
-
-        # Verify auth early
-        dbx.users_get_current_account()
-
-        # Internal backup metadata — never upload to cloud storage
-        _SKIP = {"MANIFEST.json", "BACKUP.sha256"}
-
-        for fp in ld.rglob("*"):
-            if not fp.is_file():
-                continue
-            if fp.name in _SKIP:
-                continue
-
-            rel  = fp.relative_to(ld)
-            dest = f"{remote_path}/{ld.name}/{rel}".replace("\\", "/")
-            size = fp.stat().st_size
-
-            with open(fp, "rb") as f:
-                if size <= CHUNK_SIZE:
-                    # Small file — single request
-                    dbx.files_upload(f.read(), dest, mode=WriteMode.overwrite)
-                else:
-                    # Large file — chunked session upload
-                    session = dbx.files_upload_session_start(f.read(CHUNK_SIZE))
-                    cursor  = UploadSessionCursor(
-                        session_id=session.session_id,
-                        offset=f.tell(),
-                    )
-                    session_finished = False
-                    while True:
-                        chunk     = f.read(CHUNK_SIZE)
-                        remaining = size - f.tell()
-                        if not chunk or remaining <= 0:
-                            dbx.files_upload_session_finish(
-                                chunk or b"", cursor,
-                                CommitInfo(path=dest, mode=WriteMode.overwrite),
-                            )
-                            session_finished = True
-                            break
-                        dbx.files_upload_session_append_v2(chunk, cursor)
-                        cursor.offset = f.tell()
-                    # Safety net — prevents a dangling session if loop exits unexpectedly
-                    if not session_finished:
-                        dbx.files_upload_session_finish(
-                            b"", cursor,
-                            CommitInfo(path=dest, mode=WriteMode.overwrite),
-                        )
-
-            uploaded += 1
-
-        return {"ok": True, "uploaded": uploaded, "path": remote_path}
-
-    except dropbox.exceptions.AuthError:
-        return {"ok": False, "error": "Invalid Dropbox access token"}
-    except KeyError:
-        return {"ok": False, "error": "Missing 'access_token' in cloud_config"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 def upload_to_gdrive(local_dir: str, cloud_config: dict) -> dict:
     """Upload backup folder to Google Drive using OAuth user credentials.
 
@@ -807,20 +705,15 @@ def run_backup(
     throttler=None,
     cloud_config: Optional[Dict] = None,
     triggered_by: Optional[str] = None,
-    parallel_workers: int = 0,  # 0 = use MAX_COPY_WORKERS, 1 = sequential, N = exactly N threads
 ) -> dict:
     """
     Execute a backup from source → destination.
     progress_cb(copied, total, current_file) is called after each file copy.
     Tracks failed files for reporting.
     Cloud upload result is persisted in MANIFEST.json and returned in result dict.
-
-    parallel_workers:
-        0  → use MAX_COPY_WORKERS (recommended default)
-        1  → sequential copy, old behaviour (use for single-spindle HDDs or debugging)
-        N  → exactly N concurrent file-copy threads
     """
-    # gzip and shutil are now module-level imports
+    import gzip
+    import shutil as _sh
 
     started = time.time()
     ts      = datetime.now().isoformat()
@@ -912,9 +805,9 @@ def run_backup(
                 elif compress:
                     dest_gz = backup_dir / (src_path.name + '.gz')
                     with open(source, 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
+                        _sh.copyfileobj(f_in, f_out)
                 else:
-                    _chunked_copy(source, str(backup_dir / src_path.name), throttler=throttler)
+                    shutil.copy2(source, backup_dir / src_path.name)
                     if hash_file(str(source)) != hash_file(str(backup_dir / src_path.name)):
                         logger.warning(f"⚠ Integrity mismatch for {src_path.name} — file may have changed during backup")
                         result["failed_files"].append({
@@ -934,105 +827,72 @@ def run_backup(
                 except Exception:
                     pass
 
-        # ── Directory source (PARALLEL) ────────────────────────────────────
+        # ── Directory source ───────────────────────────────
         else:
-            _workers = parallel_workers if parallel_workers > 0 else MAX_COPY_WORKERS
-
-            # Thread-safe counters — mutable container so closures can write back
-            _lock_state = threading.Lock()
-            _copied_ref = [0]   # [int] — wraps int so the closure can mutate it
-
-            # Pre-create ALL destination directories before spawning threads.
-            # Prevents a race condition on Windows where two threads try to
-            # mkdir() the same path simultaneously and one raises OSError.
             for entry in files_to_copy:
-                (backup_dir / entry["path"]).parent.mkdir(parents=True, exist_ok=True)
-
-            def _copy_one(entry: dict) -> dict:
-                """Copy a single file.  Runs inside a ThreadPoolExecutor thread."""
-                src_file  = src_path  / entry["path"]
+                src_file  = src_path / entry["path"]
                 dest_file = backup_dir / entry["path"]
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
 
-                if not src_file.exists():
-                    return {"ok": False, "path": entry["path"], "reason": "source file vanished before copy"}
-
-                # Low-disk check: sample every 20 completions from any thread
-                with _lock_state:
-                    local_copied = _copied_ref[0]
-                if local_copied % 20 == 0:
+                if src_file.exists():
                     try:
-                        free = shutil.disk_usage(destination).free
-                        if free < 100 * 1024 * 1024:
-                            raise OSError(f"Critical: only {_human_size(free)} free at destination")
-                    except OSError:
-                        raise
-                    except Exception:
-                        pass
-
-                try:
-                    if encrypt_key and CRYPTO_AVAILABLE:
-                        _encrypt_file(str(src_file), str(dest_file), encrypt_key)
-                    elif compress:
-                        dest_gz = Path(str(dest_file) + '.gz')
-                        with open(str(src_file), 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
-                            shutil.copyfileobj(f_in, f_out)
-                    else:
-                        _chunked_copy(str(src_file), str(dest_file), throttler=throttler)
-                        if hash_file(str(src_file)) != hash_file(str(dest_file)):
-                            logger.warning(
-                                f"⚠ Integrity mismatch for {entry['path']} — file may have changed during backup"
-                            )
-                            return {
-                                "ok": False, "path": entry["path"],
-                                "reason": "Hash mismatch — file modified during backup",
-                            }
-
-                    return {"ok": True, "path": entry["path"]}
-
-                except (PermissionError, OSError) as e:
-                    logger.warning(f"⚠ Skipped {entry['path']}: {e}")
-                    return {"ok": False, "path": entry["path"], "reason": str(e)}
-
-            # ── Submit all files to the thread pool ───────────────────────────
-            with ThreadPoolExecutor(max_workers=_workers) as pool:
-                futures = {pool.submit(_copy_one, e): e for e in files_to_copy}
-
-                for fut in as_completed(futures):
-                    try:
-                        res = fut.result()
-                    except InterruptedError:
-                        # User cancelled — abort remaining futures cleanly
-                        for f in futures:
-                            f.cancel()
-                        raise
-                    except Exception as ex:
-                        entry = futures[fut]
-                        res = {"ok": False, "path": entry["path"], "reason": str(ex)}
-
-                    with _lock_state:
-                        if res["ok"]:
-                            _copied_ref[0] += 1
-                        else:
-                            result["failed_files"].append(
-                                {"path": res["path"], "reason": res.get("reason", "unknown")}
-                            )
-
-                        # Progress callback — must be inside the lock so pct is coherent
-                        if progress_cb:
+                        # Periodic low-disk check every 5 files
+                        if copied % 5 == 0:
                             try:
-                                c   = _copied_ref[0]
-                                pct = int(c / max(total, 1) * 100) if total > 0 else 0
-                                if pct % 10 == 0 and c > 0:
-                                    logger.info(f"📦 {watch_name}: {pct}% ({c}/{total} files)")
-                                progress_cb(c, total or 1, res["path"])
-                            except InterruptedError:
+                                free = shutil.disk_usage(destination).free
+                                if free < 100 * 1024 * 1024:
+                                    raise OSError(f"Critical: Only {_human_size(free)} free at destination")
+                            except OSError:
                                 raise
                             except Exception:
                                 pass
 
-            copied = _copied_ref[0]
+                        if encrypt_key and CRYPTO_AVAILABLE:
+                            _encrypt_file(str(src_file), str(dest_file), encrypt_key)
+                        elif compress:
+                            dest_gz = Path(str(dest_file) + '.gz')
+                            dest_gz.parent.mkdir(parents=True, exist_ok=True)
+                            with open(str(src_file), 'rb') as f_in, gzip.open(str(dest_gz), 'wb') as f_out:
+                                _sh.copyfileobj(f_in, f_out)
+                            dest_file = dest_gz
+                        else:
+                            shutil.copy2(str(src_file), str(dest_file))
+                            if hash_file(str(src_file)) != hash_file(str(dest_file)):
+                                logger.warning(f"⚠ Integrity mismatch for {entry['path']} — file may have changed during backup")
+                                result["failed_files"].append({
+                                    "path": entry["path"],
+                                    "reason": "Hash mismatch — file modified during backup"
+                                })
+                                continue
 
-            # Write .DELETED markers (unchanged logic)
+                        # Throttle if requested
+                        if throttler:
+                            try:
+                                throttler.throttle(entry.get("size", 0))
+                            except Exception:
+                                pass
+
+                        copied += 1
+
+                    except (PermissionError, OSError) as e:
+                        logger.warning(f"⚠ Skipped {entry['path']}: {e}")
+                        result["failed_files"].append({
+                            "path": entry["path"],
+                            "reason": str(e)
+                        })
+
+                if progress_cb:
+                    try:
+                        pct = int(copied / max(total, 1) * 100) if total > 0 else 0
+                        if pct % 10 == 0 and copied > 0:
+                            logger.info(f"📦 {watch_name}: {pct}% ({copied}/{total} files)")
+                        progress_cb(copied, total or 1, entry["path"])
+                    except InterruptedError:
+                        raise
+                    except Exception:
+                        pass
+
+            # Write .DELETED markers
             for c in changes:
                 if c["type"] == "deleted":
                     marker = backup_dir / (c["path"] + ".DELETED")
@@ -1068,18 +928,16 @@ def run_backup(
                 compression_ratio = round((1 - actual_size / uncompressed_est) * 100, 1)
 
         # ── Remote destination upload ──────────────────────────────────────────
-        # Handles: cloud (Dropbox/GDrive), sftp, ftp, smb, https.
+        # Handles: cloud (GDrive), sftp, ftp, smb, https.
         # _dest_type is forwarded from desktop_app via cloud_config["_dest_type"].
         # Falls back to storage_type for backward compatibility.
         cloud_upload_result = None
         _dest_type = (cloud_config or {}).get("_dest_type", "") or storage_type
 
         if _dest_type == "cloud" and cloud_config:
-            provider = cloud_config.get("provider", "dropbox")
+            provider = cloud_config.get("provider", "gdrive")
             logger.info(f"☁ Uploading backup to cloud ({provider}): {watch_name}")
-            if provider == "dropbox" and cloud_config.get("access_token"):
-                cloud_upload_result = upload_to_dropbox(str(backup_dir), cloud_config)
-            elif provider == "gdrive" and cloud_config.get("access_token"):
+            if provider == "gdrive" and cloud_config.get("access_token"):
                 cloud_upload_result = upload_to_gdrive(str(backup_dir), cloud_config)
             else:
                 cloud_upload_result = {"ok": False, "error": f"Not connected — use the Connect button for {provider}"}
