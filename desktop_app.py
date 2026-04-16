@@ -1018,9 +1018,10 @@ class BackupWorker(QThread):
             )
 
             # Remove internal metadata from local backup folder
+            # NOTE: Keep MANIFEST.json for local backups so list_backups() can find them
             if result.get("backup_dir"):
                 from pathlib import Path as _P
-                for _meta in ("MANIFEST.json", "BACKUP.sha256"):
+                for _meta in ("BACKUP.sha256",):  # Don't delete MANIFEST.json
                     try:
                         _mp = _P(result["backup_dir"]) / _meta
                         if _mp.exists(): _mp.unlink()
