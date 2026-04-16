@@ -7,7 +7,6 @@ Your developer secrets NEVER leave this server.
 Endpoints:
   POST /send-otp          → send 6-digit OTP to admin email
   POST /verify-otp        → verify OTP, returns true/false
-  POST /dropbox/exchange  → exchange auth code for tokens
   POST /gdrive/exchange   → exchange auth code for tokens
   GET  /health            → health check
 
@@ -23,8 +22,6 @@ HOW TO DEPLOY ON RAILWAY (free):
        BACKUPSYS_SMTP_USER    = backupsys.alerts@outlook.com
        BACKUPSYS_SMTP_PASS    = your-smtp-password
        BACKUPSYS_SMTP_FROM    = backupsys.alerts@outlook.com
-       DROPBOX_APP_KEY        = your-dropbox-app-key
-       DROPBOX_APP_SECRET     = your-dropbox-app-secret
        GDRIVE_CLIENT_ID       = your-client-id.apps.googleusercontent.com
        GDRIVE_CLIENT_SECRET   = your-client-secret
   5. Railway gives you a URL like: https://backupsys-api.up.railway.app
@@ -55,8 +52,6 @@ SMTP_PORT      = int(os.environ.get("BACKUPSYS_SMTP_PORT", "587"))
 SMTP_USER      = os.environ.get("BACKUPSYS_SMTP_USER", "")
 SMTP_PASS      = os.environ.get("BACKUPSYS_SMTP_PASS", "")
 SMTP_FROM      = os.environ.get("BACKUPSYS_SMTP_FROM", SMTP_USER)
-DROPBOX_KEY    = os.environ.get("DROPBOX_APP_KEY", "")
-DROPBOX_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")
 GDRIVE_ID      = os.environ.get("GDRIVE_CLIENT_ID", "")
 GDRIVE_SECRET  = os.environ.get("GDRIVE_CLIENT_SECRET", "")
 
@@ -191,98 +186,6 @@ def verify_otp():
     # Correct — delete OTP (single use)
     del _otp_store[email]
     return jsonify({"ok": True})
-
-
-# ── Dropbox OAuth: Exchange code for tokens ───────────────────────────────────
-
-@app.route("/dropbox/exchange", methods=["POST"])
-def dropbox_exchange():
-    """
-    Body: { "code": "auth_code", "redirect_uri": "http://localhost:8766/..." }
-    Returns Dropbox access_token + refresh_token.
-    App Secret never leaves this server.
-    """
-    if not _check_api_key():
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    data         = request.get_json(silent=True) or {}
-    code         = data.get("code", "")
-    redirect_uri = data.get("redirect_uri", "")
-    verifier     = data.get("code_verifier", "")
-
-    if not code:
-        return jsonify({"ok": False, "error": "Missing code"}), 400
-
-    payload = {
-        "code":          code,
-        "grant_type":    "authorization_code",
-        "client_id":     DROPBOX_KEY,
-        "client_secret": DROPBOX_SECRET,
-        "redirect_uri":  redirect_uri,
-    }
-    if verifier:
-        payload["code_verifier"] = verifier
-
-    try:
-        req_data = urllib.parse.urlencode(payload).encode()
-        req = urllib.request.Request(
-            "https://api.dropboxapi.com/oauth2/token",
-            data=req_data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            tokens = json.loads(resp.read())
-
-        return jsonify({
-            "ok":            True,
-            "access_token":  tokens.get("access_token", ""),
-            "refresh_token": tokens.get("refresh_token", ""),
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ── Dropbox OAuth: Refresh token ──────────────────────────────────────────────
-
-@app.route("/dropbox/refresh", methods=["POST"])
-def dropbox_refresh():
-    """
-    Body: { "refresh_token": "..." }
-    Returns new access_token. App Secret stays on server.
-    """
-    if not _check_api_key():
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    data          = request.get_json(silent=True) or {}
-    refresh_token = data.get("refresh_token", "")
-
-    if not refresh_token:
-        return jsonify({"ok": False, "error": "Missing refresh_token"}), 400
-
-    try:
-        import base64
-        auth    = base64.b64encode(f"{DROPBOX_KEY}:{DROPBOX_SECRET}".encode()).decode()
-        payload = urllib.parse.urlencode({
-            "grant_type":    "refresh_token",
-            "refresh_token": refresh_token,
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.dropboxapi.com/oauth2/token",
-            data=payload,
-            headers={
-                "Authorization":  f"Basic {auth}",
-                "Content-Type":   "application/x-www-form-urlencoded",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            tokens = json.loads(resp.read())
-
-        return jsonify({
-            "ok":           True,
-            "access_token": tokens.get("access_token", ""),
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ── Google Drive OAuth: Exchange code for tokens ──────────────────────────────
