@@ -51,6 +51,8 @@ Output: `dist/BackupSystem/BackupSystem.exe` — copy the entire `dist/BackupSys
 | `watcher.py` | File-system watching via watchdog (polling fallback for network shares) |
 | `transport_utils.py` | Remote upload helpers — SFTP, FTP/FTPS, SMB, HTTPS |
 | `notification_utils.py` | Email (SMTP/STARTTLS/SSL) and webhook notification helpers |
+| `live_dest_tests.py` | Comprehensive testing suite for all remote destination protocols |
+| `sftp_repro.py` | SFTP debugging and reproduction script |
 | `build_exe.py` | PyInstaller packaging script |
 | `config.json` | Runtime configuration (auto-generated on first run) |
 | `INTEGRATION_PATCH.py` | Reference: shows how transport/notification modules were integrated into `backup_engine.py` |
@@ -96,6 +98,8 @@ Configure under `dest_sftp`, `dest_ftp`, `dest_smb`, or `dest_https` in `config.
 ```json
 "dest_https": { "url": "https://api.example.com/backup", "token": "Bearer xxx", "verify_ssl": true }
 ```
+
+All remote destinations support live connection testing via the Settings UI "Test Connection" buttons.
 
 ---
 
@@ -163,6 +167,22 @@ Per-watch Fernet (AES-128-CBC + HMAC-SHA256) encryption. Set `encrypt_key` on a 
 ## Restore
 
 From the backup history UI, select a backup and click **Restore**. For incremental backups, use **Restore Full Chain** to replay all snapshots in order up to a chosen point in time.
+
+## Testing Remote Destinations
+
+Test all remote destination protocols with local servers:
+
+```bash
+python live_dest_tests.py
+```
+
+This starts local test servers for SFTP, FTP, HTTPS, and SMB, then runs comprehensive upload tests for each protocol. Useful for validating remote destination configurations before deploying.
+
+For SFTP debugging specifically:
+
+```bash
+python sftp_repro.py
+```
 
 ---
 
