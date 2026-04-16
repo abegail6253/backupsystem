@@ -1,5 +1,5 @@
 """
-Backup System  EWindows Desktop App
+Backup System  · Windows Desktop App
 PyQt5-based system tray app with dashboard + admin panel.
 Place this file in the same folder as backup_engine.py, config_manager.py, watcher.py
 """
@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-# winreg is Windows-only  Eguard so the module can at least be imported on other platforms
+# winreg is Windows-only  · guard so the module can at least be imported on other platforms
 try:
     import winreg
     WINREG_AVAILABLE = True
@@ -29,10 +29,10 @@ except ImportError:
 def _load_dotenv():
     # Accepted filenames in priority order.
     # Prefer ".env" (standard); "_env" is supported as a legacy fallback.
-    # Rename your _env file to .env  Eit will not be loaded by other tools otherwise.
+    # Rename your _env file to .env  · it will not be loaded by other tools otherwise.
     _env_candidates = [
         Path(__file__).parent / ".env",
-        Path(__file__).parent / "_env",          # legacy fallback  Erename to .env
+        Path(__file__).parent / "_env",          # legacy fallback  · rename to .env
         Path(os.environ.get("BACKUPSYS_DATA_DIR", "")) / ".env" if os.environ.get("BACKUPSYS_DATA_DIR") else None,
     ]
     for _env_path in _env_candidates:
@@ -104,7 +104,7 @@ def _setup_logging():
     root.setLevel(logging.INFO)
 
     fmt = logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(name)s  E%(message)s",
+        "%(asctime)s  %(levelname)-8s  %(name)s  · %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -563,7 +563,7 @@ def _ensure_smb_mounted(smb_cfg: dict):
     domain = smb_cfg.get("domain", "").strip()
 
     if not path:
-        return True, ""   # nothing to mount  Euser mapped the drive manually
+        return True, ""   # nothing to mount  · user mapped the drive manually
 
     # Extract \\server\share from a full UNC path
     norm = path.replace("/", "\\")
@@ -571,7 +571,7 @@ def _ensure_smb_mounted(smb_cfg: dict):
     unc  = m.group(1) if m else norm
 
     if not user:
-        return True, ""   # no credentials  Eshare may already be accessible
+        return True, ""   # no credentials  · share may already be accessible
 
     user_arg = f"{domain}\\{user}" if domain else user
     pw_arg   = pw if pw else ""
@@ -584,7 +584,7 @@ def _ensure_smb_mounted(smb_cfg: dict):
 
         res    = _sp.run(cmd, capture_output=True, text=True, timeout=15)
         stderr = (res.stdout + res.stderr).lower()
-        # "already" or "local device" means the share is already connected  Efine
+        # "already" or "local device" means the share is already connected  · fine
         if res.returncode != 0 and "already" not in stderr and "local device" not in stderr:
             return False, (res.stderr or res.stdout).strip()
         return True, ""
@@ -596,9 +596,9 @@ def _upload_smb(local_dir: str, smb_cfg: dict) -> dict:
     """
     Copy a backup folder to a Windows SMB / CIFS share.
 
-    • Windows   Emount via 'net use' (if credentials provided) then copy
+    • Windows   · mount via 'net use' (if credentials provided) then copy
                  files directly over the UNC path using shutil.
-    • Linux/macOS  Euse the optional 'smbprotocol' package.
+    • Linux/macOS  · use the optional 'smbprotocol' package.
 
     smb_cfg keys  (from cfg["dest_smb"]):
         path    full UNC destination e.g. \\\\nas\\backups
@@ -686,7 +686,7 @@ def _upload_smb(local_dir: str, smb_cfg: dict) -> dict:
         return {
             "ok": False,
             "error": (
-                "smbprotocol not installed  Erun: pip install smbprotocol\n"
+                "smbprotocol not installed  · run: pip install smbprotocol\n"
                 "(on Windows the built-in UNC copy is used automatically)"
             ),
         }
@@ -786,7 +786,7 @@ def _upload_https(local_dir: str, api_cfg: dict) -> dict:
             "ok":       uploaded > 0,
             "uploaded": uploaded,
             "errors":   errors,
-            "error":    f"{len(errors)} file(s) failed  Efirst: {errors[0]}" if uploaded == 0 else None,
+            "error":    f"{len(errors)} file(s) failed  · first: {errors[0]}" if uploaded == 0 else None,
         }
     return {"ok": True, "uploaded": uploaded}
 
@@ -806,7 +806,7 @@ except ImportError:
 
 
 def _send_email_notification(cfg: dict, subject: str, body: str):
-    """Send an email notification  Edelegates to notification_utils when available."""
+    """Send an email notification  · delegates to notification_utils when available."""
     ec = cfg.get("email_config", {})
     if not ec.get("enabled", False):
         return
@@ -869,7 +869,7 @@ def _send_webhook(cfg: dict, result: dict):
         return
 
     # Success webhooks are opt-in; failures are always sent.
-    # BUG FIX: previous condition was inverted  Eit suppressed failure webhooks
+    # BUG FIX: previous condition was inverted  · it suppressed failure webhooks
     # when webhook_on_success=True instead of suppressing success webhooks when
     # webhook_on_success=False.
     if result.get("status") == "success" and not cfg.get("webhook_on_success", False):
@@ -914,7 +914,7 @@ class BackupWorker(QThread):
     log_message = pyqtSignal(str)                # status text
 
     def __init__(self, watch: dict, cfg: dict, triggered_by: str = "manual"):
-        super().__init__()   # BUG FIX: was super().__init__(self)  Epassing self as own parent
+        super().__init__()   # BUG FIX: was super().__init__(self)  · passing self as own parent
         self.watch        = watch
         self.cfg          = cfg
         self.triggered_by = triggered_by
@@ -960,7 +960,7 @@ class BackupWorker(QThread):
                     f"⏳ Retrying {w['name']} (attempt {attempt}/{max_attempts}) "
                     f"in {cfg.get('retry_delay_min', 5)} min…"
                 )
-                # Interruptible sleep  Ewakes immediately if request_stop() is called
+                # Interruptible sleep  · wakes immediately if request_stop() is called
                 interrupted = self._stop_event.wait(timeout=retry_delay)
                 if interrupted:
                     result = {"status": "cancelled", "error": "Cancelled during retry wait", "watch_id": w["id"]}
@@ -994,7 +994,7 @@ class BackupWorker(QThread):
                     throttler         = throttler,
                 )
             except InterruptedError:
-                # User pressed ✁ECancel  Etreat as a clean cancellation not a failure
+                # User pressed ▶ Cancel  · treat as a clean cancellation not a failure
                 result = {"status": "cancelled", "error": "Cancelled by user", "watch_id": w["id"]}
                 break
             except Exception as e:
@@ -1014,7 +1014,7 @@ class BackupWorker(QThread):
                 dest_type=dest_type,
             )
             self.log_message.emit(
-                f"✁E{w['name']}: {result['files_copied']} file(s)  E{result['total_size']}"
+                f"▶ {w['name']}: {result['files_copied']} file(s) · {result['total_size']}"
             )
 
             # Remove internal metadata from local backup folder
@@ -1042,7 +1042,7 @@ class BackupWorker(QThread):
                         "backup_id": result.get("backup_id", result.get("id", "N/A")),
                     })
                 except ImportError:
-                    subject = f"✁EBackup complete: {w['name']}"
+                    subject = f"✅ Backup complete: {w['name']}"
                     body    = (
                         f"Watch:         {w['name']}\n"
                         f"Source:        {w['path']}\n"
@@ -1096,7 +1096,7 @@ class BackupWorker(QThread):
                     _ec = cfg.get("email_config", {})
                     if _ec.get("enabled") and _ec.get("notify_on_failure", True):
                         _send_email_notification(cfg,
-                            f"⚠ BackupSys  E{dest_type.upper()} upload failed: {w['name']}",
+                            f"⚠ BackupSys  · {dest_type.upper()} upload failed: {w['name']}",
                             f"Backup completed but remote upload failed.\n\n"
                             f"  Watch:      {w['name']}\n"
                             f"  Dest type:  {dest_type.upper()}\n"
@@ -1149,7 +1149,7 @@ class BackupWorker(QThread):
                     _ec = cfg.get("email_config", {})
                     if _ec.get("enabled") and _ec.get("notify_on_failure", True):
                         _send_email_notification(cfg,
-                            f"⚠ BackupSys  EFTPS upload failed: {w['name']}",
+                            f"⚠ BackupSys  · FTPS upload failed: {w['name']}",
                             f"Backup completed but FTPS upload failed.\n\n"
                             f"  Watch:      {w['name']}\n"
                             f"  Dest type:  FTPS\n"
@@ -1194,7 +1194,7 @@ class BackupWorker(QThread):
                     _ec = cfg.get("email_config", {})
                     if _ec.get("enabled") and _ec.get("notify_on_failure", True):
                         _send_email_notification(cfg,
-                            f"⚠ BackupSys  EFTP upload failed: {w['name']}",
+                            f"⚠ BackupSys  · FTP upload failed: {w['name']}",
                             f"Backup completed but FTP upload failed.\n\n"
                             f"  Watch:      {w['name']}\n"
                             f"  Dest type:  FTP\n"
@@ -1239,7 +1239,7 @@ class BackupWorker(QThread):
                     _ec = cfg.get("email_config", {})
                     if _ec.get("enabled") and _ec.get("notify_on_failure", True):
                         _send_email_notification(cfg,
-                            f"⚠ BackupSys  EHTTPS upload failed: {w['name']}",
+                            f"⚠ BackupSys  · HTTPS upload failed: {w['name']}",
                             f"Backup completed but HTTPS upload failed.\n\n"
                             f"  Watch:      {w['name']}\n"
                             f"  Dest type:  HTTPS\n"
@@ -1272,7 +1272,7 @@ class BackupWorker(QThread):
                     else:
                         self.log_message.emit(f"⚠ SMB copy failed: {smb_result.get('error','')}")
         else:
-            self.log_message.emit(f"❁E{w['name']}: {result.get('error', 'unknown error')}")
+            self.log_message.emit(f"⚠ {w['name']}: {result.get('error', 'unknown error')}")
 
             # ── Email + webhook on failure ─────────────────────────────
             ec = cfg.get("email_config", {})
@@ -1286,7 +1286,7 @@ class BackupWorker(QThread):
                         "error": result.get("error", "Unknown error"),
                     })
                 except ImportError:
-                    subject = f"❁EBackup failed: {w['name']}"
+                    subject = f"⚠ Backup failed: {w['name']}"
                     body    = (
                         f"Watch:     {w['name']}\n"
                         f"Source:    {w['path']}\n"
@@ -1396,7 +1396,7 @@ class PasswordDialog(QDialog):
                 # Lockout: 30-second cooldown after 5 consecutive failures
                 if self._attempts >= 5:
                     self._locked = True
-                    self.error_lbl.setText("Too many attempts  Elocked for 30 seconds")
+                    self.error_lbl.setText("Too many attempts  · locked for 30 seconds")
                     self.pw_input.setEnabled(False)
                     QTimer.singleShot(30_000, self._unlock)
                 else:
@@ -1453,7 +1453,7 @@ class PasswordDialog(QDialog):
         """
         import hashlib as _hl
         if ":" not in stored:
-            # Legacy plain-SHA256  Eaccept it but user should reset password
+            # Legacy plain-SHA256  · accept it but user should reset password
             return _hl.sha256(pw.encode()).hexdigest() == stored
         try:
             salt_hex, hash_hex = stored.split(":", 1)
@@ -1471,7 +1471,7 @@ class PasswordDialog(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         stored = s.value(ADMIN_PASS_KEY, "")
         if not stored:
-            # No password set yet ↁEany input grants access
+            # No password set yet >any input grants access
             return True
         return self._hash_verify(pw, stored)
 
@@ -1659,13 +1659,13 @@ class AddWatchDialog(QDialog):
             self.error_lbl.setText(f"Cannot access path: {e}")
             return False
 
-        # 7. Duplicate path  Ealready being watched
+        # 7. Duplicate path  · already being watched
         existing_paths = [w.get("path", "").strip().lower() for w in self.cfg.get("watches", [])]
         if path_str.strip().lower() in existing_paths:
             self.error_lbl.setText("This path is already in your watch list.")
             return False
 
-        # 8. Duplicate name  Ealready used
+        # 8. Duplicate name  · already used
         existing_names = [w.get("name", "").strip().lower() for w in self.cfg.get("watches", [])]
         if name.strip().lower() in existing_names:
             self.error_lbl.setText(f"A watch named \"{name}\" already exists. Choose a different name.")
@@ -1785,7 +1785,7 @@ class AddWatchDialog(QDialog):
         if warnings:
             msg = "\n\n".join(f"⚠ {w}" for w in warnings)
             reply = QMessageBox.warning(
-                self, "Warning  EReview Before Adding",
+                self, "Warning  · Review Before Adding",
                 msg + "\n\nDo you want to add this watch anyway?",
                 QMessageBox.Yes | QMessageBox.Cancel
             )
@@ -1845,7 +1845,7 @@ class EditWatchDialog(QDialog):
     def __init__(self, watch: dict, parent=None):
         super().__init__(parent)
         self.watch = watch
-        self.setWindowTitle(f"Edit Watch  E{watch.get('name', '')}")
+        self.setWindowTitle(f"Edit Watch  · {watch.get('name', '')}")
         self.setMinimumWidth(500)
         self._build_ui()
 
@@ -1902,7 +1902,7 @@ class EditWatchDialog(QDialog):
         self.encrypt_input.setToolTip(
             "AES encryption key for this watch.\n"
             "Generate one: python -c \"from backup_engine import generate_encryption_key; print(generate_encryption_key())\"\n"
-            "⚠ Store your key safely  Ewithout it backups cannot be restored!"
+            "⚠ Store your key safely  · without it backups cannot be restored!"
         )
         gen_key_btn = QPushButton("Generate")
         gen_key_btn.setObjectName("secondary")
@@ -2041,7 +2041,7 @@ class AdminPanel(QDialog):
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self.cfg = cfg
-        self.setWindowTitle("Admin Settings  EBackup System")
+        self.setWindowTitle("Admin Settings  · Backup System")
         self.setMinimumSize(880, 580)
         self.setModal(True)
         self._build_ui()
@@ -2058,7 +2058,7 @@ class AdminPanel(QDialog):
         header.setFixedHeight(56)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 20, 0)
-        title = QLabel("⚁E Admin Settings")
+        title = QLabel("Admin Settings")
         title.setStyleSheet("font-size:15px; font-weight:700; color:#f1f3f9;")
         hl.addWidget(title)
         hl.addStretch()
@@ -2304,7 +2304,7 @@ class AdminPanel(QDialog):
         wl.setSpacing(12)
 
         btn_row = QHBoxLayout()
-        add_btn = QPushButton("�E�EAdd Watch")
+        add_btn = QPushButton("➕ Add Watch")
         add_btn.setObjectName("success")
         add_btn.clicked.connect(self._add_watch)
         refresh_btn = QPushButton("↻ Refresh")
@@ -2349,7 +2349,7 @@ class AdminPanel(QDialog):
 
         cloud_info = QLabel(
             "Connect your cloud accounts below. Once connected, select a watch and assign "
-            "a cloud provider  Ebackups will upload automatically after each local backup."
+            "a cloud provider  · backups will upload automatically after each local backup."
         )
         cloud_info.setWordWrap(True)
         cloud_info.setStyleSheet("color:#6b7280; font-size:11px;")
@@ -2440,7 +2440,7 @@ class AdminPanel(QDialog):
         egl.addRow("", self.email_notify_success_check)
 
         self.email_notify_failure_check = QCheckBox("Send on failed backup")
-        self.email_notify_failure_check.setChecked(True)   # default on  Efailure alerts are more important
+        self.email_notify_failure_check.setChecked(True)   # default on  · failure alerts are more important
         egl.addRow("", self.email_notify_failure_check)
 
         self.email_smtp_host = QLineEdit()
@@ -2596,7 +2596,7 @@ class AdminPanel(QDialog):
         self._on_interval_unit_changed(1 if unit == "seconds" else 0)
         self.interval_spin.setValue(self.cfg.get("interval_min", 30))
         self.retention_spin.setValue(self.cfg.get("retention_days", 30))
-        # Scheduled backup times  Edisplay as comma-separated "HH:MM" string
+        # Scheduled backup times  · display as comma-separated "HH:MM" string
         sched = self.cfg.get("backup_schedule_times", [])
         self.schedule_times_input.setText(", ".join(sched) if sched else "")
         try:
@@ -2658,14 +2658,14 @@ class AdminPanel(QDialog):
                         self.gd_folder_id.setText(c.get("folder_id", ""))
 
     def _on_cloud_provider_ui_changed(self, provider: str):
-        """Kept for backward compatibility  Eno-op since we now use checkboxes."""
+        """Kept for backward compatibility  · no-op since we now use checkboxes."""
         pass
 
     def _on_provider_changed(self, provider: str):
         """Kept for backward compatibility."""
         pass
 
-    # ── OAuth credentials  Eloaded from .env file ────────────────────────────
+    # ── OAuth credentials  · loaded from .env file ────────────────────────────
     # Create a .env file in your project folder with:
     #   GDRIVE_CLIENT_ID=your_client_id
     #   GDRIVE_CLIENT_SECRET=your_client_secret
@@ -2834,7 +2834,7 @@ class AdminPanel(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         s.setValue("gdrive_access_token",  tokens.get("access_token", ""))
         s.setValue("gdrive_refresh_token", tokens.get("refresh_token", ""))
-        self.gd_status_lbl.setText("✁E Connected")
+        self.gd_status_lbl.setText("▶  Connected")
         self.gd_status_lbl.setObjectName("status_ok")
         self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
         self.gd_status_lbl.style().polish(self.gd_status_lbl)
@@ -2873,7 +2873,7 @@ class AdminPanel(QDialog):
         self._validate_cloud_tokens()
 
     def _validate_cloud_tokens(self):
-        """Check if saved tokens are still valid  Eruns in a background thread."""
+        """Check if saved tokens are still valid  · runs in a background thread."""
         import threading
         def _check():
             s        = QSettings(SETTINGS_ORG, SETTINGS_APP)
@@ -2896,7 +2896,7 @@ class AdminPanel(QDialog):
                         if not refreshed:
                             warnings.append("gdrive")
                 except Exception:
-                    # Token invalid  Etry refresh
+                    # Token invalid  · try refresh
                     refreshed = self._silent_refresh_gdrive()
                     if not refreshed:
                         warnings.append("gdrive")
@@ -2951,7 +2951,7 @@ class AdminPanel(QDialog):
             name = "Google Drive"
             # 1. Update Cloud tab status label
             if provider == "gdrive" and hasattr(self, "gd_status_lbl"):
-                self.gd_status_lbl.setText("⚠ Token expired  Ereconnect")
+                self.gd_status_lbl.setText("⚠ Token expired  · reconnect")
                 self.gd_status_lbl.setObjectName("status_err")
                 self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
                 self.gd_status_lbl.style().polish(self.gd_status_lbl)
@@ -2960,15 +2960,15 @@ class AdminPanel(QDialog):
             # 2. Tray notification
             if hasattr(self, "_tray"):
                 self._tray.showMessage(
-                    f"⚠ {name}  EReconnect Required",
+                    f"⚠ {name}  · Reconnect Required",
                     f"Your {name} token has expired.\n"
-                    f"Open Settings ↁECloud tab ↁEReconnect to continue cloud backups.",
+                    f"Open Settings >Cloud tab >Reconnect to continue cloud backups.",
                     QSystemTrayIcon.Warning, 8000
                 )
             # 3. Log
             if hasattr(self, "log_text"):
                 self._append_log(
-                    f"⚠ {name} token expired  Ego to Settings ↁECloud tab to reconnect"
+                    f"⚠ {name} token expired  · go to Settings >Cloud tab to reconnect"
                 )
 
     def _save_cloud(self):
@@ -3079,7 +3079,7 @@ class AdminPanel(QDialog):
         try:
             # ── Auto-reset snapshots when destination changes ──────────────
             # If the user changed the remote host/path, the old snapshots are
-            # no longer valid  Ereset them so the next backup is a full backup.
+            # no longer valid  · reset them so the next backup is a full backup.
             _old_sftp = getattr(self, "_saved_dest_sftp", {})
             _new_sftp = self.cfg.get("dest_sftp", {})
             _dest_changed = (
@@ -3105,7 +3105,7 @@ class AdminPanel(QDialog):
 
             if _dest_changed:
                 QMessageBox.information(self, "Saved",
-                    "Settings saved.\n\nDestination changed  Enext backup will be a full backup automatically.")
+                    "Settings saved.\n\nDestination changed  · next backup will be a full backup automatically.")
             else:
                 QMessageBox.information(self, "Saved", "Settings saved successfully.")
         except Exception as e:
@@ -3207,7 +3207,7 @@ class AdminPanel(QDialog):
                 from notification_utils import send_email_notification as _nu_send_email
                 result = _nu_send_email(
                     ec,
-                    "✁EBackup System  ETest Email",
+                    "▶ Backup System  · Test Email",
                     "This is a test email from your Backup System app.\n\nIf you received this, email notifications are working correctly.",
                 )
 
@@ -3353,7 +3353,7 @@ class AdminPanel(QDialog):
 
 class WatchCard(QFrame):
     backup_requested          = pyqtSignal(dict)
-    full_backup_requested     = pyqtSignal(dict)  # watch  Eforce full backup
+    full_backup_requested     = pyqtSignal(dict)  # watch  · force full backup
     validate_requested        = pyqtSignal(dict)
     restore_requested         = pyqtSignal(dict)
     pause_requested           = pyqtSignal(str, bool)   # watch_id, paused
@@ -3451,7 +3451,7 @@ class WatchCard(QFrame):
         status_layout.setSpacing(4)
         status_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.status_lbl = QLabel("◁E Watching")
+        self.status_lbl = QLabel("▶ Watching")
         self.status_lbl.setObjectName("status_ok")
         self.status_lbl.setAlignment(Qt.AlignRight)
         status_layout.addWidget(self.status_lbl)
@@ -3480,7 +3480,7 @@ class WatchCard(QFrame):
         self.pause_btn.clicked.connect(self._toggle_pause)
         status_layout.addWidget(self.pause_btn)
 
-        self.validate_btn = QPushButton("✁EValidate")
+        self.validate_btn = QPushButton("▶ Validate")
         self.validate_btn.setObjectName("secondary")
         self.validate_btn.setMinimumWidth(130)
         self.validate_btn.clicked.connect(lambda: self.validate_requested.emit(self.watch))
@@ -3492,7 +3492,7 @@ class WatchCard(QFrame):
         self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.watch))
         status_layout.addWidget(self.restore_btn)
 
-        self.cancel_btn = QPushButton("✁ECancel")
+        self.cancel_btn = QPushButton("▶ Cancel")
         self.cancel_btn.setObjectName("danger")
         self.cancel_btn.setMinimumWidth(130)
         self.cancel_btn.setVisible(False)
@@ -3583,7 +3583,7 @@ class WatchCard(QFrame):
         self.changes_panel.setVisible(False)
         self._expanded = False
         self.changes_list.clear()
-        self.status_lbl.setText("◁E Watching")
+        self.status_lbl.setText("▶  Watching")
         self.status_lbl.setObjectName("status_ok")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
@@ -3603,10 +3603,10 @@ class WatchCard(QFrame):
         self.cancel_btn.setVisible(active)
         self.progress_bar.setVisible(active)
         if active:
-            self.status_lbl.setText("◁EBacking up…")
+            self.status_lbl.setText("▶ Backing up…")
             self.status_lbl.setObjectName("status_warn")
         else:
-            self.status_lbl.setText("◁E Watching")
+            self.status_lbl.setText("▶ Watching")
             self.status_lbl.setObjectName("status_ok")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
@@ -3618,11 +3618,11 @@ class WatchCard(QFrame):
     def set_done(self, success: bool):
         self.set_backing_up(False)
         if success:
-            self.status_lbl.setText("✁E Done")
+            self.status_lbl.setText("▶  Done")
             self.status_lbl.setObjectName("status_ok")
             self.clear_changes()
         else:
-            self.status_lbl.setText("✁E Failed")
+            self.status_lbl.setText("▶  Failed")
             self.status_lbl.setObjectName("status_err")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
@@ -3664,14 +3664,14 @@ class WatchCard(QFrame):
         # Rebuild the entire card UI if name/path/color changed significantly
         # (cheaply update the known labels instead of rebuilding)
         try:
-            # name label is the first bold label in the top row  Ewalk the layout
+            # name label is the first bold label in the top row  · walk the layout
             top_widget = self._root_layout.itemAt(0).widget()
             top_layout = top_widget.layout()
             # slot 0: color strip, slot 1: info_layout, slot 2: status_widget
             info_item = top_layout.itemAt(1)
             if info_item:
                 info_layout = info_item.layout()
-                # Row 0: name_row layout ↁEfirst widget is name_lbl
+                # Row 0: name_row layout >first widget is name_lbl
                 name_row_item = info_layout.itemAt(0)
                 if name_row_item:
                     name_row = name_row_item.layout()
@@ -3705,12 +3705,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(780, 620)
         self.resize(860, 680)
 
-        self._workers: dict          = {}   # watch_id ↁEBackupWorker
-        self._cards: dict            = {}   # watch_id ↁEWatchCard
+        self._workers: dict          = {}   # watch_id >BackupWorker
+        self._cards: dict            = {}   # watch_id >WatchCard
         self._watcher_mgr            = WatcherManager() if BACKEND_AVAILABLE else None
         self._change_counts: dict    = {}
-        self._pending_entries: dict  = {}   # watch_id ↁE[entries]
-        self._last_notif_time: dict  = {}   # watch_id ↁEtimestamp
+        self._pending_entries: dict  = {}   # watch_id >[entries]
+        self._last_notif_time: dict  = {}   # watch_id >timestamp
         self._history_log: list      = []   # all change entries across all watches
         self._history_save_counter   = 0    # throttle disk saves
         self._history_window         = None
@@ -3761,7 +3761,7 @@ class MainWindow(QMainWindow):
         tl.addWidget(logo)
         tl.addStretch()
 
-        self.status_dot = QLabel("◁E Active")
+        self.status_dot = QLabel("● Active")
         self.status_dot.setObjectName("status_ok")
         tl.addWidget(self.status_dot)
 
@@ -3774,7 +3774,7 @@ class MainWindow(QMainWindow):
 
         tl.addSpacing(8)
 
-        admin_btn = QPushButton("⚁E Admin")
+        admin_btn = QPushButton("🔧 Admin")
         admin_btn.setObjectName("secondary")
         admin_btn.clicked.connect(self._open_admin)
         tl.addWidget(admin_btn)
@@ -3935,7 +3935,7 @@ class MainWindow(QMainWindow):
 
         watches = self.cfg.get("watches", [])
         if not watches:
-            placeholder = QLabel("No folders are being watched.\nClick Admin ↁEWatches ↁEAdd Watch to get started.")
+            placeholder = QLabel("No folders are being watched.\nClick Admin > Watches > Add Watch to get started.")
             placeholder.setAlignment(Qt.AlignCenter)
             placeholder.setStyleSheet("color:#374151; font-size:13px; padding:40px;")
             self.watches_layout.insertWidget(0, placeholder)
@@ -4071,7 +4071,7 @@ class MainWindow(QMainWindow):
 
         self._update_stats()
 
-        # Tray toast  Ethrottle to max 1 per 10s per watch
+        # Tray toast  · throttle to max 1 per 10s per watch
         now_ts = datetime.now().timestamp()
         last_notif = self._last_notif_time.get(watch_id, 0)
         if now_ts - last_notif > 10 and hasattr(self, "_tray"):
@@ -4085,7 +4085,7 @@ class MainWindow(QMainWindow):
             machine = entry.get("editor_machine", "")
             who     = f" by {user}" if user else (f" on {machine}" if machine else "")
             self._tray.showMessage(
-                f"Change detected  E{name}",
+                f"Change detected  · {name}",
                 f"{icon}  {etype.capitalize()}: {path}{who}",
                 QSystemTrayIcon.Information, 3000
             )
@@ -4132,7 +4132,7 @@ class MainWindow(QMainWindow):
 
         # ── Time-of-day schedule check ────────────────────────────────────────
         # If backup_schedule_times is set, those times ARE the auto backup.
-        # The interval is completely ignored  Ethe backup only fires at the
+        # The interval is completely ignored  · the backup only fires at the
         # exact scheduled times (e.g. 17:50). This way the backup runs when
         # the PC is idle and doesn't eat resources during working hours.
         # If no scheduled times are configured, the interval runs as normal.
@@ -4142,7 +4142,7 @@ class MainWindow(QMainWindow):
         now_secs_day   = now.hour * 3600 + now.minute * 60 + now.second
 
         if schedule_times:
-            # Scheduled mode  Echeck if it's time to fire
+            # Scheduled mode  · check if it's time to fire
             for sched_str in schedule_times:
                 try:
                     sh, sm    = int(sched_str[:2]), int(sched_str[3:5])
@@ -4159,7 +4159,7 @@ class MainWindow(QMainWindow):
                     continue
 
             if not _schedule_due:
-                return  # Not the scheduled time yet  Eskip interval entirely
+                return  # Not the scheduled time yet  · skip interval entirely
 
         for w in cfg.get("watches", []):
             if not w.get("active", True) or w.get("paused", False):
@@ -4219,7 +4219,7 @@ class MainWindow(QMainWindow):
         if wid in self._cards:
             self._cards[wid].set_backing_up(True)
 
-        self.status_dot.setText("◁EBacking up…")
+        self.status_dot.setText("● Backing up…")
         self.status_dot.setObjectName("status_warn")
         self.status_dot.style().unpolish(self.status_dot)
         self.status_dot.style().polish(self.status_dot)
@@ -4241,7 +4241,7 @@ class MainWindow(QMainWindow):
         if BACKEND_AVAILABLE:
             try:
                 # Delete snapshots for ALL destinations so a full backup runs
-                # to SFTP, GDrive, etc.  Enot just the primary dest.
+                # to SFTP, GDrive, etc.  · not just the primary dest.
                 config_manager.delete_snapshot(wid)   # deletes all variants
                 # Mark watch so auto backup ignores "no changes" check
                 for w in self.cfg.get("watches", []):
@@ -4333,7 +4333,7 @@ class MainWindow(QMainWindow):
                     )
                     if prune["pruned"] > 0:
                         self._append_log(
-                            f"✁E Pruned {prune['pruned']} old backup(s) for {watch.get('name',wid)} "
+                            f"▶  Pruned {prune['pruned']} old backup(s) for {watch.get('name',wid)} "
                             f"(max={max_b}), freed {prune['freed_human']}"
                         )
 
@@ -4377,15 +4377,15 @@ class MainWindow(QMainWindow):
         self._update_auto_label()
 
         if not self._workers:
-            self.status_dot.setText("◁E Active")
+            self.status_dot.setText("● Active")
             self.status_dot.setObjectName("status_ok")
             self.status_dot.style().unpolish(self.status_dot)
             self.status_dot.style().polish(self.status_dot)
 
         # Tray notification
         if hasattr(self, "_tray"):
-            msg = (f"✁EBackup complete: {result.get('files_copied',0)} file(s)"
-                   if success else f"❁EBackup failed: {result.get('error','')}")
+            msg = (f"✅ Backup complete: {result.get('files_copied',0)} file(s)"
+                   if success else f"⚠ Backup failed: {result.get('error','')}")
             self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Information, 3000)
 
     def _append_log(self, text: str):
@@ -4432,14 +4432,14 @@ class MainWindow(QMainWindow):
 
         if result.get("valid") and result.get("manifest_ok"):
             msg = (
-                f"✁E Backup is valid\n\n"
+                f"▶  Backup is valid\n\n"
                 f"Watch:     {watch['name']}\n"
                 f"Date:      {ts}\n"
                 f"Hash:      {result.get('stored_hash', '')[:16]}…\n"
                 f"Files OK:  {result.get('manifest_ok')}"
             )
-            QMessageBox.information(self, "Validate  EPassed", msg)
-            self._append_log(f"✁EValidate passed: {watch['name']}")
+            QMessageBox.information(self, "Validate  · Passed", msg)
+            self._append_log(f"▶ Validate passed: {watch['name']}")
         else:
             missing   = result.get("missing_files", [])
             corrupted = result.get("corrupted_files", [])
@@ -4451,9 +4451,9 @@ class MainWindow(QMainWindow):
                 details += f"\nCorrupted files ({len(corrupted)}):\n  " + "\n  ".join(corrupted[:5])
             if err:
                 details += f"\nError: {err}"
-            QMessageBox.critical(self, "Validate  EFailed",
-                f"❁E Backup validation failed\n\nWatch: {watch['name']}\nDate:  {ts}{details}")
-            self._append_log(f"❁EValidate failed: {watch['name']}")
+            QMessageBox.critical(self, "Validate  · Failed",
+                f"⚠  Backup validation failed\n\nWatch: {watch['name']}\nDate:  {ts}{details}")
+            self._append_log(f"⚠ Validate failed: {watch['name']}")
 
     # ── Restore ────────────────────────────────────────────────────────────────
 
@@ -4480,12 +4480,12 @@ class MainWindow(QMainWindow):
             size  = b.get("total_size_bytes", 0)
             size_h = f"{size // 1024} KB" if size < 1024*1024 else f"{size // (1024*1024)} MB"
             incremental = "incremental" if b.get("incremental") else "full"
-            items.append(f"{ts}   E {files} file(s)  {size_h}  [{incremental}]")
+            items.append(f"{ts}   ·  {files} file(s)  {size_h}  [{incremental}]")
 
         chosen, ok = QInputDialog.getItem(
             self, "Restore Backup",
             f"Select a restore point for \"{watch['name']}\":\n"
-            "(Full Chain Restore replays ALL backups up to the chosen point  Erecommended for incremental setups)",
+            "(Full Chain Restore replays ALL backups up to the chosen point  · recommended for incremental setups)",
             items, 0, False
         )
         if not ok:
@@ -4536,7 +4536,7 @@ class MainWindow(QMainWindow):
                 total = contents.get("total", 0)
                 overflow = f"\n  … and {total - 30} more" if total > 30 else ""
                 QMessageBox.information(
-                    self, f"Backup Contents  E{chosen}",
+                    self, f"Backup Contents  · {chosen}",
                     f"Files in this snapshot ({total} total):\n\n{files_txt}{overflow}{deleted_txt}"
                 )
             except Exception as e:
@@ -4561,7 +4561,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        self._append_log(f"Restoring backup: {watch['name']} ↁE{target} ({mode_label}) …")
+        self._append_log(f"Restoring backup: {watch['name']} >{target} ({mode_label}) …")
 
         try:
             if use_chain:
@@ -4586,26 +4586,26 @@ class MainWindow(QMainWindow):
         if result.get("ok"):
             extra = f"\nChain steps applied:  {steps}" if steps is not None else ""
             QMessageBox.information(self, "Restore Complete",
-                f"✁E Restore complete\n\n"
+                f"▶  Restore complete\n\n"
                 f"Files restored:  {result.get('files_restored', 0)}\n"
                 f"Files skipped:   {result.get('skipped', 0)}\n"
                 f"Destination:     {target}{extra}"
             )
             self._append_log(
-                f"✁ERestore complete: {watch['name']}  E"
-                f"{result.get('files_restored', 0)} file(s) ↁE{target}"
+                f"▶ Restore complete: {watch['name']}  · "
+                f"{result.get('files_restored', 0)} file(s) >{target}"
             )
         else:
             errors = result.get("errors", [])
             err_preview = "\n".join(errors[:5]) if errors else result.get("error", "Unknown error")
             QMessageBox.critical(self, "Restore Failed",
-                f"❁E Restore failed\n\n{err_preview}")
-            self._append_log(f"❁ERestore failed: {watch['name']}")
+                f"⚠  Restore failed\n\n{err_preview}")
+            self._append_log(f"⚠ Restore failed: {watch['name']}")
 
     # ── Admin ──────────────────────────────────────────────────────────────────
 
     def _validate_cloud_tokens(self):
-        """Validate cloud tokens from MainWindow  Edelegates to AdminPanel logic in background."""
+        """Validate cloud tokens from MainWindow  · delegates to AdminPanel logic in background."""
         import threading
         def _check():
             try:
@@ -4638,18 +4638,18 @@ class MainWindow(QMainWindow):
             name = "Google Drive"
             if hasattr(self, "_tray"):
                 self._tray.showMessage(
-                    f"⚠ {name}  EReconnect Required",
+                    f"⚠ {name}  · Reconnect Required",
                     f"Your {name} token has expired.\n"
-                    f"Open Settings ↁECloud tab ↁEReconnect.",
+                    f"Open Settings >Cloud tab >Reconnect.",
                     QSystemTrayIcon.Warning, 8000
                 )
             self._append_log(
-                f"⚠ {name} token expired  Ego to Settings ↁECloud tab to reconnect"
+                f"⚠ {name} token expired  · go to Settings >Cloud tab to reconnect"
             )
 
     def _open_admin(self):
         if not PasswordDialog.has_password():
-            # First time  Eprompt to set password
+            # First time  · prompt to set password
             reply = QMessageBox.question(self, "Set Admin Password",
                 "No admin password is set. Would you like to set one now?\n"
                 "(If you skip, any user can access admin settings)",
@@ -4765,7 +4765,7 @@ class MainWindow(QMainWindow):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HistoryWindow(QDialog):
-    """Full change history table  Eall edits across all watches."""
+    """Full change history table  · all edits across all watches."""
 
     def __init__(self, history: list, parent=None):
         super().__init__(parent)
@@ -4825,9 +4825,9 @@ class HistoryWindow(QDialog):
         sl.setSpacing(24)
 
         self.stat_total   = QLabel("Total: 0")
-        self.stat_mod     = QLabel("✁EModified: 0")
-        self.stat_added   = QLabel("�E�EAdded: 0")
-        self.stat_deleted = QLabel("✁EDeleted: 0")
+        self.stat_mod     = QLabel("Modified: 0")
+        self.stat_added   = QLabel("➕ Added: 0")
+        self.stat_deleted = QLabel("Deleted: 0")
 
         for lbl in (self.stat_total, self.stat_mod, self.stat_added, self.stat_deleted):
             lbl.setStyleSheet("color:#6b7280; font-size:11px; font-weight:600;")
@@ -4915,9 +4915,9 @@ class HistoryWindow(QDialog):
         deleted = sum(1 for e in entries if e.get("type") == "deleted")
 
         self.stat_total.setText(f"Total: {total}")
-        self.stat_mod.setText(f"✁EModified: {mod}")
-        self.stat_added.setText(f"�E�EAdded: {added}")
-        self.stat_deleted.setText(f"✁EDeleted: {deleted}")
+        self.stat_mod.setText(f"Modified: {mod}")
+        self.stat_added.setText(f"➕ Added: {added}")
+        self.stat_deleted.setText(f"Deleted: {deleted}")
 
     def _filter(self):
         text      = self.filter_input.text().lower()
@@ -4977,7 +4977,7 @@ class HistoryWindow(QDialog):
     def append_entry(self, entry: dict):
         """Live-add a new entry to the top without full reload.
 
-        Previously this called _filter() ↁE_populate() ↁEresizeRowsToContents()
+        Previously this called _filter() >_populate() >resizeRowsToContents()
         on *every* incoming file-change event, which caused visible UI freezes
         on busy watches.  Now we insert a single row at position 0.
         """
@@ -5062,7 +5062,7 @@ class TrayApp:
         backup_action = QAction("⚡  Backup All Now", menu)
         backup_action.triggered.connect(self.window._backup_all)
 
-        admin_action = QAction("⚁E Admin Settings", menu)
+        admin_action = QAction("🔧 Admin Settings", menu)
         admin_action.triggered.connect(self.window._open_admin)
 
         history_action = QAction("📋  Change History", menu)
@@ -5142,14 +5142,14 @@ def _acquire_single_instance_lock():
                 return None
             return fh
     except Exception:
-        return None   # can't lock ↁEallow app to start
+        return None   # can't lock >allow app to start
 
 
 def main():
     # Single-instance guard
     _lock_fh = _acquire_single_instance_lock()
     if _lock_fh is None:
-        # Another instance is already running  Eshow a quick error and exit
+        # Another instance is already running  · show a quick error and exit
         _tmp_app = QApplication.instance() or QApplication(sys.argv)
         QMessageBox.warning(None, APP_NAME,
             "Backup System is already running.\n\nCheck your system tray.")
