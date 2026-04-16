@@ -931,7 +931,7 @@ class BackupWorker(QThread):
         self.log_message.emit(f"Starting backup: {w['name']} …")
 
         # Determine the primary destination type for snapshot keying.
-        # Each destination (sftp, gdrive, dropbox, local …) maintains its own
+        # Each destination (sftp, gdrive, local …) maintains its own
         # independent snapshot so that a file already on SFTP but not yet on
         # GDrive is correctly detected as "new" for the GDrive destination.
         dest_type = cfg.get("dest_type", "local")
@@ -1057,148 +1057,6 @@ class BackupWorker(QThread):
             # ── Webhook notification ───────────────────────────────────
             _send_webhook(cfg, result)
 
-                        # ── Multi-cloud upload (gdrive + dropbox) ──────────────────
-            # Each provider ALWAYS runs its own independent run_backup()
-            # from source using its own snapshot. We never share the SFTP
-            # staging dir — it will be empty whenever SFTP is current.
-            _all_cloud_configs = w.get("cloud_configs", [])
-            if not _all_cloud_configs and w.get("cloud_config"):
-                _all_cloud_configs = [w["cloud_config"]]
-
-            for _cc in _all_cloud_configs:
-                _provider = _cc.get("provider", "")
-                if not _provider:
-                    continue
-
-                # Load this provider's own snapshot.
-                # None → first run → full backup.
-                # Non-empty dict → incremental from that point.
-                _prov_snap = config_manager.load_snapshot(w["id"], _provider) or None
-
-                # Stage files from SOURCE for this provider specifically.
-                import tempfile as _ptmp
-                _prov_dir = _ptmp.mkdtemp(prefix=f"backupsys_{_provider}_")
-                try:
-                    self.log_message.emit(
-                        f"☁ Staging {'incremental' if _prov_snap else 'full'} "
-                        f"backup for {_provider.capitalize()}…"
-                    )
-                    _pr = backup_engine.run_backup(
-                        source            = w["path"],
-                        destination       = _prov_dir,
-                        watch_id          = w["id"],
-                        watch_name        = w["name"],
-                        storage_type      = "local",
-                        previous_snapshot = _prov_snap,
-                        incremental       = bool(_prov_snap),
-                        exclude_patterns  = w.get("exclude_patterns", []),
-                        compress          = w.get("compression", False),
-                        encrypt_key       = w.get("encrypt_key") or None,
-                        triggered_by      = f"{_provider}_upload",
-                    )
-                    if _pr.get("status") != "success":
-                        self.log_message.emit(
-                            f"⚠ {_provider.capitalize()} staging failed: "
-                            f"{_pr.get('error', 'unknown')}"
-                        )
-                        continue
-
-                    _files_staged = _pr.get("files_copied", 0)
-                    _prov_new_snap = _pr.get("snapshot", {})
-                    _prov_backup_dir = _pr.get("backup_dir", "")
-
-                    if _files_staged == 0:
-                        self.log_message.emit(
-                            f"☁ {_provider.capitalize()}: no new files to upload"
-                        )
-                        # Still save snapshot so next run stays incremental
-                        if _prov_new_snap:
-                            config_manager.save_snapshot(w["id"], _prov_new_snap, _provider)
-                        continue
-
-                    self.log_message.emit(
-                        f"☁ Uploading {_files_staged} file(s) to "
-                        f"{_provider.capitalize()}…"
-                    )
-                    try:
-                        _cr = None
-                        if _provider == "gdrive":
-                            from backup_engine import upload_to_gdrive as _up_gd
-                            _cr = _up_gd(_prov_backup_dir, _cc)
-                        elif _provider == "dropbox":
-                            from backup_engine import upload_to_dropbox as _up_db
-                            _cr = _up_db(_prov_backup_dir, _cc)
-                        else:
-                            continue
-
-                        if _cr and _cr.get("ok"):
-                            config_manager.save_snapshot(w["id"], _prov_new_snap, _provider)
-                            self.log_message.emit(
-                                f"✅ {_provider.capitalize()} upload done "
-                                f"({_cr.get('uploaded', 0)} file(s) transferred)"
-                            )
-                        else:
-                            _err = (_cr.get("error", "") if _cr else "no response")
-                            _is_tok = any(
-                                x in _err.lower()
-                                for x in ["token", "auth", "invalid", "expired",
-                                           "unauthorized", "401"]
-                            )
-                            if _is_tok:
-                                self.log_message.emit(
-                                    f"🔄 {_provider.capitalize()} token expired — "
-                                    f"attempting refresh…"
-                                )
-                                _refreshed = (
-                                    self._silent_refresh_gdrive()
-                                    if _provider == "gdrive"
-                                    else self._silent_refresh_dropbox()
-                                )
-                                if _refreshed:
-                                    _new_tok = QSettings(
-                                        SETTINGS_ORG, SETTINGS_APP
-                                    ).value(
-                                        f"{'gdrive' if _provider == 'gdrive' else 'dropbox'}"
-                                        f"_access_token", ""
-                                    )
-                                    _cc2 = {**_cc, "access_token": _new_tok}
-                                    try:
-                                        _cr2 = (
-                                            _up_gd(_prov_backup_dir, _cc2)
-                                            if _provider == "gdrive"
-                                            else _up_db(_prov_backup_dir, _cc2)
-                                        )
-                                        if _cr2.get("ok"):
-                                            config_manager.save_snapshot(
-                                                w["id"], _prov_new_snap, _provider
-                                            )
-                                            self.log_message.emit(
-                                                f"✅ {_provider.capitalize()} upload done "
-                                                f"(after token refresh)"
-                                            )
-                                            continue
-                                    except Exception:
-                                        pass
-                                self.log_message.emit(
-                                    f"⚠ {_provider.capitalize()} upload failed: {_err}\n"
-                                    f"   → Settings → Cloud tab → "
-                                    f"Reconnect {_provider.capitalize()}"
-                                )
-                                _pname = (
-                                    "Google Drive" if _provider == "gdrive" else "Dropbox"
-                                )
-                                QTimer.singleShot(0, lambda p=_pname: (
-                                    self._tray.showMessage(
-                                        f"⚠ {p} — Reconnect Required",
-                                        "Token expired. Open Settings → Cloud tab → "
-                                        "Reconnect.",
-                                        QSystemTrayIcon.Warning, 8000,
-                                    ) if hasattr(self, "_tray") else None
-                                ))
-                            else:
-                                self.log_message.emit(
-                                    f"⚠ {_provider.capitalize()} upload failed: {_err}"
-                                )
                     except Exception as _ce:
                         self.log_message.emit(
                             f"⚠ {_provider.capitalize()} upload error: {_ce}"
@@ -1463,8 +1321,8 @@ class PasswordDialog(QDialog):
         self.setWindowTitle("Admin Authentication")
         self.setMinimumWidth(360)
         self.setModal(True)
-        self._attempts  = 0
-        self._locked    = False
+        self._attempts  = 0       # wrong-password counter
+        self._locked    = False   # True while cooldown is active
         self._build_ui()
 
     def _build_ui(self):
@@ -1499,16 +1357,9 @@ class PasswordDialog(QDialog):
             self.pw_confirm.setPlaceholderText("Confirm password")
             layout.addWidget(self.pw_confirm)
 
-        self.error_lbl = QLabel(" ")
+        self.error_lbl = QLabel("")
         self.error_lbl.setObjectName("status_err")
         self.error_lbl.setAlignment(Qt.AlignCenter)
-        self.error_lbl.setMinimumHeight(36)
-        self.error_lbl.setStyleSheet(
-            "color: #ffffff; background-color: transparent; "
-            "font-size: 12px; font-weight: 700; "
-            "border-radius: 6px; padding: 6px 12px;"
-        )
-        self.error_lbl.setWordWrap(True)
         layout.addWidget(self.error_lbl)
 
         btn_row = QHBoxLayout()
@@ -1518,87 +1369,43 @@ class PasswordDialog(QDialog):
 
         ok = QPushButton("Confirm" if self.mode == "verify" else "Set Password")
         ok.clicked.connect(self._submit)
-        ok.setAutoDefault(False)
-        ok.setDefault(False)
+        self.pw_input.returnPressed.connect(self._submit)
 
         btn_row.addWidget(cancel)
         btn_row.addWidget(ok)
         layout.addLayout(btn_row)
 
-        if self.mode == "verify":
-            forgot_btn = QPushButton("Forgot password?")
-            forgot_btn.setObjectName("secondary")
-            forgot_btn.setStyleSheet(
-                "border: none; color: #6b7280; font-size: 11px; "
-                "padding: 4px; background: transparent;"
-            )
-            forgot_btn.clicked.connect(self._forgot_password)
-            layout.addWidget(forgot_btn, alignment=Qt.AlignCenter)
-
-    def _forgot_password(self):
-        dlg = PasswordDialog(self, mode="set")
-        if dlg.exec_() == QDialog.Accepted:
-            self.accept()
-
-        # ── Send OTP via API ──────────────────────────────────────────────
-        sending = QMessageBox(self)
-        sending.setWindowTitle("Sending...")
-    def keyPressEvent(self, event):
-        from PyQt5.QtCore import Qt as _Qt
-        if event.key() in (_Qt.Key_Return, _Qt.Key_Enter):
-            self._submit()
-        else:
-            super().keyPressEvent(event)
-
-    def _show_error(self, msg: str):
-        self.error_lbl.setText(msg)
-        self.error_lbl.setStyleSheet(
-            "color: #ffffff; background-color: #dc2626; "
-            "font-size: 12px; font-weight: 700; "
-            "border-radius: 6px; padding: 6px 12px;"
-        )
-        self.error_lbl.setVisible(True)
-        self.error_lbl.repaint()
-
     def _submit(self):
         if self._locked:
-            return
+            return  # silently ignore while locked
         pw = self.pw_input.text()
         if not pw:
-            self._show_error("Password cannot be empty")
+            self.error_lbl.setText("Password cannot be empty")
             return
 
         if self.mode == "set":
             if pw != self.pw_confirm.text():
-                self._show_error("Passwords do not match")
+                self.error_lbl.setText("Passwords do not match")
                 return
             self._save_password(pw)
             self.accept()
         else:
-            try:
-                verified = self._verify_password(pw)
-            except Exception:
-                verified = False
-
-            if verified:
+            if self._verify_password(pw):
                 self.accept()
             else:
                 self._attempts += 1
                 self.pw_input.clear()
-                self.pw_input.setFocus()
+                # Lockout: 30-second cooldown after 5 consecutive failures
                 if self._attempts >= 5:
                     self._locked = True
-                    self._show_error("Too many attempts — locked for 30 seconds")
+                    self.error_lbl.setText("Too many attempts — locked for 30 seconds")
                     self.pw_input.setEnabled(False)
                     QTimer.singleShot(30_000, self._unlock)
                 else:
                     remaining = 5 - self._attempts
-                    self._show_error(
-                        f"Incorrect password — {remaining} attempt{'s' if remaining != 1 else ''} remaining."
+                    self.error_lbl.setText(
+                        f"Incorrect password ({remaining} attempt{'s' if remaining != 1 else ''} left)"
                     )
-                self.raise_()
-                self.activateWindow()
-                self.pw_input.setFocus()
 
     def _unlock(self):
         """Called after the 30-second lockout expires."""
@@ -1643,8 +1450,8 @@ class PasswordDialog(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         stored = s.value(ADMIN_PASS_KEY, "")
         if not stored:
-            # No password set yet — require them to set one first
-            return False
+            # No password set yet → any input grants access
+            return True
         return self._hash_verify(pw, stored)
 
     @staticmethod
@@ -2560,39 +2367,6 @@ class AdminPanel(QDialog):
         gd_layout.addLayout(gd_btn_col)
         cl.addWidget(gd_card)
 
-        # ── Dropbox card ─────────────────────────────────────────────────────
-        db_card = QFrame()
-        db_card.setObjectName("card")
-        db_layout = QHBoxLayout(db_card)
-        db_layout.setContentsMargins(16, 14, 16, 14)
-
-        db_icon = QLabel("📦")
-        db_icon.setStyleSheet("font-size:28px;")
-        db_layout.addWidget(db_icon)
-
-        db_text = QVBoxLayout()
-        db_text.setSpacing(2)
-        db_title = QLabel("Dropbox")
-        db_title.setStyleSheet("font-size:14px; font-weight:700; color:#f1f3f9;")
-        db_text.addWidget(db_title)
-        self.db_status_lbl = QLabel("Not connected")
-        self.db_status_lbl.setObjectName("status_err")
-        db_text.addWidget(self.db_status_lbl)
-        db_layout.addLayout(db_text, stretch=1)
-
-        db_btn_col = QVBoxLayout()
-        self.db_connect_btn = QPushButton("Connect Dropbox")
-        self.db_connect_btn.setObjectName("success")
-        self.db_connect_btn.clicked.connect(self._connect_dropbox)
-        db_btn_col.addWidget(self.db_connect_btn)
-        self.db_disconnect_btn = QPushButton("Disconnect")
-        self.db_disconnect_btn.setObjectName("danger")
-        self.db_disconnect_btn.setVisible(False)
-        self.db_disconnect_btn.clicked.connect(self._disconnect_dropbox)
-        db_btn_col.addWidget(self.db_disconnect_btn)
-        db_layout.addLayout(db_btn_col)
-        cl.addWidget(db_card)
-
         # ── Assign cloud to watch ────────────────────────────────────────────
         assign_group = QGroupBox("Assign Cloud to Watch")
         agl = QFormLayout(assign_group)
@@ -2603,10 +2377,8 @@ class AdminPanel(QDialog):
 
         # Checkboxes for multi-cloud selection
         self.chk_gdrive  = QCheckBox("Google Drive")
-        self.chk_dropbox = QCheckBox("Dropbox")
         chk_row = QHBoxLayout()
         chk_row.addWidget(self.chk_gdrive)
-        chk_row.addWidget(self.chk_dropbox)
         chk_row.addStretch()
         chk_widget = QWidget()
         chk_widget.setLayout(chk_row)
@@ -2614,7 +2386,6 @@ class AdminPanel(QDialog):
 
         self.db_remote_path = QLineEdit()
         self.db_remote_path.setPlaceholderText("/backups")
-        agl.addRow("Dropbox remote path:", self.db_remote_path)
 
         self.gd_folder_id = QLineEdit()
         self.gd_folder_id.setPlaceholderText("Optional Google Drive folder ID")
@@ -2826,12 +2597,9 @@ class AdminPanel(QDialog):
         providers = {c.get("provider") for c in configs}
         if hasattr(self, "chk_gdrive"):
             self.chk_gdrive.setChecked("gdrive" in providers)
-        if hasattr(self, "chk_dropbox"):
-            self.chk_dropbox.setChecked("dropbox" in providers)
 
         # Populate fields from existing configs
         for c in configs:
-            if c.get("provider") == "dropbox" and hasattr(self, "db_remote_path"):
                 self.db_remote_path.setText(c.get("remote_path", "/backups"))
             if c.get("provider") == "gdrive" and hasattr(self, "gd_folder_id"):
                 self.gd_folder_id.setText(c.get("folder_id", ""))
@@ -2848,8 +2616,6 @@ class AdminPanel(QDialog):
     # Create a .env file in your project folder with:
     #   GDRIVE_CLIENT_ID=your_client_id
     #   GDRIVE_CLIENT_SECRET=your_client_secret
-    #   DROPBOX_APP_KEY=your_app_key
-    #   DROPBOX_APP_SECRET=your_app_secret
 
     @staticmethod
     def _load_env_credentials():
@@ -2860,8 +2626,6 @@ class AdminPanel(QDialog):
         creds = {
             "GDRIVE_CLIENT_ID":     "",
             "GDRIVE_CLIENT_SECRET": "",
-            "DROPBOX_APP_KEY":      "",
-            "DROPBOX_APP_SECRET":   "",
         }
         # Try python-dotenv first
         try:
@@ -2899,12 +2663,8 @@ class AdminPanel(QDialog):
         return self._load_env_credentials()["GDRIVE_CLIENT_SECRET"]
 
     @property
-    def DROPBOX_APP_KEY(self):
-        return self._load_env_credentials()["DROPBOX_APP_KEY"]
 
     @property
-    def DROPBOX_APP_SECRET(self):
-        return self._load_env_credentials()["DROPBOX_APP_SECRET"]
 
     def _connect_gdrive(self):
         """Open browser for Google OAuth, catch callback on localhost."""
@@ -3051,152 +2811,6 @@ class AdminPanel(QDialog):
         self.gd_connect_btn.setEnabled(True)
         self.gd_disconnect_btn.setVisible(False)
 
-    def _connect_dropbox(self):
-        """Open browser for Dropbox OAuth PKCE flow."""
-        import urllib.parse, threading, webbrowser, secrets, hashlib, base64
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-
-        app_key = self.DROPBOX_APP_KEY
-        if not app_key:
-            from pathlib import Path
-            env_path = Path(__file__).parent / ".env"
-            env_exists = env_path.exists()
-            # Read raw content for debug
-            raw = ""
-            if env_exists:
-                try:
-                    raw = env_path.read_text(encoding="utf-8")[:300]
-                except Exception as re:
-                    raw = f"(read error: {re})"
-            QMessageBox.warning(self, "Not configured",
-                f"DROPBOX_APP_KEY not found.\n\n"
-                f".env path: {env_path}\n"
-                f".env exists: {env_exists}\n\n"
-                f"Contents preview:\n{raw if env_exists else '(file not found)'}\n\n"
-                f"Make sure your .env file has:\n"
-                f"DROPBOX_APP_KEY=your_app_key"
-            )
-            return
-
-        REDIRECT_URI   = "http://localhost:8766/oauth/dropbox"
-        code_verifier  = secrets.token_urlsafe(64)
-        digest         = hashlib.sha256(code_verifier.encode()).digest()
-        code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-        self._db_code_verifier = code_verifier
-
-        params = {
-            "client_id":             app_key,
-            "redirect_uri":          REDIRECT_URI,
-            "response_type":         "code",
-            "code_challenge":        code_challenge,
-            "code_challenge_method": "S256",
-            "token_access_type":     "offline",
-        }
-        url = "https://www.dropbox.com/oauth2/authorize?" + urllib.parse.urlencode(params)
-
-        self.db_connect_btn.setText("Waiting for login…")
-        self.db_connect_btn.setEnabled(False)
-        webbrowser.open(url)
-
-        self._dropbox_result = {}
-
-        class _Handler(BaseHTTPRequestHandler):
-            def do_GET(self_handler):
-                parsed = urllib.parse.urlparse(self_handler.path)
-                qp     = urllib.parse.parse_qs(parsed.query)
-                code   = qp.get("code", [None])[0]
-                self_handler.send_response(200)
-                self_handler.send_header("Content-type", "text/html")
-                self_handler.end_headers()
-                if code:
-                    self_handler.wfile.write(
-                        b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
-                        b"<h2 style='color:#22c55e'>Dropbox connected! You can close this tab.</h2>"
-                        b"<p>Return to the Backup System app.</p></body></html>"
-                    )
-                    self._dropbox_result["code"] = code
-                else:
-                    self_handler.wfile.write(b"<h2>Login failed. Please try again.</h2>")
-                    self._dropbox_result["error"] = "No code returned"
-            def log_message(self, *a): pass
-
-        def _serve():
-            try:
-                srv = HTTPServer(("localhost", 8766), _Handler)
-                srv.timeout = 180
-                srv.handle_request()
-                srv.server_close()
-            except Exception as e:
-                self._dropbox_result["error"] = str(e)
-
-        threading.Thread(target=_serve, daemon=True).start()
-
-        self._dropbox_poll_count = 0
-        self._dropbox_poll_timer = QTimer(self)
-        self._dropbox_poll_timer.timeout.connect(self._poll_dropbox_result)
-        self._dropbox_poll_timer.start(500)
-
-    def _poll_dropbox_result(self):
-        self._dropbox_poll_count += 1
-        if self._dropbox_poll_count > 360:
-            self._dropbox_poll_timer.stop()
-            self._dropbox_connect_failed("Timed out waiting for login")
-            return
-        if "error" in self._dropbox_result:
-            self._dropbox_poll_timer.stop()
-            self._dropbox_connect_failed(self._dropbox_result["error"])
-        elif "code" in self._dropbox_result:
-            self._dropbox_poll_timer.stop()
-            code = self._dropbox_result.pop("code")
-            self._exchange_dropbox_code(code, "http://localhost:8766/oauth/dropbox")
-
-    def _exchange_dropbox_code(self, code: str, redirect_uri: str):
-        import urllib.request, urllib.parse, json as _json
-        data = urllib.parse.urlencode({
-            "code":          code,
-            "grant_type":    "authorization_code",
-            "client_id":     self.DROPBOX_APP_KEY,
-            "client_secret": self.DROPBOX_APP_SECRET,
-            "redirect_uri":  redirect_uri,
-            "code_verifier": self._db_code_verifier,
-        }).encode()
-        try:
-            req    = urllib.request.Request("https://api.dropboxapi.com/oauth2/token", data=data)
-            resp   = urllib.request.urlopen(req, timeout=15)
-            tokens = _json.loads(resp.read())
-            self._dropbox_connected(tokens)
-        except Exception as e:
-            self._dropbox_connect_failed(str(e))
-
-    def _dropbox_connected(self, tokens: dict):
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        s.setValue("dropbox_access_token",  tokens.get("access_token", ""))
-        s.setValue("dropbox_refresh_token", tokens.get("refresh_token", ""))
-        self.db_status_lbl.setText("✓  Connected")
-        self.db_status_lbl.setObjectName("status_ok")
-        self.db_status_lbl.style().unpolish(self.db_status_lbl)
-        self.db_status_lbl.style().polish(self.db_status_lbl)
-        self.db_connect_btn.setVisible(False)
-        self.db_disconnect_btn.setVisible(True)
-        QMessageBox.information(self, "Dropbox", "Dropbox connected successfully!")
-
-    def _dropbox_connect_failed(self, err=""):
-        self.db_connect_btn.setText("Connect Dropbox")
-        self.db_connect_btn.setEnabled(True)
-        QMessageBox.critical(self, "Dropbox", f"Connection failed: {err}")
-
-    def _disconnect_dropbox(self):
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        s.remove("dropbox_access_token")
-        s.remove("dropbox_refresh_token")
-        self.db_status_lbl.setText("Not connected")
-        self.db_status_lbl.setObjectName("status_err")
-        self.db_status_lbl.style().unpolish(self.db_status_lbl)
-        self.db_status_lbl.style().polish(self.db_status_lbl)
-        self.db_connect_btn.setVisible(True)
-        self.db_connect_btn.setText("Connect Dropbox")
-        self.db_connect_btn.setEnabled(True)
-        self.db_disconnect_btn.setVisible(False)
 
     def _check_cloud_connections(self):
         """Update connect/disconnect state and validate tokens."""
@@ -3206,7 +2820,6 @@ class AdminPanel(QDialog):
             self.gd_status_lbl.setObjectName("status_ok")
             self.gd_connect_btn.setVisible(False)
             self.gd_disconnect_btn.setVisible(True)
-        if s.value("dropbox_access_token", ""):
             self.db_status_lbl.setText("✓  Connected")
             self.db_status_lbl.setObjectName("status_ok")
             self.db_connect_btn.setVisible(False)
@@ -3243,24 +2856,6 @@ class AdminPanel(QDialog):
                     if not refreshed:
                         warnings.append("gdrive")
 
-            # Check Dropbox
-            db_token = s.value("dropbox_access_token", "")
-            if db_token:
-                try:
-                    import urllib.request as _ur
-                    req = _ur.Request(
-                        "https://api.dropboxapi.com/2/auth/token/revoke",
-                    )
-                    # Use check_user instead — non-destructive
-                    req2 = _ur.Request("https://api.dropboxapi.com/2/check/user")
-                    req2.add_header("Authorization", f"Bearer {db_token}")
-                    req2.add_header("Content-Type", "application/json")
-                    _ur.urlopen(req2, data=b'{}', timeout=10)
-                except Exception as e:
-                    if "401" in str(e) or "invalid" in str(e).lower() or "expired" in str(e).lower():
-                        refreshed = self._silent_refresh_dropbox()
-                        if not refreshed:
-                            warnings.append("dropbox")
 
             if warnings:
                 # Use QTimer to update UI on main thread
@@ -3304,46 +2899,11 @@ class AdminPanel(QDialog):
             pass
         return False
 
-    def _silent_refresh_dropbox(self) -> bool:
-        """Try to refresh Dropbox token silently. Returns True if successful."""
-        try:
-            import urllib.request as _ur, urllib.parse, json as _json
-            s             = QSettings(SETTINGS_ORG, SETTINGS_APP)
-            refresh_token = s.value("dropbox_refresh_token", "")
-            app_key       = self.DROPBOX_APP_KEY
-            app_secret    = self.DROPBOX_APP_SECRET
-            if not refresh_token or not app_key:
-                return False
-            data = urllib.parse.urlencode({
-                "grant_type":    "refresh_token",
-                "refresh_token": refresh_token,
-            }).encode()
-            import base64
-            auth = base64.b64encode(f"{app_key}:{app_secret}".encode()).decode()
-            req  = _ur.Request("https://api.dropboxapi.com/oauth2/token", data=data)
-            req.add_header("Authorization", f"Basic {auth}")
-            tokens = _json.loads(_ur.urlopen(req, timeout=15).read())
-            if tokens.get("access_token"):
-                s.setValue("dropbox_access_token", tokens["access_token"])
-                for w in self.cfg.get("watches", []):
-                    for cc in w.get("cloud_configs", []):
-                        if cc.get("provider") == "dropbox":
-                            cc["access_token"] = tokens["access_token"]
-                    if w.get("cloud_config", {}).get("provider") == "dropbox":
-                        w["cloud_config"]["access_token"] = tokens["access_token"]
-                import config_manager as _cm
-                _cm.save(self.cfg)
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, lambda: self._append_log("🔄 Dropbox token refreshed silently ✅"))
-                return True
-        except Exception:
-            pass
-        return False
 
     def _on_token_warnings(self, warnings: list):
         """Called on main thread when token validation finds expired tokens."""
         for provider in warnings:
-            name = "Google Drive" if provider == "gdrive" else "Dropbox"
+            name = "Google Drive"
             # 1. Update Cloud tab status label
             if provider == "gdrive" and hasattr(self, "gd_status_lbl"):
                 self.gd_status_lbl.setText("⚠ Token expired — reconnect")
@@ -3352,13 +2912,6 @@ class AdminPanel(QDialog):
                 self.gd_status_lbl.style().polish(self.gd_status_lbl)
                 self.gd_connect_btn.setVisible(True)
                 self.gd_connect_btn.setText("🔄 Reconnect Google Drive")
-            elif provider == "dropbox" and hasattr(self, "db_status_lbl"):
-                self.db_status_lbl.setText("⚠ Token expired — reconnect")
-                self.db_status_lbl.setObjectName("status_err")
-                self.db_status_lbl.style().unpolish(self.db_status_lbl)
-                self.db_status_lbl.style().polish(self.db_status_lbl)
-                self.db_connect_btn.setVisible(True)
-                self.db_connect_btn.setText("🔄 Reconnect Dropbox")
             # 2. Tray notification
             if hasattr(self, "_tray"):
                 self._tray.showMessage(
@@ -3381,7 +2934,7 @@ class AdminPanel(QDialog):
         wid    = self.cloud_watch_combo.itemData(idx)
         s      = QSettings(SETTINGS_ORG, SETTINGS_APP)
         use_gd = hasattr(self, "chk_gdrive")  and self.chk_gdrive.isChecked()
-        use_db = hasattr(self, "chk_dropbox") and self.chk_dropbox.isChecked()
+        use_db = False
 
         cloud_configs = []
 
@@ -3400,470 +2953,6 @@ class AdminPanel(QDialog):
             })
 
         if use_db:
-            token = s.value("dropbox_access_token", "")
-            if not token:
-                QMessageBox.warning(self, "Not Connected", "Please connect Dropbox first.")
-                return
-            cloud_configs.append({
-                "provider":     "dropbox",
-                "access_token": token,
-                "remote_path":  self.db_remote_path.text().strip() or "/backups",
-            })
-
-        for w in self.cfg.get("watches", []):
-            if w["id"] == wid:
-                w["cloud_configs"] = cloud_configs
-                w["cloud_config"]  = cloud_configs[0] if cloud_configs else {}
-                w["type"]          = "cloud" if cloud_configs else "local"
-        try:
-            config_manager.save(self.cfg)
-            if cloud_configs:
-                providers = " + ".join(c["provider"].capitalize() for c in cloud_configs)
-                QMessageBox.information(self, "Saved",
-                    f"Watch will now upload to {providers} after each backup. ✅")
-            else:
-                QMessageBox.information(self, "Saved", "Cloud backup disabled for this watch.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
-    def _refresh_watch_table(self):
-        if hasattr(self, 'cloud_watch_combo'):
-            self._refresh_cloud_combo()
-        watches  = self.cfg.get("watches", [])
-        cfg      = self.cfg
-        now      = datetime.now()
-        self.watch_table.setRowCount(len(watches))
-
-        # Row colors
-        COLOR_OK      = "#1a2e1a"   # dark green
-        COLOR_FAILED  = "#2e1a1a"   # dark red
-        COLOR_WARN    = "#2e2a1a"   # dark yellow
-        COLOR_PAUSED  = "#1e1e2e"   # dark blue
-        COLOR_PENDING = "#1e2128"   # default
-
-        def _cell(text, tooltip=None):
-            item = QTableWidgetItem(str(text))
-            item.setToolTip(str(tooltip or text))
-            return item
-
-        def _set_row_color(row, color):
-            for col in range(self.watch_table.columnCount()):
-                item = self.watch_table.item(row, col)
-                if item:
-                    item.setBackground(__import__('PyQt5.QtGui', fromlist=['QColor']).QColor(color))
-
-        # dest_label is computed per-watch inside the loop below.
-        # Pre-compute QSettings once for the per-watch cloud-parts check.
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-
-        # Next scheduled backup
-        schedule_times = cfg.get("backup_schedule_times", [])
-        next_sched = "—"
-        if schedule_times:
-            now_secs = now.hour * 3600 + now.minute * 60 + now.second
-            upcoming = []
-            for t in schedule_times:
-                try:
-                    h, m = int(t[:2]), int(t[3:5])
-                    secs = h * 3600 + m * 60
-                    if secs > now_secs:
-                        upcoming.append(t)
-                except Exception:
-                    pass
-            next_sched = upcoming[0] if upcoming else schedule_times[0] + " (tomorrow)"
-        elif cfg.get("auto_backup"):
-            interval_val  = cfg.get("interval_min", 30)
-            interval_unit = cfg.get("interval_unit", "minutes")
-            interval_secs = interval_val if interval_unit == "seconds" else interval_val * 60
-            next_sched = f"~{interval_val}{'s' if interval_unit == 'seconds' else 'm'} interval"
-
-        # Backup history count
-        dest_path = cfg.get("destination", "")
-        history_counts = {}
-        if dest_path:
-            try:
-                from pathlib import Path as _Path
-                for w in watches:
-                    wid   = w["id"]
-                    count = len([d for d in _Path(dest_path).iterdir()
-                                 if d.is_dir() and wid in d.name]) if _Path(dest_path).exists() else 0
-                    history_counts[wid] = count
-            except Exception:
-                pass
-
-        for i, w in enumerate(watches):
-            lb_raw   = w.get("last_backup", "")
-            status   = w.get("last_backup_status", "")
-            paused   = w.get("paused", False)
-            failed_f = w.get("last_failed_files", 0)
-            duration = w.get("last_backup_duration", 0)
-
-            # Format last backup
-            lb_display = "Never"
-            days_since = None
-            if lb_raw:
-                try:
-                    lb_dt      = datetime.fromisoformat(lb_raw)
-                    lb_display = lb_dt.strftime("%Y-%m-%d %H:%M")
-                    days_since = (now - lb_dt).days
-                except Exception:
-                    lb_display = lb_raw
-
-            # Status text
-            if paused:
-                status_text = "⏸ Paused"
-            elif not lb_raw:
-                status_text = "⏳ Pending"
-            elif status == "failed":
-                status_text = "❌ Failed"
-            elif days_since is not None and days_since >= 2:
-                status_text = f"⚠️ {days_since}d ago"
-            else:
-                status_text = "✅ Success"
-
-            # Row color
-            if paused:
-                row_color = COLOR_PAUSED
-            elif status == "failed":
-                row_color = COLOR_FAILED
-            elif days_since is not None and days_since >= 2:
-                row_color = COLOR_WARN
-            elif lb_raw:
-                row_color = COLOR_OK
-            else:
-                row_color = COLOR_PENDING
-
-            # Duration
-            dur_text = f"{duration:.1f}s" if duration is not None and duration != "" else "—"
-
-            # Failed files
-            failed_text = f"⚠ {failed_f}" if failed_f else "0"
-
-            # Size
-            size_bytes = w.get("last_backup_size", 0)
-            if size_bytes >= 1024 * 1024:
-                size_str = f"{size_bytes / (1024*1024):.1f} MB"
-            elif size_bytes >= 1024:
-                size_str = f"{size_bytes / 1024:.1f} KB"
-            else:
-                size_str = f"{size_bytes} B" if size_bytes else "—"
-
-            # History count
-            hist = history_counts.get(w["id"], w.get("backup_count", 0))
-            hist_text = f"{hist} stored"
-
-            # Destination label — computed per watch so each row shows its own cloud providers
-            dest_type = cfg.get("dest_type", "local")
-            if dest_type in ("sftp", "ftps"):
-                _sftp = cfg.get("dest_sftp", {})
-                dest_label = f"SFTP: {_sftp.get('host','—')}:{_sftp.get('port',22)}{_sftp.get('path','')}"
-            elif dest_type == "ftp":
-                _ftp = cfg.get("dest_ftp", {})
-                dest_label = f"FTP: {_ftp.get('host','—')}:{_ftp.get('port',21)}{_ftp.get('path','')}"
-            elif dest_type == "smb":
-                _smb = cfg.get("dest_smb", {})
-                _srv = _smb.get("server", "")
-                _shr = _smb.get("share", "")
-                dest_label = f"SMB: \\\\{_srv}\\{_shr}" if _srv else "SMB: —"
-            elif dest_type == "https":
-                dest_label = f"HTTPS: {cfg.get('dest_https', {}).get('url', '—')}"
-            else:
-                dest_label = f"Local: {cfg.get('destination', '—')}"
-
-            # Append this watch's cloud providers
-            _cloud_parts = []
-            for cc in w.get("cloud_configs", [w.get("cloud_config", {})]):
-                p = cc.get("provider", "")
-                if not p:
-                    continue
-                _pname = "GDrive" if p == "gdrive" else "Dropbox"
-                _token_key = "gdrive_access_token" if p == "gdrive" else "dropbox_access_token"
-                _has_token = bool(s.value(_token_key, "")) or bool(cc.get("access_token", ""))
-                _warn = " ⚠" if not _has_token else ""
-                if f"{_pname}{_warn}" not in _cloud_parts:
-                    _cloud_parts.append(f"{_pname}{_warn}")
-            _cloud_suffix = " + " + ", ".join(_cloud_parts) if _cloud_parts else ""
-            # dest_label_full = full details for tooltip; dest_label = compact for cell
-            dest_label_full = dest_label + _cloud_suffix
-            # Shorten the primary dest to just its type keyword so cloud names are always visible
-            _dest_short = dest_label.split(":")[0]  # e.g. "SFTP", "Local", "FTP" ...
-            dest_label  = _dest_short + _cloud_suffix
-
-            # Set all cells
-            self.watch_table.setItem(i, 0,  _cell(w.get("name", "")))
-            self.watch_table.setItem(i, 1,  _cell(w.get("path", "")))
-            self.watch_table.setItem(i, 2,  _cell(status_text))
-            self.watch_table.setItem(i, 3,  _cell(lb_display))
-            self.watch_table.setItem(i, 4,  _cell(dur_text, f"Last backup took {dur_text}"))
-            self.watch_table.setItem(i, 5,  _cell(next_sched, f"Next scheduled: {next_sched}"))
-            self.watch_table.setItem(i, 6,  _cell(w.get("backup_count", 0), "Total successful backup runs"))
-            self.watch_table.setItem(i, 7,  _cell(failed_text, f"{failed_f} file(s) failed in last backup"))
-            self.watch_table.setItem(i, 8,  _cell(size_str, f"Last backup size: {size_str}"))
-            self.watch_table.setItem(i, 9,  _cell(hist_text, f"{hist} backup(s) stored on destination"))
-            self.watch_table.setItem(i, 10, _cell(dest_label, dest_label_full))
-
-            # Apply row color
-            _set_row_color(i, row_color)
-
-            # Col 11 — Edit button
-            edit_btn = QPushButton("Edit")
-            edit_btn.setObjectName("secondary")
-            edit_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            edit_btn.setContentsMargins(0, 0, 0, 0)
-            edit_btn.setProperty("watch_id", w["id"])
-            edit_btn.clicked.connect(self._edit_watch)
-            self.watch_table.setCellWidget(i, 11, edit_btn)
-
-            # Col 12 — Delete button
-            del_btn = QPushButton("Delete")
-            del_btn.setObjectName("danger")
-            del_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            del_btn.setContentsMargins(0, 0, 0, 0)
-            del_btn.setToolTip("Delete this watch")
-            del_btn.setProperty("watch_id", w["id"])
-            del_btn.clicked.connect(self._remove_watch)
-            self.watch_table.setCellWidget(i, 12, del_btn)
-
-    def _edit_watch(self):
-        btn = self.sender()
-        wid = btn.property("watch_id")
-        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
-        if not watch:
-            return
-        dlg = EditWatchDialog(watch, self)
-        if dlg.exec_() == QDialog.Accepted:
-            v = dlg.get_values()
-            try:
-                config_manager.update_watch_meta(
-                    self.cfg, wid,
-                    name             = v["name"],
-                    interval_min     = v["interval_min"],
-                    retention_days   = v["retention_days"],
-                    max_backups      = v["max_backups"],
-                    compression      = v["compression"],
-                    skip_auto_backup = v["skip_auto_backup"],
-                    color            = v["color"],
-                    notes            = v["notes"],
-                    tags             = v.get("tags"),
-                    exclude_patterns = v["exclude_patterns"],
-                    encrypt_key      = v.get("encrypt_key", ""),
-                )
-                self._refresh_watch_table()
-                self.watches_changed.emit()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
-
-    def _browse_dest(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Backup Destination")
-        if folder:
-            self.dest_input.setText(folder)
-
-    def _on_dest_type_changed(self, idx):
-        self.dest_local_widget.setVisible(idx == 0)
-        self.dest_smb_widget.setVisible(idx == 1)
-        self.dest_sftp_widget.setVisible(idx in (2, 3))
-        self.dest_ftp_widget.setVisible(idx == 4)
-        self.dest_https_widget.setVisible(idx == 5)
-        if idx in (2, 3):
-            self.sftp_port.setValue(22 if idx == 2 else 21)
-        if hasattr(self, "dest_local_widget") and self.dest_local_widget.parent():
-            self.dest_local_widget.parent().adjustSize()
-
-    def _test_sftp(self):
-        host    = self.sftp_host.text().strip()
-        port    = self.sftp_port.value()
-        user    = self.sftp_user.text().strip()
-        pw      = self.sftp_pass.text()
-        keyfile = self.sftp_keyfile.text().strip()
-        rpath   = self.sftp_path.text().strip() or "/"
-
-        if not host or not user:
-            QMessageBox.warning(self, "Missing", "Host and username are required.")
-            return
-
-        # FTPS (idx=3) uses FTP over TLS — not SSH/SFTP
-        is_ftps = self.dest_type_combo.currentIndex() == 3
-        if is_ftps:
-            try:
-                from transport_utils import test_ftp_connection
-                result = test_ftp_connection({
-                    "host": host, "port": port, "username": user,
-                    "password": pw, "remote_path": rpath, "use_tls": True,
-                })
-                if result["ok"]:
-                    QMessageBox.information(self, "FTPS", result["message"])
-                else:
-                    QMessageBox.critical(self, "FTPS Connection Failed", result["message"])
-            except ImportError:
-                try:
-                    import ftplib, ssl
-                    ctx = ssl.create_default_context()
-                    ftp = ftplib.FTP_TLS(timeout=10)
-                    ftp.connect(host, port)
-                    ftp.login(user, pw)
-                    ftp.prot_p()
-                    ftp.cwd(rpath)
-                    ftp.quit()
-                    QMessageBox.information(self, "FTPS", f"✅ FTPS connected to {host}:{port}")
-                except Exception as e:
-                    QMessageBox.critical(self, "FTPS Connection Failed", str(e))
-            except Exception as e:
-                QMessageBox.critical(self, "Connection Failed", str(e))
-            return
-
-        try:
-            from transport_utils import test_sftp_connection
-            result = test_sftp_connection({
-                "host": host, "port": port, "username": user,
-                "password": pw, "key_path": keyfile, "remote_path": rpath,
-                "key_passphrase": self.sftp_key_pass.text(),
-            })
-            if result["ok"]:
-                QMessageBox.information(self, "SFTP", result["message"])
-            else:
-                QMessageBox.critical(self, "SFTP Connection Failed", result["message"])
-        except ImportError:
-            QMessageBox.warning(self, "Missing package",
-                "transport_utils.py not found in the app folder.\n"
-                "Also ensure paramiko is installed: pip install paramiko")
-        except Exception as e:
-            QMessageBox.critical(self, "Connection Failed", str(e))
-
-    def _test_ftp(self):
-        """Test plain FTP connection."""
-        host  = self.ftp_host.text().strip()
-        port  = self.ftp_port.value()
-        user  = self.ftp_user.text().strip()
-        pw    = self.ftp_pass.text()
-        rpath = self.ftp_path.text().strip() or "/"
-
-        if not host or not user:
-            QMessageBox.warning(self, "Missing", "Host and username are required.")
-            return
-
-        try:
-            from transport_utils import test_ftp_connection
-            result = test_ftp_connection({
-                "host": host, "port": port, "username": user,
-                "password": pw, "remote_path": rpath, "use_tls": False,
-            })
-            if result["ok"]:
-                QMessageBox.information(self, "FTP", result["message"])
-            else:
-                QMessageBox.critical(self, "FTP Connection Failed", result["message"])
-        except ImportError:
-            # Fallback: inline ftplib test
-            try:
-                import ftplib
-                ftp = ftplib.FTP()
-                ftp.connect(host, port, timeout=10)
-                ftp.login(user, pw)
-                ftp.cwd(rpath)
-                ftp.quit()
-                QMessageBox.information(self, "FTP", f"✅ Connected to {host}:{port}")
-            except Exception as e:
-                QMessageBox.critical(self, "FTP Connection Failed", str(e))
-        except Exception as e:
-            QMessageBox.critical(self, "FTP Connection Failed", str(e))
-
-    def _test_smb(self):
-        """Test SMB/CIFS share connectivity."""
-        path   = self.dest_smb_path.text().strip()
-        user   = self.dest_smb_user.text().strip()
-        pw     = self.dest_smb_pass.text()
-        domain = self.dest_smb_domain.text().strip()
-
-        if not path:
-            QMessageBox.warning(self, "Missing", "SMB path (e.g. \\\\server\\share) is required.")
-            return
-
-        try:
-            from transport_utils import test_smb_connection
-            result = test_smb_connection({
-                "unc_path": path, "username": user,
-                "password": pw,   "domain":   domain,
-            })
-            if result["ok"]:
-                QMessageBox.information(self, "SMB", result["message"])
-            else:
-                QMessageBox.critical(self, "SMB Connection Failed", result["message"])
-        except ImportError:
-            QMessageBox.warning(self, "Missing package",
-                "transport_utils.py not found.\n"
-                "On Linux/macOS also install: pip install smbprotocol")
-        except Exception as e:
-            QMessageBox.critical(self, "SMB Connection Failed", str(e))
-
-    def _test_https(self):
-        """Test HTTPS API endpoint reachability via HEAD request."""
-        url        = self.https_url.text().strip()
-        token      = self.https_token.text().strip()
-        verify_ssl = self.https_verify_ssl.isChecked()
-
-        if not url:
-            QMessageBox.warning(self, "Missing", "Endpoint URL is required.")
-            return
-
-        try:
-            from transport_utils import test_https_connection
-            result = test_https_connection({
-                "url": url, "token": token, "verify_ssl": verify_ssl,
-            })
-            if result["ok"]:
-                QMessageBox.information(self, "HTTPS API", result["message"])
-            else:
-                QMessageBox.critical(self, "HTTPS Connection Failed", result["message"])
-        except ImportError:
-            # Fallback: inline urllib test
-            import urllib.request, urllib.error, ssl
-            ctx = ssl.create_default_context()
-            if not verify_ssl:
-                ctx.check_hostname = False
-                ctx.verify_mode    = ssl.CERT_NONE
-            try:
-                req = urllib.request.Request(url, method="HEAD")
-                if token:
-                    req.add_header("Authorization", f"Bearer {token}")
-                with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-                    QMessageBox.information(self, "HTTPS API", f"✅ Endpoint reachable (HTTP {resp.getcode()})")
-            except urllib.error.HTTPError as e:
-                if e.code in (400, 401, 403, 405, 422):
-                    QMessageBox.information(self, "HTTPS API",
-                        f"✅ Server reachable (HTTP {e.code} — normal for HEAD on upload endpoints)")
-                else:
-                    QMessageBox.critical(self, "HTTPS API Error", f"HTTP {e.code}: {e.reason}")
-            except Exception as e:
-                QMessageBox.critical(self, "HTTPS Connection Failed", str(e))
-        except Exception as e:
-            QMessageBox.critical(self, "HTTPS Connection Failed", str(e))
-
-    def _on_interval_unit_changed(self, idx):
-        if idx == 1:  # seconds
-            self.interval_spin.setRange(5, 3600)
-            if self.interval_spin.value() > 3600:
-                self.interval_spin.setValue(30)
-        else:  # minutes
-            self.interval_spin.setRange(1, 1440)
-            if self.interval_spin.value() > 1440:
-                self.interval_spin.setValue(30)
-
-    def _save_general(self):
-        dtype = self.dest_type_combo.currentIndex()
-
-        if dtype == 0:  # Local
-            self.cfg["destination"]    = self.dest_input.text().strip()
-            self.cfg["dest_type"]      = "local"
-            self.cfg["dest_sftp"]      = {}
-            self.cfg["dest_smb"]       = {}
-        elif dtype == 1:  # SMB
-            self.cfg["destination"]    = self.dest_smb_path.text().strip()
-            self.cfg["dest_type"]      = "smb"
-            self.cfg["dest_smb"]       = {
-                "path":   self.dest_smb_path.text().strip(),
-                "user":   self.dest_smb_user.text().strip(),
-                "pass":   self.dest_smb_pass.text(),
-                "domain": self.dest_smb_domain.text().strip(),
-            }
             self.cfg["dest_sftp"] = {}
         elif dtype in (2, 3):  # SFTP or FTPS
             import tempfile
@@ -5044,7 +4133,7 @@ class MainWindow(QMainWindow):
         if BACKEND_AVAILABLE:
             try:
                 # Delete snapshots for ALL destinations so a full backup runs
-                # to SFTP, GDrive, Dropbox, etc. — not just the primary dest.
+                # to SFTP, GDrive, etc. — not just the primary dest.
                 config_manager.delete_snapshot(wid)   # deletes all variants
                 # Mark watch so auto backup ignores "no changes" check
                 for w in self.cfg.get("watches", []):
@@ -5429,18 +4518,6 @@ class MainWindow(QMainWindow):
                             warnings.append("gdrive")
                     except Exception:
                         warnings.append("gdrive")
-                # Check Dropbox
-                db_token = s.value("dropbox_access_token", "")
-                if db_token:
-                    try:
-                        import urllib.request as _ur
-                        req2 = _ur.Request("https://api.dropboxapi.com/2/check/user")
-                        req2.add_header("Authorization", f"Bearer {db_token}")
-                        req2.add_header("Content-Type", "application/json")
-                        _ur.urlopen(req2, data=b'{}', timeout=10)
-                    except Exception as e:
-                        if any(x in str(e).lower() for x in ["401", "invalid", "expired", "unauthorized"]):
-                            warnings.append("dropbox")
                 if warnings:
                     QTimer.singleShot(0, lambda: self._on_cloud_token_warnings(warnings))
             except Exception:
@@ -5450,7 +4527,7 @@ class MainWindow(QMainWindow):
     def _on_cloud_token_warnings(self, warnings: list):
         """Show tray and log warnings for expired tokens."""
         for provider in warnings:
-            name = "Google Drive" if provider == "gdrive" else "Dropbox"
+            name = "Google Drive"
             if hasattr(self, "_tray"):
                 self._tray.showMessage(
                     f"⚠ {name} — Reconnect Required",
@@ -5464,12 +4541,15 @@ class MainWindow(QMainWindow):
 
     def _open_admin(self):
         if not PasswordDialog.has_password():
-            # No password set yet — must set one before accessing admin
-            QMessageBox.information(self, "Set Admin Password",
-                "You need to set an admin password before accessing settings.")
-            dlg = PasswordDialog(self, mode="set")
-            if dlg.exec_() != QDialog.Accepted:
-                return
+            # First time — prompt to set password
+            reply = QMessageBox.question(self, "Set Admin Password",
+                "No admin password is set. Would you like to set one now?\n"
+                "(If you skip, any user can access admin settings)",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                dlg = PasswordDialog(self, mode="set")
+                if dlg.exec_() != QDialog.Accepted:
+                    return
 
         dlg = PasswordDialog(self, mode="verify")
         if dlg.exec_() != QDialog.Accepted:

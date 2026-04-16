@@ -1,6 +1,6 @@
 # BackupSys
 
-A Windows desktop backup system with a PyQt5 tray app, incremental backups, encryption, compression, and multi-destination support (local, SFTP, FTP, SMB, HTTPS, Dropbox, Google Drive).
+A Windows desktop backup system with a PyQt5 tray app, incremental backups, encryption, compression, and multi-destination support (local, SFTP, FTP, SMB, HTTPS, Google Drive).
 
 ---
 
@@ -103,7 +103,7 @@ Configure under `dest_sftp`, `dest_ftp`, `dest_smb`, or `dest_https` in `config.
 
 Copy `.env.example` to `.env` (or rename `_env` → `.env`) and fill in your values.
 
-> ⚠ **Never commit `.env` to Git.** It's already in `.gitignore`. If credentials were accidentally shared, regenerate them immediately at [Google Cloud Console](https://console.cloud.google.com/apis/credentials) and [Dropbox App Console](https://www.dropbox.com/developers/apps).
+> ⚠ **Never commit `.env` to Git.** It's already in `.gitignore`. If credentials were accidentally shared, regenerate them immediately at [Google Cloud Console](https://console.cloud.google.com/apis/credentials).
 
 | Variable | Purpose |
 |----------|---------|
@@ -113,8 +113,6 @@ Copy `.env.example` to `.env` (or rename `_env` → `.env`) and fill in your val
 | `BACKUPSYS_ENCRYPT_KEY_DEFAULT` | Fallback key for watches without an explicit key |
 | `GDRIVE_CLIENT_ID` | Google Drive OAuth client ID |
 | `GDRIVE_CLIENT_SECRET` | Google Drive OAuth client secret |
-| `DROPBOX_APP_KEY` | Dropbox app key |
-| `DROPBOX_APP_SECRET` | Dropbox app secret |
 
 Generate an encryption key:
 ```bash
