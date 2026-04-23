@@ -1,2 +1,33 @@
-flask>=3.0.0
+# BackupSys API — server-side dependencies
+# Install with: pip install -r requirements_api.txt
+#
+# No extra packages are needed for SQLite (stdlib) or HMAC (stdlib).
+# All OTP persistence and security improvements use only the standard library.
+
+flask>=3.0.0,<4.0
 gunicorn>=21.0.0
+
+# ── Required Railway environment variables ────────────────────────────────────
+# Set these in Railway → Project → Variables:
+#
+#   BACKUPSYS_API_KEY       Shared secret between app and server.
+#                           Generate: python -c "import secrets; print(secrets.token_hex(32))"
+#
+#   BACKUPSYS_OTP_HMAC_KEY  Key used to HMAC OTPs before storing them.
+#                           Generate: python -c "import secrets; print(secrets.token_hex(32))"
+#
+#   BACKUPSYS_SMTP_HOST     e.g. smtp-mail.outlook.com
+#   BACKUPSYS_SMTP_PORT     e.g. 587
+#   BACKUPSYS_SMTP_USER     your SMTP username / email address
+#   BACKUPSYS_SMTP_PASS     your SMTP password or app password
+#   BACKUPSYS_SMTP_FROM     sender address (defaults to SMTP_USER)
+#
+#   GDRIVE_CLIENT_ID        Google OAuth client ID
+#   GDRIVE_CLIENT_SECRET    Google OAuth client secret
+#
+# ── Optional ──────────────────────────────────────────────────────────────────
+#   BACKUPSYS_DB_PATH       Path to the SQLite DB file.
+#                           Default: /data/backupsys.db  (Railway persistent volume)
+#                                    ./backupsys.db       (local dev)
+#
+#   PORT                    HTTP port (Railway sets this automatically)

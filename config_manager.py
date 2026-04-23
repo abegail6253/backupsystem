@@ -23,16 +23,29 @@ from typing import List, Optional
 import logging
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH   = Path(__file__).parent / "config.json"
-QUEUE_PATH    = Path(os.environ.get("BACKUPSYS_DATA_DIR", Path(__file__).parent)) / "backup_queue.json"
-HISTORY_PATH  = Path(os.environ.get("BACKUPSYS_DATA_DIR", Path(__file__).parent)) / "history.json"
-SNAPSHOTS_DIR = Path(os.environ.get("BACKUPSYS_DATA_DIR", Path(__file__).parent)) / "snapshots"  # ← now env-var aware like QUEUE_PATH / HISTORY_PATH
+# ── Portable mode ─────────────────────────────────────────────────────────────
+# If a "portable.flag" file exists next to the script (or the PyInstaller exe),
+# ALL data (config, snapshots, logs, queue) lives inside the app folder so the
+# entire installation can be moved around as a single directory (e.g. USB drive).
+# Portable mode overrides BACKUPSYS_DATA_DIR completely.
+# To enable: create an empty file named "portable.flag" next to desktop_app.py.
+# To disable: delete portable.flag and restart the app.
+_HERE         = Path(__file__).resolve().parent
+_PORTABLE_FLAG = _HERE / "portable.flag"
+_IS_PORTABLE  = _PORTABLE_FLAG.exists() or os.environ.get("BACKUPSYS_PORTABLE", "").strip() == "1"
+_DATA_DIR     = _HERE if _IS_PORTABLE else Path(os.environ.get("BACKUPSYS_DATA_DIR", str(_HERE)))
+
+CONFIG_PATH   = _DATA_DIR / "config.json"
+QUEUE_PATH    = _DATA_DIR / "backup_queue.json"
+HISTORY_PATH  = _DATA_DIR / "history.json"
+SNAPSHOTS_DIR = _DATA_DIR / "snapshots"
 _save_lock    = threading.Lock()
 
 DEFAULT_CONFIG = {
     "destination":         "./backups",
     "storage_type":        "local",
     "dest_type":           "local",
+    "dest_webdav":         {},
     "dest_sftp":           {},
     "dest_smb":            {},
     "dest_ftp":            {},
@@ -40,14 +53,18 @@ DEFAULT_CONFIG = {
     "auto_backup":         False,
     "interval_min":        30,
     "interval_unit":       "minutes",
-    "retention_days":      30,
+    "retention_days":      0,
     "webhook_url":         "",
     "webhook_on_success":  False,
     "compression_enabled": False,
     "auto_retry":          False,
     "retry_delay_min":     5,
     "max_backup_mbps":     0.0,
+    "idle_threshold_cpu":  0,     # 0 = disabled; auto-backup only when CPU% < this value
     "backup_schedule_times": [],   # e.g. ["02:00", "14:00"] — run at specific times of day
+    # ── Integrity check scheduler ──────────────────────────────────────────
+    "integrity_check_enabled":       False,  # run scheduled hash-verification of stored backups
+    "integrity_check_interval_days": 7,      # how many days between checks (per watch)
     "email_config": {
         "enabled":           False,
         "notify_on_success": False,   # ← send email on successful backup
@@ -64,6 +81,7 @@ DEFAULT_CONFIG = {
         ".git", ".gitignore", "__pycache__", "node_modules",
         "*.pyc", "*.tmp", ".DS_Store", "Thumbs.db",
         "*.lock", "*.db", "*.sqlite*", ".env",
+        "~$*",   # Office lock files — silently skip, never log a warning
     ],
     "watches":        [],
 }
@@ -84,12 +102,17 @@ WATCH_TEMPLATE = {
     "last_backup_size": 0,
     "compression":      False,
     "max_backups":      0,        # 0 = unlimited; prunes oldest first after each backup
+    "max_file_size_mb": 0,        # 0 = no limit; skip files larger than N MB
+    "max_backup_bytes": 0,        # 0 = no limit; refuse new backup if stored bytes exceed this
     "skip_auto_backup": False,    # exclude from daemon without pausing manual backups
     "color":            "",       # optional color label (hex or empty)
     "interval_min":     0,
     "retention_days":   0,        # 0 = use global interval; >0 = watch-specific interval
-    "cloud_config":     {},       # S3/cloud credentials per-watch
+    "destinations":     [],       # list of {"dest_type": "sftp", "config": {...}}
+    "cloud_config":     {},       # Google Drive OAuth credentials per-watch
+    "smb_cfg":          {},       # SMB source credentials for UNC paths
     "encrypt_key":      "",       # Fernet key (44 chars, URL-safe base64); empty = no encryption
+    "last_integrity_check": None, # ISO timestamp of last scheduled integrity check, or None
 }
 
 
@@ -229,7 +252,7 @@ def load() -> dict:
 
             # Guard against hand-edited bad values that would spin the daemon
             cfg["interval_min"]   = max(1, int(cfg.get("interval_min",   30)))
-            cfg["retention_days"] = max(1, int(cfg.get("retention_days", 30)))
+            cfg["retention_days"] = max(0, int(cfg.get("retention_days", 0)))  # 0 = disabled (no auto-delete)
 
             # Ensure schedule list is always a list of "HH:MM" strings
             sched = cfg.get("backup_schedule_times", [])
@@ -245,6 +268,13 @@ def load() -> dict:
                     if k not in w:
                         w[k] = list(v) if isinstance(v, list) else v
                         migrated = True
+
+            # Migration: ensure ~$* is in default_exclude_patterns so Office lock
+            # files are silently skipped on all existing installations.
+            _excl = cfg.setdefault("default_exclude_patterns", [])
+            if "~$*" not in _excl:
+                _excl.append("~$*")
+                migrated = True
 
             if migrated:
                 try:
@@ -419,6 +449,7 @@ def add_watch(cfg: dict, name: str, path: str, watch_type: str = "local",
               exclude_patterns: Optional[list] = None,
               skip_path_check: bool = False,
               cloud_config: Optional[dict] = None,
+              smb_cfg: Optional[dict] = None,
               interval_min: int = 0,
               encrypt_key: Optional[str] = None) -> dict:
     """Add a new watch target with validation."""
@@ -536,6 +567,7 @@ def add_watch(cfg: dict, name: str, path: str, watch_type: str = "local",
         "notes":            notes or "",
         "exclude_patterns": list(exclude_patterns) if exclude_patterns else cfg.get("default_exclude_patterns", []),
         "cloud_config":     cloud_config or {},
+        "smb_cfg":          dict(smb_cfg) if smb_cfg else {},
         "interval_min":     max(0, int(interval_min)),
         "encrypt_key":      encrypt_key.strip() if encrypt_key else "",
     })
@@ -612,6 +644,9 @@ def update_watch_meta(
     retention_days:    Optional[int]  = None,   # ← added
     compression:       Optional[bool] = None,   # ← added
     encrypt_key:       Optional[str]  = None,   # ← added: Fernet key or "" to disable
+    sync_mode:         Optional[bool] = None,   # ← added: mirror/sync mode
+    smb_cfg:           Optional[dict] = None,   # ← fix: was referenced in body but missing from signature
+    destination:       Optional[str]  = None,   # ← per-watch destination override
 ):
     """Update watch metadata and optionally reset snapshot for full re-backup."""
     for w in cfg["watches"]:
@@ -627,7 +662,10 @@ def update_watch_meta(
             if active           is not None: w["active"]           = bool(active)
             if retention_days   is not None: w["retention_days"]   = max(0, int(retention_days))  # ← added
             if compression      is not None: w["compression"]      = bool(compression)            # ← added
+            if smb_cfg          is not None: w["smb_cfg"]          = dict(smb_cfg)
             if encrypt_key      is not None: w["encrypt_key"]      = encrypt_key.strip()          # ← added
+            if sync_mode        is not None: w["sync_mode"]        = bool(sync_mode)              # ← added
+            if destination      is not None: w["destination"]      = destination.strip()           # ← per-watch destination
             if reset_snapshot   is not None and reset_snapshot:
                 w["last_snapshot"] = None
     save(cfg)
@@ -664,6 +702,7 @@ def clone_watch(cfg: dict, watch_id: str, new_name: str, new_path: str) -> Optio
             retention_days=src.get("retention_days", 0),
             color=src.get("color", ""),
             encrypt_key=src.get("encrypt_key", ""),  # BUG FIX: persist in config too
+            sync_mode=src.get("sync_mode", False),
         )
         new_watch["max_backups"]      = src.get("max_backups", 0)
         new_watch["skip_auto_backup"] = src.get("skip_auto_backup", False)
@@ -671,6 +710,7 @@ def clone_watch(cfg: dict, watch_id: str, new_name: str, new_path: str) -> Optio
         new_watch["retention_days"]   = src.get("retention_days", 0)
         new_watch["color"]            = src.get("color", "")
         new_watch["encrypt_key"]      = src.get("encrypt_key", "")  # BUG FIX: return dict too
+        new_watch["sync_mode"]        = src.get("sync_mode", False)
     return new_watch
 
 

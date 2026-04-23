@@ -1,0 +1,67 @@
+{
+  "destination": "./backups",
+  "dest_type": "local",
+  "auto_backup": false,
+  "interval_min": 30,
+  "interval_unit": "minutes",
+  "retention_days": 30,
+  "compression_enabled": false,
+  "auto_retry": true,
+  "retry_delay_min": 5,
+  "max_backup_mbps": 0,
+  "webhook_url": "",
+  "webhook_on_success": false,
+  "backup_schedule_times": [],
+  "backup_window_end": "",
+  "idle_threshold_cpu": 0,
+  "watches": [],
+  "default_exclude_patterns": [
+    "*.tmp", "*.log", "~$*", ".DS_Store",
+    "Thumbs.db", "__pycache__", "*.pyc", ".git"
+  ],
+  "email_config": {
+    "enabled": false,
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_use_ssl": false,
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable — never paste passwords here",
+    "from_addr": "",
+    "to_addr": "",
+    "notify_on_success": false,
+    "notify_on_failure": true
+  },
+  "dest_sftp": {
+    "host": "",
+    "port": 22,
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable — never paste passwords here",
+    "remote_path": ""
+  },
+  "dest_ftp": {
+    "host": "",
+    "port": 21,
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable — never paste passwords here",
+    "use_tls": true
+  },
+  "dest_smb": {
+    "server": "",
+    "share": "",
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable — never paste passwords here",
+    "remote_path": ""
+  },
+  "dest_https": {
+    "url": "",
+    "token": "",
+    "verify_ssl": true
+  },
+  "dest_webdav": {
+    "url": "",
+    "username": "",
+    "webdav_root": "",
+    "remote_path": "",
+    "verify_ssl": true
+  }
+}

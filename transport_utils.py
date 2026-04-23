@@ -37,15 +37,31 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ── Optional keyring-backed credential store ──────────────────────────────────
+# If credential_store.py is present, passwords are read from the OS keyring
+# first (falling back to the value in config.json if the keyring has nothing).
+try:
+    from credential_store import (
+        get_sftp_password as _cred_sftp,
+        get_ftp_password  as _cred_ftp,
+        get_smb_password  as _cred_smb,
+        get_webdav_password as _cred_webdav,
+    )
+    _CRED_STORE = True
+except ImportError:
+    _CRED_STORE = False
+
 
 # ─── SFTP ─────────────────────────────────────────────────────────────────────
 
-def upload_to_sftp(local_dir: str, sftp_config: dict) -> dict:
+def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None) -> dict:
     """
     Upload a backup folder to an SFTP server using Paramiko.
 
     Recreates the full subdirectory tree under remote_path/<backup_folder_name>/.
     Supports both password auth and private-key auth.
+
+    progress_cb(bytes_done, total_bytes, filename) — optional, called per chunk.
     """
     try:
         import paramiko
@@ -57,7 +73,7 @@ def upload_to_sftp(local_dir: str, sftp_config: dict) -> dict:
     # Accept both "username" (transport_utils convention) and "user" (desktop_app convention)
     username   = (sftp_config.get("username") or sftp_config.get("user", "")).strip()
     # Accept both "password" and "pass"
-    password   = sftp_config.get("password") or sftp_config.get("pass", "")
+    password   = _cred_sftp(sftp_config) if _CRED_STORE else (sftp_config.get("password") or sftp_config.get("pass", ""))
     # Accept both "key_path" and "keyfile"
     key_path   = (sftp_config.get("key_path") or sftp_config.get("keyfile", "")).strip()
     key_pass   = sftp_config.get("key_passphrase") or sftp_config.get("key_pass", "")
@@ -72,9 +88,54 @@ def upload_to_sftp(local_dir: str, sftp_config: dict) -> dict:
     transport = None
     sftp      = None
 
+    # Larger SSH window/packet sizes drastically improve throughput for big files:
+    # default window=2MB, packet=32KB → we use window=33MB, packet=32KB.
+    # This matches OpenSSH client behaviour and avoids the "slow SFTP" problem.
+    _WIN_SIZE = 33 * 1024 * 1024   # 33 MB window
+    _PKT_SIZE = 32 * 1024           # 32 KB max packet (SSH spec limit)
+
+    # ── Host-key store (trust-on-first-use) ───────────────────────────────────
+    # Stored in ~/.backupsys_known_hosts so we detect server fingerprint changes.
+    # On first connect we accept and persist the key; on subsequent connects we
+    # reject mismatches to prevent man-in-the-middle attacks.
+    _known_hosts_path = Path.home() / ".backupsys_known_hosts"
+    _known_hosts = paramiko.HostKeys()
+    if _known_hosts_path.exists():
+        try:
+            _known_hosts.load(_known_hosts_path)
+        except Exception:
+            pass
+
     try:
         transport = paramiko.Transport((host, port))
+        transport.default_window_size     = _WIN_SIZE
+        transport.default_max_packet_size = _PKT_SIZE
         transport.connect()  # TCP only — auth follows
+
+        # ── Host key verification ─────────────────────────────────────────────
+        _host_key = transport.get_remote_server_key()
+        _host_id  = f"[{host}]:{port}" if port != 22 else host
+        _stored   = _known_hosts.lookup(_host_id)
+        if _stored:
+            _stored_key = _stored.get(_host_key.get_name())
+            if _stored_key and _stored_key != _host_key:
+                transport.close()
+                return {
+                    "ok": False,
+                    "error": (
+                        f"SFTP host key mismatch for {host}:{port} — "
+                        "the server's fingerprint has changed, which may indicate a "
+                        "man-in-the-middle attack. If the server was legitimately "
+                        f"reinstalled, delete the entry from {_known_hosts_path} and reconnect."
+                    ),
+                }
+        else:
+            # First connect — trust and persist this key (TOFU)
+            _known_hosts.add(_host_id, _host_key.get_name(), _host_key)
+            try:
+                _known_hosts.save(str(_known_hosts_path))
+            except Exception:
+                pass  # best-effort; don't fail the backup over this
 
         # Key-based auth
         if key_path and Path(key_path).exists():
@@ -127,22 +188,60 @@ def upload_to_sftp(local_dir: str, sftp_config: dict) -> dict:
                     except Exception:
                         pass  # may already exist due to race or permission; continue
 
-        for fp in ld.rglob("*"):
-            if not fp.is_file():
-                continue
-            if fp.name in _SKIP:
-                continue
+        # Pre-compute total bytes for accurate progress reporting
+        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+        _total_bytes = sum(fp.stat().st_size for fp in _all_files)
+        _bytes_done  = 0
+        _SFTP_CHUNK  = 256 * 1024   # 256 KB — balances round-trips vs. memory
+
+        for fp in _all_files:
             rel         = fp.relative_to(ld)
             remote_file = f"{remote_base}/{ld.name}/{str(rel).replace(os.sep, '/')}"
             remote_dir  = str(Path(remote_file).parent).replace("\\", "/")
             _mkdir_p(remote_dir)
             try:
-                sftp.put(str(fp), remote_file)
+                with open(str(fp), "rb") as fh:
+                    if progress_cb:
+                        # Chunked so progress fires regularly on large files
+                        f_handle = sftp.open(remote_file, "wb")
+                        try:
+                            while True:
+                                chunk = fh.read(_SFTP_CHUNK)
+                                if not chunk:
+                                    break
+                                f_handle.write(chunk)
+                                _bytes_done += len(chunk)
+                                try:
+                                    progress_cb(_bytes_done, _total_bytes, fp.name)
+                                except Exception:
+                                    pass
+                        finally:
+                            f_handle.close()
+                    else:
+                        sftp.putfo(fh, remote_file, file_size=fp.stat().st_size)
+                        _bytes_done += fp.stat().st_size
                 uploaded += 1
             except Exception as e:
                 logger.warning(f"[sftp] Failed to upload {rel}: {e}")
 
         logger.info(f"[sftp] Uploaded {uploaded} file(s) to {host}:{remote_base}/{ld.name}")
+
+        # ── Post-upload verification: remote file count must match local ──────
+        _expected = len(_all_files)
+        if _expected > 0 and uploaded != _expected:
+            _missing = _expected - uploaded
+            logger.warning(
+                f"[sftp] Verification warning: expected {_expected} file(s), "
+                f"only {uploaded} confirmed uploaded ({_missing} may have failed silently)"
+            )
+            return {
+                "ok": True,
+                "uploaded": uploaded,
+                "path": f"{remote_base}/{ld.name}",
+                "warning": f"{_missing} file(s) may not have uploaded correctly "
+                           f"({uploaded}/{_expected} confirmed)",
+            }
+
         return {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
 
     except paramiko.AuthenticationException as e:
@@ -168,19 +267,21 @@ def upload_to_sftp(local_dir: str, sftp_config: dict) -> dict:
 
 # ─── FTP / FTPS ───────────────────────────────────────────────────────────────
 
-def upload_to_ftp(local_dir: str, ftp_config: dict) -> dict:
+def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None) -> dict:
     """
     Upload a backup folder to an FTP/FTPS server using ftplib (stdlib).
 
     use_tls=True (default) uses explicit TLS (FTPS).  Set to False for plain FTP.
     Recreates the full directory tree under remote_path/<backup_folder_name>/.
+
+    progress_cb(bytes_done, total_bytes, filename) — optional, called per chunk.
     """
     import ftplib
 
     host        = ftp_config.get("host", "").strip()
     port        = int(ftp_config.get("port", 21))
     username    = (ftp_config.get("username") or ftp_config.get("user", "")).strip()
-    password    = ftp_config.get("password") or ftp_config.get("pass", "")
+    password    = _cred_ftp(ftp_config) if _CRED_STORE else (ftp_config.get("password") or ftp_config.get("pass", ""))
     remote_base = (ftp_config.get("remote_path") or ftp_config.get("path", "/backups")).rstrip("/")
     use_tls     = bool(ftp_config.get("use_tls", True))
 
@@ -223,27 +324,62 @@ def upload_to_ftp(local_dir: str, ftp_config: dict) -> dict:
                     except ftplib.error_perm:
                         pass  # may already exist; continue
 
-        for fp in ld.rglob("*"):
-            if not fp.is_file():
-                continue
-            if fp.name in _SKIP:
-                continue
-            rel         = fp.relative_to(ld)
-            parts       = list(rel.parts)
-            remote_dir  = f"{remote_base}/{ld.name}" + (
+        # Pre-compute total bytes for progress
+        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+        _total_bytes = sum(fp.stat().st_size for fp in _all_files)
+        _bytes_done  = 0
+        _FTP_BLOCK   = 8 * 1024 * 1024   # 8 MB — reduces round-trips vs ftplib default 8 KB
+
+        for fp in _all_files:
+            rel        = fp.relative_to(ld)
+            parts      = list(rel.parts)
+            remote_dir = f"{remote_base}/{ld.name}" + (
                 ("/" + "/".join(parts[:-1])) if len(parts) > 1 else ""
             )
             _ftp_makedirs(remote_dir)
             try:
                 ftp.cwd("/" + remote_dir.lstrip("/"))
-                with open(fp, "rb") as f:
-                    ftp.storbinary(f"STOR {fp.name}", f)
+                if progress_cb:
+                    # Wrap file in a callback-firing reader
+                    with open(fp, "rb") as _raw_f:
+                        def _cb_read(bs=_FTP_BLOCK, _f=_raw_f):
+                            chunk = _f.read(bs)
+                            if chunk:
+                                nonlocal _bytes_done
+                                _bytes_done += len(chunk)
+                                try:
+                                    progress_cb(_bytes_done, _total_bytes, fp.name)
+                                except Exception:
+                                    pass
+                            return chunk
+                        ftp.storbinary(f"STOR {fp.name}", type('R', (), {'read': _cb_read})(), blocksize=_FTP_BLOCK)
+                else:
+                    with open(fp, "rb") as f:
+                        ftp.storbinary(f"STOR {fp.name}", f, blocksize=_FTP_BLOCK)
+                    _bytes_done += fp.stat().st_size
                 uploaded += 1
             except Exception as e:
                 logger.warning(f"[ftp] Failed to upload {rel}: {e}")
 
         proto = "FTPS" if use_tls else "FTP"
         logger.info(f"[ftp] {proto} uploaded {uploaded} file(s) to {host}:{remote_base}/{ld.name}")
+
+        # ── Post-upload verification ──────────────────────────────────────────
+        _expected = len(_all_files)
+        if _expected > 0 and uploaded != _expected:
+            _missing = _expected - uploaded
+            logger.warning(
+                f"[ftp] Verification warning: expected {_expected} file(s), "
+                f"only {uploaded} confirmed uploaded"
+            )
+            return {
+                "ok": True,
+                "uploaded": uploaded,
+                "path": f"{remote_base}/{ld.name}",
+                "warning": f"{_missing} file(s) may not have uploaded correctly "
+                           f"({uploaded}/{_expected} confirmed)",
+            }
+
         return {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
 
     except ftplib.all_errors as e:
@@ -262,7 +398,7 @@ def upload_to_ftp(local_dir: str, ftp_config: dict) -> dict:
 
 # ─── SMB / CIFS ───────────────────────────────────────────────────────────────
 
-def upload_to_smb(local_dir: str, smb_config: dict) -> dict:
+def upload_to_smb(local_dir: str, smb_config: dict, progress_cb=None) -> dict:
     """
     Upload a backup folder to an SMB/CIFS network share.
 
@@ -270,11 +406,12 @@ def upload_to_smb(local_dir: str, smb_config: dict) -> dict:
     On Linux/Mac: Falls back to smbprotocol (must be installed: pip install smbprotocol).
 
     smb_config: { server, share, username, password, domain, remote_path }
+    progress_cb(bytes_done, total_bytes, filename) — optional, called per chunk.
     """
     server      = smb_config.get("server", "").strip()
     share       = smb_config.get("share", "").strip()
     username    = smb_config.get("username", "").strip()
-    password    = smb_config.get("password", "")
+    password    = _cred_smb(smb_config) if _CRED_STORE else smb_config.get("password", "")
     domain      = smb_config.get("domain", "")
     remote_base = smb_config.get("remote_path", "backups").strip().strip("/\\")
 
@@ -305,16 +442,29 @@ def upload_to_smb(local_dir: str, smb_config: dict) -> dict:
         remote_dir = Path(unc_root) / remote_base / ld.name
         try:
             remote_dir.mkdir(parents=True, exist_ok=True)
-            # Skip internal metadata files
-            _SKIP = {"MANIFEST.json", "BACKUP.sha256"}
-            uploaded = 0
-            for _smb_fp in ld.rglob("*"):
-                if not _smb_fp.is_file() or _smb_fp.name in _SKIP:
-                    continue
+            _SKIP        = {"MANIFEST.json", "BACKUP.sha256"}
+            uploaded     = 0
+            _SMB_BUF     = 16 * 1024 * 1024   # 16 MB — minimise SMB round-trips
+            _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+            _total_bytes = sum(fp.stat().st_size for fp in _all_files)
+            _bytes_done  = 0
+            for _smb_fp in _all_files:
                 _smb_rel  = _smb_fp.relative_to(ld)
                 _smb_dest = remote_dir / _smb_rel
                 _smb_dest.parent.mkdir(parents=True, exist_ok=True)
-                _sh.copy2(str(_smb_fp), str(_smb_dest))
+                with open(str(_smb_fp), "rb") as _src_f, open(str(_smb_dest), "wb") as _dst_f:
+                    while True:
+                        _buf = _src_f.read(_SMB_BUF)
+                        if not _buf:
+                            break
+                        _dst_f.write(_buf)
+                        _bytes_done += len(_buf)
+                        if progress_cb:
+                            try:
+                                progress_cb(_bytes_done, _total_bytes, _smb_fp.name)
+                            except Exception:
+                                pass
+                _sh.copystat(str(_smb_fp), str(_smb_dest))
                 uploaded += 1
             logger.info(f"[smb] Copied {uploaded} file(s) to {remote_dir}")
             return {"ok": True, "uploaded": uploaded, "path": str(remote_dir)}
@@ -350,12 +500,17 @@ def upload_to_smb(local_dir: str, smb_config: dict) -> dict:
 
         uploaded = 0
 
-        SMB_CHUNK = 1024 * 1024  # 1 MB write chunks — avoids loading large files into RAM
+        SMB_CHUNK = 16 * 1024 * 1024  # 16 MB chunks — minimise SMB round-trips
 
-        def _smb_write(rel_path: str, local_fp: Path):
+        _SKIP        = {"MANIFEST.json", "BACKUP.sha256"}
+        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+        _total_bytes = sum(fp.stat().st_size for fp in _all_files)
+        _bytes_done  = 0
+
+        def _smb_write_tracked(rel_path: str, local_fp: Path):
+            nonlocal _bytes_done
             rel_win     = rel_path.replace('/', '\\')
             remote_path = f"{remote_base}\\{ld.name}\\{rel_win}".lstrip("\\")
-            # Ensure parent dirs exist
             parts = remote_path.replace("/", "\\").split("\\")
             for i in range(1, len(parts)):
                 dir_path = "\\".join(parts[:i])
@@ -372,7 +527,6 @@ def upload_to_smb(local_dir: str, smb_config: dict) -> dict:
                     d.close(False)
                 except Exception:
                     pass
-            # Write file in chunks to avoid loading large files into RAM
             f_handle = Open(tree, remote_path)
             f_handle.create(
                 ImpersonationLevel.Impersonation,
@@ -390,17 +544,18 @@ def upload_to_smb(local_dir: str, smb_config: dict) -> dict:
                         break
                     f_handle.write(chunk, offset)
                     offset += len(chunk)
+                    _bytes_done += len(chunk)
+                    if progress_cb:
+                        try:
+                            progress_cb(_bytes_done, _total_bytes, local_fp.name)
+                        except Exception:
+                            pass
             f_handle.close(False)
 
-        _SKIP = {"MANIFEST.json", "BACKUP.sha256"}
-        for fp in ld.rglob("*"):
-            if not fp.is_file():
-                continue
-            if fp.name in _SKIP:
-                continue
+        for fp in _all_files:
             rel = str(fp.relative_to(ld))
             try:
-                _smb_write(rel, fp)
+                _smb_write_tracked(rel, fp)
                 uploaded += 1
             except Exception as e:
                 logger.warning(f"[smb] Failed to upload {rel}: {e}")
@@ -418,9 +573,12 @@ def upload_to_smb(local_dir: str, smb_config: dict) -> dict:
 
 # ─── HTTPS (webhook / REST upload endpoint) ───────────────────────────────────
 
-def upload_to_https(local_dir: str, https_config: dict) -> dict:
+def upload_to_https(local_dir: str, https_config: dict, progress_cb=None) -> dict:
     """
     Upload each file in a backup folder to an HTTPS endpoint via multipart POST.
+
+    Files are streamed in 256 KB chunks — no file is fully loaded into RAM,
+    so this works correctly for large backups without any arbitrary size cap.
 
     Supports Bearer token auth and custom headers.
     verify_ssl=False disables certificate verification (useful for self-signed certs).
@@ -428,14 +586,19 @@ def upload_to_https(local_dir: str, https_config: dict) -> dict:
     https_config: { url, token, headers(dict), verify_ssl(=true) }
 
     The server receives multipart/form-data with:
-        file       — the binary file content
+        file       — the binary file content (streamed)
         filename   — relative path inside the backup folder
         backup_dir — the top-level backup folder name
+
+    progress_cb(bytes_done, total_bytes, filename) — optional, called after each file upload.
     """
-    import urllib.request
-    import urllib.error
+    import http.client
     import ssl
-    import json as _json
+    import urllib.parse
+
+    _CHUNK = 256 * 1024   # 256 KB streaming chunk
+    _CRLF  = b"\r\n"
+    _SKIP  = {"MANIFEST.json", "BACKUP.sha256"}
 
     url        = https_config.get("url", "").strip()
     token      = https_config.get("token", "").strip()
@@ -450,102 +613,98 @@ def upload_to_https(local_dir: str, https_config: dict) -> dict:
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode    = ssl.CERT_NONE
 
-    ld       = Path(local_dir)
-    uploaded = 0
-    errors   = []
+    parsed    = urllib.parse.urlparse(url)
+    host      = parsed.netloc
+    path_qs   = parsed.path + (("?" + parsed.query) if parsed.query else "")
+    use_https = parsed.scheme.lower() == "https"
 
-    def _multipart_encode(file_path: Path, field_name: str, filename: str, extra_fields: dict):
-        """
-        Build a multipart/form-data body.
-        NOTE: The full body is assembled in memory. Files > 50 MB are warned;
-        files > 200 MB are rejected to prevent OOM. Use SFTP for large files.
-        """
-        MAX_HTTPS_BYTES = 200 * 1024 * 1024   # 200 MB hard limit
-        WARN_HTTPS_BYTES = 50 * 1024 * 1024   # 50 MB soft warning
-        file_size = file_path.stat().st_size if file_path.exists() else 0
-        if file_size > MAX_HTTPS_BYTES:
-            raise ValueError(
-                f"File too large for HTTPS multipart upload ({file_size // (1024*1024)} MB). "
-                "Hard limit is 200 MB — use SFTP/FTP for large files."
-            )
-        if file_size > WARN_HTTPS_BYTES:
-            logger.warning(
-                f"[https] {file_path.name} is {file_size // (1024*1024)} MB — "
-                "multipart upload requires the full body in memory; this may be slow."
-            )
+    ld           = Path(local_dir)
+    uploaded     = 0
+    errors       = []
+    _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+    _total_bytes = sum(fp.stat().st_size for fp in _all_files)
+    _bytes_done  = 0
 
-        boundary = "----BackupSysBoundary" + os.urandom(8).hex()
-        CRLF = b"\r\n"
-        chunks = []
+    def _stream_multipart(conn, fp: Path, rel: str) -> int:
+        """Stream one file as multipart/form-data.  Returns HTTP status code."""
+        boundary  = "----BackupSysBoundary" + os.urandom(8).hex()
+        file_size = fp.stat().st_size
 
-        # Extra text fields
-        for k, v in extra_fields.items():
-            chunks.append(f"--{boundary}".encode() + CRLF)
-            chunks.append(f'Content-Disposition: form-data; name="{k}"'.encode() + CRLF)
-            chunks.append(CRLF)
-            chunks.append(str(v).encode() + CRLF)
+        preamble = b""
+        for k, v in {"filename": rel, "backup_dir": ld.name}.items():
+            preamble += f"--{boundary}".encode() + _CRLF
+            preamble += f'Content-Disposition: form-data; name="{k}"'.encode() + _CRLF
+            preamble += _CRLF
+            preamble += str(v).encode() + _CRLF
+        preamble += f"--{boundary}".encode() + _CRLF
+        preamble += f'Content-Disposition: form-data; name="file"; filename="{fp.name}"'.encode() + _CRLF
+        preamble += b"Content-Type: application/octet-stream" + _CRLF
+        preamble += _CRLF
 
-        # File field header
-        chunks.append(f"--{boundary}".encode() + CRLF)
-        chunks.append(
-            f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"'.encode() + CRLF
-        )
-        chunks.append(b"Content-Type: application/octet-stream" + CRLF)
-        chunks.append(CRLF)
+        epilogue  = _CRLF + f"--{boundary}--".encode() + _CRLF
+        total_len = len(preamble) + file_size + len(epilogue)
 
-        with open(file_path, "rb") as fh:
-            chunks.append(fh.read())
-
-        chunks.append(CRLF)
-        chunks.append(f"--{boundary}--".encode() + CRLF)
-
-        body = b"".join(chunks)
-        ct   = f"multipart/form-data; boundary={boundary}"
-        return body, ct
-
-    _SKIP = {"MANIFEST.json", "BACKUP.sha256"}
-    for fp in ld.rglob("*"):
-        if not fp.is_file():
-            continue
-        if fp.name in _SKIP:
-            continue
-        rel  = str(fp.relative_to(ld)).replace("\\", "/")
-        body, ct = _multipart_encode(
-            fp, "file", rel,
-            {"filename": rel, "backup_dir": ld.name}
-        )
-
-        headers = {"Content-Type": ct}
+        hdrs = {
+            "Content-Type":   f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(total_len),
+        }
         if token:
-            headers["Authorization"] = f"Bearer {token}"
-        headers.update(extra_hdrs)
+            hdrs["Authorization"] = f"Bearer {token}"
+        hdrs.update(extra_hdrs)
 
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        conn.putrequest("POST", path_qs)
+        for k, v in hdrs.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+
+        conn.send(preamble)
+        with open(fp, "rb") as fh:
+            while True:
+                chunk = fh.read(_CHUNK)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        conn.send(epilogue)
+
+        resp = conn.getresponse()
+        resp.read()   # drain so connection can be reused
+        return resp.status
+
+    for fp in _all_files:
+        rel = str(fp.relative_to(ld)).replace("\\", "/")
         try:
-            with urllib.request.urlopen(req, context=ssl_ctx, timeout=60) as resp:
-                status = resp.status
-                if status not in (200, 201, 202, 204):
-                    errors.append(f"{rel}: HTTP {status}")
-                else:
-                    uploaded += 1
-        except urllib.error.HTTPError as e:
-            errors.append(f"{rel}: HTTP {e.code} {e.reason}")
-        except urllib.error.URLError as e:
-            errors.append(f"{rel}: {e.reason}")
+            conn = (
+                http.client.HTTPSConnection(host, context=ssl_ctx, timeout=120)
+                if use_https
+                else http.client.HTTPConnection(host, timeout=120)
+            )
+            status = _stream_multipart(conn, fp, rel)
+            conn.close()
+            if status not in (200, 201, 202, 204):
+                errors.append(f"{rel}: HTTP {status}")
+            else:
+                uploaded    += 1
+                _bytes_done += fp.stat().st_size
+                if progress_cb:
+                    try:
+                        progress_cb(_bytes_done, _total_bytes, fp.name)
+                    except Exception:
+                        pass
         except Exception as e:
             errors.append(f"{rel}: {e}")
 
     if errors:
         logger.warning(f"[https] {len(errors)} file(s) failed to upload: {errors[:5]}")
 
-    ok = uploaded > 0 or (uploaded == 0 and len(list(ld.rglob("*"))) == 0)
+    ok = uploaded > 0 or (uploaded == 0 and not _all_files)
     logger.info(f"[https] Uploaded {uploaded} file(s) to {url}")
     return {
-        "ok": ok,
+        "ok":       ok,
         "uploaded": uploaded,
-        "errors": errors[:20],   # cap to avoid enormous log entries
-        "path": url,
+        "errors":   errors[:20],
+        "path":     url,
     }
+
 
 # ─── Test-connection helpers ──────────────────────────────────────────────────
 # Used by desktop_app.py "Test Connection" buttons — centralises auth logic here
@@ -580,6 +739,35 @@ def test_sftp_connection(sftp_config: dict) -> dict:
     try:
         transport = paramiko.Transport((host, port))
         transport.connect()
+
+        # Host key verification — same TOFU logic as upload_to_sftp()
+        _known_hosts_path = Path.home() / ".backupsys_known_hosts"
+        _known_hosts = paramiko.HostKeys()
+        if _known_hosts_path.exists():
+            try:
+                _known_hosts.load(_known_hosts_path)
+            except Exception:
+                pass
+        _host_key = transport.get_remote_server_key()
+        _host_id  = f"[{host}]:{port}" if port != 22 else host
+        _stored   = _known_hosts.lookup(_host_id)
+        if _stored:
+            _stored_key = _stored.get(_host_key.get_name())
+            if _stored_key and _stored_key != _host_key:
+                transport.close()
+                return {
+                    "ok": False,
+                    "message": (
+                        f"Host key mismatch for {host}:{port} — fingerprint has changed. "
+                        f"If the server was reinstalled, remove its entry from {_known_hosts_path}."
+                    ),
+                }
+        else:
+            _known_hosts.add(_host_id, _host_key.get_name(), _host_key)
+            try:
+                _known_hosts.save(str(_known_hosts_path))
+            except Exception:
+                pass
 
         if key_path and Path(key_path).exists():
             pkey = None
@@ -925,12 +1113,25 @@ def cleanup_remote_ftp(ftp_config: dict, retention_days: int, watch_id: str = ""
 def cleanup_remote_smb(smb_config: dict, retention_days: int, watch_id: str = "") -> dict:
     """Delete old backup folders from SMB share older than retention_days."""
     import shutil as _sh
-    server      = smb_config.get("server", "").strip()
-    share       = smb_config.get("share", "").strip()
-    username    = smb_config.get("username", "").strip()
-    password    = smb_config.get("password", "")
-    domain      = smb_config.get("domain", "")
-    remote_base = smb_config.get("remote_path", "backups").strip().strip("/\\")
+    import re as _re
+
+    # Accept both transport_utils convention (server/share/username/password)
+    # and desktop_app convention (path=full UNC / user / pass).
+    server   = smb_config.get("server", "").strip()
+    share    = smb_config.get("share", "").strip()
+    username = (smb_config.get("username") or smb_config.get("user", "")).strip()
+    password = smb_config.get("password") or smb_config.get("pass", "")
+    domain   = smb_config.get("domain", "")
+
+    # If server/share missing, parse them from the full UNC path key
+    full_path = smb_config.get("path", "").strip()
+    if (not server or not share) and full_path:
+        m = _re.match(r"[/\\\\]{2}([^/\\\\]+)[/\\\\]([^/\\\\]+)", full_path)
+        if m:
+            server, share = m.group(1), m.group(2)
+
+    # remote_base: for desktop_app SMB config the UNC IS the destination root — no subfolder.
+    remote_base = smb_config.get("remote_path", "").strip().strip("/\\")
 
     result = {"ok": True, "deleted": 0, "freed_bytes": 0, "errors": []}
     cutoff = datetime.now() - timedelta(days=retention_days)
@@ -987,3 +1188,243 @@ def cleanup_remote_backups(cfg: dict, retention_days: int, watch_id: str = "") -
                 "error": "HTTPS retention skipped — no standard delete API"}
     else:
         return {"ok": True, "deleted": 0, "freed_bytes": 0}
+
+# ─── WebDAV / Nextcloud / ownCloud ────────────────────────────────────────────
+
+def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None) -> dict:
+    """
+    Upload a backup folder to a WebDAV server (Nextcloud, ownCloud, etc.).
+
+    Uses webdavclient3 if installed, otherwise falls back to stdlib urllib
+    so the feature works with zero extra dependencies.
+
+    webdav_config keys:
+        url          Full base URL, e.g. https://nextcloud.example.com
+        username     Login username
+        password     Login password
+        remote_path  Remote destination path, e.g. /backups
+        verify_ssl   bool, default True
+        webdav_root  Optional DAV root prefix.
+                     Nextcloud: /remote.php/dav/files/<USERNAME>/
+                     ownCloud:  /remote.php/webdav/
+                     Plain:     leave empty (server root)
+
+    Returns { ok: bool, uploaded: int, path: str, error: str }
+    """
+    import ssl
+    import urllib.request
+    import urllib.error
+    import base64 as _b64
+    import struct
+
+    url_base    = (webdav_config.get("url") or "").rstrip("/")
+    username    = (webdav_config.get("username") or webdav_config.get("user", "")).strip()
+    password    = _cred_webdav(webdav_config) if _CRED_STORE else (webdav_config.get("password") or webdav_config.get("pass", ""))
+    remote_path = (webdav_config.get("remote_path") or "/backups").strip("/")
+    verify_ssl  = webdav_config.get("verify_ssl", True)
+    webdav_root = (webdav_config.get("webdav_root") or "").rstrip("/")
+
+    if not url_base:
+        return {"ok": False, "error": "WebDAV URL not configured"}
+    if not username:
+        return {"ok": False, "error": "WebDAV username not configured"}
+
+    # Build Basic-auth header
+    _creds  = _b64.b64encode(f"{username}:{password}".encode()).decode()
+    _auth   = f"Basic {_creds}"
+    _ssl_ctx = ssl.create_default_context() if verify_ssl else (
+        lambda: (ssl._create_unverified_context())()
+    )
+
+    def _make_opener():
+        # Opener with Basic auth injected manually (avoids 401-redirect loop)
+        return urllib.request.build_opener()
+
+    def _req(method: str, path: str, data: bytes = None, content_type: str = "application/octet-stream") -> int:
+        """Send a WebDAV method, return HTTP status code."""
+        full = url_base + webdav_root + "/" + path.lstrip("/")
+        headers = {
+            "Authorization": _auth,
+            "Content-Type":  content_type,
+        }
+        if data is not None:
+            headers["Content-Length"] = str(len(data))
+        r = urllib.request.Request(full, data=data, headers=headers, method=method)
+        try:
+            ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+            with urllib.request.urlopen(r, context=ctx, timeout=60) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def _put_file(remote_file: str, local_path: Path, prog_ref: list) -> bool:
+        """PUT a single file. Returns True on success."""
+        full = url_base + webdav_root + "/" + remote_file.lstrip("/")
+        file_size = local_path.stat().st_size
+        headers = {
+            "Authorization":  _auth,
+            "Content-Type":   "application/octet-stream",
+            "Content-Length": str(file_size),
+        }
+        try:
+            ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+            CHUNK = 256 * 1024
+            bytes_sent = [0]
+
+            class _ReadWrapper:
+                def __init__(self, fh):
+                    self._fh = fh
+                def read(self, n=-1):
+                    chunk = self._fh.read(n)
+                    if chunk and progress_cb:
+                        bytes_sent[0] += len(chunk)
+                        try:
+                            progress_cb(bytes_sent[0], file_size, local_path.name)
+                        except Exception:
+                            pass
+                    return chunk
+
+            with open(str(local_path), "rb") as fh:
+                r = urllib.request.Request(full, data=_ReadWrapper(fh), headers=headers, method="PUT")
+                with urllib.request.urlopen(r, context=ctx, timeout=300) as resp:
+                    prog_ref[0] = 1
+                    return resp.status in (200, 201, 204)
+        except urllib.error.HTTPError as e:
+            if e.code in (200, 201, 204):
+                prog_ref[0] = 1
+                return True
+            logger.warning(f"[webdav] PUT {remote_file}: HTTP {e.code}")
+            return False
+        except Exception as exc:
+            logger.warning(f"[webdav] PUT {remote_file}: {exc}")
+            return False
+
+    def _mkcol(path: str) -> bool:
+        """Create a remote collection (directory). Returns True if OK or already exists."""
+        status = _req("MKCOL", path)
+        return status in (200, 201, 405)  # 405 = already exists
+
+    # ── Try webdavclient3 first (handles edge cases better for Nextcloud) ──────
+    try:
+        from webdav3.client import Client as _WDClient
+        options = {
+            "webdav_hostname": url_base,
+            "webdav_login":    username,
+            "webdav_password": password,
+            "webdav_root":     webdav_root or "/",
+            "webdav_cert_path":  "",
+            "webdav_key_path":   "",
+        }
+        if not verify_ssl:
+            options["webdav_disable_check"] = True
+        _wdc = _WDClient(options)
+        _wdc_available = True
+    except ImportError:
+        _wdc_available = False
+
+    ld        = Path(local_dir)
+    folder    = ld.name
+    dest_root = f"{remote_path}/{folder}".lstrip("/")
+    _SKIP     = {"MANIFEST.json", "BACKUP.sha256"}
+    uploaded  = 0
+
+    try:
+        if _wdc_available:
+            # ── webdavclient3 path ──────────────────────────────────────────
+            if not _wdc.check(remote_path):
+                _wdc.mkdir(remote_path)
+            if not _wdc.check(dest_root):
+                _wdc.mkdir(dest_root)
+
+            all_files = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+            total_files = len(all_files)
+            for i, fp in enumerate(all_files):
+                rel         = fp.relative_to(ld)
+                remote_file = f"{dest_root}/{str(rel).replace(os.sep, '/')}"
+                remote_dir  = str(Path(remote_file).parent).replace("\\", "/")
+                if remote_dir != dest_root and not _wdc.check(remote_dir):
+                    _wdc.mkdir(remote_dir)
+                _wdc.upload_sync(remote_path=remote_file, local_path=str(fp))
+                uploaded += 1
+                if progress_cb:
+                    try:
+                        progress_cb(i + 1, total_files, fp.name)
+                    except Exception:
+                        pass
+
+        else:
+            # ── stdlib urllib fallback ─────────────────────────────────────
+            _mkcol(remote_path)
+            _mkcol(dest_root)
+            _seen_dirs = set()
+
+            all_files = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+            for fp in all_files:
+                rel        = fp.relative_to(ld)
+                parts      = rel.parts
+                # Ensure all parent dirs exist
+                for depth in range(1, len(parts)):
+                    dpath = dest_root + "/" + "/".join(parts[:depth])
+                    if dpath not in _seen_dirs:
+                        _mkcol(dpath)
+                        _seen_dirs.add(dpath)
+
+                remote_file = dest_root + "/" + "/".join(parts)
+                _prog = [0]
+                if _put_file(remote_file, fp, _prog):
+                    uploaded += 1
+                else:
+                    logger.warning(f"[webdav] Failed to upload {fp.name}")
+
+    except Exception as e:
+        logger.error(f"[webdav] Upload failed: {e}")
+        return {"ok": False, "uploaded": uploaded, "path": dest_root, "error": str(e)}
+
+    ok = uploaded > 0 or len([f for f in ld.rglob("*") if f.is_file() and f.name not in _SKIP]) == 0
+    return {
+        "ok":       ok,
+        "uploaded": uploaded,
+        "path":     dest_root,
+        "error":    None if ok else "No files uploaded",
+    }
+
+
+def test_webdav_connection(webdav_config: dict) -> dict:
+    """
+    Verify WebDAV credentials and connectivity by sending a PROPFIND
+    request to the configured URL.  Returns { ok, error }.
+    """
+    import ssl
+    import urllib.request
+    import urllib.error
+    import base64 as _b64
+
+    url_base   = (webdav_config.get("url") or "").rstrip("/")
+    username   = (webdav_config.get("username") or webdav_config.get("user", "")).strip()
+    password   = _cred_webdav(webdav_config) if _CRED_STORE else (webdav_config.get("password") or webdav_config.get("pass", ""))
+    verify_ssl = webdav_config.get("verify_ssl", True)
+    webdav_root= (webdav_config.get("webdav_root") or "").rstrip("/")
+
+    if not url_base:
+        return {"ok": False, "error": "WebDAV URL not configured"}
+
+    _creds = _b64.b64encode(f"{username}:{password}".encode()).decode()
+    full   = url_base + webdav_root + "/"
+    req    = urllib.request.Request(
+        full,
+        data=b'<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
+        headers={"Authorization": f"Basic {_creds}", "Depth": "0", "Content-Type": "application/xml"},
+        method="PROPFIND",
+    )
+    try:
+        ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            if resp.status in (207, 200):
+                return {"ok": True, "error": None}
+            return {"ok": False, "error": f"HTTP {resp.status}"}
+    except urllib.error.HTTPError as e:
+        if e.code == 207:
+            return {"ok": True, "error": None}
+        return {"ok": False, "error": f"HTTP {e.code}: {e.reason}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

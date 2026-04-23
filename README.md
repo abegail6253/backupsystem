@@ -11,13 +11,15 @@ A Windows desktop backup system with a PyQt5 tray app, incremental backups, encr
 
 ## Installation
 
+**Option A — Guided setup (recommended for first-time installs):**
+```bash
+python setup_wizard.py
+```
+The wizard checks your Python version, installs all requirements, creates a starter `config.json`, and optionally adds BackupSys to Windows startup.
+
+**Option B — Manual:**
 ```bash
 pip install -r requirements_desktop.txt
-```
-
-For SFTP support (already in requirements):
-```bash
-pip install paramiko>=3.0.0
 ```
 
 For SMB on Linux/macOS, uncomment `smbprotocol` in `requirements_desktop.txt`.
@@ -49,13 +51,19 @@ Output: `dist/BackupSystem/BackupSystem.exe` — copy the entire `dist/BackupSys
 | `backup_engine.py` | Core backup logic — snapshot, diff, copy, encrypt, compress, restore, validate |
 | `config_manager.py` | Load/save `config.json`, watch CRUD, snapshot & queue persistence |
 | `watcher.py` | File-system watching via watchdog (polling fallback for network shares) |
-| `transport_utils.py` | Remote upload helpers — SFTP, FTP/FTPS, SMB, HTTPS |
+| `transport_utils.py` | Remote upload helpers — SFTP, FTP/FTPS, SMB, HTTPS, WebDAV/Nextcloud |
 | `notification_utils.py` | Email (SMTP/STARTTLS/SSL) and webhook notification helpers |
-| `live_dest_tests.py` | Comprehensive testing suite for all remote destination protocols |
-| `sftp_repro.py` | SFTP debugging and reproduction script |
+| `credential_store.py` | OS keyring wrapper for SFTP/FTP/SMB/SMTP passwords (falls back to config.json) |
+| `integrity_scheduler.py` | Weekly background backup integrity checker |
+| `connect_cloud.py` | Google Drive OAuth token management |
+| `backupsys_cli.py` | Headless CLI — run backups, list watches, validate, keygen (no GUI required) |
+| `setup_wizard.py` | Guided first-run setup — installs deps, writes config, adds to startup |
+| `backupsys_api.py` | Flask API for remote OTP auth (deploy to Railway) |
 | `build_exe.py` | PyInstaller packaging script |
+| `create_release_zip.py` | Builds a clean, secret-free source release zip |
+| `tests/` | pytest unit tests — run with `pytest tests/` |
 | `config.json` | Runtime configuration (auto-generated on first run) |
-| `INTEGRATION_PATCH.py` | Reference: shows how transport/notification modules were integrated into `backup_engine.py` |
+| `CHANGELOG.md` | Version history |
 
 ---
 
@@ -68,12 +76,13 @@ Key global settings:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `destination` | `./backups` | Local path where backup folders are written |
-| `dest_type` | `local` | `local`, `sftp`, `ftp`, `smb`, `https`, `cloud` |
+| `dest_type` | `local` | `local`, `sftp`, `ftp`, `smb`, `https`, `webdav`, `cloud` |
 | `auto_backup` | `false` | Enable timed automatic backups |
 | `interval_min` | `30` | Minutes between auto-backups |
 | `retention_days` | `30` | Delete backups older than N days |
 | `compression_enabled` | `false` | gzip-compress all files |
 | `max_backup_mbps` | `0` | Throttle backup I/O (0 = unlimited) |
+| `idle_threshold_cpu` | `0` | Defer auto-backups while CPU% exceeds this value (0 = always run, requires psutil) |
 
 ### Remote Destinations
 
@@ -98,6 +107,42 @@ Configure under `dest_sftp`, `dest_ftp`, `dest_smb`, or `dest_https` in `config.
 ```json
 "dest_https": { "url": "https://api.example.com/backup", "token": "Bearer xxx", "verify_ssl": true }
 ```
+
+
+**WebDAV / Nextcloud / ownCloud**
+```json
+"dest_webdav": {
+  "url": "https://nextcloud.example.com",
+  "username": "user",
+  "webdav_root": "/remote.php/dav/files/user/",
+  "remote_path": "/backups",
+  "verify_ssl": true
+}
+```
+
+Store the password via the Settings UI (saved to OS keyring) — never paste it in `config.json`.
+
+> **Nextcloud DAV root:** `/remote.php/dav/files/<USERNAME>/`  
+> **ownCloud DAV root:** `/remote.php/webdav/`  
+> **OneDrive DAV root:** `https://d.docs.live.net/<CID>/` where CID is your OneDrive CID (visible at onedrive.live.com)  
+> **Plain WebDAV:** leave `webdav_root` empty.
+
+Example OneDrive config:
+```json
+"dest_webdav": {
+  "url": "https://d.docs.live.net/1234567890abcdef",
+  "username": "user@example.com",
+  "webdav_root": "",
+  "remote_path": "/backups",
+  "verify_ssl": true
+}
+```
+
+Install `webdavclient3` for the best Nextcloud compatibility:
+```bash
+pip install webdavclient3
+```
+Without it, BackupSys falls back to the built-in `urllib` client automatically.
 
 All remote destinations support live connection testing via the Settings UI "Test Connection" buttons.
 
@@ -156,11 +201,109 @@ Set `webhook_url` to any endpoint that accepts a POST with `Content-Type: applic
 
 ---
 
+## Credential Store (Keyring)
+
+Passwords for SFTP, FTP, SMB, and SMTP are sensitive.  By default BackupSys
+falls back to storing them in `config.json`, but the recommended approach is
+to use the OS-native credential vault via the `keyring` package:
+
+```bash
+pip install keyring
+```
+
+Once installed, passwords saved through the Settings UI are stored in:
+- **Windows** — Windows Credential Manager
+- **macOS** — macOS Keychain
+- **Linux** — SecretService (GNOME Keyring / KWallet)
+
+If `keyring` is not installed the app works exactly as before — passwords are
+read from `config.json` and no errors are raised.
+
+---
+
+
+---
+
+## CLI / Headless Mode
+
+`backupsys_cli.py` lets you run backups without a display, GUI, or running Qt application.
+Useful for servers, WSL, SSH sessions, and Windows Task Scheduler.
+
+```bash
+# List all configured watches
+python backupsys_cli.py list
+
+# Back up a specific watch by name or ID
+python backupsys_cli.py backup --watch "My Documents"
+python backupsys_cli.py backup --watch w_abc123
+
+# Back up ALL active watches (exit code 1 if any fail with --strict)
+python backupsys_cli.py backup --all --strict
+
+# Show last 20 backup results
+python backupsys_cli.py history --limit 20
+
+# Validate the most-recent backup for a watch
+python backupsys_cli.py validate --watch "My Documents"
+python backupsys_cli.py validate --all
+
+# Generate a new encryption key
+python backupsys_cli.py keygen
+
+# Print active config (secrets redacted)
+python backupsys_cli.py config
+
+# Dry run — preview what would be backed up without copying anything
+python backupsys_cli.py dry-run --watch "My Documents"
+python backupsys_cli.py dry-run --all --verbose
+```
+
+All destination types (SFTP, FTP, HTTPS, WebDAV, Google Drive) are supported via the same `config.json` the GUI uses.
+
+### Per-watch advanced fields (set via Settings → Edit Watch)
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_backups` | `0` | Keep only this many versioned backups (0 = unlimited) |
+| `max_file_size_mb` | `0` | Skip individual files larger than N MB (0 = no limit) |
+| `max_backup_bytes` | `0` | Refuse new backups if this watch already uses more than N bytes of storage (0 = no limit) |
+| `retention_days` | `0` | Override global retention for this watch |
+| `interval_min` | `0` | Override global backup interval for this watch |
+| `skip_auto_backup` | `false` | Exclude from scheduled auto-backups (manual only) |
+
+---
+
+## Portable Mode
+
+To run BackupSys entirely from a single self-contained folder (e.g. a USB drive):
+
+1. Create an empty file named `portable.flag` next to `desktop_app.py`.
+2. Restart BackupSys.
+
+All config, snapshots, logs, and the backup queue will be stored inside the app folder instead of using `BACKUPSYS_DATA_DIR`.  To disable, delete `portable.flag` and restart.
+
+You can also set `BACKUPSYS_PORTABLE=1` as an environment variable for the same effect.
+
+---
+
 ## Encryption
 
-Per-watch Fernet (AES-128-CBC + HMAC-SHA256) encryption. Set `encrypt_key` on a watch in the Settings UI, or supply it via `BACKUPSYS_ENCRYPT_KEY_<ID>`.
+Per-watch AES-256-GCM streaming encryption (upgraded from Fernet in v1.1.0).
+Files of **any size** are encrypted in 1 MB chunks with ~2 MB constant RAM overhead — the old 200 MB limit is gone.
 
-**Limits:** Fernet loads the entire file into RAM. Files larger than 200 MB cannot be encrypted (raise `FERNET_MAX_BYTES` in `backup_engine.py` if needed, or use compression first to reduce file sizes).
+The same 44-character key format is used as before; existing keys continue to work.
+Old Fernet-encrypted backups from BackupSys v1.0.x are decrypted automatically — no migration needed.
+
+Set `encrypt_key` on a watch in the Settings UI, or supply it via `BACKUPSYS_ENCRYPT_KEY_<ID>`.
+
+Generate a key:
+```bash
+python backupsys_cli.py keygen
+# or
+python -c "from backup_engine import generate_encryption_key; print(generate_encryption_key())"
+```
+
+> **Legacy note (v1.0.x):** Earlier versions used Fernet (AES-128-CBC + HMAC-SHA256), which loaded entire files into RAM and had a 200 MB hard limit. The current engine uses streaming AES-256-GCM with no file-size limit. Existing Fernet-encrypted backups are read transparently — no action required.
 
 ---
 
@@ -168,21 +311,16 @@ Per-watch Fernet (AES-128-CBC + HMAC-SHA256) encryption. Set `encrypt_key` on a 
 
 From the backup history UI, select a backup and click **Restore**. For incremental backups, use **Restore Full Chain** to replay all snapshots in order up to a chosen point in time.
 
-## Testing Remote Destinations
-
-Test all remote destination protocols with local servers:
+## Running Tests
 
 ```bash
-python live_dest_tests.py
+pip install pytest
+pytest tests/
 ```
 
-This starts local test servers for SFTP, FTP, HTTPS, and SMB, then runs comprehensive upload tests for each protocol. Useful for validating remote destination configurations before deploying.
-
-For SFTP debugging specifically:
-
-```bash
-python sftp_repro.py
-```
+The test suite covers `backup_engine`, `backupsys_api`, `config_manager`, and
+`credential_store`.  Tests are self-contained and use temporary directories —
+no real files, servers, or email accounts are needed.
 
 ---
 

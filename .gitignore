@@ -1,58 +1,53 @@
-# ── Secrets & environment ─────────────────────────────────────────────────────
+# ── Credentials & secrets ─────────────────────────────────────────────────────
 .env
-_env
-*.env
+.env.*
 env
 env.developer
+*.token
+token.json
+credentials.json
+.user_cloud_tokens.json
+user_cloud_tokens.json
+secret_key
+.secret_key
 
-# ── Runtime data (generated on first run) ─────────────────────────────────────
+# ── Runtime state (contain real paths, tokens, backup history) ────────────────
 config.json
-backup_queue.json
 history.json
+backup_queue.json
+*.sha256
+
+# ── SFTP known-hosts (auto-generated, machine-specific) ───────────────────────
+.backupsys_known_hosts
+
+# ── Backup data & snapshots ───────────────────────────────────────────────────
+backups/
 snapshots/
 logs/
 
-# ── PyInstaller output ────────────────────────────────────────────────────────
-build/
+# ── Build artefacts ───────────────────────────────────────────────────────────
 dist/
+build/
 *.spec
+*.exe
 
-# ── Python cache ──────────────────────────────────────────────────────────────
+# ── Dev & scratch scripts ─────────────────────────────────────────────────────
+sftp_repro.py
+tmp_patch_add_watch.py
+regenerate_manifests.py
+clear_admin.py
+live_dest_tests.py
+setup_cloud_dev.py
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
-.Python
-
-# ── Virtual environments ──────────────────────────────────────────────────────
-venv/
 .venv/
-env/
-ENV/
+venv/
 
-# ── IDE / OS files ────────────────────────────────────────────────────────────
-.idea/
-.vscode/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
+# ── OS noise ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# ── Temp / backup files ───────────────────────────────────────────────────────
-*.tmp
-*.bak
-*.swp
-*~
-backups/
-.user_cloud_tokens.json
-
-# ── Credentials & tokens ──────────────────────────────────────────────────────
-credentials.json
-token.json
-*.token
-.secret_key
-
-# ── Logs ─────────────────────────────────────────────────────────────────────
-*.log.env
+Desktop.ini

@@ -28,9 +28,6 @@ except ImportError:
             return 0
 
 
-
-
-
 # ─── Watchdog handler ────────────────────────────────────────────────────────
 
 if WATCHDOG_AVAILABLE:
@@ -332,6 +329,12 @@ class WatcherManager:
                                 _debounced_cb(watch_id, entry)
                             except Exception:
                                 pass
+
+                    # FIX: advance the baseline so we don't re-report the same
+                    # changes on every tick.  Without this, every poll cycle
+                    # would diff against the original snapshot and flood the
+                    # pending buffer with duplicate entries.
+                    snap = new_snap
 
                 except Exception:
                     pass

@@ -111,9 +111,6 @@ def create_env():
 # GDRIVE_CLIENT_ID=
 # GDRIVE_CLIENT_SECRET=
 
-# Dropbox OAuth (optional)
-# DROPBOX_APP_KEY=
-# DROPBOX_APP_SECRET=
 """
     env_path.write_text(env_content, encoding="utf-8")
     OK(".env created")
@@ -226,7 +223,6 @@ def verify_install():
             all_ok = False
 
     optional = [
-        ("dropbox",              "dropbox (optional — for Dropbox cloud backup)"),
         ("google.oauth2",        "google-auth (optional — for Google Drive backup)"),
         ("smbprotocol",          "smbprotocol (optional — for SMB/NAS backup on Linux/macOS)"),
     ]

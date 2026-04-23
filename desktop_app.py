@@ -10,10 +10,40 @@ import shutil
 import threading
 import hashlib
 import json
+import urllib.request
 import socket
 import logging
+import time as _time_mod
 from datetime import datetime
 from pathlib import Path
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Format a number of seconds into a human-readable ETA string, e.g. '~2m 30s'."""
+    if seconds <= 0:
+        return ""
+    s = int(seconds)
+    if s < 60:
+        return f"~{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"~{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"~{h}h {m:02d}m"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format elapsed seconds into a compact duration string, e.g. '2m 30s'."""
+    if seconds <= 0:
+        return ""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
 
 # winreg is Windows-only  · guard so the module can at least be imported on other platforms
 try:
@@ -56,17 +86,34 @@ def _load_dotenv():
 
 _load_dotenv()
 
-# ── PyQt5 imports ─────────────────────────────────────────────────────────────
+# ── API-key strength check ─────────────────────────────────────────────────────
+# Warn at startup if BACKUPSYS_API_KEY is missing or looks like a placeholder.
+# The actual dialog is shown from MainWindow.__init__ once Qt is ready.
+_WEAK_API_KEY_PATTERNS = {
+    "", "mysecretkey123", "replace-with-a-random-secret",
+    "your-api-key", "changeme", "secret", "test",
+}
+
+def _api_key_is_weak() -> bool:
+    key = os.environ.get("BACKUPSYS_API_KEY", "").strip()
+    if key.lower() in _WEAK_API_KEY_PATTERNS:
+        return True
+    if len(key) < 20:
+        return True
+    return False
+
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSystemTrayIcon, QMenu, QAction,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea,
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
     QFileDialog, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QStackedWidget, QProgressBar, QTextEdit,
-    QSplitter, QComboBox, QGroupBox, QTabWidget, QToolButton, QStyle
+    QSplitter, QComboBox, QGroupBox, QTabWidget, QToolButton, QStyle,
+    QRadioButton
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QSize, QSettings, QPoint
+    Qt, QTimer, QThread, pyqtSignal, QSize, QSettings, QPoint, QRectF
 )
 from PyQt5.QtGui import (
     QIcon, QFont, QColor, QPalette, QPixmap, QPainter, QBrush,
@@ -78,6 +125,8 @@ try:
     import config_manager
     import backup_engine
     from watcher import WatcherManager
+    from integrity_scheduler import IntegrityScheduler
+    import credential_store
     BACKEND_AVAILABLE = True
 except ImportError as e:
     BACKEND_AVAILABLE = False
@@ -85,12 +134,13 @@ except ImportError as e:
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME        = "Backup System"
-APP_VERSION     = "2.0"
+APP_VERSION     = "1.1.0"
 ADMIN_PASS_KEY  = "admin_password_hash"
 SETTINGS_ORG    = "BackupSystem"
 SETTINGS_APP    = "BackupSystem"
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 TRAY_ICON_SIZE  = 64
+BACKUPSYS_API_URL = os.environ.get("BACKUPSYS_API_URL", "")
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 def _setup_logging():
@@ -311,6 +361,124 @@ QMenu::item:selected { background-color: #2563eb; }
 QMenu::separator { background-color: #2e3340; height: 1px; margin: 4px 8px; }
 """
 
+LIGHT_STYLE = """
+QMainWindow, QDialog, QWidget {
+    background-color: #f3f4f6;
+    color: #111827;
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 13px;
+}
+QFrame#card {
+    background-color: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 8px;
+}
+QPushButton {
+    background-color: #2563eb;
+    color: #ffffff;
+    border: none;
+    border-radius: 5px;
+    padding: 6px 14px;
+    font-weight: 600;
+}
+QPushButton:hover   { background-color: #1d4ed8; }
+QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }
+QPushButton[objectName="secondary"] {
+    background-color: #e5e7eb;
+    color: #374151;
+    border: 1px solid #d1d5db;
+}
+QPushButton[objectName="secondary"]:hover { background-color: #d1d5db; }
+QPushButton[objectName="danger"] {
+    background-color: #dc2626;
+    color: #ffffff;
+}
+QPushButton[objectName="danger"]:hover { background-color: #b91c1c; }
+QLabel[objectName="status_ok"]   { color: #16a34a; font-weight: 600; }
+QLabel[objectName="status_warn"] { color: #d97706; font-weight: 600; }
+QLabel[objectName="status_err"]  { color: #dc2626; font-weight: 600; }
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox {
+    background-color: #ffffff;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: #111827;
+}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #2563eb;
+}
+QScrollBar:vertical {
+    background: #f3f4f6;
+    width: 8px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical {
+    background: #d1d5db;
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover { background: #9ca3af; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QTabWidget::pane { border: 1px solid #e5e7eb; border-radius: 6px; }
+QTabBar::tab {
+    background: #e5e7eb;
+    color: #374151;
+    padding: 6px 16px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected { background: #2563eb; color: #ffffff; }
+QTabBar::tab:hover    { background: #d1d5db; }
+QHeaderView::section {
+    background-color: #f9fafb;
+    color: #6b7280;
+    border: none;
+    border-bottom: 1px solid #e5e7eb;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+QTreeWidget, QTableWidget, QListWidget {
+    background-color: #ffffff;
+    alternate-background-color: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    gridline-color: #f3f4f6;
+}
+QTreeWidget::item:selected, QTableWidget::item:selected {
+    background-color: #eff6ff;
+    color: #1e40af;
+}
+QMenu {
+    background-color: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 4px;
+}
+QMenu::item { padding: 6px 20px; border-radius: 4px; color: #111827; }
+QMenu::item:selected { background-color: #eff6ff; color: #1e40af; }
+QMenu::separator { background-color: #e5e7eb; height: 1px; margin: 4px 8px; }
+"""
+
+
+def _detect_os_theme() -> str:
+    """Return 'dark' or 'light' based on the Windows registry colour preference.
+    Falls back to 'dark' on non-Windows or if the registry key is unavailable."""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        )
+        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return "light" if val == 1 else "dark"
+    except Exception:
+        return "dark"   # safe default on Linux/macOS or if registry unavailable
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Tray Icon Generator ────────────────────────────────────────────────────────
@@ -379,416 +547,46 @@ def _get_editor_info(filepath: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Remote Upload Helpers (SFTP / FTPS / FTP / SMB / HTTPS) ───────────────────
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# All upload logic lives in transport_utils.py.  These thin wrappers exist so
+# the rest of desktop_app.py can call _upload_sftp / _upload_ftp / etc. without
+# knowing which module provides the implementation.  If transport_utils cannot
+# be imported (e.g. a packaging edge case) a clear error dict is returned
+# instead of crashing — but in normal use the module is always present.
+# ──────────────────────────────────────────────────────────────────────────────
 
-try:
-    from transport_utils import (
-        upload_to_sftp as _tu_sftp,
-        upload_to_ftp  as _tu_ftp,
-        upload_to_smb  as _tu_smb,
-        upload_to_https as _tu_https,
-    )
-    _TRANSPORT_UTILS_AVAILABLE = True
-except ImportError:
-    _TRANSPORT_UTILS_AVAILABLE = False
+from transport_utils import (
+    upload_to_sftp  as _tu_sftp,
+    upload_to_ftp   as _tu_ftp,
+    upload_to_smb   as _tu_smb,
+    upload_to_https as _tu_https,
+)
+_TRANSPORT_UTILS_AVAILABLE = True
 
 
 def _upload_sftp(local_dir: str, sftp_cfg: dict, proto: str = "sftp") -> dict:
-    """Upload a backup folder to SFTP or FTPS server."""
-    if _TRANSPORT_UTILS_AVAILABLE:
-        return _tu_sftp(local_dir, sftp_cfg)
-
-    # Fallback inline implementation (used only when transport_utils is unavailable)
-    host    = sftp_cfg.get("host", "")
-    port    = sftp_cfg.get("port", 22 if proto == "sftp" else 21)
-    user    = sftp_cfg.get("user") or sftp_cfg.get("username", "")
-    pw      = sftp_cfg.get("pass") or sftp_cfg.get("password", "")
-    rpath   = (sftp_cfg.get("path") or sftp_cfg.get("remote_path", "/")).rstrip("/")
-    keyfile = sftp_cfg.get("keyfile") or sftp_cfg.get("key_path", "")
-
-    if not host or not user:
-        return {"ok": False, "error": "SFTP host/user not configured"}
-
-    local_path = Path(local_dir)
-    if not local_path.exists():
-        return {"ok": False, "error": "Local backup dir not found"}
-
-    uploaded = 0
-    try:
-        import paramiko
-        transport = paramiko.Transport((host, int(port)))
-        transport.connect()
-
-        if keyfile and Path(keyfile).exists():
-            key_pass = sftp_cfg.get("key_pass") or None
-            try:
-                pkey = paramiko.RSAKey.from_private_key_file(keyfile, password=key_pass)
-            except paramiko.SSHException:
-                try:
-                    pkey = paramiko.Ed25519Key.from_private_key_file(keyfile, password=key_pass)
-                except paramiko.SSHException:
-                    pkey = paramiko.ECDSAKey.from_private_key_file(keyfile, password=key_pass)
-            transport.auth_publickey(user, pkey)
-        else:
-            if not pw:
-                return {"ok": False, "error": "SFTP password (or keyfile) not configured"}
-            transport.auth_password(user, pw)
-
-        if not transport.is_authenticated():
-            return {"ok": False, "error": "SFTP authentication failed"}
-
-        sftp = paramiko.SFTPClient.from_transport(transport)
-
-        def _mkdir_p(remote_dir):
-            parts = remote_dir.replace("\\", "/").split("/")
-            current = ""
-            for part in parts:
-                if not part:
-                    current = "/"
-                    continue
-                current = (current.rstrip("/") + "/" + part) if current else part
-                try:
-                    sftp.stat(current)
-                except FileNotFoundError:
-                    try:
-                        sftp.mkdir(current)
-                    except Exception:
-                        pass
-
-        for fp in local_path.rglob("*"):
-            if not fp.is_file():
-                continue
-            rel         = fp.relative_to(local_path)
-            remote_file = f"{rpath}/{local_path.name}/{str(rel).replace(os.sep, '/')}"
-            _mkdir_p(str(Path(remote_file).parent).replace("\\", "/"))
-            try:
-                sftp.put(str(fp), remote_file)
-                uploaded += 1
-            except Exception as e:
-                logger.warning(f"[sftp] Failed to upload {rel}: {e}")
-
-        sftp.close()
-        transport.close()
-        return {"ok": True, "uploaded": uploaded, "path": f"{rpath}/{local_path.name}"}
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    """Upload a backup folder to an SFTP server via transport_utils."""
+    return _tu_sftp(local_dir, sftp_cfg)
 
 
 def _upload_ftp(local_dir: str, ftp_cfg: dict) -> dict:
-    """Upload a backup folder to an FTP/FTPS server."""
-    if _TRANSPORT_UTILS_AVAILABLE:
-        return _tu_ftp(local_dir, ftp_cfg)
-
-    import ftplib
-    host     = ftp_cfg.get("host", "")
-    port     = int(ftp_cfg.get("port", 21))
-    user     = ftp_cfg.get("user") or ftp_cfg.get("username", "")
-    pw       = ftp_cfg.get("pass") or ftp_cfg.get("password", "")
-    rpath    = (ftp_cfg.get("path") or ftp_cfg.get("remote_path", "/backups")).rstrip("/")
-    use_tls  = bool(ftp_cfg.get("use_tls", True))
-
-    if not host or not user:
-        return {"ok": False, "error": "FTP host/user not configured"}
-
-    local_path = Path(local_dir)
-    uploaded   = 0
-    ftp        = None
-    try:
-        if use_tls:
-            ftp = ftplib.FTP_TLS(timeout=30)
-            ftp.connect(host, port)
-            ftp.login(user, pw)
-            ftp.prot_p()
-        else:
-            ftp = ftplib.FTP(timeout=30)
-            ftp.connect(host, port)
-            ftp.login(user, pw)
-
-        def _makedirs(remote_dir):
-            parts = remote_dir.replace("\\", "/").lstrip("/").split("/")
-            ftp.cwd("/")
-            for part in parts:
-                if not part:
-                    continue
-                try:
-                    ftp.cwd(part)
-                except ftplib.error_perm:
-                    try:
-                        ftp.mkd(part)
-                        ftp.cwd(part)
-                    except ftplib.error_perm:
-                        pass
-
-        for fp in local_path.rglob("*"):
-            if not fp.is_file():
-                continue
-            rel    = fp.relative_to(local_path)
-            parts  = list(rel.parts)
-            rdir   = f"{rpath}/{local_path.name}" + (("/" + "/".join(parts[:-1])) if len(parts) > 1 else "")
-            _makedirs(rdir)
-            try:
-                ftp.cwd("/" + rdir.lstrip("/"))
-                with open(fp, "rb") as f:
-                    ftp.storbinary(f"STOR {fp.name}", f)
-                uploaded += 1
-            except Exception as e:
-                logger.warning(f"[ftp] Failed to upload {rel}: {e}")
-
-        return {"ok": True, "uploaded": uploaded, "path": f"{rpath}/{local_path.name}"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    finally:
-        try:
-            if ftp:
-                ftp.quit()
-        except Exception:
-            pass
+    """Upload a backup folder to an FTP/FTPS server via transport_utils."""
+    return _tu_ftp(local_dir, ftp_cfg)
 
 
-def _ensure_smb_mounted(smb_cfg: dict):
-    """
-    On Windows: run 'net use' to authenticate the SMB share so the UNC path
-    is accessible as a normal filesystem path.
-    Returns (ok: bool, error: str).
-    """
-    if os.name != "nt":
-        return False, "SMB auto-mount requires Windows"
-
-    import re
-    import subprocess as _sp
-
-    path   = smb_cfg.get("path", "").strip()
-    user   = smb_cfg.get("user", smb_cfg.get("username", "")).strip()
-    pw     = smb_cfg.get("pass", smb_cfg.get("password", ""))
-    domain = smb_cfg.get("domain", "").strip()
-
-    if not path:
-        return True, ""   # nothing to mount  · user mapped the drive manually
-
-    # Extract \\server\share from a full UNC path
-    norm = path.replace("/", "\\")
-    m    = re.match(r"(\\\\[^\\]+\\[^\\]+)", norm)
-    unc  = m.group(1) if m else norm
-
-    if not user:
-        return True, ""   # no credentials  · share may already be accessible
-
-    user_arg = f"{domain}\\{user}" if domain else user
-    pw_arg   = pw if pw else ""
-
-    try:
-        cmd = ["net", "use", unc]
-        if pw_arg:
-            cmd.append(pw_arg)
-        cmd += [f"/user:{user_arg}", "/persistent:no"]
-
-        res    = _sp.run(cmd, capture_output=True, text=True, timeout=15)
-        stderr = (res.stdout + res.stderr).lower()
-        # "already" or "local device" means the share is already connected  · fine
-        if res.returncode != 0 and "already" not in stderr and "local device" not in stderr:
-            return False, (res.stderr or res.stdout).strip()
-        return True, ""
-    except Exception as e:
-        return False, str(e)
+def _ensure_smb_mounted(_smb_cfg: dict):
+    """No-op shim — SMB mounting is handled inside transport_utils.upload_to_smb."""
+    return True, ""
 
 
 def _upload_smb(local_dir: str, smb_cfg: dict) -> dict:
-    """
-    Copy a backup folder to a Windows SMB / CIFS share.
+    """Upload a backup folder to a Windows SMB share via transport_utils."""
+    return _tu_smb(local_dir, smb_cfg)
 
-    • Windows   · mount via 'net use' (if credentials provided) then copy
-                 files directly over the UNC path using shutil.
-    • Linux/macOS  · use the optional 'smbprotocol' package.
-
-    smb_cfg keys  (from cfg["dest_smb"]):
-        path    full UNC destination e.g. \\\\nas\\backups
-        user    SMB username
-        pass    SMB password
-        domain  Windows domain (optional)
-    """
-    ld = Path(local_dir)
-    if not ld.exists():
-        return {"ok": False, "error": f"Local backup dir not found: {local_dir}"}
-
-    dest_path = smb_cfg.get("path", "").strip()
-    if not dest_path:
-        return {"ok": False, "error": "SMB destination path not configured"}
-
-    # ── Windows: UNC copy ─────────────────────────────────────────────────────
-    if os.name == "nt":
-        ok, err = _ensure_smb_mounted(smb_cfg)
-        if not ok:
-            return {"ok": False, "error": f"SMB mount failed: {err}"}
-
-        dest_root = Path(dest_path) / ld.name
-        uploaded  = 0
-        errors    = []
-        try:
-            dest_root.mkdir(parents=True, exist_ok=True)
-            for fp in ld.rglob("*"):
-                if fp.is_file():
-                    rel = fp.relative_to(ld)
-                    dst = dest_root / rel
-                    try:
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(fp), str(dst))
-                        uploaded += 1
-                    except Exception as copy_err:
-                        errors.append(f"{rel}: {copy_err}")
-            return {"ok": True, "uploaded": uploaded, "path": str(dest_root), "errors": errors}
-        except Exception as e:
-            return {"ok": False, "error": f"UNC copy failed: {e}"}
-
-    # ── Non-Windows: smbprotocol ──────────────────────────────────────────────
-    try:
-        import smbclient
-        import smbclient.shutil as smb_shutil
-
-        user   = smb_cfg.get("user", smb_cfg.get("username", "")).strip()
-        pw     = smb_cfg.get("pass", smb_cfg.get("password", ""))
-        domain = smb_cfg.get("domain", "").strip()
-
-        import re
-        m = re.match(r"[/\\]{2}([^/\\]+)", dest_path)
-        if not m:
-            return {"ok": False, "error": f"Cannot parse server from SMB path: {dest_path}"}
-        server = m.group(1)
-
-        smbclient.register_session(server, username=user, password=pw, connection_timeout=10)
-
-        smb_dest = dest_path.replace("/", "\\").rstrip("\\") + "\\" + ld.name
-        try:
-            smbclient.makedirs(smb_dest, exist_ok=True)
-        except Exception:
-            pass
-
-        uploaded = 0
-        errors   = []
-        for fp in ld.rglob("*"):
-            if fp.is_file():
-                rel      = str(fp.relative_to(ld)).replace("/", "\\")
-                smb_file = smb_dest + "\\" + rel
-                smb_par  = "\\".join(smb_file.split("\\")[:-1])
-                try:
-                    smbclient.makedirs(smb_par, exist_ok=True)
-                except Exception:
-                    pass
-                try:
-                    with open(str(fp), "rb") as lf, smbclient.open_file(smb_file, mode="wb") as rf:
-                        shutil.copyfileobj(lf, rf)
-                    uploaded += 1
-                except Exception as copy_err:
-                    errors.append(f"{rel}: {copy_err}")
-
-        return {"ok": True, "uploaded": uploaded, "path": smb_dest, "errors": errors}
-
-    except ImportError:
-        return {
-            "ok": False,
-            "error": (
-                "smbprotocol not installed  · run: pip install smbprotocol\n"
-                "(on Windows the built-in UNC copy is used automatically)"
-            ),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ── HTTPS API Upload Helper ────────────────────────────────────════════════════
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _upload_https(local_dir: str, api_cfg: dict) -> dict:
-    """
-    Upload a backup folder to a custom HTTPS API endpoint.
-
-    Each file is POSTed as multipart/form-data with:
-      - 'file'  : the file binary
-      - 'path'  : the relative path (so the server can reconstruct the folder)
-
-    api_cfg keys:
-      url        : full HTTPS endpoint, e.g. https://backup.company.com/api/upload
-      token      : Bearer token (optional)
-      verify_ssl : True by default; set False to allow self-signed certs
-    """
-    if _TRANSPORT_UTILS_AVAILABLE:
-        return _tu_https(local_dir, api_cfg)
-
-    import urllib.request
-    import urllib.error
-    import ssl
-    import uuid as _uuid
-    import mimetypes
-
-    url        = api_cfg.get("url", "").strip()
-    token      = api_cfg.get("token", "").strip()
-    verify_ssl = api_cfg.get("verify_ssl", True)
-
-    if not url:
-        return {"ok": False, "error": "HTTPS API URL not configured"}
-
-    local_path = Path(local_dir)
-    if not local_path.exists():
-        return {"ok": False, "error": "Local backup dir not found"}
-
-    uploaded = 0
-    errors   = []
-
-    ctx = ssl.create_default_context()
-    if not verify_ssl:
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-
-    for fp in local_path.rglob("*"):
-        if not fp.is_file():
-            continue
-
-        rel       = str(fp.relative_to(local_path)).replace("\\", "/")
-        mime_type = mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
-        boundary  = f"----BackupSysBoundary{_uuid.uuid4().hex}"
-
-        try:
-            with open(fp, "rb") as f:
-                file_data = f.read()
-        except Exception as e:
-            errors.append(f"{rel}: {e}")
-            continue
-
-        # Build multipart/form-data body
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="path"\r\n\r\n'
-            f"{rel}\r\n"
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="{fp.name}"\r\n'
-            f"Content-Type: {mime_type}\r\n\r\n"
-        ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
-
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-        req.add_header("Content-Length", str(len(body)))
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-
-        try:
-            with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
-                if resp.getcode() not in (200, 201, 202, 204):
-                    errors.append(f"{rel}: HTTP {resp.getcode()}")
-                    continue
-            uploaded += 1
-        except urllib.error.HTTPError as e:
-            errors.append(f"{rel}: HTTP {e.code} {e.reason}")
-        except Exception as e:
-            errors.append(f"{rel}: {e}")
-
-    if errors:
-        return {
-            "ok":       uploaded > 0,
-            "uploaded": uploaded,
-            "errors":   errors,
-            "error":    f"{len(errors)} file(s) failed  · first: {errors[0]}" if uploaded == 0 else None,
-        }
-    return {"ok": True, "uploaded": uploaded}
+    """Upload a backup folder to a custom HTTPS API endpoint via transport_utils."""
+    return _tu_https(local_dir, api_cfg)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -909,7 +707,8 @@ def _send_webhook(cfg: dict, result: dict):
 
 
 class BackupWorker(QThread):
-    progress    = pyqtSignal(int, int, str)      # copied, total, filename
+    # current, total, fname, elapsed_s, is_scanning, bytes_done, total_bytes
+    progress    = pyqtSignal(int, int, str, float, bool, int, int)
     finished    = pyqtSignal(dict)               # result dict
     log_message = pyqtSignal(str)                # status text
 
@@ -928,7 +727,15 @@ class BackupWorker(QThread):
         w   = self.watch
         cfg = self.cfg
 
-        self.log_message.emit(f"Starting backup: {w['name']} …")
+        # For network source paths, warn user the scan may take a while
+        _src_path = w.get("path", "")
+        _is_network_src = _src_path.startswith("\\\\") or _src_path.startswith("//")
+        if _is_network_src:
+            self.log_message.emit(
+                f"Starting backup: {w['name']} … (network source — scanning may take several minutes)"
+            )
+        else:
+            self.log_message.emit(f"Starting backup: {w['name']} …")
 
         # Determine the primary destination type for snapshot keying.
         # Each destination (sftp, gdrive, local …) maintains its own
@@ -937,13 +744,48 @@ class BackupWorker(QThread):
         dest_type = cfg.get("dest_type", "local")
         snapshot = config_manager.load_snapshot(w["id"], dest_type)
 
-        def cb(copied, total, fname):
+        # Track when the copy phase begins so we can compute ETA.
+        _copy_start: list  = [None]   # list so the inner closure can mutate it
+        # Rolling speed window: keep the last N (bytes_done, timestamp) samples
+        # so the displayed MB/s and ETA reflect recent throughput rather than
+        # average-since-start.  This prevents the ETA from shooting to "2 hours"
+        # just because the throttler paused between files.
+        _speed_window: list = []   # [(time, bytes_done), ...]
+        _SPEED_WINDOW_SEC   = 8    # look back 8 seconds for rate calculation
+
+        def cb(copied, total, fname, bytes_done=0, total_bytes=0):
             # Raise InterruptedError so run_backup()'s inner loop propagates
             # the cancellation immediately rather than waiting until the next
             # retry window.
             if self._stop_event.is_set():
                 raise InterruptedError("Backup cancelled by user")
-            self.progress.emit(copied, total, fname)
+            now = _time_mod.time()
+            if _copy_start[0] is None:
+                _copy_start[0] = now
+            elapsed = now - _copy_start[0]
+
+            # Maintain rolling window — drop samples older than _SPEED_WINDOW_SEC
+            _speed_window.append((now, bytes_done))
+            cutoff = now - _SPEED_WINDOW_SEC
+            while len(_speed_window) > 2 and _speed_window[0][0] < cutoff:
+                _speed_window.pop(0)
+
+            self.progress.emit(copied, total, fname, elapsed, False, bytes_done, total_bytes)
+
+        # For scanning ETA: use previous snapshot file count as estimated total.
+        # This gives a meaningful ETA on repeat backups. First-time backups
+        # will show elapsed time only (no estimate available).
+        _estimated_scan_total = len(snapshot)   # 0 on first backup
+        _scan_count: list = [0]
+        _scan_start: list = [_time_mod.time()]
+
+        def scan_cb(fname):
+            """Called for each file during snapshot scan."""
+            if self._stop_event.is_set():
+                raise InterruptedError("Backup cancelled by user")
+            _scan_count[0] += 1
+            elapsed = _time_mod.time() - _scan_start[0]
+            self.progress.emit(_scan_count[0], _estimated_scan_total, fname, elapsed, True, 0, 0)
 
         # Honour the bandwidth throttle setting
         max_mbps  = cfg.get("max_backup_mbps", 0.0)
@@ -970,6 +812,11 @@ class BackupWorker(QThread):
             dest_type = cfg.get("dest_type", "local")
             if dest_type == "smb":
                 smb_cfg = cfg.get("dest_smb", {})
+                smb_unc = smb_cfg.get("path", "").strip()
+                # Self-heal: fix stale local destination saved before the SMB _save_general fix
+                dest_cur = cfg.get("destination", "")
+                if smb_unc and not (dest_cur.startswith("\\") or dest_cur.startswith("//")):
+                    cfg["destination"] = smb_unc
                 ok, smb_err = _ensure_smb_mounted(smb_cfg)
                 if not ok:
                     self.log_message.emit(f"⚠ SMB mount failed: {smb_err}")
@@ -977,21 +824,63 @@ class BackupWorker(QThread):
                     continue  # try again on next attempt
 
             try:
+                _src = w["path"]
+                if os.name == "nt" and (_src.startswith("\\\\") or _src.startswith("//")):
+                    _src_smb = dict(w.get("smb_cfg") or {})
+                    _src_smb["path"] = _src
+                    ok, smb_err = _ensure_smb_mounted(_src_smb)
+                    if not ok:
+                        self.log_message.emit(f"⚠ {w['name']}: SMB source mount failed: {smb_err}")
+                        result = {"status": "failed", "error": f"SMB source mount failed: {smb_err}", "watch_id": w["id"]}
+                        continue
+
+                # Resolve destination: per-watch overrides global cfg destination
+                _w_dest = w.get("destination", "").strip() or cfg.get("destination", "")
+                # Build destinations list for multi-destination support
+                _destinations = w.get("destinations", [])
+                if not _destinations:
+                    # Fallback to global dest_type
+                    _dest_type  = cfg.get("dest_type", "local")
+                    _cloud_cfg  = None
+                    if _dest_type == "sftp":
+                        _cloud_cfg = {**cfg.get("dest_sftp", {}), "_dest_type": "sftp"}
+                    elif _dest_type in ("ftp", "ftps"):
+                        _cloud_cfg = {**cfg.get("dest_ftp", {}), "_dest_type": _dest_type}
+                    elif _dest_type == "https":
+                        _cloud_cfg = {**cfg.get("dest_https", {}), "_dest_type": "https"}
+                    elif _dest_type == "webdav":
+                        _cloud_cfg = {**cfg.get("dest_webdav", {}), "_dest_type": "webdav"}
+                    elif _dest_type == "cloud":
+                        _w_cloud = w.get("cloud_config") or {}
+                        if _w_cloud:
+                            _cloud_cfg = {**_w_cloud, "_dest_type": "cloud"}
+                    _destinations = None  # Use legacy cloud_config
+                else:
+                    _dest_type = "local"  # For legacy compatibility
+                    _cloud_cfg = None
+
                 result = backup_engine.run_backup(
                     source            = w["path"],
-                    destination       = cfg["destination"],
+                    destination       = _w_dest,
                     watch_id          = w["id"],
                     watch_name        = w["name"],
-                    storage_type      = "local",  # cloud uploads handled below per-provider
+                    storage_type      = _dest_type,
                     previous_snapshot = snapshot or None,
                     incremental       = bool(snapshot),
                     progress_cb       = cb,
+                    scan_cb           = scan_cb,
                     exclude_patterns  = w.get("exclude_patterns", []),
                     compress          = w.get("compression", False),
                     encrypt_key       = w.get("encrypt_key") or None,
-                    cloud_config      = None,  # suppress internal cloud upload
+                    cloud_config      = _cloud_cfg,
+                    destinations      = _destinations,
                     triggered_by      = self.triggered_by,
                     throttler         = throttler,
+                    cancel_event      = self._stop_event,
+                    sync_mode         = w.get("sync_mode", False),
+                    max_file_size_mb  = w.get("max_file_size_mb", 0),
+                    pre_backup_cmd    = w.get("pre_backup_cmd") or None,
+                    post_backup_cmd   = w.get("post_backup_cmd") or None,
                 )
             except InterruptedError:
                 # User pressed ▶ Cancel  · treat as a clean cancellation not a failure
@@ -1015,18 +904,8 @@ class BackupWorker(QThread):
             )
             self.log_message.emit(
                 f"▶ {w['name']}: {result['files_copied']} file(s) · {result['total_size']}"
+                f" · {_fmt_duration(result.get('duration_s', 0.0))}"
             )
-
-            # Remove internal metadata from local backup folder
-            # NOTE: Keep MANIFEST.json for local backups so list_backups() can find them
-            if result.get("backup_dir"):
-                from pathlib import Path as _P
-                for _meta in ("BACKUP.sha256",):  # Don't delete MANIFEST.json
-                    try:
-                        _mp = _P(result["backup_dir"]) / _meta
-                        if _mp.exists(): _mp.unlink()
-                    except Exception:
-                        pass
 
             # ── Email notification on success ──────────────────────────
             ec = cfg.get("email_config", {})
@@ -1058,46 +937,24 @@ class BackupWorker(QThread):
             # ── Webhook notification ───────────────────────────────────
             _send_webhook(cfg, result)
 
-
-
-            # Upload to remote destination if configured
+            # ── Remote upload result (surfaced from backup_engine.run_backup) ──
+            # The engine handles all SFTP/FTP/FTPS/SMB/HTTPS/GDrive uploads
+            # internally and stores the outcome in result["cloud_upload"].
             dest_type = cfg.get("dest_type", "local")
-            if dest_type == "sftp" and result.get("backup_dir"):
-                self.log_message.emit("📡 Uploading to SFTP…")
-                sftp_result = _upload_sftp(
-                    result["backup_dir"], cfg.get("dest_sftp", {}), dest_type
-                )
-                if sftp_result["ok"]:
-                    self.log_message.emit(f"☁E{dest_type.upper()} upload done: {sftp_result.get('uploaded',0)} file(s)")
-                    # Persist cloud upload result in MANIFEST before deleting local staging copy
-                    try:
-                        import json as _json, tempfile as _tmp
-                        _mpath = Path(result["backup_dir"]) / "MANIFEST.json"
-                        if _mpath.exists():
-                            with open(_mpath) as _f:
-                                _m = _json.load(_f)
-                            _m["cloud_upload"] = sftp_result
-                            _fd, _tp = _tmp.mkstemp(dir=Path(result["backup_dir"]), suffix=".tmp")
-                            with os.fdopen(_fd, "w") as _f:
-                                _json.dump(_m, _f, indent=2)
-                            os.replace(_tp, str(_mpath))
-                    except Exception:
-                        pass
-                    # Clean up local staging copy now that it's on the server
-                    try:
-                        import shutil as _sh
-                        _sh.rmtree(result["backup_dir"], ignore_errors=True)
-                        # Invalidate index so ghost entry doesn't appear in UI
-                        backup_engine._backup_index.invalidate(cfg.get("destination", ""))
-                    except Exception:
-                        pass
-                else:
-                    _err_msg = sftp_result.get('error', 'unknown error')
+            if dest_type not in ("local",):
+                upload_res = result.get("cloud_upload") or {}
+                if upload_res.get("ok"):
+                    self.log_message.emit(
+                        f"☁  {dest_type.upper()} upload done: "
+                        f"{upload_res.get('uploaded', 0)} file(s)"
+                    )
+                elif upload_res:
+                    _err_msg = upload_res.get("error", "unknown error")
                     self.log_message.emit(f"⚠ {dest_type.upper()} upload failed: {_err_msg}")
                     _ec = cfg.get("email_config", {})
                     if _ec.get("enabled") and _ec.get("notify_on_failure", True):
                         _send_email_notification(cfg,
-                            f"⚠ BackupSys  · {dest_type.upper()} upload failed: {w['name']}",
+                            f"⚠ BackupSys · {dest_type.upper()} upload failed: {w['name']}",
                             f"Backup completed but remote upload failed.\n\n"
                             f"  Watch:      {w['name']}\n"
                             f"  Dest type:  {dest_type.upper()}\n"
@@ -1109,169 +966,6 @@ class BackupWorker(QThread):
                     _send_webhook(cfg, {**result, "status": "upload_failed",
                                         "upload_error": _err_msg, "upload_dest": dest_type})
 
-            elif dest_type == "ftps" and result.get("backup_dir"):
-                # FTPS = FTP over TLS. The UI shares the SFTP form fields (host/port/user/pass/path)
-                # but the actual transfer uses ftplib FTP_TLS, not Paramiko SSH.
-                _ftps_raw = cfg.get("dest_sftp", {})
-                _ftps_cfg = {
-                    "host":        _ftps_raw.get("host", ""),
-                    "port":        int(_ftps_raw.get("port", 21)),
-                    "username":    _ftps_raw.get("user", "") or _ftps_raw.get("username", ""),
-                    "password":    _ftps_raw.get("pass", "") or _ftps_raw.get("password", ""),
-                    "remote_path": _ftps_raw.get("path", "/backups") or _ftps_raw.get("remote_path", "/backups"),
-                    "use_tls":     True,   # FTPS always uses TLS
-                }
-                self.log_message.emit("📡 Uploading to FTPS (FTP over TLS)…")
-                ftp_result = _upload_ftp(result["backup_dir"], _ftps_cfg)
-                if ftp_result["ok"]:
-                    self.log_message.emit(f"☁EFTPS upload done: {ftp_result.get('uploaded',0)} file(s)")
-                    try:
-                        import json as _json, tempfile as _tmp
-                        _mpath = Path(result["backup_dir"]) / "MANIFEST.json"
-                        if _mpath.exists():
-                            with open(_mpath) as _f:
-                                _m = _json.load(_f)
-                            _m["cloud_upload"] = ftp_result
-                            _fd, _tp = _tmp.mkstemp(dir=Path(result["backup_dir"]), suffix=".tmp")
-                            with os.fdopen(_fd, "w") as _f:
-                                _json.dump(_m, _f, indent=2)
-                            os.replace(_tp, str(_mpath))
-                    except Exception:
-                        pass
-                    try:
-                        import shutil as _sh
-                        _sh.rmtree(result["backup_dir"], ignore_errors=True)
-                        backup_engine._backup_index.invalidate(cfg.get("destination", ""))
-                    except Exception:
-                        pass
-                else:
-                    _err_msg = ftp_result.get('error', 'unknown error')
-                    self.log_message.emit(f"⚠ FTPS upload failed: {_err_msg}")
-                    _ec = cfg.get("email_config", {})
-                    if _ec.get("enabled") and _ec.get("notify_on_failure", True):
-                        _send_email_notification(cfg,
-                            f"⚠ BackupSys  · FTPS upload failed: {w['name']}",
-                            f"Backup completed but FTPS upload failed.\n\n"
-                            f"  Watch:      {w['name']}\n"
-                            f"  Dest type:  FTPS\n"
-                            f"  Error:      {_err_msg}\n"
-                            f"  Backup ID:  {result.get('backup_id', 'N/A')}\n"
-                            f"  Timestamp:  {result.get('timestamp', '')[:19]}\n\n"
-                            f"The backup is stored locally and will be retried on the next run."
-                        )
-                    _send_webhook(cfg, {**result, "status": "upload_failed",
-                                        "upload_error": _err_msg, "upload_dest": "ftps"})
-
-            elif dest_type == "ftp" and result.get("backup_dir"):
-                self.log_message.emit("📡 Uploading to FTP…")
-                ftp_result = _upload_ftp(result["backup_dir"], cfg.get("dest_ftp", {}))
-                if ftp_result["ok"]:
-                    self.log_message.emit(f"☁EFTP upload done: {ftp_result.get('uploaded',0)} file(s)")
-                    # Persist cloud upload result in MANIFEST before deleting local staging copy
-                    try:
-                        import json as _json, tempfile as _tmp
-                        _mpath = Path(result["backup_dir"]) / "MANIFEST.json"
-                        if _mpath.exists():
-                            with open(_mpath) as _f:
-                                _m = _json.load(_f)
-                            _m["cloud_upload"] = ftp_result
-                            _fd, _tp = _tmp.mkstemp(dir=Path(result["backup_dir"]), suffix=".tmp")
-                            with os.fdopen(_fd, "w") as _f:
-                                _json.dump(_m, _f, indent=2)
-                            os.replace(_tp, str(_mpath))
-                    except Exception:
-                        pass
-                    # Clean up local staging copy now that it's on the server
-                    try:
-                        import shutil as _sh
-                        _sh.rmtree(result["backup_dir"], ignore_errors=True)
-                        # Invalidate index so ghost entry doesn't appear in UI
-                        backup_engine._backup_index.invalidate(cfg.get("destination", ""))
-                    except Exception:
-                        pass
-                else:
-                    _err_msg = ftp_result.get('error', 'unknown error')
-                    self.log_message.emit(f"⚠ FTP upload failed: {_err_msg}")
-                    _ec = cfg.get("email_config", {})
-                    if _ec.get("enabled") and _ec.get("notify_on_failure", True):
-                        _send_email_notification(cfg,
-                            f"⚠ BackupSys  · FTP upload failed: {w['name']}",
-                            f"Backup completed but FTP upload failed.\n\n"
-                            f"  Watch:      {w['name']}\n"
-                            f"  Dest type:  FTP\n"
-                            f"  Error:      {_err_msg}\n"
-                            f"  Backup ID:  {result.get('backup_id', 'N/A')}\n"
-                            f"  Timestamp:  {result.get('timestamp', '')[:19]}\n\n"
-                            f"The backup is stored locally and will be retried on the next run."
-                        )
-                    _send_webhook(cfg, {**result, "status": "upload_failed",
-                                        "upload_error": _err_msg, "upload_dest": "ftp"})
-
-            elif dest_type == "https" and result.get("backup_dir"):
-                self.log_message.emit("📡 Uploading to HTTPS API…")
-                https_result = _upload_https(result["backup_dir"], cfg.get("dest_https", {}))
-                if https_result["ok"]:
-                    self.log_message.emit(f"☁EHTTPS upload done: {https_result.get('uploaded',0)} file(s)")
-                    # Persist cloud upload result in MANIFEST before deleting local staging copy
-                    try:
-                        import json as _json, tempfile as _tmp
-                        _mpath = Path(result["backup_dir"]) / "MANIFEST.json"
-                        if _mpath.exists():
-                            with open(_mpath) as _f:
-                                _m = _json.load(_f)
-                            _m["cloud_upload"] = https_result
-                            _fd, _tp = _tmp.mkstemp(dir=Path(result["backup_dir"]), suffix=".tmp")
-                            with os.fdopen(_fd, "w") as _f:
-                                _json.dump(_m, _f, indent=2)
-                            os.replace(_tp, str(_mpath))
-                    except Exception:
-                        pass
-                    # Clean up local staging copy now that it's on the server
-                    try:
-                        import shutil as _sh
-                        _sh.rmtree(result["backup_dir"], ignore_errors=True)
-                        # Invalidate index so ghost entry doesn't appear in UI
-                        backup_engine._backup_index.invalidate(cfg.get("destination", ""))
-                    except Exception:
-                        pass
-                else:
-                    _err_msg = https_result.get('error', 'unknown error')
-                    self.log_message.emit(f"⚠ HTTPS upload failed: {_err_msg}")
-                    _ec = cfg.get("email_config", {})
-                    if _ec.get("enabled") and _ec.get("notify_on_failure", True):
-                        _send_email_notification(cfg,
-                            f"⚠ BackupSys  · HTTPS upload failed: {w['name']}",
-                            f"Backup completed but HTTPS upload failed.\n\n"
-                            f"  Watch:      {w['name']}\n"
-                            f"  Dest type:  HTTPS\n"
-                            f"  Error:      {_err_msg}\n"
-                            f"  Backup ID:  {result.get('backup_id', 'N/A')}\n"
-                            f"  Timestamp:  {result.get('timestamp', '')[:19]}\n\n"
-                            f"The backup is stored locally and will be retried on the next run."
-                        )
-                    _send_webhook(cfg, {**result, "status": "upload_failed",
-                                        "upload_error": _err_msg, "upload_dest": "https"})
-
-            elif dest_type == "smb" and result.get("backup_dir"):
-                # SMB destination: the backup was written to the UNC path directly
-                # (backup_engine used cfg["destination"] = the UNC path).
-                # We still run _upload_smb to verify/copy in case the engine used a
-                # local temp path or the direct write was attempted without credentials.
-                smb_cfg = cfg.get("dest_smb", {})
-                # Only run the explicit upload if the destination is NOT the UNC path
-                # (i.e. backup_dir is inside a local temp dir, not already on the share).
-                backup_dir_path = result.get("backup_dir", "")
-                dest_unc        = cfg.get("destination", "")
-                if dest_unc and not backup_dir_path.lower().startswith(dest_unc.lower()):
-                    self.log_message.emit("📡 Copying backup to SMB share…")
-                    smb_result = _upload_smb(backup_dir_path, smb_cfg)
-                    if smb_result["ok"]:
-                        self.log_message.emit(f"☁ESMB copy done: {smb_result.get('uploaded',0)} file(s)")
-                        errs = smb_result.get("errors", [])
-                        if errs:
-                            self.log_message.emit(f"  ⚠ {len(errs)} file(s) had errors")
-                    else:
-                        self.log_message.emit(f"⚠ SMB copy failed: {smb_result.get('error','')}")
         else:
             self.log_message.emit(f"⚠ {w['name']}: {result.get('error', 'unknown error')}")
 
@@ -1298,6 +992,35 @@ class BackupWorker(QThread):
                 _send_email_notification(cfg, subject, body)
             _send_webhook(cfg, result)
 
+        self.finished.emit(result)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Restore Worker ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RestoreWorker(QThread):
+    """Runs restore_backup / restore_full_chain off the main thread so the UI stays responsive."""
+    progress  = pyqtSignal(int, int, str)   # step, total_steps, label
+    finished  = pyqtSignal(dict)            # result dict
+
+    def __init__(self, mode: str, kwargs: dict, parent=None):
+        super().__init__(parent)
+        self.mode   = mode    # "single" or "chain"
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            if self.mode == "chain":
+                def _progress_cb(step, total, label):
+                    self.progress.emit(step, total, label)
+                result = backup_engine.restore_full_chain(
+                    progress_cb=_progress_cb, **self.kwargs
+                )
+            else:
+                result = backup_engine.restore_backup(**self.kwargs)
+        except Exception as e:
+            result = {"ok": False, "error": str(e), "files_restored": 0, "skipped": 0, "errors": [str(e)]}
         self.finished.emit(result)
 
 
@@ -1352,6 +1075,11 @@ class PasswordDialog(QDialog):
         self.error_lbl.setObjectName("status_err")
         self.error_lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.error_lbl)
+
+        if BACKUPSYS_API_URL and self.mode == "verify":
+            self.otp_btn = QPushButton("Login with OTP")
+            self.otp_btn.clicked.connect(self._otp_login)
+            layout.addWidget(self.otp_btn)
 
         btn_row = QHBoxLayout()
         self.forgot_btn = QPushButton("Forgot password?")
@@ -1481,15 +1209,41 @@ class PasswordDialog(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         return bool(s.value(ADMIN_PASS_KEY, ""))
 
+    def _otp_login(self):
+        from PyQt5.QtWidgets import QInputDialog
+        try:
+            # Send OTP
+            req = urllib.request.Request(f"{BACKUPSYS_API_URL}/send-otp", method="POST", headers={"Content-Type": "application/json", "X-API-Key": os.environ.get("BACKUPSYS_API_KEY", "")})
+            with urllib.request.urlopen(req, data=json.dumps({}).encode()) as response:
+                if response.getcode() != 200:
+                    self.error_lbl.setText("Failed to send OTP")
+                    return
+            # Prompt for OTP
+            otp, ok = QInputDialog.getText(self, "OTP Login", "Enter the OTP code sent to your email:")
+            if not ok or not otp:
+                return
+            # Verify OTP
+            req = urllib.request.Request(f"{BACKUPSYS_API_URL}/verify-otp", method="POST", headers={"Content-Type": "application/json", "X-API-Key": os.environ.get("BACKUPSYS_API_KEY", "")})
+            with urllib.request.urlopen(req, data=json.dumps({"otp": otp}).encode()) as response:
+                if response.getcode() == 200:
+                    self.accept()
+                else:
+                    self.error_lbl.setText("Invalid OTP")
+        except Exception as e:
+            self.error_lbl.setText(f"OTP error: {str(e)}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Add Watch Dialog ───────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AddWatchDialog(QDialog):
-    def __init__(self, parent=None, cfg=None):
+    def __init__(self, parent=None, cfg=None, edit_watch_id=None):
         super().__init__(parent)
         self.cfg = cfg or {}
+        # When set, this dialog is editing an existing watch — skip duplicate
+        # checks for the watch's own path/name so saves are never blocked.
+        self._edit_watch_id = edit_watch_id
         self.setWindowTitle("Add Watched Folder / Network Path")
         self.setMinimumWidth(520)
         self._build_ui()
@@ -1566,8 +1320,28 @@ class AddWatchDialog(QDialog):
         self.interval_spin.setSuffix(" min (0 = use global)")
         form.addRow("Interval:", self.interval_spin)
 
+        # Per-watch destination
+        dest_widget = QWidget()
+        dest_row = QHBoxLayout(dest_widget)
+        dest_row.setContentsMargins(0, 0, 0, 0)
+        self.dest_input = QLineEdit()
+        self.dest_input.setPlaceholderText(
+            "Leave blank to use global destination  ·  or enter e.g. \\\\server\\share\\folder"
+        )
+        dest_browse_btn = QPushButton("Browse")
+        dest_browse_btn.setObjectName("secondary")
+        dest_browse_btn.setMaximumWidth(80)
+        dest_browse_btn.clicked.connect(self._browse_dest)
+        dest_row.addWidget(self.dest_input)
+        dest_row.addWidget(dest_browse_btn)
+        form.addRow("Destination:", dest_widget)
+
         self.compress_check = QCheckBox("Enable compression")
         form.addRow("", self.compress_check)
+
+        # Sync mode is always ON — files are copied directly into the destination.
+        # No versioned timestamped subfolders are created.
+        self._sync_mode = True
 
         layout.addLayout(form)
 
@@ -1579,16 +1353,22 @@ class AddWatchDialog(QDialog):
         cancel = QPushButton("Cancel")
         cancel.setObjectName("secondary")
         cancel.clicked.connect(self.reject)
-        add = QPushButton("Add Watch")
-        add.setObjectName("success")
-        add.clicked.connect(self._submit)
+        self._submit_btn = QPushButton("Add Watch")
+        self._submit_btn.setObjectName("success")
+        self._submit_btn.clicked.connect(self._submit)
         btn_row.addWidget(cancel)
-        btn_row.addWidget(add)
+        btn_row.addWidget(self._submit_btn)
         layout.addLayout(btn_row)
 
     def _on_source_type_changed(self, idx):
         self.local_widget.setVisible(idx == 0)
         self.smb_widget.setVisible(idx == 1)
+
+    def _browse_dest(self):
+        """Browse for a per-watch destination folder."""
+        path = QFileDialog.getExistingDirectory(self, "Select Destination Folder")
+        if path:
+            self.dest_input.setText(path)
 
     def _browse(self):
         msg = QMessageBox(self)
@@ -1661,13 +1441,21 @@ class AddWatchDialog(QDialog):
             return False
 
         # 7. Duplicate path  · already being watched
-        existing_paths = [w.get("path", "").strip().lower() for w in self.cfg.get("watches", [])]
+        existing_paths = [
+            w.get("path", "").strip().lower()
+            for w in self.cfg.get("watches", [])
+            if w.get("id") != self._edit_watch_id          # skip self when editing
+        ]
         if path_str.strip().lower() in existing_paths:
             self.error_lbl.setText("This path is already in your watch list.")
             return False
 
         # 8. Duplicate name  · already used
-        existing_names = [w.get("name", "").strip().lower() for w in self.cfg.get("watches", [])]
+        existing_names = [
+            w.get("name", "").strip().lower()
+            for w in self.cfg.get("watches", [])
+            if w.get("id") != self._edit_watch_id          # skip self when editing
+        ]
         if name.strip().lower() in existing_names:
             self.error_lbl.setText(f"A watch named \"{name}\" already exists. Choose a different name.")
             return False
@@ -1696,6 +1484,8 @@ class AddWatchDialog(QDialog):
 
         # 12. Path is inside an existing watched folder (sub-folder overlap)
         for w in self.cfg.get("watches", []):
+            if w.get("id") == self._edit_watch_id:         # skip self when editing
+                continue
             wp = w.get("path", "")
             try:
                 if path_str.lower().startswith(wp.lower().rstrip("/\\") + os.sep) \
@@ -1726,10 +1516,19 @@ class AddWatchDialog(QDialog):
             pass
 
         # 14. Very large source folder (>2 GB warning)
+        # Skip recursive size scan for network paths — scanning a large SMB share
+        # (e.g. 2 TB) over the network on the main thread causes the UI to freeze.
+        _is_network_path = path_str.startswith("//") or path_str.startswith("\\\\")
+        _src_size_bytes = 0   # shared with check 15 to avoid a second full scan
+        _src_size_complete = False  # True only if scan finished without hitting the timeout
         try:
-            if p.is_dir():
+            import time as _time
+            if p.is_dir() and not _is_network_path:
                 total = 0
+                _scan_deadline = _time.monotonic() + 2.0  # never block main thread > 2 s
                 for fp in p.rglob("*"):
+                    if _time.monotonic() > _scan_deadline:
+                        break
                     if fp.is_file():
                         try:
                             total += fp.stat().st_size
@@ -1737,8 +1536,10 @@ class AddWatchDialog(QDialog):
                             pass
                     if total > 2 * 1024 ** 3:
                         break
+                else:
+                    _src_size_complete = True  # loop finished normally — scan is authoritative
+                _src_size_bytes = total
                 if total > 2 * 1024 ** 3:
-                    import math
                     gb = total / 1024 ** 3
                     warnings.append(
                         f"This folder appears to be larger than 2 GB ({gb:.1f} GB estimated).\n"
@@ -1748,17 +1549,19 @@ class AddWatchDialog(QDialog):
             pass
 
         # 15. Destination disk space check (local destination only)
+        # Reuses the size already measured in check 14 — no second rglob scan.
         try:
             dest = self.cfg.get("destination", "")
-            if dest and Path(dest).exists():
+            if dest and not (dest.startswith("//") or dest.startswith("\\\\")) and Path(dest).exists():
                 free = shutil.disk_usage(dest).free
                 if p.is_file():
                     src_size = p.stat().st_size
+                elif not _is_network_path and _src_size_complete:
+                    # _src_size_bytes was fully measured in check 14 — safe to compare
+                    src_size = _src_size_bytes
                 else:
-                    src_size = sum(
-                        fp.stat().st_size for fp in p.rglob("*") if fp.is_file()
-                    )
-                if src_size > free * 0.9:
+                    src_size = 0  # skip: network source, or check-14 scan timed out
+                if src_size and src_size > free * 0.9:
                     warnings.append(
                         f"Destination may not have enough free space.\n"
                         f"Source: {src_size // 1024 ** 2} MB  |  "
@@ -1796,6 +1599,12 @@ class AddWatchDialog(QDialog):
         return True
 
     def _submit(self):
+        try:
+            self._do_submit()
+        except Exception as e:
+            self.error_lbl.setText(f"Unexpected error: {e}")
+
+    def _do_submit(self):
         name = self.name_input.text().strip()
 
         # Name: required
@@ -1806,8 +1615,8 @@ class AddWatchDialog(QDialog):
         is_smb = self.source_type.currentIndex() == 1
 
         if is_smb:
-            path_str = self.smb_path_input.text().strip()
-            # SMB must start with // or \\
+            path_str = self.smb_path_input.text().strip().replace("/", "\\")
+            # SMB must start with // or \\\
             if not path_str:
                 self.error_lbl.setText("SMB path is required.")
                 return
@@ -1818,6 +1627,21 @@ class AddWatchDialog(QDialog):
             path_str = self.path_input.text().strip()
 
         self.error_lbl.setText("")
+        if is_smb:
+            ok, err = _ensure_smb_mounted({
+                "path":   path_str,
+                "user":   self.smb_user.text().strip(),
+                "pass":   self.smb_pass.text(),
+                "domain": self.smb_domain.text().strip(),
+            })
+            if not ok:
+                # In edit mode, allow saving even if SMB isn't reachable right now
+                if self._edit_watch_id:
+                    pass   # path unchanged — don't block save on connectivity
+                else:
+                    self.error_lbl.setText(f"Cannot connect to SMB share: {err}")
+                    return
+
         if self._validate_and_warn(path_str, name):
             self.accept()
 
@@ -1829,11 +1653,289 @@ class AddWatchDialog(QDialog):
             "path":         path,
             "interval_min": self.interval_spin.value(),
             "compression":  self.compress_check.isChecked(),
+            "sync_mode":    True,
+            "destination":  self.dest_input.text().strip(),
             "is_smb":       is_smb,
             "smb_user":     self.smb_user.text().strip() if is_smb else "",
             "smb_pass":     self.smb_pass.text() if is_smb else "",
             "smb_domain":   self.smb_domain.text().strip() if is_smb else "",
         }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Destination Entry Dialog (used by multi-destination list in EditWatch) ─────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _DestinationEntryDialog(QDialog):
+    """Small dialog to configure one extra backup destination for the multi-dest list."""
+
+    _TYPE_LABELS = [
+        ("sftp",   "SFTP"),
+        ("ftps",   "FTPS"),
+        ("ftp",    "FTP (plain)"),
+        ("smb",    "Network Share (SMB)"),
+        ("https",  "HTTPS API"),
+        ("webdav", "WebDAV / Nextcloud"),
+    ]
+
+    def __init__(self, parent=None, existing: dict = None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Destination")
+        self.setMinimumWidth(460)
+        self._existing = existing or {}
+        self._build_ui()
+        if existing:
+            self._populate(existing)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._type_combo = QComboBox()
+        for _, label in self._TYPE_LABELS:
+            self._type_combo.addItem(label)
+        self._type_combo.currentIndexChanged.connect(self._on_type_changed)
+        form.addRow("Type:", self._type_combo)
+
+        # ── SFTP / FTPS ─────────────────────────────────────────────────────
+        self._sftp_widget = QWidget()
+        sl = QFormLayout(self._sftp_widget)
+        sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(4)
+        self._sftp_host = QLineEdit(); self._sftp_host.setPlaceholderText("hostname or IP")
+        self._sftp_port = QSpinBox(); self._sftp_port.setRange(1, 65535); self._sftp_port.setValue(22)
+        self._sftp_user = QLineEdit(); self._sftp_user.setPlaceholderText("username")
+        self._sftp_pass = QLineEdit(); self._sftp_pass.setPlaceholderText("password")
+        self._sftp_pass.setEchoMode(QLineEdit.Password)
+        self._sftp_path = QLineEdit(); self._sftp_path.setPlaceholderText("/remote/backup/path")
+        sl.addRow("Host:", self._sftp_host); sl.addRow("Port:", self._sftp_port)
+        sl.addRow("User:", self._sftp_user); sl.addRow("Password:", self._sftp_pass)
+        sl.addRow("Remote Path:", self._sftp_path)
+        form.addRow("", self._sftp_widget)
+
+        # ── FTP (plain) ──────────────────────────────────────────────────────
+        self._ftp_widget = QWidget()
+        fl = QFormLayout(self._ftp_widget)
+        fl.setContentsMargins(0, 0, 0, 0); fl.setSpacing(4)
+        self._ftp_host = QLineEdit(); self._ftp_host.setPlaceholderText("hostname or IP")
+        self._ftp_port = QSpinBox(); self._ftp_port.setRange(1, 65535); self._ftp_port.setValue(21)
+        self._ftp_user = QLineEdit(); self._ftp_user.setPlaceholderText("username")
+        self._ftp_pass = QLineEdit(); self._ftp_pass.setPlaceholderText("password")
+        self._ftp_pass.setEchoMode(QLineEdit.Password)
+        self._ftp_path = QLineEdit(); self._ftp_path.setPlaceholderText("/remote/path")
+        _ftp_warn = QLabel("⚠ FTP sends credentials in plaintext — use FTPS/SFTP when possible.")
+        _ftp_warn.setWordWrap(True)
+        _ftp_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
+        fl.addRow("Host:", self._ftp_host); fl.addRow("Port:", self._ftp_port)
+        fl.addRow("User:", self._ftp_user); fl.addRow("Password:", self._ftp_pass)
+        fl.addRow("Remote Path:", self._ftp_path); fl.addRow("", _ftp_warn)
+        form.addRow("", self._ftp_widget)
+        self._ftp_widget.setVisible(False)
+
+        # ── SMB ───────────────────────────────────────────────────────────────
+        self._smb_widget = QWidget()
+        ml = QFormLayout(self._smb_widget)
+        ml.setContentsMargins(0, 0, 0, 0); ml.setSpacing(4)
+        self._smb_server = QLineEdit(); self._smb_server.setPlaceholderText("nas or 192.168.1.100")
+        self._smb_share  = QLineEdit(); self._smb_share.setPlaceholderText("backups")
+        self._smb_user   = QLineEdit(); self._smb_user.setPlaceholderText("username (optional)")
+        self._smb_pass   = QLineEdit(); self._smb_pass.setPlaceholderText("password (optional)")
+        self._smb_pass.setEchoMode(QLineEdit.Password)
+        self._smb_path   = QLineEdit(); self._smb_path.setPlaceholderText("subfolder (optional)")
+        ml.addRow("Server:", self._smb_server); ml.addRow("Share:", self._smb_share)
+        ml.addRow("User:", self._smb_user);     ml.addRow("Password:", self._smb_pass)
+        ml.addRow("Path:", self._smb_path)
+        form.addRow("", self._smb_widget)
+        self._smb_widget.setVisible(False)
+
+        # ── HTTPS API ─────────────────────────────────────────────────────────
+        self._https_widget = QWidget()
+        hl2 = QFormLayout(self._https_widget)
+        hl2.setContentsMargins(0, 0, 0, 0); hl2.setSpacing(4)
+        self._https_url   = QLineEdit(); self._https_url.setPlaceholderText("https://api.example.com/backup")
+        self._https_token = QLineEdit(); self._https_token.setPlaceholderText("Bearer token (optional)")
+        self._https_token.setEchoMode(QLineEdit.Password)
+        self._https_ssl   = QCheckBox("Verify SSL certificate"); self._https_ssl.setChecked(True)
+        hl2.addRow("URL:", self._https_url); hl2.addRow("Auth Token:", self._https_token)
+        hl2.addRow("", self._https_ssl)
+        form.addRow("", self._https_widget)
+        self._https_widget.setVisible(False)
+
+        # ── WebDAV / Nextcloud ────────────────────────────────────────────────
+        self._webdav_widget = QWidget()
+        wl2 = QFormLayout(self._webdav_widget)
+        wl2.setContentsMargins(0, 0, 0, 0); wl2.setSpacing(4)
+        self._wdav_url  = QLineEdit(); self._wdav_url.setPlaceholderText("https://nextcloud.example.com")
+        self._wdav_user = QLineEdit(); self._wdav_user.setPlaceholderText("username")
+        self._wdav_pass = QLineEdit(); self._wdav_pass.setPlaceholderText("password")
+        self._wdav_pass.setEchoMode(QLineEdit.Password)
+        self._wdav_path = QLineEdit(); self._wdav_path.setPlaceholderText("/backups")
+        self._wdav_root = QLineEdit(); self._wdav_root.setPlaceholderText("/remote.php/dav/files/username/")
+        self._wdav_ssl  = QCheckBox("Verify SSL certificate"); self._wdav_ssl.setChecked(True)
+        wl2.addRow("URL:", self._wdav_url);       wl2.addRow("User:", self._wdav_user)
+        wl2.addRow("Password:", self._wdav_pass); wl2.addRow("Remote Path:", self._wdav_path)
+        wl2.addRow("DAV Root:", self._wdav_root); wl2.addRow("", self._wdav_ssl)
+        form.addRow("", self._webdav_widget)
+        self._webdav_widget.setVisible(False)
+
+        layout.addLayout(form)
+
+        self._err_lbl = QLabel("")
+        self._err_lbl.setObjectName("status_err")
+        layout.addWidget(self._err_lbl)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("secondary")
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = QPushButton("Save")
+        ok_btn.setObjectName("success")
+        ok_btn.clicked.connect(self._submit)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
+
+    def _on_type_changed(self, idx):
+        type_key = self._TYPE_LABELS[idx][0]
+        self._sftp_widget.setVisible(type_key in ("sftp", "ftps"))
+        self._ftp_widget.setVisible(type_key == "ftp")
+        self._smb_widget.setVisible(type_key == "smb")
+        self._https_widget.setVisible(type_key == "https")
+        self._webdav_widget.setVisible(type_key == "webdav")
+        if type_key == "sftp":
+            self._sftp_port.setValue(22)
+        elif type_key == "ftps":
+            self._sftp_port.setValue(990)
+        self.adjustSize()
+
+    def _populate(self, dest: dict):
+        """Pre-fill fields when editing an existing destination."""
+        type_key = dest.get("dest_type", "sftp")
+        for i, (k, _) in enumerate(self._TYPE_LABELS):
+            if k == type_key:
+                self._type_combo.setCurrentIndex(i)
+                break
+        cfg = dest.get("config", {})
+        if type_key in ("sftp", "ftps"):
+            self._sftp_host.setText(cfg.get("host", ""))
+            self._sftp_port.setValue(int(cfg.get("port", 22)))
+            self._sftp_user.setText(cfg.get("username", ""))
+            self._sftp_pass.setText(cfg.get("password", ""))
+            self._sftp_path.setText(cfg.get("remote_path", ""))
+        elif type_key == "ftp":
+            self._ftp_host.setText(cfg.get("host", ""))
+            self._ftp_port.setValue(int(cfg.get("port", 21)))
+            self._ftp_user.setText(cfg.get("username", ""))
+            self._ftp_pass.setText(cfg.get("password", ""))
+            self._ftp_path.setText(cfg.get("remote_path", ""))
+        elif type_key == "smb":
+            self._smb_server.setText(cfg.get("server", ""))
+            self._smb_share.setText(cfg.get("share", ""))
+            self._smb_user.setText(cfg.get("username", ""))
+            self._smb_pass.setText(cfg.get("password", ""))
+            self._smb_path.setText(cfg.get("remote_path", ""))
+        elif type_key == "https":
+            self._https_url.setText(cfg.get("url", ""))
+            self._https_token.setText(cfg.get("token", ""))
+            self._https_ssl.setChecked(cfg.get("verify_ssl", True))
+        elif type_key == "webdav":
+            self._wdav_url.setText(cfg.get("url", ""))
+            self._wdav_user.setText(cfg.get("username", ""))
+            self._wdav_pass.setText(cfg.get("password", ""))
+            self._wdav_path.setText(cfg.get("remote_path", ""))
+            self._wdav_root.setText(cfg.get("webdav_root", ""))
+            self._wdav_ssl.setChecked(cfg.get("verify_ssl", True))
+
+    def _submit(self):
+        dest = self.get_dest()
+        if not dest:
+            self._err_lbl.setText("Please fill in the required fields.")
+            return
+        self.accept()
+
+    def get_dest(self) -> dict:
+        """Return a destination dict {dest_type, config} or {} if validation fails."""
+        idx      = self._type_combo.currentIndex()
+        type_key = self._TYPE_LABELS[idx][0]
+
+        if type_key in ("sftp", "ftps"):
+            host = self._sftp_host.text().strip()
+            if not host:
+                return {}
+            config = {
+                "host": host,
+                "port": self._sftp_port.value(),
+                "username": self._sftp_user.text().strip(),
+                "password": self._sftp_pass.text(),
+                "remote_path": self._sftp_path.text().strip() or "/backups",
+            }
+            if type_key == "ftps":
+                config["use_tls"] = True
+
+        elif type_key == "ftp":
+            host = self._ftp_host.text().strip()
+            if not host:
+                return {}
+            config = {
+                "host": host,
+                "port": self._ftp_port.value(),
+                "username": self._ftp_user.text().strip(),
+                "password": self._ftp_pass.text(),
+                "remote_path": self._ftp_path.text().strip() or "/backups",
+                "use_tls": False,
+            }
+
+        elif type_key == "smb":
+            server = self._smb_server.text().strip()
+            if not server:
+                return {}
+            config = {
+                "server": server,
+                "share": self._smb_share.text().strip(),
+                "username": self._smb_user.text().strip(),
+                "password": self._smb_pass.text(),
+                "remote_path": self._smb_path.text().strip(),
+            }
+
+        elif type_key == "https":
+            url = self._https_url.text().strip()
+            if not url:
+                return {}
+            config = {
+                "url": url,
+                "token": self._https_token.text(),
+                "verify_ssl": self._https_ssl.isChecked(),
+            }
+
+        elif type_key == "webdav":
+            url = self._wdav_url.text().strip()
+            if not url:
+                return {}
+            config = {
+                "url": url,
+                "username": self._wdav_user.text().strip(),
+                "password": self._wdav_pass.text(),
+                "remote_path": self._wdav_path.text().strip() or "/backups",
+                "webdav_root": self._wdav_root.text().strip(),
+                "verify_ssl": self._wdav_ssl.isChecked(),
+            }
+
+        else:
+            return {}
+
+        return {"dest_type": type_key, "config": config}
+
+    @staticmethod
+    def dest_label(dest: dict) -> str:
+        """Human-readable one-line summary of a destination dict."""
+        type_key = dest.get("dest_type", "")
+        cfg      = dest.get("config", {})
+        host     = (cfg.get("host") or cfg.get("server") or cfg.get("url") or "").split("//")[-1]
+        path     = cfg.get("remote_path") or cfg.get("path") or ""
+        return f"{type_key.upper()} — {host}{path}" if host else type_key.upper()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1887,13 +1989,128 @@ class EditWatchDialog(QDialog):
         self.max_backups_spin.setSuffix("  (0 = unlimited)")
         form.addRow("Max backups:", self.max_backups_spin)
 
+        self.max_file_size_spin = QDoubleSpinBox()
+        self.max_file_size_spin.setRange(0, 100000)
+        self.max_file_size_spin.setDecimals(0)
+        self.max_file_size_spin.setValue(self.watch.get("max_file_size_mb", 0))
+        self.max_file_size_spin.setSuffix(" MB  (0 = no limit)")
+        self.max_file_size_spin.setToolTip(
+            "Skip any single file larger than this size. "
+            "Useful to avoid accidentally backing up video files or database dumps."
+        )
+        form.addRow("Skip files over:", self.max_file_size_spin)
+
+        self.max_backup_bytes_spin = QDoubleSpinBox()
+        self.max_backup_bytes_spin.setRange(0, 1_000_000)
+        self.max_backup_bytes_spin.setDecimals(0)
+        _cur_quota_mb = round(self.watch.get("max_backup_bytes", 0) / (1024 * 1024))
+        self.max_backup_bytes_spin.setValue(_cur_quota_mb)
+        self.max_backup_bytes_spin.setSuffix(" MB  (0 = no limit)")
+        self.max_backup_bytes_spin.setToolTip(
+            "Stop new backups for this watch once total backup storage exceeds this limit. "
+            "Old backups must be deleted (or max_backups reduced) to free space."
+        )
+        form.addRow("Storage quota:", self.max_backup_bytes_spin)
+
         self.compress_check = QCheckBox("Enable gzip compression")
         self.compress_check.setChecked(self.watch.get("compression", False))
         form.addRow("", self.compress_check)
 
+        # Per-watch destination
+        edit_dest_widget = QWidget()
+        edit_dest_row = QHBoxLayout(edit_dest_widget)
+        edit_dest_row.setContentsMargins(0, 0, 0, 0)
+        self.dest_input = QLineEdit(self.watch.get("destination", ""))
+        self.dest_input.setPlaceholderText(
+            "Leave blank to use global destination  ·  or enter e.g. \\\\server\\share\\folder"
+        )
+        edit_dest_browse = QPushButton("Browse")
+        edit_dest_browse.setObjectName("secondary")
+        edit_dest_browse.setMaximumWidth(80)
+        edit_dest_browse.clicked.connect(
+            lambda: self.dest_input.setText(
+                QFileDialog.getExistingDirectory(self, "Select Destination Folder")
+                or self.dest_input.text()
+            )
+        )
+        edit_dest_row.addWidget(self.dest_input)
+        edit_dest_row.addWidget(edit_dest_browse)
+        form.addRow("Destination:", edit_dest_widget)
+
+        # ── Multi-destinations (proper list widget) ─────────────────────────────
+        from PyQt5.QtWidgets import QListWidget, QListWidgetItem
+        dest_list_group = QGroupBox("Additional Destinations")
+        dest_list_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
+        dest_list_outer = QVBoxLayout(dest_list_group)
+        dest_list_outer.setSpacing(6)
+        dest_list_outer.setContentsMargins(8, 8, 8, 8)
+
+        _dest_note = QLabel("Backups are copied to every destination listed here after each run.")
+        _dest_note.setStyleSheet("color:#6b7280; font-size:10px;")
+        _dest_note.setWordWrap(True)
+        dest_list_outer.addWidget(_dest_note)
+
+        self._dest_list_widget = QListWidget()
+        self._dest_list_widget.setMaximumHeight(100)
+        self._dest_list_widget.setAlternatingRowColors(True)
+        for _d in self.watch.get("destinations", []):
+            _item = QListWidgetItem(_DestinationEntryDialog.dest_label(_d))
+            _item.setData(Qt.UserRole, _d)
+            self._dest_list_widget.addItem(_item)
+        dest_list_outer.addWidget(self._dest_list_widget)
+
+        dest_btn_row = QHBoxLayout()
+        _add_dest_btn = QPushButton("➕ Add Destination")
+        _add_dest_btn.setObjectName("secondary")
+        _add_dest_btn.clicked.connect(self._add_destination)
+        _edit_dest_btn = QPushButton("✏ Edit")
+        _edit_dest_btn.setObjectName("secondary")
+        _edit_dest_btn.clicked.connect(self._edit_destination)
+        _remove_dest_btn = QPushButton("🗑 Remove")
+        _remove_dest_btn.setObjectName("danger")
+        _remove_dest_btn.clicked.connect(self._remove_destination)
+        dest_btn_row.addWidget(_add_dest_btn)
+        dest_btn_row.addWidget(_edit_dest_btn)
+        dest_btn_row.addWidget(_remove_dest_btn)
+        dest_btn_row.addStretch()
+        dest_list_outer.addLayout(dest_btn_row)
+        form.addRow("", dest_list_group)
+
+        # Sync mode is always ON — files are copied directly into the destination.
+        self._sync_mode = True
+
         self.skip_auto_check = QCheckBox("Skip auto backup  (manual only)")
         self.skip_auto_check.setChecked(self.watch.get("skip_auto_backup", False))
         form.addRow("", self.skip_auto_check)
+
+        # ── Pre / Post backup hooks ─────────────────────────────────────────
+        hooks_group = QGroupBox("Backup Hooks (optional)")
+        hooks_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
+        hooks_layout = QFormLayout(hooks_group)
+        hooks_layout.setSpacing(6)
+        hooks_layout.setContentsMargins(8, 10, 8, 8)
+
+        _hook_note = QLabel(
+            "Commands run as a shell process before/after each backup.\n"
+            "Pre-hook failure aborts the backup. Post-hook failure is logged only.\n"
+            "Post-hook receives BACKUPSYS_STATUS / BACKUPSYS_WATCH env vars."
+        )
+        _hook_note.setStyleSheet("color:#6b7280; font-size:10px;")
+        _hook_note.setWordWrap(True)
+        hooks_layout.addRow(_hook_note)
+
+        self.pre_cmd_input = QLineEdit(self.watch.get("pre_backup_cmd", ""))
+        self.pre_cmd_input.setPlaceholderText(
+            "e.g.  net stop MyService  or  /scripts/flush_db.sh"
+        )
+        hooks_layout.addRow("Pre-backup:", self.pre_cmd_input)
+
+        self.post_cmd_input = QLineEdit(self.watch.get("post_backup_cmd", ""))
+        self.post_cmd_input.setPlaceholderText(
+            "e.g.  net start MyService  or  /scripts/notify.sh"
+        )
+        hooks_layout.addRow("Post-backup:", self.post_cmd_input)
+        form.addRow("", hooks_group)
 
         # ── Encryption ──────────────────────────────────────────────────────
         enc_row = QHBoxLayout()
@@ -2011,24 +2228,74 @@ class EditWatchDialog(QDialog):
         except Exception as e:
             self.error_lbl.setText(f"Key generation failed: {e}")
 
+    def _add_destination(self):
+        """Open the destination entry dialog and append the result to the list."""
+        from PyQt5.QtWidgets import QListWidgetItem
+        dlg = _DestinationEntryDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            dest = dlg.get_dest()
+            if dest:
+                item = QListWidgetItem(_DestinationEntryDialog.dest_label(dest))
+                item.setData(Qt.UserRole, dest)
+                self._dest_list_widget.addItem(item)
+
+    def _edit_destination(self):
+        """Open the entry dialog pre-filled with the selected destination."""
+        from PyQt5.QtWidgets import QListWidgetItem
+        row = self._dest_list_widget.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Edit Destination", "Select a destination from the list first.")
+            return
+        existing = self._dest_list_widget.item(row).data(Qt.UserRole)
+        dlg = _DestinationEntryDialog(self, existing=existing)
+        if dlg.exec_() == QDialog.Accepted:
+            dest = dlg.get_dest()
+            if dest:
+                item = QListWidgetItem(_DestinationEntryDialog.dest_label(dest))
+                item.setData(Qt.UserRole, dest)
+                self._dest_list_widget.takeItem(row)
+                self._dest_list_widget.insertItem(row, item)
+                self._dest_list_widget.setCurrentRow(row)
+
+    def _remove_destination(self):
+        """Remove the currently selected destination from the list."""
+        row = self._dest_list_widget.currentRow()
+        if row >= 0:
+            self._dest_list_widget.takeItem(row)
+
     def get_values(self) -> dict:
         excl = [
             ln.strip() for ln in self.excl_edit.toPlainText().splitlines()
             if ln.strip()
         ]
         tags = [t.strip() for t in self.tags_input.text().split(",") if t.strip()]
+        destinations = []
+        try:
+            for _i in range(self._dest_list_widget.count()):
+                _item = self._dest_list_widget.item(_i)
+                if _item:
+                    destinations.append(_item.data(Qt.UserRole))
+        except Exception:
+            pass
         return {
             "name":             self.name_input.text().strip(),
             "interval_min":     self.interval_spin.value(),
             "retention_days":   self.retention_spin.value(),
             "max_backups":      self.max_backups_spin.value(),
+            "max_file_size_mb": int(self.max_file_size_spin.value()),
+            "max_backup_bytes": int(self.max_backup_bytes_spin.value()) * 1024 * 1024,
             "compression":      self.compress_check.isChecked(),
+            "sync_mode":        True,
+            "destination":      self.dest_input.text().strip(),
+            "destinations":     destinations,
             "skip_auto_backup": self.skip_auto_check.isChecked(),
             "color":            self.color_input.text().strip(),
             "notes":            self.notes_input.text().strip(),
             "tags":             tags,
             "exclude_patterns": excl,
             "encrypt_key":      self.encrypt_input.text().strip(),
+            "pre_backup_cmd":   self.pre_cmd_input.text().strip(),
+            "post_backup_cmd":  self.post_cmd_input.text().strip(),
         }
 
 
@@ -2088,7 +2355,7 @@ class AdminPanel(QDialog):
         dest_type_row = QHBoxLayout()
         dest_type_row.addWidget(QLabel("Type:"))
         self.dest_type_combo = QComboBox()
-        self.dest_type_combo.addItems(["Local / Mapped Drive", "Network Share (SMB)", "SFTP", "FTPS", "FTP", "HTTPS API"])
+        self.dest_type_combo.addItems(["Local / Mapped Drive", "Network Share (SMB)", "SFTP", "FTPS", "FTP", "HTTPS API", "WebDAV / Nextcloud"])
         self.dest_type_combo.currentIndexChanged.connect(self._on_dest_type_changed)
         dest_type_row.addWidget(self.dest_type_combo, stretch=1)
         dg_main.addLayout(dest_type_row)
@@ -2215,6 +2482,29 @@ class AdminPanel(QDialog):
         self.dest_https_widget.setVisible(False)
         dg_main.addWidget(self.dest_https_widget)
 
+        # ── WebDAV / Nextcloud destination ─────────────────────────────────
+        self.dest_webdav_widget = QWidget()
+        wdvl = QFormLayout(self.dest_webdav_widget)
+        self.webdav_url  = QLineEdit(); self.webdav_url.setPlaceholderText("https://nextcloud.example.com")
+        self.webdav_user = QLineEdit(); self.webdav_user.setPlaceholderText("username")
+        self.webdav_pass = QLineEdit(); self.webdav_pass.setPlaceholderText("password"); self.webdav_pass.setEchoMode(QLineEdit.Password)
+        self.webdav_path = QLineEdit(); self.webdav_path.setPlaceholderText("/backups")
+        self.webdav_root = QLineEdit(); self.webdav_root.setPlaceholderText("/remote.php/dav/files/username/  (Nextcloud)")
+        self.webdav_ssl  = QCheckBox("Verify SSL certificate"); self.webdav_ssl.setChecked(True)
+        wdv_btn_row = QHBoxLayout()
+        self.webdav_test_btn = QPushButton("Test WebDAV")
+        self.webdav_test_btn.clicked.connect(self._test_webdav)
+        wdv_btn_row.addWidget(self.webdav_test_btn); wdv_btn_row.addStretch()
+        wdvl.addRow("URL:",         self.webdav_url)
+        wdvl.addRow("Username:",    self.webdav_user)
+        wdvl.addRow("Password:",    self.webdav_pass)
+        wdvl.addRow("Remote path:", self.webdav_path)
+        wdvl.addRow("DAV root:",    self.webdav_root)
+        wdvl.addRow("",             self.webdav_ssl)
+        wdvl.addRow("",             wdv_btn_row)
+        self.dest_webdav_widget.setVisible(False)
+        dg_main.addWidget(self.dest_webdav_widget)
+
         gl.addWidget(dest_group)
 
         sched_group = QGroupBox("Schedule & Limits")
@@ -2232,8 +2522,9 @@ class AdminPanel(QDialog):
         interval_row.addWidget(self.interval_unit)
         sg.addRow("Interval:", interval_row)
         self.retention_spin = QSpinBox()
-        self.retention_spin.setRange(1, 365)
-        self.retention_spin.setSuffix(" days")
+        self.retention_spin.setRange(0, 36500)  # 0 = keep forever, no limit on max
+        self.retention_spin.setSuffix(" days  (0 = keep forever)")
+        self.retention_spin.setSpecialValueText("0 — Keep forever (no auto-delete)")
         sg.addRow("Retention:", self.retention_spin)
 
         # Scheduled backup times
@@ -2248,13 +2539,35 @@ class AdminPanel(QDialog):
         sched_row.addWidget(self.schedule_times_input)
         sg.addRow("Run at times:", sched_row)
 
-        # Bandwidth throttle
+        # Backup window stop time
+        window_row = QHBoxLayout()
+        self.backup_window_end_input = QLineEdit()
+        self.backup_window_end_input.setPlaceholderText("e.g. 06:00  (leave blank for no cutoff)")
+        self.backup_window_end_input.setToolTip(
+            "If set, auto-backups that START after this time are skipped until the next day.\n"
+            "Useful to avoid backups running into business hours.\n"
+            "Example: set Run at times to 02:00 and Stop by to 06:00."
+        )
+        window_row.addWidget(self.backup_window_end_input)
+        sg.addRow("Stop by:", window_row)
         self.bw_spin = QDoubleSpinBox()
         self.bw_spin.setRange(0.0, 1000.0)
         self.bw_spin.setDecimals(1)
         self.bw_spin.setSuffix(" MB/s  (0 = unlimited)")
         self.bw_spin.setValue(0.0)
         sg.addRow("Max bandwidth:", self.bw_spin)
+
+        # System idle threshold
+        self.idle_spin = QSpinBox()
+        self.idle_spin.setRange(0, 100)
+        self.idle_spin.setSuffix("%  CPU  (0 = always run)")
+        self.idle_spin.setToolTip(
+            "Auto-backups are deferred while CPU usage exceeds this threshold.\n"
+            "Example: 60 = only run auto-backups when CPU is below 60%.\n"
+            "Requires psutil (pip install psutil). Set to 0 to disable."
+        )
+        self.idle_spin.setValue(0)
+        sg.addRow("Idle threshold:", self.idle_spin)
 
         # Auto-retry
         retry_row = QHBoxLayout()
@@ -2274,7 +2587,34 @@ class AdminPanel(QDialog):
         self.startup_check = QCheckBox("Start with Windows (runs in background)")
         self.startup_check.stateChanged.connect(self._toggle_startup)
         stl.addWidget(self.startup_check)
+        _startup_note = QLabel("Uncheck this box to stop BackupSys from launching at login.")
+        _startup_note.setWordWrap(True)
+        _startup_note.setStyleSheet("color: #888; font-size: 11px;")
+        stl.addWidget(_startup_note)
         gl.addWidget(startup_group)
+
+        # ── Portable mode indicator ─────────────────────────────────────────
+        _portable_group = QGroupBox("Portable Mode")
+        _pl = QVBoxLayout(_portable_group)
+        try:
+            _is_portable = config_manager._IS_PORTABLE
+        except AttributeError:
+            _is_portable = False
+        if _is_portable:
+            _pm_label = QLabel(
+                "✅  Portable mode active — all data is stored inside the app folder.\n"
+                f"Data path: {config_manager._DATA_DIR}"
+            )
+        else:
+            _pm_label = QLabel(
+                "Portable mode is OFF.  To enable it, create an empty file named\n"
+                "\"portable.flag\" next to desktop_app.py, then restart BackupSys.\n"
+                "All config, snapshots and logs will move into the app folder."
+            )
+        _pm_label.setWordWrap(True)
+        _pm_label.setStyleSheet("font-size: 11px;")
+        _pl.addWidget(_pm_label)
+        gl.addWidget(_portable_group)
 
         pass_group = QGroupBox("Admin Password")
         pl = QVBoxLayout(pass_group)
@@ -2284,12 +2624,54 @@ class AdminPanel(QDialog):
         pl.addWidget(change_pw)
         gl.addWidget(pass_group)
 
+        # ── Theme ──────────────────────────────────────────────────────────────
+        theme_group = QGroupBox("Appearance")
+        thl = QVBoxLayout(theme_group)
+        thl.addWidget(QLabel("Choose a colour theme (takes effect immediately):"))
+        theme_row = QHBoxLayout()
+        _s_theme = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        _cur = _s_theme.value("theme", "")   # "", "dark", or "light"
+        self.theme_auto  = QRadioButton("Follow OS")
+        self.theme_dark  = QRadioButton("Dark")
+        self.theme_light = QRadioButton("Light")
+        # QButtonGroup ensures the three radio buttons are mutually exclusive
+        # even though they share a QVBoxLayout rather than a QGroupBox.
+        from PyQt5.QtWidgets import QButtonGroup
+        self._theme_btn_group = QButtonGroup(self)
+        self._theme_btn_group.addButton(self.theme_auto)
+        self._theme_btn_group.addButton(self.theme_dark)
+        self._theme_btn_group.addButton(self.theme_light)
+        if _cur == "dark":
+            self.theme_dark.setChecked(True)
+        elif _cur == "light":
+            self.theme_light.setChecked(True)
+        else:
+            self.theme_auto.setChecked(True)
+        for rb in (self.theme_auto, self.theme_dark, self.theme_light):
+            rb.toggled.connect(self._apply_theme)
+            theme_row.addWidget(rb)
+        theme_row.addStretch()
+        thl.addLayout(theme_row)
+        gl.addWidget(theme_group)
+
         gl.addStretch()
 
+        footer_row = QHBoxLayout()
         save_btn = QPushButton("Save Settings")
         save_btn.setObjectName("success")
         save_btn.clicked.connect(self._save_general)
-        gl.addWidget(save_btn)
+        footer_row.addWidget(save_btn)
+
+        export_btn = QPushButton("📤 Export Config…")
+        export_btn.setObjectName("secondary")
+        export_btn.setToolTip(
+            "Save a copy of config.json (with passwords redacted) to a file you choose.\n"
+            "Use this to back up your BackupSys configuration or move it to another PC."
+        )
+        export_btn.clicked.connect(self._export_config)
+        footer_row.addWidget(export_btn)
+        footer_row.addStretch()
+        gl.addLayout(footer_row)
 
         general = QScrollArea()
         general.setWidget(general_inner)
@@ -2328,8 +2710,8 @@ class AdminPanel(QDialog):
         self.watch_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.Fixed)
         self.watch_table.horizontalHeader().setSectionResizeMode(12, QHeaderView.Fixed)
         self.watch_table.horizontalHeader().setMinimumSectionSize(60)
-        self.watch_table.horizontalHeader().resizeSection(11, 80)
-        self.watch_table.horizontalHeader().resizeSection(12, 80)
+        self.watch_table.horizontalHeader().resizeSection(11, 90)
+        self.watch_table.horizontalHeader().resizeSection(12, 110)  # was 80 — too narrow for "🗑 Remove"
         self.watch_table.setMouseTracking(True)
         self.watch_table.viewport().setMouseTracking(True)
         self.watch_table.verticalHeader().setVisible(False)
@@ -2410,8 +2792,21 @@ class AdminPanel(QDialog):
         self.db_remote_path.setPlaceholderText("/backups")
 
         self.gd_folder_id = QLineEdit()
-        self.gd_folder_id.setPlaceholderText("Optional Google Drive folder ID")
-        agl.addRow("GDrive folder ID:", self.gd_folder_id)
+        self.gd_folder_id.setPlaceholderText("Google Drive folder ID (leave blank for root)")
+        self.gd_folder_id.setToolTip(
+            "The ID of the Drive folder where backups are stored.\n"
+            "Click 'Browse…' to pick a folder from your Drive."
+        )
+        gd_folder_row = QHBoxLayout()
+        gd_folder_row.addWidget(self.gd_folder_id)
+        gd_browse_btn = QPushButton("Browse…")
+        gd_browse_btn.setObjectName("secondary")
+        gd_browse_btn.setToolTip("List your Drive folders and select one.")
+        gd_browse_btn.clicked.connect(self._pick_gdrive_folder)
+        gd_folder_row.addWidget(gd_browse_btn)
+        gd_folder_widget = QWidget()
+        gd_folder_widget.setLayout(gd_folder_row)
+        agl.addRow("GDrive folder:", gd_folder_widget)
 
         save_assign_btn = QPushButton("Save Assignment")
         save_assign_btn.setObjectName("success")
@@ -2535,6 +2930,7 @@ class AdminPanel(QDialog):
         self.dest_sftp_widget.setVisible(idx == 2)
         self.dest_ftp_widget.setVisible(idx == 3 or idx == 4)
         self.dest_https_widget.setVisible(idx == 5)
+        self.dest_webdav_widget.setVisible(idx == 6)
 
     def _browse_dest(self):
         path = QFileDialog.getExistingDirectory(self, "Select Backup Destination")
@@ -2542,16 +2938,128 @@ class AdminPanel(QDialog):
             self.dest_input.setText(path)
 
     def _test_smb(self):
-        QMessageBox.information(self, "Test", "SMB connection test not implemented yet.")
+        cfg = {
+            "path":   self.dest_smb_path.text().strip(),
+            "user":   self.dest_smb_user.text().strip(),
+            "pass":   self.dest_smb_pass.text(),
+            "domain": self.dest_smb_domain.text().strip(),
+        }
+        if not cfg["path"]:
+            QMessageBox.warning(self, "Missing", "Please enter an SMB path first.")
+            return
+        try:
+            from transport_utils import test_smb_connection
+            result = test_smb_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "SMB Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "SMB  ·  Connected ✓",
+                f"Successfully connected to:\n{cfg['path']}")
+        else:
+            QMessageBox.critical(self, "SMB  ·  Failed",
+                f"Could not connect:\n\n{result.get('error', 'Unknown error')}")
 
     def _test_sftp(self):
-        QMessageBox.information(self, "Test", "SFTP connection test not implemented yet.")
+        cfg = {
+            "host":     self.sftp_host.text().strip(),
+            "port":     self.sftp_port.value(),
+            "user":     self.sftp_user.text().strip(),
+            "pass":     self.sftp_pass.text(),
+            "path":     self.sftp_path.text().strip(),
+            "keyfile":  self.sftp_keyfile.text().strip(),
+            "key_pass": self.sftp_key_pass.text(),
+        }
+        if not cfg["host"]:
+            QMessageBox.warning(self, "Missing", "Please enter an SFTP host first.")
+            return
+        try:
+            from transport_utils import test_sftp_connection
+            result = test_sftp_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "SFTP Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "SFTP  ·  Connected ✓",
+                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+        else:
+            QMessageBox.critical(self, "SFTP  ·  Failed",
+                f"Could not connect:\n\n{result.get('error', 'Unknown error')}")
 
     def _test_ftp(self):
-        QMessageBox.information(self, "Test", "FTP connection test not implemented yet.")
+        cfg = {
+            "host": self.ftp_host.text().strip(),
+            "port": self.ftp_port.value(),
+            "user": self.ftp_user.text().strip(),
+            "pass": self.ftp_pass.text(),
+            "path": self.ftp_path.text().strip(),
+        }
+        if not cfg["host"]:
+            QMessageBox.warning(self, "Missing", "Please enter an FTP host first.")
+            return
+        try:
+            from transport_utils import test_ftp_connection
+            result = test_ftp_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "FTP Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "FTP  ·  Connected ✓",
+                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+        else:
+            QMessageBox.critical(self, "FTP  ·  Failed",
+                f"Could not connect:\n\n{result.get('error', 'Unknown error')}")
 
     def _test_https(self):
-        QMessageBox.information(self, "Test", "HTTPS API connection test not implemented yet.")
+        cfg = {
+            "url":        self.https_url.text().strip(),
+            "token":      self.https_token.text().strip(),
+            "verify_ssl": self.https_verify_ssl.isChecked(),
+        }
+        if not cfg["url"]:
+            QMessageBox.warning(self, "Missing", "Please enter an endpoint URL first.")
+            return
+        try:
+            from transport_utils import test_https_connection
+            result = test_https_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "HTTPS Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "HTTPS  ·  Connected ✓",
+                f"Endpoint reachable:\n{cfg['url']}\n\nHTTP status: {result.get('status_code', 'n/a')}")
+        else:
+            QMessageBox.critical(self, "HTTPS  ·  Failed",
+                f"Could not reach endpoint:\n\n{result.get('error', 'Unknown error')}")
+
+    def _test_webdav(self):
+        cfg = {
+            "url":         self.webdav_url.text().strip(),
+            "username":    self.webdav_user.text().strip(),
+            "password":    self.webdav_pass.text(),
+            "webdav_root": self.webdav_root.text().strip(),
+            "verify_ssl":  self.webdav_ssl.isChecked(),
+        }
+        if not cfg["url"]:
+            QMessageBox.warning(self, "Missing", "Please enter the WebDAV URL first.")
+            return
+        try:
+            from transport_utils import test_webdav_connection
+            result = test_webdav_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "WebDAV Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "WebDAV  ·  Connected ✓",
+                f"WebDAV server reachable:\n{cfg['url']}\n\n"
+                "PROPFIND succeeded — credentials and URL are correct.")
+        else:
+            QMessageBox.critical(self, "WebDAV  ·  Failed",
+                f"Could not connect:\n\n{result.get('error', 'Unknown error')}\n\n"
+                "Tips:\n"
+                "• Nextcloud DAV root: /remote.php/dav/files/<USERNAME>/\n"
+                "• ownCloud DAV root: /remote.php/webdav/\n"
+                "• Plain WebDAV: leave DAV root empty")
 
     def _on_interval_unit_changed(self, idx):
         # Keep interval limits reasonable for seconds mode
@@ -2591,17 +3099,34 @@ class AdminPanel(QDialog):
         self.https_url.setText(api.get("url", ""))
         self.https_token.setText(api.get("token", ""))
         self.https_verify_ssl.setChecked(api.get("verify_ssl", True))
+        wdv = self.cfg.get("dest_webdav", {})
+        self.webdav_url.setText(wdv.get("url", ""))
+        self.webdav_user.setText(wdv.get("username", wdv.get("user", "")))
+        self.webdav_pass.setText(credential_store.get_webdav_password(wdv))
+        self.webdav_path.setText(wdv.get("remote_path", "/backups"))
+        self.webdav_root.setText(wdv.get("webdav_root", ""))
+        self.webdav_ssl.setChecked(wdv.get("verify_ssl", True))
+        # Sync dest_type combo to 6 for webdav
+        _dt = self.cfg.get("dest_type", "local")
+        if _dt == "webdav":
+            self.dest_type_combo.setCurrentIndex(6)
         self.auto_check.setChecked(self.cfg.get("auto_backup", False))
         unit = self.cfg.get("interval_unit", "minutes")
         self.interval_unit.setCurrentIndex(1 if unit == "seconds" else 0)
         self._on_interval_unit_changed(1 if unit == "seconds" else 0)
         self.interval_spin.setValue(self.cfg.get("interval_min", 30))
-        self.retention_spin.setValue(self.cfg.get("retention_days", 30))
+        self.retention_spin.setValue(self.cfg.get("retention_days", 0))
         # Scheduled backup times  · display as comma-separated "HH:MM" string
         sched = self.cfg.get("backup_schedule_times", [])
         self.schedule_times_input.setText(", ".join(sched) if sched else "")
+        self.backup_window_end_input.setText(self.cfg.get("backup_window_end", ""))
         try:
-            self.bw_spin.setValue(float(self.cfg.get("max_backup_mbps", 0.0)))
+            bw_val = float(self.cfg.get("max_backup_mbps", 0.0))
+            self.bw_spin.setValue(bw_val)
+        except Exception:
+            pass
+        try:
+            self.idle_spin.setValue(int(self.cfg.get("idle_threshold_cpu", 0)))
         except Exception:
             pass
         self.retry_check.setChecked(self.cfg.get("auto_retry", False))
@@ -2835,6 +3360,26 @@ class AdminPanel(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         s.setValue("gdrive_access_token",  tokens.get("access_token", ""))
         s.setValue("gdrive_refresh_token", tokens.get("refresh_token", ""))
+        # Sync tokens to every watch that uses GDrive so config.json and
+        # QSettings stay consistent and backups don't use stale tokens.
+        _access  = tokens.get("access_token", "")
+        _refresh = tokens.get("refresh_token", "")
+        _changed = False
+        for w in self.cfg.get("watches", []):
+            for cc in w.get("cloud_configs", []):
+                if cc.get("provider") == "gdrive":
+                    cc["access_token"]  = _access
+                    cc["refresh_token"] = _refresh
+                    _changed = True
+            if w.get("cloud_config", {}).get("provider") == "gdrive":
+                w["cloud_config"]["access_token"]  = _access
+                w["cloud_config"]["refresh_token"] = _refresh
+                _changed = True
+        if _changed and BACKEND_AVAILABLE:
+            try:
+                config_manager.save(self.cfg)
+            except Exception:
+                pass
         self.gd_status_lbl.setText("▶  Connected")
         self.gd_status_lbl.setObjectName("status_ok")
         self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
@@ -2972,6 +3517,84 @@ class AdminPanel(QDialog):
                     f"⚠ {name} token expired  · go to Settings >Cloud tab to reconnect"
                 )
 
+    def _pick_gdrive_folder(self):
+        """Fetch the user's Drive folders and let them pick one from a dialog."""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QListWidget, QListWidgetItem, QDialogButtonBox, QLabel
+
+        # Load current cloud config to get tokens
+        cfg = config_manager.load()
+        cloud_cfg = None
+        for w in cfg.get("watches", []):
+            cc = w.get("cloud_config", {})
+            if cc.get("provider") == "gdrive":
+                cloud_cfg = cc
+                break
+        if cloud_cfg is None:
+            cloud_cfg = cfg.get("_cloud_default_gdrive", {})
+
+        if not cloud_cfg or not cloud_cfg.get("access_token"):
+            QMessageBox.warning(self, "Not Connected",
+                "Connect your Google Drive account first (click 'Connect Google Drive').")
+            return
+
+        try:
+            from googleapiclient.discovery import build
+            import google.oauth2.credentials as _gc
+            _creds = _gc.Credentials(
+                token         = cloud_cfg.get("access_token"),
+                refresh_token = cloud_cfg.get("refresh_token"),
+                client_id     = cloud_cfg.get("client_id"),
+                client_secret = cloud_cfg.get("client_secret"),
+                token_uri     = "https://oauth2.googleapis.com/token",
+            )
+            service = build("drive", "v3", credentials=_creds)
+            result  = service.files().list(
+                q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id, name)",
+                orderBy="name",
+                pageSize=100,
+            ).execute()
+            folders = result.get("files", [])
+        except Exception as e:
+            QMessageBox.critical(self, "Drive Error",
+                f"Could not list Drive folders:\n{e}\n\nTry reconnecting your account.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Google Drive Folder")
+        dlg.setMinimumSize(420, 380)
+        vlay = QVBoxLayout(dlg)
+        vlay.addWidget(QLabel("Choose the Drive folder where backups will be stored:"))
+
+        lst = QListWidget()
+        root_item = QListWidgetItem("📁  My Drive (root)")
+        root_item.setData(0x100, "")           # folder_id = ""
+        root_item.setData(0x101, "My Drive (root)")
+        lst.addItem(root_item)
+        for f in folders:
+            item = QListWidgetItem(f"📁  {f['name']}")
+            item.setData(0x100, f["id"])
+            item.setData(0x101, f["name"])
+            lst.addItem(item)
+        lst.setCurrentRow(0)
+        vlay.addWidget(lst)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        vlay.addWidget(btns)
+
+        if dlg.exec_() == QDialog.Accepted:
+            sel = lst.currentItem()
+            if sel:
+                fid   = sel.data(0x100)
+                fname = sel.data(0x101)
+                self.gd_folder_id.setText(fid)
+                self.gd_folder_id.setToolTip(f"Folder: {fname}  (ID: {fid or 'root'})")
+                QMessageBox.information(self, "Folder Selected",
+                    f"Backups will be stored in:\n📁 {fname}"
+                    + (f"\n(ID: {fid})" if fid else ""))
+
     def _save_cloud(self):
         idx = self.cloud_watch_combo.currentIndex()
         if idx < 0:
@@ -2979,8 +3602,7 @@ class AdminPanel(QDialog):
             return
         wid    = self.cloud_watch_combo.itemData(idx)
         s      = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        use_gd = hasattr(self, "chk_gdrive")  and self.chk_gdrive.isChecked()
-        use_db = False
+        use_gd = hasattr(self, "chk_gdrive") and self.chk_gdrive.isChecked()
 
         cloud_configs = []
 
@@ -2998,133 +3620,55 @@ class AdminPanel(QDialog):
                 "folder_id":     self.gd_folder_id.text().strip(),
             })
 
-        if use_db:
-            self.cfg["dest_sftp"] = {}
-        elif dtype in (2, 3):  # SFTP or FTPS
-            import tempfile
-            proto = "sftp" if dtype == 2 else "ftps"
-            staging = os.path.join(tempfile.gettempdir(), f"backupsys_{proto}_staging")
-            os.makedirs(staging, exist_ok=True)
-            self.cfg["dest_type"] = proto
-            self.cfg["dest_sftp"] = {
-                "proto":   proto,
-                "host":    self.sftp_host.text().strip(),
-                "port":    self.sftp_port.value(),
-                "user":    self.sftp_user.text().strip(),
-                "pass":    self.sftp_pass.text(),
-                "path":    self.sftp_path.text().strip(),
-                "keyfile": self.sftp_keyfile.text().strip(),
-                "key_pass": self.sftp_key_pass.text(),
-            }
-            self.cfg["destination"] = staging   # local staging; uploaded to SFTP/FTPS after backup
-            self.cfg["dest_smb"]    = {}
-            self.cfg["dest_ftp"]    = {}
-            self.cfg["dest_https"]  = {}
+        # Write cloud_configs to the selected watch and persist
+        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
+        if not watch:
+            QMessageBox.warning(self, "Error", "Watch not found — please refresh and try again.")
+            return
 
-        elif dtype == 4:  # Plain FTP
-            import tempfile
-            staging = os.path.join(tempfile.gettempdir(), "backupsys_ftp_staging")
-            os.makedirs(staging, exist_ok=True)
-            self.cfg["dest_type"]   = "ftp"
-            self.cfg["dest_ftp"]    = {
-                "host": self.ftp_host.text().strip(),
-                "port": self.ftp_port.value(),
-                "user": self.ftp_user.text().strip(),
-                "pass": self.ftp_pass.text(),
-                "path": self.ftp_path.text().strip(),
-            }
-            self.cfg["destination"] = staging   # local staging; uploaded to FTP after backup
-            self.cfg["dest_sftp"]   = {}
-            self.cfg["dest_smb"]    = {}
-            self.cfg["dest_https"]  = {}
+        watch["cloud_configs"] = cloud_configs
+        # Keep legacy single cloud_config in sync for backward compatibility
+        watch["cloud_config"] = cloud_configs[0] if cloud_configs else {}
 
-        elif dtype == 5:  # HTTPS API
-            import tempfile
-            staging = os.path.join(tempfile.gettempdir(), "backupsys_https_staging")
-            os.makedirs(staging, exist_ok=True)
-            self.cfg["dest_type"]   = "https"
-            self.cfg["dest_https"]  = {
-                "url":        self.https_url.text().strip(),
-                "token":      self.https_token.text().strip(),
-                "verify_ssl": self.https_verify_ssl.isChecked(),
-            }
-            self.cfg["destination"] = staging   # local staging; uploaded to API after backup
-            self.cfg["dest_sftp"]   = {}
-            self.cfg["dest_smb"]    = {}
-            self.cfg["dest_ftp"]    = {}
-
-        self.cfg["auto_backup"]    = self.auto_check.isChecked()
-        self.cfg["interval_unit"]  = "seconds" if self.interval_unit.currentIndex() == 1 else "minutes"
-        self.cfg["interval_min"]   = self.interval_spin.value()
-        self.cfg["retention_days"] = self.retention_spin.value()
-        # Parse and validate scheduled backup times (comma-separated HH:MM)
-        raw_sched = self.schedule_times_input.text().strip()
-        if raw_sched:
-            import re as _re
-            times = []
-            for tok in raw_sched.split(","):
-                tok = tok.strip()
-                if _re.match(r"^\d{2}:\d{2}$", tok):
-                    h, m = int(tok[:2]), int(tok[3:5])
-                    if 0 <= h <= 23 and 0 <= m <= 59:
-                        times.append(tok)
-            self.cfg["backup_schedule_times"] = times
-        else:
-            self.cfg["backup_schedule_times"] = []
         try:
-            self.cfg["max_backup_mbps"] = float(self.bw_spin.value())
-        except Exception:
-            self.cfg["max_backup_mbps"] = 0.0
-        self.cfg["auto_retry"]      = self.retry_check.isChecked()
-        self.cfg["retry_delay_min"] = self.retry_delay_spin.value()
-        try:
-            # ── Auto-reset snapshots when destination changes ──────────────
-            # If the user changed the remote host/path, the old snapshots are
-            # no longer valid  · reset them so the next backup is a full backup.
-            _old_sftp = getattr(self, "_saved_dest_sftp", {})
-            _new_sftp = self.cfg.get("dest_sftp", {})
-            _dest_changed = (
-                _old_sftp.get("host") != _new_sftp.get("host") or
-                _old_sftp.get("port") != _new_sftp.get("port") or
-                _old_sftp.get("path") != _new_sftp.get("path") or
-                getattr(self, "_saved_dest_type", None) != self.cfg.get("dest_type")
-            )
-            if _dest_changed and BACKEND_AVAILABLE:
-                for w in self.cfg.get("watches", []):
-                    try:
-                        config_manager.delete_snapshot(w["id"])
-                        w["needs_full_backup"] = True
-                    except Exception:
-                        pass
-                config_manager.save(self.cfg)
-
             config_manager.save(self.cfg)
-
-            # Remember current dest for next change-detection
-            self._saved_dest_sftp = dict(self.cfg.get("dest_sftp", {}))
-            self._saved_dest_type = self.cfg.get("dest_type")
-
-            if _dest_changed:
+            if cloud_configs:
+                providers = ", ".join(c["provider"].upper() for c in cloud_configs)
                 QMessageBox.information(self, "Saved",
-                    "Settings saved.\n\nDestination changed  · next backup will be a full backup automatically.")
+                    f"Cloud assignment saved.\n\n"
+                    f"Watch:     {watch.get('name', wid)}\n"
+                    f"Providers: {providers}")
             else:
-                QMessageBox.information(self, "Saved", "Settings saved successfully.")
+                QMessageBox.information(self, "Saved",
+                    f"Cloud assignment cleared for:\n{watch.get('name', wid)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save: {e}")
 
     def _add_watch(self):
         dlg = AddWatchDialog(self, cfg=self.cfg)
         if dlg.exec_() == QDialog.Accepted:
-            v = dlg.get_values()
             try:
+                v = dlg.get_values()
                 config_manager.add_watch(
-                    self.cfg, v["name"], v["path"],
-                    interval_min=v["interval_min"]
+                    self.cfg,
+                    v["name"],
+                    v["path"],
+                    watch_type="smb" if v["is_smb"] else "local",
+                    interval_min=v["interval_min"],
+                    smb_cfg={
+                        "user":   v["smb_user"],
+                        "pass":   v["smb_pass"],
+                        "domain": v["smb_domain"],
+                    } if v["is_smb"] else {},
                 )
-                if v["compression"]:
-                    w = config_manager.get_watch_by_path(self.cfg, v["path"])
-                    if w:
-                        config_manager.update_watch_meta(self.cfg, w["id"], compression=True)
+                w = config_manager.get_watch_by_path(self.cfg, v["path"])
+                if w:
+                    config_manager.update_watch_meta(
+                        self.cfg, w["id"],
+                        compression=v.get("compression", False),
+                        sync_mode=True,
+                        destination=v.get("destination", "") or None,
+                    )
                 self._refresh_watch_table()
                 self.watches_changed.emit()
             except Exception as e:
@@ -3145,6 +3689,68 @@ class AdminPanel(QDialog):
             self._refresh_watch_table()
             self.watches_changed.emit()
 
+    def _edit_watch(self):
+        btn = self.sender()
+        wid = btn.property("watch_id")
+        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
+        if not watch:
+            return
+
+        dlg = AddWatchDialog(self, cfg=self.cfg, edit_watch_id=wid)
+        dlg.setWindowTitle("Edit Watched Folder")
+        dlg._submit_btn.setText("Save Changes")
+
+        # Pre-fill existing values
+        dlg.name_input.setText(watch.get("name", ""))
+        is_smb = watch.get("type", "local") == "smb" or watch.get("path", "").startswith("\\\\") or watch.get("path", "").startswith("//")
+        if is_smb:
+            dlg.source_type.setCurrentIndex(1)
+            dlg.smb_path_input.setText(watch.get("path", ""))
+            smb_cfg = watch.get("smb_cfg", {})
+            dlg.smb_user.setText(smb_cfg.get("user", ""))
+            dlg.smb_pass.setText(smb_cfg.get("pass", ""))
+            dlg.smb_domain.setText(smb_cfg.get("domain", ""))
+        else:
+            dlg.source_type.setCurrentIndex(0)
+            dlg.path_input.setText(watch.get("path", ""))
+        dlg.interval_spin.setValue(watch.get("interval_min", 0))
+        dlg.compress_check.setChecked(watch.get("compression", False))
+
+        if dlg.exec_() == QDialog.Accepted:
+            v = dlg.get_values()
+            try:
+                config_manager.update_watch_meta(
+                    self.cfg, wid,
+                    name=v["name"],
+                    interval_min=v["interval_min"],
+                    compression=v.get("compression", False),
+                    sync_mode=v.get("sync_mode", False),
+                    destination=v.get("destination", "") or None,
+                )
+                # Update path and SMB credentials directly (not in update_watch_meta)
+                for w in self.cfg.get("watches", []):
+                    if w["id"] == wid:
+                        w["path"] = v["path"]   # get_values() always returns "path" key
+                        w["type"] = "smb" if v["is_smb"] else "local"
+                        if v["is_smb"]:
+                            w["smb_cfg"] = {
+                                "user":   v["smb_user"],
+                                "pass":   v["smb_pass"],
+                                "domain": v["smb_domain"],
+                            }
+                        break
+                config_manager.save(self.cfg)
+                self._refresh_watch_table()
+                self.watches_changed.emit()
+                # ── Success feedback ──────────────────────────────────────
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Saved")
+                msg.setText(f"✅  <b>{v['name']}</b> settings saved successfully.")
+                msg.setIcon(QMessageBox.Information)
+                msg.exec_()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
+
     def _refresh_watch_table(self):
         self.watch_table.setRowCount(0)
         watches = self.cfg.get("watches", [])
@@ -3161,8 +3767,22 @@ class AdminPanel(QDialog):
             self.watch_table.setItem(row, 8, QTableWidgetItem(w.get("size", "")))
             self.watch_table.setItem(row, 9, QTableWidgetItem(w.get("history", "")))
             self.watch_table.setItem(row, 10, QTableWidgetItem(w.get("destination", "")))
-            self.watch_table.setItem(row, 11, QTableWidgetItem(""))
-            self.watch_table.setItem(row, 12, QTableWidgetItem(""))
+
+            # ── Edit button (col 11) ────────────────────────────────────────
+            edit_btn = QPushButton("✏ Edit")
+            edit_btn.setObjectName("secondary")
+            edit_btn.setFixedHeight(26)
+            edit_btn.setProperty("watch_id", w["id"])
+            edit_btn.clicked.connect(self._edit_watch)
+            self.watch_table.setCellWidget(row, 11, edit_btn)
+
+            # ── Delete button (col 12) ──────────────────────────────────────
+            del_btn = QPushButton("🗑 Remove")
+            del_btn.setObjectName("danger")
+            del_btn.setFixedHeight(26)
+            del_btn.setProperty("watch_id", w["id"])
+            del_btn.clicked.connect(self._remove_watch)
+            self.watch_table.setCellWidget(row, 12, del_btn)
 
     def _save_email_settings(self):
         ec = self.cfg.setdefault("email_config", {})
@@ -3263,15 +3883,89 @@ class AdminPanel(QDialog):
         dlg = PasswordDialog(self, mode="set")
         dlg.exec_()
 
+    def _apply_theme(self):
+        """Apply the selected theme immediately and persist the choice."""
+        if self.theme_dark.isChecked():
+            choice = "dark"
+        elif self.theme_light.isChecked():
+            choice = "light"
+        else:
+            choice = ""   # auto — follow OS
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s.setValue("theme", choice)
+        _resolved = choice or _detect_os_theme()
+        sheet = LIGHT_STYLE if _resolved == "light" else DARK_STYLE
+        from PyQt5.QtWidgets import QApplication as _QApp
+        _QApp.instance().setStyleSheet(sheet)
+        _QApp.instance().setProperty("theme", _resolved)
+
+    def _export_config(self):
+        """Export a redacted copy of config.json that the user can save anywhere."""
+        import copy, json as _json
+        from PyQt5.QtWidgets import QFileDialog
+
+        try:
+            raw = copy.deepcopy(config_manager.load())
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Could not load config: {e}")
+            return
+
+        # ── Redact all known secret fields ────────────────────────────────
+        _SECRET_KEYS = {
+            "password", "pass", "token", "encrypt_key",
+            "access_token", "refresh_token", "client_secret",
+            "api_key", "webhook_url",
+        }
+
+        def _redact(obj):
+            if isinstance(obj, dict):
+                return {
+                    k: ("*** REDACTED ***" if k.lower() in _SECRET_KEYS else _redact(v))
+                    for k, v in obj.items()
+                }
+            if isinstance(obj, list):
+                return [_redact(i) for i in obj]
+            return obj
+
+        redacted = _redact(raw)
+        redacted["_export_note"] = (
+            "Passwords and secrets have been removed. "
+            "Re-enter them after importing on a new machine."
+        )
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Export BackupSys Config",
+            "backupsys_config_export.json",
+            "JSON files (*.json)"
+        )
+        if not out_path:
+            return
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                _json.dump(redacted, fh, indent=2)
+            QMessageBox.information(
+                self, "Config Exported",
+                f"Configuration exported to:\n{out_path}\n\n"
+                "Passwords have been redacted — re-enter them after importing."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Could not write file: {e}")
+
     def _save_general(self):
-        self.cfg["dest_type"] = ["local", "smb", "sftp", "ftps", "ftp", "https"][self.dest_type_combo.currentIndex()]
-        self.cfg["destination"] = self.dest_input.text().strip()
         self.cfg["dest_smb"] = {
             "path": self.dest_smb_path.text().strip(),
             "user": self.dest_smb_user.text().strip(),
             "pass": self.dest_smb_pass.text(),
             "domain": self.dest_smb_domain.text().strip(),
         }
+        # For SMB, the backup destination IS the UNC path — not the local dest_input.
+        # Using a local path when dest_type is smb causes WinError 21 (device not ready)
+        # because the engine tries to create the backup folder on a non-existent local drive.
+        if self.cfg["dest_type"] == "smb":
+            self.cfg["destination"] = self.cfg["dest_smb"]["path"]
+        else:
+            self.cfg["destination"] = self.dest_input.text().strip()
         self.cfg["dest_sftp"] = {
             "host": self.sftp_host.text().strip(),
             "port": self.sftp_port.value(),
@@ -3293,13 +3987,28 @@ class AdminPanel(QDialog):
             "token": self.https_token.text().strip(),
             "verify_ssl": self.https_verify_ssl.isChecked(),
         }
+        self.cfg["dest_webdav"] = {
+            "url":         self.webdav_url.text().strip(),
+            "username":    self.webdav_user.text().strip(),
+            "password":    self.webdav_pass.text(),
+            "remote_path": self.webdav_path.text().strip() or "/backups",
+            "webdav_root": self.webdav_root.text().strip(),
+            "verify_ssl":  self.webdav_ssl.isChecked(),
+        }
+        credential_store.set_webdav_password(self.cfg["dest_webdav"], self.webdav_pass.text())
+        idx = self.dest_type_combo.currentIndex()
+        dest_map = {0: "local", 1: "smb", 2: "sftp", 3: "ftps",
+                    4: "ftp", 5: "https", 6: "webdav"}
+        self.cfg["dest_type"] = dest_map.get(idx, "local")
         self.cfg["auto_backup"] = self.auto_check.isChecked()
         self.cfg["interval_unit"] = "seconds" if self.interval_unit.currentIndex() == 1 else "minutes"
         self.cfg["interval_min"] = self.interval_spin.value()
         self.cfg["retention_days"] = self.retention_spin.value()
         self.cfg["backup_schedule_times"] = [t.strip() for t in self.schedule_times_input.text().split(",") if t.strip()]
-        self.cfg["max_backup_mbps"] = self.bw_spin.value()
-        self.cfg["auto_retry"] = self.retry_check.isChecked()
+        self.cfg["backup_window_end"]     = self.backup_window_end_input.text().strip()
+        self.cfg["max_backup_mbps"]    = self.bw_spin.value()
+        self.cfg["idle_threshold_cpu"] = self.idle_spin.value()
+        self.cfg["auto_retry"]         = self.retry_check.isChecked()
         self.cfg["retry_delay_min"] = self.retry_delay_spin.value()
         try:
             config_manager.save(self.cfg)
@@ -3348,6 +4057,75 @@ class AdminPanel(QDialog):
             return False
 
 
+class StorageChartWidget(QWidget):
+    def __init__(self, watch: dict, parent=None):
+        super().__init__(parent)
+        self.watch = watch
+        self._data = []  # list of (timestamp, size_mb)
+        self._load_data()
+
+    def _load_data(self):
+        """Load last 30 backup sizes from manifests."""
+        try:
+            dest = self.watch.get("destination", "")
+            if not dest:
+                from config_manager import load_config
+                cfg = load_config()
+                dest = cfg.get("destination", "")
+            if not dest:
+                return
+            dest_path = Path(dest)
+            if not dest_path.exists():
+                return
+            safe_name = "".join(c if c.isalnum() else "_" for c in self.watch.get("name", ""))
+            # List backup dirs
+            backup_dirs = [d for d in dest_path.iterdir() if d.is_dir() and safe_name in d.name]
+            backup_dirs.sort(key=lambda d: d.name, reverse=True)  # newest first
+            for bd in backup_dirs[:30]:
+                manifest_path = bd / "MANIFEST.json"
+                if manifest_path.exists():
+                    try:
+                        with open(manifest_path, 'r', encoding='utf-8') as f:
+                            manifest = json.load(f)
+                        ts = manifest.get("timestamp", "")
+                        size_bytes = manifest.get("total_size_bytes", 0)
+                        size_mb = size_bytes / (1024 * 1024)
+                        self._data.append((ts, size_mb))
+                    except Exception:
+                        pass
+            self._data.reverse()  # oldest first for chart
+        except Exception:
+            pass
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+        if not self._data:
+            painter.setPen(QColor("#6b7280"))
+            painter.drawText(rect, Qt.AlignCenter, "No backup data")
+            return
+        # Draw bars
+        bar_color = QColor("#2563eb")
+        label_color = QColor("#e8eaf0")
+        painter.setPen(label_color)
+        painter.setFont(QFont("Arial", 8))
+        max_size = max(s for _, s in self._data) if self._data else 1
+        bar_width = rect.width() / len(self._data) if self._data else 1
+        for i, (ts, size) in enumerate(self._data):
+            bar_height = (size / max_size) * (rect.height() - 20) if max_size > 0 else 0
+            bar_rect = QRectF(i * bar_width, rect.height() - bar_height - 15, bar_width - 2, bar_height)
+            painter.fillRect(bar_rect, bar_color)
+            # Date label
+            try:
+                date = datetime.fromisoformat(ts).strftime("%m/%d")
+                painter.drawText(int(i * bar_width), rect.height() - 5, date)
+            except:
+                pass
+        # Y axis label
+        painter.drawText(5, 10, f"Size (MB, max {max_size:.0f})")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Watch Card Widget ──────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3355,6 +4133,7 @@ class AdminPanel(QDialog):
 class WatchCard(QFrame):
     backup_requested          = pyqtSignal(dict)
     full_backup_requested     = pyqtSignal(dict)  # watch  · force full backup
+    dry_run_requested         = pyqtSignal(dict)  # watch  · preview only
     validate_requested        = pyqtSignal(dict)
     restore_requested         = pyqtSignal(dict)
     pause_requested           = pyqtSignal(str, bool)   # watch_id, paused
@@ -3368,6 +4147,11 @@ class WatchCard(QFrame):
         self._expanded    = False
         self.setObjectName("card")
         self.setMinimumHeight(90)
+        # Rolling speed window for ETA: list of (timestamp, bytes_done) pairs.
+        # Using recent samples (last 8 s) avoids the "ETA explodes after a
+        # throttle pause" problem caused by using total-elapsed as the divisor.
+        self._speed_window: list = []
+        self._SPEED_WIN_SEC: int = 8
         self._build_ui()
 
     def _build_ui(self):
@@ -3401,6 +4185,15 @@ class WatchCard(QFrame):
             badge.setStyleSheet("background:#f59e0b; color:#000; font-size:9px; font-weight:700;"
                                 "padding:2px 6px; border-radius:3px;")
             name_row.addWidget(badge)
+
+        if self.watch.get("sync_mode", False):
+            sync_badge = QLabel("SYNC")
+            sync_badge.setStyleSheet(
+                "background:#0ea5e9; color:#fff; font-size:9px; font-weight:700;"
+                "padding:2px 6px; border-radius:3px;"
+            )
+            sync_badge.setToolTip("Sync mode: files are copied directly into the destination folder, no versioned subfolders.")
+            name_row.addWidget(sync_badge)
 
         # Change count badge
         self.change_badge = QLabel("")
@@ -3441,13 +4234,65 @@ class WatchCard(QFrame):
                 lb_text = f"Last backup: {lb}"
 
         count = self.watch.get("backup_count", 0)
+
+        # Inline last-backup status indicator (✔ / ✘ / —)
+        _last_status = self.watch.get("last_backup_status", "")
+        if _last_status == "success":
+            _status_icon = "✔"
+            _status_color = "#22c55e"   # green
+        elif _last_status == "failed":
+            _status_icon = "✘"
+            _status_color = "#ef4444"   # red
+        else:
+            _status_icon = "—"
+            _status_color = "#6b7280"   # grey
+
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(6)
+        meta_row.setContentsMargins(0, 0, 0, 0)
+
         self.meta_lbl = QLabel(f"{lb_text}   ·   {count} backup(s)")
         self.meta_lbl.setStyleSheet("color: #4b5563; font-size: 11px;")
-        info_layout.addWidget(self.meta_lbl)
+        meta_row.addWidget(self.meta_lbl)
+
+        self._status_dot = QLabel(_status_icon)
+        self._status_dot.setStyleSheet(
+            f"color: {_status_color}; font-size: 13px; font-weight: 700;"
+        )
+        self._status_dot.setToolTip(
+            f"Last backup status: {_last_status or 'unknown'}"
+        )
+        meta_row.addWidget(self._status_dot)
+        meta_row.addStretch()
+        info_layout.addLayout(meta_row)
+
+        self.next_lbl = QLabel("")
+        self.next_lbl.setStyleSheet("color: #374151; font-size: 10px;")
+        self.next_lbl.setVisible(False)
+        info_layout.addWidget(self.next_lbl)
+
+        # ── Tag badges ────────────────────────────────────────────────────────
+        tags = self.watch.get("tags", [])
+        if tags:
+            tags_row = QHBoxLayout()
+            tags_row.setSpacing(4)
+            tags_row.setContentsMargins(0, 2, 0, 0)
+            for tag in tags[:8]:   # cap at 8 badges to avoid overflow
+                badge = QLabel(tag)
+                badge.setStyleSheet(
+                    "font-size: 10px; padding: 1px 6px; border-radius: 8px;"
+                    "background: #2e3a55; color: #7aa2d4; border: 1px solid #3d5278;"
+                )
+                tags_row.addWidget(badge)
+            tags_row.addStretch()
+            info_layout.addLayout(tags_row)
 
         layout.addLayout(info_layout, stretch=1)
 
         self.status_widget = QWidget()
+        # Fix: lock the width so the indeterminate progress bar animation
+        # cannot push or shift the buttons during scanning/backing up.
+        self.status_widget.setFixedWidth(170)
         status_layout = QVBoxLayout(self.status_widget)
         status_layout.setSpacing(4)
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -3458,51 +4303,79 @@ class WatchCard(QFrame):
         status_layout.addWidget(self.status_lbl)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMinimumWidth(130)
+        self.progress_bar.setFixedWidth(160)   # fixed — never resizes during marquee animation
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         status_layout.addWidget(self.progress_bar)
 
+        self.file_lbl = QLabel("")
+        self.file_lbl.setObjectName("file_scan_lbl")
+        self.file_lbl.setStyleSheet(
+            "font-size: 10px; color: #8b95a8; padding: 0 2px;"
+        )
+        self.file_lbl.setMaximumWidth(300)
+        self.file_lbl.setVisible(False)
+        self.file_lbl.setWordWrap(False)
+        status_layout.addWidget(self.file_lbl)
+
+        # ── Windows-Explorer-style details row ────────────────────────────
+        # Shows: "8% · 70.1 GB left · 71,307 files left · 4.3 MB/s"
+        self.details_lbl = QLabel("")
+        self.details_lbl.setStyleSheet(
+            "font-size: 10px; color: #6b7280; padding: 0 2px;"
+        )
+        self.details_lbl.setMaximumWidth(300)
+        self.details_lbl.setVisible(False)
+        self.details_lbl.setWordWrap(False)
+        status_layout.addWidget(self.details_lbl)
+
         self.backup_btn = QPushButton("Backup Now")
-        self.backup_btn.setMinimumWidth(130)
+        self.backup_btn.setFixedWidth(160)
         self.backup_btn.clicked.connect(lambda: self.backup_requested.emit(self.watch))
         status_layout.addWidget(self.backup_btn)
 
         self.full_backup_btn = QPushButton("⟳ Force Full Backup")
         self.full_backup_btn.setObjectName("secondary")
-        self.full_backup_btn.setMinimumWidth(130)
+        self.full_backup_btn.setFixedWidth(160)
         self.full_backup_btn.clicked.connect(lambda: self.full_backup_requested.emit(self.watch))
         status_layout.addWidget(self.full_backup_btn)
+
+        self.dry_run_btn = QPushButton("🔍 Dry Run")
+        self.dry_run_btn.setObjectName("secondary")
+        self.dry_run_btn.setFixedWidth(160)
+        self.dry_run_btn.setToolTip("Preview what would be backed up without copying any files")
+        self.dry_run_btn.clicked.connect(lambda: self.dry_run_requested.emit(self.watch))
+        status_layout.addWidget(self.dry_run_btn)
 
         paused_now = self.watch.get("paused", False)
         self.pause_btn = QPushButton("⏸ Pause" if not paused_now else "▶ Resume")
         self.pause_btn.setObjectName("secondary")
-        self.pause_btn.setMinimumWidth(130)
+        self.pause_btn.setFixedWidth(160)
         self.pause_btn.clicked.connect(self._toggle_pause)
         status_layout.addWidget(self.pause_btn)
 
         self.validate_btn = QPushButton("▶ Validate")
         self.validate_btn.setObjectName("secondary")
-        self.validate_btn.setMinimumWidth(130)
+        self.validate_btn.setFixedWidth(160)
         self.validate_btn.clicked.connect(lambda: self.validate_requested.emit(self.watch))
         status_layout.addWidget(self.validate_btn)
 
         self.restore_btn = QPushButton("↩ Restore")
         self.restore_btn.setObjectName("secondary")
-        self.restore_btn.setMinimumWidth(130)
+        self.restore_btn.setFixedWidth(160)
         self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.watch))
         status_layout.addWidget(self.restore_btn)
 
         self.cancel_btn = QPushButton("▶ Cancel")
         self.cancel_btn.setObjectName("danger")
-        self.cancel_btn.setMinimumWidth(130)
+        self.cancel_btn.setFixedWidth(160)
         self.cancel_btn.setVisible(False)
         self.cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self.watch["id"]))
         status_layout.addWidget(self.cancel_btn)
 
         self.open_backup_btn = QPushButton("Open Backup")
         self.open_backup_btn.setObjectName("secondary")
-        self.open_backup_btn.setMinimumWidth(130)
+        self.open_backup_btn.setFixedWidth(160)
         self.open_backup_btn.clicked.connect(lambda: self.open_backup_requested.emit(self.watch["id"]))
         status_layout.addWidget(self.open_backup_btn)
 
@@ -3532,6 +4405,15 @@ class WatchCard(QFrame):
             "font-family:'Consolas',monospace; font-size:11px;"
         )
         cp_layout.addWidget(self.changes_list)
+
+        # Storage trend chart
+        chart_title = QLabel("STORAGE TREND")
+        chart_title.setStyleSheet("color:#374151; font-size:10px; font-weight:700; letter-spacing:0.08em;")
+        cp_layout.addWidget(chart_title)
+
+        self.storage_chart = StorageChartWidget(self.watch)
+        self.storage_chart.setFixedHeight(100)
+        cp_layout.addWidget(self.storage_chart)
 
         self._root_layout.addWidget(self.changes_panel)
 
@@ -3603,23 +4485,152 @@ class WatchCard(QFrame):
         self.restore_btn.setEnabled(not active)
         self.cancel_btn.setVisible(active)
         self.progress_bar.setVisible(active)
+        self.file_lbl.setVisible(active)
+        self.details_lbl.setVisible(active)
         if active:
+            self._speed_window.clear()   # fresh window for each backup run
             self.status_lbl.setText("▶ Backing up…")
             self.status_lbl.setObjectName("status_warn")
+            # Start in indeterminate (scanning) mode
+            self.progress_bar.setRange(0, 0)
+            self.file_lbl.setText("Scanning…")
+            self.details_lbl.setText("")
         else:
+            self.progress_bar.setRange(0, 100)
+            self.file_lbl.setText("")
+            self.details_lbl.setText("")
             self.status_lbl.setText("▶ Watching")
             self.status_lbl.setObjectName("status_ok")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
 
-    def set_progress(self, copied: int, total: int):
-        if total > 0:
-            self.progress_bar.setValue(int(copied / total * 100))
+    def set_progress(self, current: int, total: int, fname: str = "", elapsed: float = 0.0, is_scanning: bool = False, bytes_done: int = 0, total_bytes: int = 0):
+        short_name = fname.replace("\\", "/").split("/")[-1] if fname else ""
 
-    def set_done(self, success: bool):
+        if is_scanning:
+            # ── Scanning phase ────────────────────────────────────────────
+            if self.progress_bar.maximum() != 0:
+                self.progress_bar.setRange(0, 0)   # ensure marquee during scan
+
+            if total > 0 and current > 0 and elapsed > 2.0:
+                # Repeat backup — use previous snapshot count as estimated total
+                pct = min(int(current / total * 100), 99)
+                self.progress_bar.setRange(0, 100)
+                self.progress_bar.setValue(pct)
+                rate = current / elapsed
+                eta_s = (total - current) / rate
+                eta_text = _fmt_eta(eta_s)
+                eta_part = f"  ·  ETA {eta_text}" if eta_text else ""
+                lbl = f"Scanning ({current}/{total}){eta_part}"
+            elif elapsed > 1.0:
+                # First-time backup — no estimate, show elapsed + count
+                elapsed_text = _fmt_duration(elapsed)
+                count_part = f"  {current} files" if current > 0 else ""
+                lbl = f"Scanning{count_part}  ·  {elapsed_text} elapsed"
+            else:
+                lbl = f"Scanning: {short_name}" if short_name else "Scanning…"
+
+            self.file_lbl.setText(lbl)
+
+        else:
+            # ── Copying / Uploading phase ──────────────────────────────────
+            # Use byte-based progress when available (accurate for large files).
+            # Falls back to file-count progress for edge cases (0-byte files, etc.)
+            # When current==1 and total==1 the signal is coming from the remote
+            # upload leg (_upload_progress in backup_engine) — label as "Uploading".
+            _is_uploading = (current == 1 and total == 1 and bytes_done > 0 and total_bytes > 0)
+            use_bytes = total_bytes > 0 and bytes_done >= 0
+
+            if total == 0 and not use_bytes:
+                self.progress_bar.setRange(0, 0)
+                self.file_lbl.setText(f"Copying: {short_name}" if short_name else "Copying…")
+            else:
+                if self.progress_bar.maximum() == 0:
+                    self.progress_bar.setRange(0, 100)
+
+                if use_bytes:
+                    pct = int(min(bytes_done / total_bytes * 100, 99)) if bytes_done < total_bytes else 100
+                elif total > 0:
+                    pct = int(current / total * 100)
+                else:
+                    pct = 0
+                self.progress_bar.setValue(pct)
+
+                byte_rate  = 0.0
+                eta_part   = ""
+                speed_text = ""
+                if elapsed > 1.0:
+                    if use_bytes and bytes_done > 0 and bytes_done < total_bytes:
+                        # ── Rolling-window speed (last _SPEED_WIN_SEC seconds) ──
+                        # This stays accurate even after throttle pauses, because
+                        # we measure only recent activity — not total-since-start.
+                        import time as _t
+                        now = _t.time()
+                        self._speed_window.append((now, bytes_done))
+                        cutoff = now - self._SPEED_WIN_SEC
+                        while len(self._speed_window) > 2 and self._speed_window[0][0] < cutoff:
+                            self._speed_window.pop(0)
+
+                        if len(self._speed_window) >= 2:
+                            dt = self._speed_window[-1][0] - self._speed_window[0][0]
+                            db = self._speed_window[-1][1] - self._speed_window[0][1]
+                            if dt > 0.1 and db > 0:
+                                byte_rate = db / dt
+
+                        if byte_rate > 0:
+                            eta_s      = (total_bytes - bytes_done) / byte_rate
+                            mbps       = byte_rate / (1024 * 1024)
+                            eta_text   = _fmt_eta(eta_s)
+                            speed_text = f"{mbps:.1f} MB/s"
+                            if eta_text:
+                                eta_part = f"  ·  ETA {eta_text}  ·  {speed_text}"
+                            else:
+                                eta_part = f"  ·  {speed_text}"
+                    elif not use_bytes and current > 0 and total > 0 and current < total:
+                        # Fallback: file-count ETA
+                        rate     = current / elapsed
+                        eta_s    = (total - current) / rate
+                        eta_text = _fmt_eta(eta_s)
+                        if eta_text:
+                            eta_part = f"  ·  ETA {eta_text}"
+
+                # ── Windows-Explorer-style details row ────────────────────
+                # "8% complete  ·  70.1 GB left  ·  71,307 files left  ·  4.3 MB/s"
+                details_parts = []
+                if pct > 0:
+                    details_parts.append(f"{pct}% complete")
+                if use_bytes and total_bytes > 0 and bytes_done < total_bytes:
+                    bytes_left = total_bytes - bytes_done
+                    if bytes_left >= 1024 ** 3:
+                        details_parts.append(f"{bytes_left / (1024**3):.1f} GB left")
+                    elif bytes_left >= 1024 ** 2:
+                        details_parts.append(f"{bytes_left / (1024**2):.0f} MB left")
+                    else:
+                        details_parts.append(f"{bytes_left / 1024:.0f} KB left")
+                if not _is_uploading and total > 0 and current < total:
+                    files_left = total - current
+                    details_parts.append(f"{files_left:,} files left")
+                if speed_text:
+                    details_parts.append(speed_text)
+                self.details_lbl.setText("  ·  ".join(details_parts))
+
+                if short_name:
+                    # Truncate long filenames so the ETA is never clipped off
+                    max_name     = 35
+                    display_name = (short_name[:max_name] + "…") if len(short_name) > max_name else short_name
+                    verb         = "Uploading" if _is_uploading else "Copying"
+                    # Show ETA first so it's always visible even on narrow cards
+                    if eta_part:
+                        self.file_lbl.setText(f"{eta_part.strip()}  ·  {display_name}")
+                    else:
+                        self.file_lbl.setText(f"{verb}: {display_name}")
+
+    def set_done(self, success: bool, duration_s: float = 0.0):
         self.set_backing_up(False)
+        dur_str = _fmt_duration(duration_s)
         if success:
-            self.status_lbl.setText("▶  Done")
+            done_text = f"▶  Done  ·  {dur_str}" if dur_str else "▶  Done"
+            self.status_lbl.setText(done_text)
             self.status_lbl.setObjectName("status_ok")
             self.clear_changes()
         else:
@@ -3627,6 +4638,50 @@ class WatchCard(QFrame):
             self.status_lbl.setObjectName("status_err")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
+
+    def refresh_next_backup_lbl(self, cfg: dict):
+        """Update the 'Next backup in …' countdown label.  Called every 30 s by MainWindow."""
+        if not hasattr(self, "next_lbl"):
+            return
+        # Hide when auto-backup is globally off, watch is paused, or watch opts out
+        if (not cfg.get("auto_backup", False)
+                or self.watch.get("paused", False)
+                or self.watch.get("skip_auto_backup", False)):
+            self.next_lbl.setVisible(False)
+            return
+
+        lb = self.watch.get("last_backup", "")
+        if not lb:
+            self.next_lbl.setText("⏱ Auto-backup pending")
+            self.next_lbl.setVisible(True)
+            return
+
+        # Effective interval in seconds (per-watch overrides global)
+        w_interval_min = self.watch.get("interval_min", 0)
+        if w_interval_min:
+            interval_secs = w_interval_min * 60
+        else:
+            interval_val  = cfg.get("interval_min", 30)
+            interval_unit = cfg.get("interval_unit", "minutes")
+            interval_secs = interval_val if interval_unit == "seconds" else interval_val * 60
+
+        try:
+            last_dt   = datetime.fromisoformat(lb)
+            remaining = (last_dt.timestamp() + interval_secs) - datetime.now().timestamp()
+            if remaining <= 0:
+                text = "⏱ Backup due soon"
+            elif remaining < 60:
+                text = f"⏱ Next backup in {int(remaining)}s"
+            elif remaining < 3600:
+                text = f"⏱ Next backup in {int(remaining / 60)}m"
+            else:
+                h = int(remaining / 3600)
+                m = int((remaining % 3600) / 60)
+                text = f"⏱ Next backup in {h}h {m:02d}m"
+            self.next_lbl.setText(text)
+            self.next_lbl.setVisible(True)
+        except Exception:
+            self.next_lbl.setVisible(False)
 
     def _toggle_pause(self):
         """Toggle paused state and emit signal for the main window to persist."""
@@ -3656,6 +4711,20 @@ class WatchCard(QFrame):
                 pass
         if hasattr(self, "meta_lbl"):
             self.meta_lbl.setText(f"{lb_text}   ·   {count} backup(s){size_h}")
+
+        # Refresh the status dot
+        if hasattr(self, "_status_dot"):
+            _ls = watch.get("last_backup_status", "")
+            if _ls == "success":
+                self._status_dot.setText("✔")
+                self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px; font-weight: 700;")
+            elif _ls == "failed":
+                self._status_dot.setText("✘")
+                self._status_dot.setStyleSheet("color: #ef4444; font-size: 13px; font-weight: 700;")
+            else:
+                self._status_dot.setText("—")
+                self._status_dot.setStyleSheet("color: #6b7280; font-size: 13px; font-weight: 700;")
+            self._status_dot.setToolTip(f"Last backup status: {_ls or 'unknown'}")
 
         # Refresh pause button label
         paused = watch.get("paused", False)
@@ -3715,6 +4784,7 @@ class MainWindow(QMainWindow):
         self._history_log: list      = []   # all change entries across all watches
         self._history_save_counter   = 0    # throttle disk saves
         self._history_window         = None
+        self._user_cancelled_watches: set = set()  # watches cancelled by user — suppress auto-restart
 
         # Load persisted history from previous sessions
         if BACKEND_AVAILABLE:
@@ -3727,19 +4797,153 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._start_watchers()
         self._start_auto_timer()
+        # ── Integrity scheduler — weekly background validation ─────────────────
+        if BACKEND_AVAILABLE:
+            self._integrity_scheduler = IntegrityScheduler(self)
+            self._integrity_scheduler.watch_result.connect(self._on_integrity_result)
+            self._integrity_scheduler.run_finished.connect(self._on_integrity_run_finished)
+            self._integrity_scheduler.start()
         # Resume any backups that were queued but not completed in a previous session
         QTimer.singleShot(3000, self._process_startup_queue)
         # Check cloud tokens 5 seconds after startup
         QTimer.singleShot(5000, self._validate_cloud_tokens)
+        # Non-blocking update check 10 seconds after startup
+        QTimer.singleShot(10000, self._check_for_updates)
+        # Show one-time v1.0.x → v1.1.0 migration notice if needed
+        QTimer.singleShot(4000, self._check_migration_notice)
+        # Warn if BACKUPSYS_API_KEY looks like a placeholder
+        if _api_key_is_weak():
+            QTimer.singleShot(2000, self._warn_weak_api_key)
 
     # ── Config ─────────────────────────────────────────────────────────────────
+
+    def _check_for_updates(self):
+        """Non-blocking background update check against GitHub releases API.
+
+        Compares APP_VERSION against the latest published release tag.
+        Runs in a daemon thread so it never blocks the UI.
+        Shows a tray balloon (not a blocking dialog) if a new version is found.
+        Suppressed entirely if the check fails for any reason — never crashes the app.
+        """
+        def _worker():
+            try:
+                import urllib.request, urllib.error, json as _json
+                url = "https://api.github.com/repos/abegail6253/backupsystem/releases/latest"
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": f"BackupSys/{APP_VERSION}",
+                             "Accept": "application/vnd.github+json"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = _json.loads(resp.read().decode())
+                latest_tag = data.get("tag_name", "").lstrip("v")
+                if not latest_tag:
+                    return
+                # Simple version comparison (handles "1.2.3" format)
+                def _ver(s):
+                    try:
+                        return tuple(int(x) for x in s.split("."))
+                    except Exception:
+                        return (0,)
+                if _ver(latest_tag) > _ver(APP_VERSION):
+                    html_url = data.get("html_url", "https://github.com/abegail6253/backupsystem/releases")
+                    _QTimer_call(lambda: self._notify_update(latest_tag, html_url))
+            except Exception:
+                pass  # network error, rate-limit, wrong URL — all silently ignored
+
+        def _QTimer_call(fn):
+            """Schedule fn on the Qt main thread (safe to call from a worker thread)."""
+            QTimer.singleShot(0, fn)
+
+        threading.Thread(target=_worker, daemon=True, name="update-check").start()
+
+    def _notify_update(self, latest_tag: str, html_url: str):
+        """Show a non-intrusive tray message about the new version."""
+        try:
+            # Try tray balloon first (least intrusive)
+            tray = self.parent()
+            if hasattr(tray, "tray") and tray.tray.isVisible():
+                tray.tray.showMessage(
+                    f"BackupSys {latest_tag} available",
+                    f"A new version is available. Visit:\n{html_url}",
+                    QSystemTrayIcon.Information, 8000,
+                )
+                return
+        except Exception:
+            pass
+        # Fallback: log it
+        logger.info(f"[update] New version available: {latest_tag}  →  {html_url}")
+
+    def _check_migration_notice(self):
+        """Show a one-time notice to users upgrading from BackupSys v1.0.x."""
+        _s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        _seen_key = "migration_notice_v110_shown"
+        if _s.value(_seen_key, False, type=bool):
+            return  # already shown — don't nag again
+
+        # Detect v1.0.x users: they have watches but no backup_window_end key
+        # (introduced in v1.1.0) and may have Fernet-encrypted backups
+        cfg = config_manager.load()
+        has_watches = bool(cfg.get("watches"))
+        already_has_v11_keys = "backup_window_end" in cfg
+        if not has_watches or already_has_v11_keys:
+            # Brand-new install or already migrated — mark done silently
+            _s.setValue(_seen_key, True)
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("BackupSys v1.1.0 — What's New")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText("<b>Welcome to BackupSys v1.1.0!</b>")
+        msg.setInformativeText(
+            "Here's what changed since v1.0.x:\n\n"
+            "🔐  Encryption upgraded to AES-256-GCM streaming\n"
+            "     (old Fernet backups still open automatically — no action needed)\n\n"
+            "📁  Google Drive folder picker — choose exactly where backups land\n\n"
+            "⚙️  Pre/post backup script hooks per watch\n"
+            "     (Settings → Edit Watch → Backup Hooks)\n\n"
+            "📄  Single-file restore — restore one file from any snapshot\n"
+            "     (History → Preview → Restore Selected File)\n\n"
+            "🕐  Backup window stop time — limit auto-backups to a time window\n"
+            "     (Settings → Run at times / Stop by)\n\n"
+            "📤  Config export — back up your settings\n"
+            "     (Settings → General → Export Config)\n\n"
+            "✔  Per-watch last-backup status shown inline on each watch card\n\n"
+            "No migration steps required — all existing watches and backups continue to work."
+        )
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec_()
+        _s.setValue(_seen_key, True)
+
+    def _warn_weak_api_key(self):
+        """Show a one-time startup warning if BACKUPSYS_API_KEY looks weak or unset."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("⚠ Weak API Key Detected")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText(
+            "<b>BACKUPSYS_API_KEY looks like a placeholder or is too short.</b>"
+        )
+        msg.setInformativeText(
+            "Your current key is either empty, a known example value, or fewer than "
+            "20 characters. This key protects your backup API from unauthorized access.\n\n"
+            "Generate a strong key by running:\n"
+            "  python -c \"import secrets; print(secrets.token_hex(32))\"\n\n"
+            "Then set it in your .env file:\n"
+            "  BACKUPSYS_API_KEY=<your-generated-key>"
+        )
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec_()
+        if hasattr(self, "log_text"):
+            self._append_log(
+                "⚠ BACKUPSYS_API_KEY is weak/unset — generate a secure key and update .env"
+            )
 
     def _load_config(self):
         if BACKEND_AVAILABLE:
             self.cfg = config_manager.load()
         else:
             self.cfg = {"watches": [], "destination": "", "auto_backup": False,
-                        "interval_min": 30, "retention_days": 30}
+                        "interval_min": 30, "retention_days": 0}
 
     # ── UI Build ───────────────────────────────────────────────────────────────
 
@@ -3945,6 +5149,7 @@ class MainWindow(QMainWindow):
                 card = WatchCard(w)
                 card.backup_requested.connect(self._backup_single)
                 card.full_backup_requested.connect(self._force_full_backup)
+                card.dry_run_requested.connect(self._dry_run_watch)
                 card.validate_requested.connect(self._validate_watch)
                 card.restore_requested.connect(self._restore_watch)
                 card.pause_requested.connect(self._on_pause_requested)
@@ -3952,6 +5157,11 @@ class MainWindow(QMainWindow):
                 card.open_backup_requested.connect(self._on_open_backup_folder)
                 self._cards[w["id"]] = card
                 self.watches_layout.insertWidget(self.watches_layout.count() - 1, card)
+                # Seed countdown label immediately so it shows on first load
+                try:
+                    card.refresh_next_backup_lbl(self.cfg)
+                except Exception:
+                    pass
 
     def _update_stats(self):
         watches = self.cfg.get("watches", [])
@@ -4097,12 +5307,44 @@ class MainWindow(QMainWindow):
                 return w.get("name", watch_id)
         return watch_id
 
+    def _watch_dest(self, watch: dict) -> str:
+        """Return the effective destination for a watch.
+        Per-watch destination takes priority over the global cfg destination.
+        Falls back to global cfg[destination] if not set on the watch.
+        """
+        dest_type = self.cfg.get("dest_type", "local")
+        per_watch = watch.get("destination", "").strip()
+        if per_watch:
+            return per_watch
+        if dest_type == "smb":
+            return self.cfg.get("dest_smb", {}).get("path", "").strip()
+        return self.cfg.get("destination", "")
+
+
     # ── Auto Timer ─────────────────────────────────────────────────────────────
 
     def _start_auto_timer(self):
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._auto_backup_tick)
         self._auto_timer.start(5_000)  # check every 5s (supports seconds interval)
+
+        # Refresh "next backup in …" labels every 30 seconds
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.timeout.connect(self._refresh_countdown_labels)
+        self._countdown_timer.start(30_000)
+
+    def _refresh_countdown_labels(self):
+        """Refresh the 'Next backup in …' label on every watch card."""
+        if not BACKEND_AVAILABLE:
+            return
+        cfg = getattr(self, "cfg", None)
+        if not cfg:
+            return
+        for card in getattr(self, "_cards", {}).values():
+            try:
+                card.refresh_next_backup_lbl(cfg)
+            except Exception:
+                pass
 
     def _auto_backup_tick(self):
         if not BACKEND_AVAILABLE:
@@ -4125,6 +5367,37 @@ class MainWindow(QMainWindow):
 
         if not cfg.get("auto_backup", False):
             return
+
+        # ── Backup window end check — don't START new backups after stop time ──
+        _window_end = cfg.get("backup_window_end", "").strip()
+        if _window_end:
+            try:
+                _we_h, _we_m = int(_window_end[:2]), int(_window_end[3:5])
+                _now = datetime.now()
+                _window_end_secs = _we_h * 3600 + _we_m * 60
+                _now_secs = _now.hour * 3600 + _now.minute * 60 + _now.second
+                if _now_secs >= _window_end_secs:
+                    logger.debug(
+                        f"[window] Auto-backup suppressed: current time "
+                        f"{_now.strftime('%H:%M')} is past backup window end {_window_end}"
+                    )
+                    return
+            except Exception:
+                pass  # malformed stop time — ignore silently
+        # idle_threshold_cpu: 0 = disabled; e.g. 50 = only backup when CPU < 50%
+        _idle_threshold = cfg.get("idle_threshold_cpu", 0)
+        if _idle_threshold and _idle_threshold > 0:
+            try:
+                import psutil
+                _cpu = psutil.cpu_percent(interval=0)   # non-blocking sample
+                if _cpu > _idle_threshold:
+                    logger.debug(
+                        f"[idle] CPU at {_cpu:.0f}% > threshold {_idle_threshold}% "
+                        "— deferring auto-backup until system is idle"
+                    )
+                    return
+            except ImportError:
+                pass   # psutil not installed — skip idle check silently
 
         interval_val  = cfg.get("interval_min", 30)
         interval_unit = cfg.get("interval_unit", "minutes")
@@ -4169,6 +5442,8 @@ class MainWindow(QMainWindow):
                 continue
             if w["id"] in self._workers:
                 continue  # already running
+            if w["id"] in self._user_cancelled_watches:
+                continue  # user explicitly cancelled — don't auto-restart
 
             if _schedule_due:
                 self._backup_single(w, triggered_by="scheduled")
@@ -4201,11 +5476,81 @@ class MainWindow(QMainWindow):
         if wid in self._workers:
             return  # already running
 
+        # A new backup starting (manual or scheduled) clears any prior
+        # user-cancel so auto-backups resume normally after this run.
+        self._user_cancelled_watches.discard(wid)
+
+        # ── Per-watch storage quota check ─────────────────────────────────────
+        # max_backup_bytes: if > 0, refuse to start a new backup once that
+        # watch has already consumed more than N bytes of backup storage.
+        _max_bytes = watch.get("max_backup_bytes", 0)
+        if _max_bytes and _max_bytes > 0 and BACKEND_AVAILABLE:
+            try:
+                _used = backup_engine._backup_index.get_watch_disk_usage(
+                    self.cfg.get("destination", ""), wid
+                )
+                if _used >= _max_bytes:
+                    _used_h  = backup_engine._human_size(_used)
+                    _limit_h = backup_engine._human_size(_max_bytes)
+                    self._append_log(
+                        f"⚠ Skipped backup for '{watch.get('name', wid)}' — "
+                        f"storage quota exceeded ({_used_h} used of {_limit_h} limit). "
+                        "Delete old backups or raise the quota in Settings → Edit Watch."
+                    )
+                    if hasattr(self, "_tray"):
+                        self._tray.showMessage(
+                            APP_NAME,
+                            f"⚠ Quota exceeded for {watch.get('name',wid)}: "
+                            f"{_used_h} / {_limit_h}",
+                            QSystemTrayIcon.Warning, 6000,
+                        )
+                    return
+            except Exception:
+                pass  # quota check failure is non-fatal; proceed with backup
+
         worker = BackupWorker(watch, self.cfg, triggered_by=triggered_by)
-        worker.progress.connect(lambda c, t, f, _wid=wid: self._on_progress(_wid, c, t))
+        worker.progress.connect(lambda c, t, f, e, s, bd, tb, _wid=wid: self._on_progress(_wid, c, t, f, e, s, bd, tb))
         worker.finished.connect(lambda r, _wid=wid: self._on_backup_done(_wid, r))
         worker.log_message.connect(self._append_log)
         self._workers[wid] = worker
+
+        # ── Background size estimate (non-blocking, manual triggers only) ───
+        # Shows "Estimated: X files / Y MB" in the log before the backup starts.
+        # Skipped for scheduled/watcher triggers to avoid double scanning.
+        if triggered_by == "manual" and BACKEND_AVAILABLE:
+            def _run_estimate():
+                try:
+                    snapshot = (config_manager.load_snapshot(self.cfg, wid) or {}).get("files")
+                    est = backup_engine.estimate_backup_size(
+                        source            = watch["path"],
+                        exclude_patterns  = watch.get("exclude_patterns", []),
+                        previous_snapshot = snapshot,
+                        max_file_size_mb  = watch.get("max_file_size_mb", 0),
+                    )
+                    if est.get("error"):
+                        return
+                    mode  = "incremental" if est["incremental"] else "full"
+                    files = est["total_files"]
+                    size  = est["total_human"]
+                    parts = [f"~{files} file(s)  ·  ~{size}  ({mode})"]
+                    if est["incremental"]:
+                        parts.append(
+                            f"{est['new_files']} new  ·  {est['changed_files']} changed  ·  "
+                            f"{est['deleted_files']} deleted"
+                        )
+                    if est.get("skipped_files"):
+                        parts.append(f"{est['skipped_files']} skipped")
+                    from PyQt5.QtCore import QMetaObject, Q_ARG
+                    msg = "📊 Estimate:  " + "   |   ".join(parts)
+                    QMetaObject.invokeMethod(
+                        self, "_append_log",
+                        Qt.QueuedConnection,
+                        Q_ARG(str, msg),
+                    )
+                except Exception:
+                    pass  # size estimate failure is always non-fatal
+            import threading as _thr
+            _thr.Thread(target=_run_estimate, daemon=True).start()
 
         # ── Persist to queue so crash recovery works on next startup ────────
         if BACKEND_AVAILABLE:
@@ -4264,9 +5609,9 @@ class MainWindow(QMainWindow):
             if w.get("active", True) and not w.get("paused", False) and not w.get("skip_auto_backup", False):
                 self._backup_single(w)
 
-    def _on_progress(self, wid: str, copied: int, total: int):
+    def _on_progress(self, wid: str, current: int, total: int, fname: str = "", elapsed: float = 0.0, is_scanning: bool = False, bytes_done: int = 0, total_bytes: int = 0):
         if wid in self._cards:
-            self._cards[wid].set_progress(copied, total)
+            self._cards[wid].set_progress(current, total, fname, elapsed, is_scanning, bytes_done, total_bytes)
 
     def _on_backup_done(self, wid: str, result: dict):
         if wid in self._workers:
@@ -4287,7 +5632,7 @@ class MainWindow(QMainWindow):
         success = result.get("status") == "success"
 
         if wid in self._cards:
-            self._cards[wid].set_done(success)
+            self._cards[wid].set_done(success, result.get("duration_s", 0.0))
 
         # Reset change count for this watch
         if success:
@@ -4295,6 +5640,56 @@ class MainWindow(QMainWindow):
             self._pending_entries[wid] = []
             if self._watcher_mgr:
                 self._watcher_mgr.clear_pending(wid)
+
+            # ── Inject backup-diff changes into history ─────────────────
+            # Works for ALL source types (local, SMB, network) because it
+            # uses snapshot diffing, not live file system events.
+            diff_changes = result.get("changes", [])
+            if diff_changes:
+                watch_name = self._watch_name_for(wid)
+                ts_iso     = result.get("timestamp", datetime.now().isoformat())
+                # Use the source path of the first changed file for file-owner lookup.
+                # Falls back to machine/user via os.getlogin() if pywin32 isn't installed.
+                _watch_src  = result.get("source", "")
+                _first_path = diff_changes[0].get("path", "") if diff_changes else ""
+                _sample_fp  = str(Path(_watch_src) / _first_path) if _watch_src and _first_path else ""
+                editor      = _get_editor_info(_sample_fp)
+                for ch in diff_changes:
+                    hist_entry = {
+                        "type":           ch.get("type", "modified"),
+                        "path":           ch.get("path", ""),
+                        "timestamp":      ts_iso,
+                        "watch_name":     watch_name,
+                        "watch_id":       wid,
+                        "editor_user":    editor["user"],
+                        "editor_machine": editor["machine"],
+                        "editor_ip":      editor["ip"],
+                        "source":         "backup_diff",
+                    }
+                    self._history_log.append(hist_entry)
+                if len(self._history_log) > 5000:
+                    self._history_log = self._history_log[-2500:]
+                # Persist immediately after backup (don't wait for 25-entry threshold)
+                if BACKEND_AVAILABLE:
+                    try:
+                        config_manager.save_history(self._history_log)
+                    except Exception:
+                        pass
+                # Live-update history window if open
+                if self._history_window and self._history_window.isVisible():
+                    for ch in diff_changes:
+                        hist_entry = {
+                            "type":           ch.get("type", "modified"),
+                            "path":           ch.get("path", ""),
+                            "timestamp":      ts_iso,
+                            "watch_name":     watch_name,
+                            "watch_id":       wid,
+                            "editor_user":    editor["user"],
+                            "editor_machine": editor["machine"],
+                            "editor_ip":      editor["ip"],
+                            "source":         "backup_diff",
+                        }
+                        self._history_window.append_entry(hist_entry)
             # Clear needs_full_backup flag now that full backup is done
             if BACKEND_AVAILABLE:
                 try:
@@ -4322,6 +5717,7 @@ class MainWindow(QMainWindow):
         for w in self.cfg.get("watches", []):
             if w["id"] == wid and wid in self._cards:
                 self._cards[wid].update_watch(w)
+                self._cards[wid].refresh_next_backup_lbl(self.cfg)
 
         # Enforce per-watch max_backups limit
         if success and BACKEND_AVAILABLE:
@@ -4344,13 +5740,56 @@ class MainWindow(QMainWindow):
                     # Per-watch retention overrides global if set
                     retention = watch.get("retention_days", 0) or self.cfg.get("retention_days", 0)
                     if retention > 0:
-                        cleaned = backup_engine.cleanup_old_backups(dest, retention, wid)
-                        if cleaned.get("deleted", 0) > 0:
-                            self._append_log(
-                                f"🗑 Cleaned {cleaned['deleted']} backup(s) older than "
-                                f"{retention}d for {watch.get('name', wid)}, "
-                                f"freed {cleaned.get('freed_human', '0 B')}"
-                            )
+                        # For auto/scheduled backups run cleanup silently — showing a
+                        # confirmation dialog during an unattended run blocks the UI forever.
+                        # Only prompt the user for manual backups.
+                        _triggered_by = result.get("triggered_by", "manual")
+                        _is_unattended = _triggered_by in ("auto", "scheduled", "queue")
+                        preview = backup_engine.preview_cleanup(dest, retention, wid)
+                        to_delete = preview.get("to_delete", [])
+                        if to_delete:
+                            count     = len(to_delete)
+                            freed_str = preview.get("freed_human", "0 B")
+                            if _is_unattended:
+                                # Silent cleanup — no dialog
+                                cleaned = backup_engine.cleanup_old_backups(dest, retention, wid)
+                                if cleaned.get("deleted", 0) > 0:
+                                    self._append_log(
+                                        f"🗑 Cleaned {cleaned['deleted']} backup(s) older than "
+                                        f"{retention}d for {watch.get('name', wid)}, "
+                                        f"freed {cleaned.get('freed_human', '0 B')}"
+                                    )
+                            else:
+                                # Manual backup — ask user before deleting
+                                names = "\n".join(f"  • {n}" for n in to_delete[:10])
+                                if count > 10:
+                                    names += f"\n  … and {count - 10} more"
+                                msg = QMessageBox(self)
+                                msg.setWindowTitle("Retention Cleanup Confirmation")
+                                msg.setIcon(QMessageBox.Warning)
+                                msg.setText(
+                                    f"<b>Retention cleanup will permanently delete {count} backup(s) "
+                                    f"older than {retention} days for '{watch.get('name', wid)}'.</b><br><br>"
+                                    f"This will free <b>{freed_str}</b> and <b>cannot be undone</b>."
+                                )
+                                msg.setDetailedText(f"Folders to be deleted:\n{names}")
+                                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                                msg.setDefaultButton(QMessageBox.No)
+                                msg.button(QMessageBox.Yes).setText("Delete permanently")
+                                msg.button(QMessageBox.No).setText("Skip cleanup")
+                                if msg.exec_() == QMessageBox.Yes:
+                                    cleaned = backup_engine.cleanup_old_backups(dest, retention, wid)
+                                    if cleaned.get("deleted", 0) > 0:
+                                        self._append_log(
+                                            f"🗑 Cleaned {cleaned['deleted']} backup(s) older than "
+                                            f"{retention}d for {watch.get('name', wid)}, "
+                                            f"freed {cleaned.get('freed_human', '0 B')}"
+                                        )
+                                else:
+                                    self._append_log(
+                                        f"⏭ Retention cleanup skipped for {watch.get('name', wid)} "
+                                        f"({count} backup(s) kept)"
+                                    )
 
                 # ── Remote retention cleanup (SFTP/FTP/SMB/FTPS) ──────────
                 dest_type = self.cfg.get("dest_type", "local")
@@ -4385,9 +5824,20 @@ class MainWindow(QMainWindow):
 
         # Tray notification
         if hasattr(self, "_tray"):
-            msg = (f"✅ Backup complete: {result.get('files_copied',0)} file(s)"
-                   if success else f"⚠ Backup failed: {result.get('error','')}")
-            self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Information, 3000)
+            if success:
+                dur_str  = _fmt_duration(result.get("duration_s", 0.0))
+                dur_part = f"  ·  {dur_str}" if dur_str else ""
+                sz_part  = f"  ·  {result.get('total_size','')}" if result.get("total_size") else ""
+                msg = f"✅ Backup complete: {result.get('files_copied',0)} file(s){sz_part}{dur_part}"
+                _icon = QSystemTrayIcon.Information
+            elif result.get("status") == "cancelled":
+                msg   = f"⏹ Backup cancelled: {result.get('watch_name', self._watch_name_for(wid))}"
+                _icon = QSystemTrayIcon.Information
+            else:
+                err_detail = result.get("error", "unknown error")
+                msg   = f"❌ Backup FAILED: {self._watch_name_for(wid)} — {err_detail}"
+                _icon = QSystemTrayIcon.Warning
+            self._tray.showMessage(APP_NAME, msg, _icon, 5000 if not success else 3000)
 
     def _append_log(self, text: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -4405,10 +5855,105 @@ class MainWindow(QMainWindow):
 
     # ── Validate ───────────────────────────────────────────────────────────────
 
+    def _dry_run_watch(self, watch: dict):
+        """Preview what would be backed up without copying any files."""
+        if not BACKEND_AVAILABLE:
+            return
+        wid  = watch["id"]
+        dest = watch.get("destination", "").strip() or self.cfg.get("destination", "")
+        dest_type = self.cfg.get("dest_type", "local")
+
+        self._append_log(f"🔍 Dry run: scanning '{watch['name']}' …")
+
+        def _run():
+            try:
+                snapshot = config_manager.load_snapshot(wid, dest_type)
+                result   = backup_engine.run_backup(
+                    source            = watch["path"],
+                    destination       = dest,
+                    watch_id          = wid,
+                    watch_name        = watch["name"],
+                    storage_type      = dest_type,
+                    previous_snapshot = snapshot or None,
+                    incremental       = bool(snapshot),
+                    exclude_patterns  = watch.get("exclude_patterns", []),
+                    max_file_size_mb  = watch.get("max_file_size_mb", 0),
+                    dry_run           = True,
+                )
+                return result
+            except Exception as e:
+                return {"status": "failed", "error": str(e)}
+
+        import threading
+        def _thread():
+            result = _run()
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, lambda: _show(result))
+
+        def _show(result):
+            if result.get("status") == "failed":
+                self._append_log(f"❌ Dry run failed: {result.get('error')}")
+                return
+            changes  = result.get("changes", [])
+            added    = [c for c in changes if c["type"] == "added"]
+            modified = [c for c in changes if c["type"] == "modified"]
+            deleted  = [c for c in changes if c["type"] == "deleted"]
+            n_copy   = result.get("files_to_copy", len(added) + len(modified))
+            sz       = result.get("total_size", "0 B")
+            self._append_log(
+                f"🔍 Dry run '{watch['name']}': {n_copy} file(s) would be copied ({sz})  "
+                f"[+{len(added)} new  ~{len(modified)} modified  -{len(deleted)} deleted]"
+            )
+            # Show a quick summary dialog
+            lines = []
+            for c in sorted(changes, key=lambda x: x.get("path",""))[:50]:
+                sym  = {"added": "+", "modified": "~", "deleted": "-"}.get(c["type"], "?")
+                from backup_engine import _human_size
+                sz_s = _human_size(c.get("size", 0))
+                lines.append(f"{sym}  {c['path']:<60}  {sz_s}")
+            if len(changes) > 50:
+                lines.append(f"… and {len(changes) - 50} more file(s)")
+            body = "\n".join(lines) if lines else "No changes detected — backup is already up to date."
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle(f"Dry Run — {watch['name']}")
+            dlg.setIcon(QMessageBox.Information)
+            dlg.setText(
+                f"<b>{n_copy} file(s) would be copied ({sz})</b><br>"
+                f"+{len(added)} new &nbsp; ~{len(modified)} modified &nbsp; -{len(deleted)} deleted"
+            )
+            dlg.setDetailedText(body)
+            dlg.exec_()
+
+        threading.Thread(target=_thread, daemon=True).start()
+
     def _validate_watch(self, watch: dict):
         if not BACKEND_AVAILABLE:
             return
-        dest = self.cfg.get("destination", "")
+
+        # Sync mode: validate the destination folder directly.
+        if watch.get("sync_mode", False):
+            folder = self._watch_dest(watch)
+            if not folder:
+                QMessageBox.warning(self, "Validate", "No destination path configured.")
+                return
+            self._append_log(f"Validating sync destination: {watch['name']} …")
+            try:
+                result = backup_engine.validate_backup(folder)
+            except Exception as e:
+                QMessageBox.critical(self, "Validate Error", str(e))
+                return
+            if result.get("valid"):
+                QMessageBox.information(self, "Validate  · Passed",
+                    f"▶  Destination is valid\n\nWatch:  {watch['name']}\nFolder: {folder}")
+                self._append_log(f"▶ Validate passed: {watch['name']}")
+            else:
+                err = result.get("error", "Unknown error")
+                QMessageBox.critical(self, "Validate  · Failed",
+                    f"⚠  Validation failed\n\nWatch: {watch['name']}\nError: {err}")
+                self._append_log(f"⚠ Validate failed: {watch['name']}")
+            return
+
+        dest = self._watch_dest(watch)
         backups = backup_engine.list_backups(dest, watch["id"])
         if not backups:
             QMessageBox.warning(self, "Validate",
@@ -4461,7 +6006,81 @@ class MainWindow(QMainWindow):
     def _restore_watch(self, watch: dict):
         if not BACKEND_AVAILABLE:
             return
-        dest = self.cfg.get("destination", "")
+
+        # Sync mode: the destination IS the live copy — no restore needed.
+        if watch.get("sync_mode", False):
+            folder = self._watch_dest(watch)
+            QMessageBox.information(self, "Restore  · Sync Mode",
+                f"This watch uses sync mode.\n\n"
+                f"Your files are stored directly at:\n{folder}\n\n"
+                f"To recover a file, open that folder and copy it back manually.")
+            return
+
+        dest = self._watch_dest(watch)
+
+        temp_dir = None
+        dest_type = self.cfg.get("dest_type", "local")
+        if dest_type == "sftp":
+            import tempfile
+            temp_dir = tempfile.mkdtemp(prefix="backupsys_restore_")
+            sftp_cfg = self.cfg.get("dest_sftp", {})
+            from PyQt5.QtWidgets import QProgressDialog
+            from PyQt5.QtCore import Qt
+            progress = QProgressDialog("Downloading backup from SFTP...", "Cancel", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            try:
+                import paramiko
+                import stat
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(sftp_cfg["host"], port=sftp_cfg.get("port", 22), username=sftp_cfg["user"], password=credential_store.get_sftp_password(sftp_cfg))
+                sftp = ssh.open_sftp()
+                def download_dir(remote_path, local_path):
+                    os.makedirs(local_path, exist_ok=True)
+                    for item in sftp.listdir_attr(remote_path):
+                        remote_item = remote_path + "/" + item.filename
+                        local_item = os.path.join(local_path, item.filename)
+                        if stat.S_ISDIR(item.st_mode):
+                            download_dir(remote_item, local_item)
+                        else:
+                            sftp.get(remote_item, local_item)
+                download_dir(dest, temp_dir)
+                dest = temp_dir
+            except Exception as e:
+                QMessageBox.critical(self, "Download Failed", f"Failed to download from SFTP: {e}")
+                if temp_dir:
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                return
+            finally:
+                progress.close()
+        elif dest_type == "cloud":
+            import tempfile
+            temp_dir = tempfile.mkdtemp(prefix="backupsys_restore_")
+            # For cloud, the config is per-watch
+            w_cloud = watch.get("cloud_config") or {}
+            from PyQt5.QtWidgets import QProgressDialog
+            from PyQt5.QtCore import Qt
+            progress = QProgressDialog("Downloading backup from Google Drive...", "Cancel", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            try:
+                result = backup_engine.download_from_gdrive(w_cloud, temp_dir)
+                if not result.get("ok"):
+                    QMessageBox.critical(self, "Download Failed", f"Failed to download from Google Drive: {result['error']}")
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                    return
+                dest = temp_dir
+            except Exception as e:
+                QMessageBox.critical(self, "Download Failed", f"Failed to download from Google Drive: {e}")
+                import shutil
+                shutil.rmtree(temp_dir)
+                return
+            finally:
+                progress.close()
+
         backups = backup_engine.list_backups(dest, watch["id"])
         if not backups:
             QMessageBox.warning(self, "Restore",
@@ -4526,22 +6145,109 @@ class MainWindow(QMainWindow):
         if browse_reply == QMessageBox.Yes:
             try:
                 contents = backup_engine.browse_backup_contents(backup_dir)
-                files_txt = "\n".join(
-                    f"  + {f['path']}  ({f['size_human']})" for f in contents.get("files", [])[:30]
+                total    = contents.get("total", 0)
+
+                # ── Scrollable tree preview dialog ────────────────────────────
+                from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel, QDialogButtonBox
+                from PyQt5.QtCore import Qt
+
+                dlg = QDialog(self)
+                dlg.setWindowTitle(f"Backup Preview  ·  {chosen}")
+                dlg.setMinimumSize(680, 480)
+                dlg.resize(760, 540)
+
+                vlay = QVBoxLayout(dlg)
+                vlay.addWidget(QLabel(f"<b>{total} file(s)</b> in this snapshot — scroll to see all:"))
+
+                tree = QTreeWidget()
+                tree.setHeaderLabels(["Path", "Size", "Status"])
+                tree.setColumnWidth(0, 420)
+                tree.setColumnWidth(1, 90)
+                tree.setColumnWidth(2, 80)
+                tree.setSortingEnabled(True)
+                tree.setRootIsDecorated(False)
+                tree.setAlternatingRowColors(True)
+
+                for f in contents.get("files", []):
+                    item = QTreeWidgetItem([
+                        f.get("path", ""),
+                        f.get("size_human", ""),
+                        "added/modified"
+                    ])
+                    tree.addTopLevelItem(item)
+
+                for p in contents.get("deleted", []):
+                    item = QTreeWidgetItem([p, "", "deleted"])
+                    item.setForeground(0, tree.palette().highlight())
+                    tree.addTopLevelItem(item)
+
+                vlay.addWidget(tree)
+
+                # ── Single-file restore button ─────────────────────────────
+                sfr_note = QLabel(
+                    "💡 Select a file above then click <b>Restore Selected File</b> "
+                    "to restore just that one file."
                 )
-                deleted_txt = ""
-                if contents.get("deleted"):
-                    deleted_txt = "\n\nDeleted markers:\n" + "\n".join(
-                        f"  - {p}" for p in contents["deleted"][:10]
+                sfr_note.setWordWrap(True)
+                sfr_note.setStyleSheet("color:#9ca3af; font-size:11px; padding:4px 0;")
+                vlay.addWidget(sfr_note)
+
+                sfr_btn_row = QHBoxLayout()
+                sfr_btn = QPushButton("📄 Restore Selected File…")
+                sfr_btn.setObjectName("secondary")
+                sfr_btn.setToolTip("Restore only the selected file from this backup snapshot.")
+
+                def _do_single_file_restore():
+                    sel = tree.selectedItems()
+                    if not sel:
+                        QMessageBox.information(dlg, "No Selection",
+                            "Please select a file in the list first.")
+                        return
+                    rel_path = sel[0].text(0)
+                    if not rel_path or sel[0].text(2) == "deleted":
+                        QMessageBox.warning(dlg, "Invalid Selection",
+                            "The selected entry is a deleted file and cannot be restored.")
+                        return
+                    dest_dir = QFileDialog.getExistingDirectory(
+                        dlg, f"Choose folder to restore  '{rel_path}'  into"
                     )
-                total = contents.get("total", 0)
-                overflow = f"\n  … and {total - 30} more" if total > 30 else ""
-                QMessageBox.information(
-                    self, f"Backup Contents  · {chosen}",
-                    f"Files in this snapshot ({total} total):\n\n{files_txt}{overflow}{deleted_txt}"
-                )
+                    if not dest_dir:
+                        return
+                    _enc_key = watch.get("encrypt_key") or None
+                    res = backup_engine.restore_single_file(
+                        backup_dir  = backup_dir,
+                        relative_path = rel_path,
+                        target_path = dest_dir,
+                        encrypt_key = _enc_key,
+                        overwrite   = True,
+                    )
+                    if res.get("ok"):
+                        QMessageBox.information(
+                            dlg, "File Restored",
+                            f"✔  Restored successfully\n\n"
+                            f"File: {rel_path}\n"
+                            f"Destination: {res['restored_to']}\n"
+                            f"Size: {backup_engine._human_size(res['size_bytes'])}"
+                        )
+                    else:
+                        QMessageBox.critical(
+                            dlg, "Restore Failed",
+                            f"Could not restore file:\n{res.get('error', 'Unknown error')}"
+                        )
+
+                sfr_btn.clicked.connect(_do_single_file_restore)
+                sfr_btn_row.addWidget(sfr_btn)
+                sfr_btn_row.addStretch()
+                vlay.addLayout(sfr_btn_row)
+
+                btns = QDialogButtonBox(QDialogButtonBox.Ok)
+                btns.accepted.connect(dlg.accept)
+                vlay.addWidget(btns)
+                dlg.exec_()
+
             except Exception as e:
                 QMessageBox.warning(self, "Preview Error", str(e))
+
 
         # Ask for target folder
         target = QFileDialog.getExistingDirectory(
@@ -4564,44 +6270,65 @@ class MainWindow(QMainWindow):
 
         self._append_log(f"Restoring backup: {watch['name']} >{target} ({mode_label}) …")
 
-        try:
-            if use_chain:
-                result = backup_engine.restore_full_chain(
-                    destination=dest,
-                    watch_id=watch["id"],
-                    target_path=target,
-                    up_to_backup_id=chosen_id,
-                    encrypt_key=watch.get("encrypt_key") or None,
-                )
-                steps = result.get("steps_applied", 0)
-            else:
-                result = backup_engine.restore_backup(
-                    backup_dir, target,
-                    encrypt_key=watch.get("encrypt_key") or None,
-                )
-                steps = None
-        except Exception as e:
-            QMessageBox.critical(self, "Restore Error", str(e))
-            return
+        # Disable restore button while running to prevent double-trigger
+        if watch["id"] in self._cards:
+            self._cards[watch["id"]].restore_btn.setEnabled(False)
 
-        if result.get("ok"):
-            extra = f"\nChain steps applied:  {steps}" if steps is not None else ""
-            QMessageBox.information(self, "Restore Complete",
-                f"▶  Restore complete\n\n"
-                f"Files restored:  {result.get('files_restored', 0)}\n"
-                f"Files skipped:   {result.get('skipped', 0)}\n"
-                f"Destination:     {target}{extra}"
+        def _on_restore_progress(step, total, label):
+            self._append_log(f"  ↳ Step {step}/{total}: {label}")
+
+        def _on_restore_done(result):
+            # Re-enable restore button
+            if watch["id"] in self._cards:
+                self._cards[watch["id"]].restore_btn.setEnabled(True)
+            if result.get("ok"):
+                steps = result.get("steps_applied")
+                extra = f"\nChain steps applied:  {steps}" if steps is not None else ""
+                QMessageBox.information(self, "Restore Complete",
+                    f"▶  Restore complete\n\n"
+                    f"Files restored:  {result.get('files_restored', 0)}\n"
+                    f"Files skipped:   {result.get('skipped', 0)}\n"
+                    f"Destination:     {target}{extra}"
+                )
+                self._append_log(
+                    f"▶ Restore complete: {watch['name']}  · "
+                    f"{result.get('files_restored', 0)} file(s) >{target}"
+                )
+            else:
+                errors = result.get("errors", [])
+                err_preview = "\n".join(errors[:5]) if errors else result.get("error", "Unknown error")
+                QMessageBox.critical(self, "Restore Failed",
+                    f"⚠  Restore failed\n\n{err_preview}")
+                self._append_log(f"⚠ Restore failed: {watch['name']}")
+            # Clean up temp dir
+            if temp_dir:
+                import shutil
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception:
+                    pass
+
+        if use_chain:
+            kwargs = dict(
+                destination=dest,
+                watch_id=watch["id"],
+                target_path=target,
+                up_to_backup_id=chosen_id,
+                encrypt_key=watch.get("encrypt_key") or None,
             )
-            self._append_log(
-                f"▶ Restore complete: {watch['name']}  · "
-                f"{result.get('files_restored', 0)} file(s) >{target}"
-            )
+            worker = RestoreWorker("chain", kwargs, parent=self)
         else:
-            errors = result.get("errors", [])
-            err_preview = "\n".join(errors[:5]) if errors else result.get("error", "Unknown error")
-            QMessageBox.critical(self, "Restore Failed",
-                f"⚠  Restore failed\n\n{err_preview}")
-            self._append_log(f"⚠ Restore failed: {watch['name']}")
+            kwargs = dict(
+                backup_dir=backup_dir,
+                target_path=target,
+                encrypt_key=watch.get("encrypt_key") or None,
+            )
+            worker = RestoreWorker("single", kwargs, parent=self)
+
+        worker.progress.connect(_on_restore_progress)
+        worker.finished.connect(_on_restore_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     # ── Admin ──────────────────────────────────────────────────────────────────
 
@@ -4650,6 +6377,10 @@ class MainWindow(QMainWindow):
 
     def _open_admin(self):
         if not PasswordDialog.has_password():
+            if not BACKUPSYS_API_URL:
+                QMessageBox.warning(self, "Admin Access", 
+                    "OTP login requires the API to be deployed and configured in .env (BACKUPSYS_API_URL).")
+                return
             # First time  · prompt to set password
             reply = QMessageBox.question(self, "Set Admin Password",
                 "No admin password is set. Would you like to set one now?\n"
@@ -4680,15 +6411,44 @@ class MainWindow(QMainWindow):
         if worker:
             worker.request_stop()
             self._append_log(f"⏹ Cancel requested for: {self._watch_name_for(watch_id)}")
+        # Remember this was a deliberate user cancel so the auto-timer does
+        # not immediately re-trigger a new backup for the same watch.
+        self._user_cancelled_watches.add(watch_id)
         if watch_id in self._cards:
             self._cards[watch_id].cancel_btn.setEnabled(False)
             self._cards[watch_id].cancel_btn.setText("Cancelling…")
 
     def _on_open_backup_folder(self, watch_id: str):
-        """Open the latest backup directory for a watch in the system file explorer."""
+        """Open the backup directory for a watch in the system file explorer.
+        For sync-mode watches, opens the destination folder directly (it IS the backup).
+        For versioned watches, opens the most recent timestamped backup subfolder.
+        """
         if not BACKEND_AVAILABLE:
             return
-        dest = self.cfg.get("destination", "")
+
+        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == watch_id), None)
+
+        # Sync mode: destination folder IS the backup — open it directly.
+        if watch and watch.get("sync_mode", False):
+            folder = self._watch_dest(watch)
+            if not folder:
+                QMessageBox.information(self, "No Destination",
+                    "No destination path is configured for this watch.")
+                return
+            try:
+                import subprocess as _sp
+                if os.name == "nt":
+                    _sp.Popen(["explorer", folder])
+                elif sys.platform == "darwin":
+                    _sp.Popen(["open", folder])
+                else:
+                    _sp.Popen(["xdg-open", folder])
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not open folder:\\n{e}")
+            return
+
+        # Versioned mode: find the latest timestamped backup subfolder.
+        dest = self._watch_dest(watch) if watch else self.cfg.get("destination", "")
         backups = backup_engine.list_backups(dest, watch_id)
         if not backups:
             QMessageBox.information(self, "No Backups",
@@ -4745,6 +6505,47 @@ class MainWindow(QMainWindow):
         self._history_window.raise_()
 
     # ── Window behavior ────────────────────────────────────────────────────────
+
+    # ── Integrity Scheduler Handlers ───────────────────────────────────────────
+
+    def _on_integrity_result(self, watch_name: str, result: dict):
+        """Called once per watch after its scheduled integrity check completes."""
+        ok = result.get("valid") and result.get("manifest_ok", True)
+        if ok:
+            self._append_log(f"✔ Integrity OK: {watch_name}")
+        else:
+            missing   = result.get("missing_files", [])
+            corrupted = result.get("corrupted_files", [])
+            err       = result.get("error", "")
+            detail    = ""
+            if missing:
+                detail += f"  Missing: {', '.join(missing[:3])}"
+                if len(missing) > 3:
+                    detail += f" (+{len(missing)-3} more)"
+            if corrupted:
+                detail += f"  Corrupted: {', '.join(corrupted[:3])}"
+                if len(corrupted) > 3:
+                    detail += f" (+{len(corrupted)-3} more)"
+            if err:
+                detail += f"  Error: {err}"
+            self._append_log(f"⚠ Integrity FAILED: {watch_name}{detail}")
+            if hasattr(self, "_tray"):
+                self._tray.showMessage(
+                    APP_NAME,
+                    f"⚠ Integrity check failed for {watch_name}. Check Activity Log.",
+                    QSystemTrayIcon.Warning, 5000
+                )
+
+    def _on_integrity_run_finished(self, summary: dict):
+        """Called after all watches have been integrity-checked in one scheduler run."""
+        total  = summary.get("total", 0)
+        passed = summary.get("passed", 0)
+        failed = summary.get("failed", 0)
+        if total > 0:
+            self._append_log(
+                f"✔ Integrity check complete: {passed}/{total} passed"
+                + (f", {failed} failed" if failed else "")
+            )
 
     def closeEvent(self, event):
         """Minimize to tray instead of closing."""
@@ -5147,6 +6948,51 @@ def _acquire_single_instance_lock():
 
 
 def main():
+    # ── Global crash handler — catches unhandled exceptions in the Qt main thread ──
+    # Without this, crashes in the .exe produce no output (stdout is hidden).
+    def _excepthook(exc_type, exc_value, exc_tb):
+        import traceback
+        tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        logger.critical(f"Unhandled exception:\n{tb_str}")
+
+        # ── Crash notification — attempt email + webhook ───────────────────
+        try:
+            _crash_cfg = config_manager.load()
+            _crash_subject = f"{APP_NAME} crashed: {exc_type.__name__}"
+            _crash_body    = (
+                f"{APP_NAME} v{APP_VERSION} encountered an unhandled error and stopped.\n\n"
+                f"Error: {exc_type.__name__}: {exc_value}\n\n"
+                f"Traceback:\n{tb_str}"
+            )
+            _email_cfg = _crash_cfg.get("email_config", {})
+            if _email_cfg.get("enabled") and _email_cfg.get("notify_on_failure", True):
+                _send_email_notification(_crash_cfg, _crash_subject, _crash_body)
+
+            _wh_url = _crash_cfg.get("webhook_url", "").strip()
+            if _wh_url:
+                _send_webhook(_crash_cfg, {
+                    "status":     "crashed",
+                    "watch_name": APP_NAME,
+                    "error":      f"{exc_type.__name__}: {exc_value}",
+                    "traceback":  tb_str[:2000],
+                })
+        except Exception as _ne:
+            logger.debug(f"Crash notification failed: {_ne}")
+
+        try:
+            _tmp_app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(
+                None,
+                f"{APP_NAME} — Unexpected Error",
+                f"An unexpected error occurred. Please check the log file for details.\n\n"
+                f"{exc_type.__name__}: {exc_value}\n\n"
+                f"Log: {_setup_logging()}"
+            )
+        except Exception:
+            pass  # if the dialog itself fails, at least the log was written
+        sys.exit(1)
+    sys.excepthook = _excepthook
+
     # Single-instance guard
     _lock_fh = _acquire_single_instance_lock()
     if _lock_fh is None:
@@ -5161,8 +7007,14 @@ def main():
     app.setOrganizationName(SETTINGS_ORG)
     app.setQuitOnLastWindowClosed(False)   # keep alive when window is closed
 
-    # Apply stylesheet
-    app.setStyleSheet(DARK_STYLE)
+    # ── Theme selection ───────────────────────────────────────────────────────
+    # Honour an explicit user override saved in QSettings; otherwise follow OS.
+    _s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    _theme_override = _s.value("theme", "")          # "dark", "light", or "" (auto)
+    _active_theme   = _theme_override or _detect_os_theme()
+    app.setStyleSheet(LIGHT_STYLE if _active_theme == "light" else DARK_STYLE)
+    # Store the resolved theme so widgets can query it at runtime
+    app.setProperty("theme", _active_theme)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         QMessageBox.critical(None, APP_NAME,

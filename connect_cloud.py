@@ -2,7 +2,7 @@
 connect_cloud.py — Each USER runs this on their own PC
 ========================================================
 This is what your end users run (or the desktop app triggers
-automatically) to connect their own Dropbox or Google Drive.
+automatically) to connect their own Google Drive.
 
 Each user authenticates with THEIR OWN account.
 Their tokens are saved only on THEIR PC — nobody else sees them.
@@ -11,7 +11,7 @@ HOW TO RUN:
     python connect_cloud.py
 
 No setup needed — just run it and follow the browser prompts.
-The desktop app can also call connect_dropbox() / connect_gdrive()
+The desktop app can also call connect_gdrive()
 directly when the user clicks the "Connect" button.
 """
 
@@ -36,7 +36,7 @@ def ask(t):    return input(f"\n  >> {t}: ").strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load app credentials (set by developer via setup_cloud_dev.py)
+# Load app credentials (set by developer in .env file)
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_env():
     """Load .env into os.environ if not already there."""
@@ -72,7 +72,6 @@ def _save_user_tokens(tokens: dict):
     existing = _load_user_tokens()
     existing.update(tokens)
     USER_TOKENS_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    # Make sure .gitignore excludes this file
     _ensure_gitignore(".user_cloud_tokens.json")
 
 def _ensure_gitignore(entry: str):
@@ -81,123 +80,6 @@ def _ensure_gitignore(entry: str):
         content = gi.read_text(encoding="utf-8")
         if entry not in content:
             gi.write_text(content.rstrip() + f"\n{entry}\n", encoding="utf-8")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DROPBOX — user login
-# ─────────────────────────────────────────────────────────────────────────────
-def connect_dropbox() -> dict:
-    """
-    Runs the Dropbox OAuth flow for the current user.
-    Returns token dict on success, empty dict on failure.
-    Can be called from desktop_app.py when user clicks 'Connect Dropbox'.
-    """
-    header("Connect your Dropbox account")
-
-    app_key    = os.environ.get("DROPBOX_APP_KEY", "").strip()
-    app_secret = os.environ.get("DROPBOX_APP_SECRET", "").strip()
-
-    if not app_key or not app_secret:
-        fail("App credentials not found.")
-        fail("The developer must run setup_cloud_dev.py first to register the app.")
-        return {}
-
-    info("You will be redirected to Dropbox to log in with YOUR account.")
-    info("BackupSys will only access your backup folder — nothing else.")
-
-    auth_url = (
-        "https://www.dropbox.com/oauth2/authorize"
-        f"?client_id={app_key}"
-        "&response_type=code"
-        "&token_access_type=offline"
-    )
-
-    print(f"\n  Opening: {auth_url}\n")
-    try:
-        webbrowser.open(auth_url)
-    except Exception:
-        info("Could not open browser automatically. Please open the URL above manually.")
-
-    auth_code = ask("After logging in, paste the code Dropbox gives you")
-    if not auth_code:
-        fail("No code entered. Dropbox connection cancelled."); return {}
-
-    # Exchange code for tokens
-    info("Connecting to Dropbox...")
-    try:
-        data = urllib.parse.urlencode({
-            "code":          auth_code,
-            "grant_type":    "authorization_code",
-            "client_id":     app_key,
-            "client_secret": app_secret,
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.dropboxapi.com/oauth2/token",
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            tokens = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        fail(f"Dropbox error: HTTP {e.code} — {e.read().decode()}"); return {}
-    except Exception as e:
-        fail(f"Connection failed: {e}"); return {}
-
-    access_token  = tokens.get("access_token", "")
-    refresh_token = tokens.get("refresh_token", "")
-
-    if not access_token or not refresh_token:
-        fail("Dropbox did not return tokens. Try again."); return {}
-
-    # Verify + get account info
-    try:
-        import dropbox as dbx_mod
-        dbx = dbx_mod.Dropbox(
-            oauth2_access_token=access_token,
-            oauth2_refresh_token=refresh_token,
-            app_key=app_key,
-            app_secret=app_secret,
-        )
-        account = dbx.users_get_current_account()
-        display_name = account.name.display_name
-        email        = account.email
-
-        # Quick upload test
-        dbx.files_upload(b"backupsys_ok", "/backupsys_connection_test.txt",
-                         mode=dbx_mod.files.WriteMode.overwrite)
-        dbx.files_delete_v2("/backupsys_connection_test.txt")
-        ok(f"Connected as: {display_name} ({email})")
-        ok("Upload test passed")
-
-    except Exception as e:
-        fail(f"Verification failed: {e}"); return {}
-
-    # Save to user's local token store
-    user_tokens = {
-        "dropbox": {
-            "access_token":  access_token,
-            "refresh_token": refresh_token,
-            "app_key":       app_key,
-            "app_secret":    app_secret,
-            "email":         email,
-            "display_name":  display_name,
-            "connected_at":  datetime.now().isoformat(),
-        }
-    }
-    _save_user_tokens(user_tokens)
-    ok(f"Tokens saved to: {USER_TOKENS_PATH.name}")
-
-    # Also update config.json cloud_config for all watches set to dropbox
-    _update_config_cloud("dropbox", {
-        "provider":      "dropbox",
-        "app_key":       app_key,
-        "app_secret":    app_secret,
-        "access_token":  access_token,
-        "refresh_token": refresh_token,
-        "remote_path":   "/backupsys",
-    })
-
-    return user_tokens["dropbox"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,7 +100,7 @@ def connect_gdrive() -> dict:
     if not client_id or not client_secret:
         if not creds_file.exists():
             fail("Google Drive app credentials not found.")
-            fail("The developer must run setup_cloud_dev.py first.")
+            fail("Set GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET in your .env file. Get them from https://console.cloud.google.com/apis/credentials — create an OAuth 2.0 Client ID for a Desktop app.")
             return {}
 
     info("You will be redirected to Google to log in with YOUR Gmail account.")
@@ -242,11 +124,11 @@ def connect_gdrive() -> dict:
             # Reconstruct from env vars if credentials.json was not bundled
             client_config = {
                 "installed": {
-                    "client_id":                  client_id,
-                    "client_secret":              client_secret,
-                    "auth_uri":                   "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri":                  "https://oauth2.googleapis.com/token",
-                    "redirect_uris":              ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"],
+                    "client_id":      client_id,
+                    "client_secret":  client_secret,
+                    "auth_uri":       "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri":      "https://oauth2.googleapis.com/token",
+                    "redirect_uris":  ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"],
                 }
             }
             flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
@@ -264,12 +146,10 @@ def connect_gdrive() -> dict:
     try:
         service = build("drive", "v3", credentials=creds)
 
-        # Get user info
         about   = service.about().get(fields="user").execute()
         email   = about["user"]["emailAddress"]
         name    = about["user"]["displayName"]
 
-        # Quick upload test using drive.file scope
         from googleapiclient.http import MediaInMemoryUpload
         media  = MediaInMemoryUpload(b"backupsys_ok", mimetype="text/plain")
         f      = service.files().create(
@@ -299,14 +179,55 @@ def connect_gdrive() -> dict:
     _save_user_tokens(user_tokens)
     ok(f"Tokens saved to: {USER_TOKENS_PATH.name}")
 
+    # ── Folder picker — let the user choose which Drive folder to use ─────────
+    chosen_folder_id   = ""
+    chosen_folder_name = "My Drive (root)"
+    try:
+        info("Listing your Google Drive folders…")
+        folders_result = service.files().list(
+            q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+            fields="files(id, name)",
+            orderBy="name",
+            pageSize=50,
+        ).execute()
+        folders = folders_result.get("files", [])
+
+        if folders:
+            print("\n  Available Google Drive folders:")
+            print("     0)  My Drive (root)")
+            for i, folder in enumerate(folders, start=1):
+                print(f"    {i:>2})  {folder['name']}")
+            print()
+            choice_str = ask(f"Enter folder number (0–{len(folders)}) or press Enter for root")
+            if choice_str.isdigit():
+                choice = int(choice_str)
+                if 1 <= choice <= len(folders):
+                    chosen_folder_id   = folders[choice - 1]["id"]
+                    chosen_folder_name = folders[choice - 1]["name"]
+                    ok(f"Backup folder set to: {chosen_folder_name}")
+                else:
+                    ok("Using My Drive root.")
+            else:
+                ok("Using My Drive root.")
+        else:
+            info("No folders found — uploads will go to My Drive root.")
+    except Exception as _fp_err:
+        info(f"Could not list Drive folders (non-fatal): {_fp_err}")
+        info("Uploads will go to root. You can change this in Settings → Cloud.")
+
     _update_config_cloud("gdrive", {
         "provider":      "gdrive",
         "client_id":     user_tokens["gdrive"]["client_id"],
         "client_secret": user_tokens["gdrive"]["client_secret"],
         "access_token":  creds.token,
         "refresh_token": creds.refresh_token,
-        "folder_id":     "",
+        "folder_id":     chosen_folder_id,
+        "folder_name":   chosen_folder_name,
     })
+    if chosen_folder_id:
+        ok(f"Backups will upload to Drive folder: {chosen_folder_name}")
+    else:
+        ok("Backups will upload to My Drive root.")
 
     return user_tokens["gdrive"]
 
@@ -340,13 +261,10 @@ def disconnect(provider: str):
     del tokens[provider]
     USER_TOKENS_PATH.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
 
-    # Also clear from config.json
     _update_config_cloud(provider, {})
     ok(f"{provider.capitalize()} disconnected from this PC.")
-    info(f"To fully revoke access, also visit:")
-    if provider == "dropbox":
-        info("  https://www.dropbox.com/account/connected_apps")
-    elif provider == "gdrive":
+    if provider == "gdrive":
+        info("To fully revoke access, also visit:")
         info("  https://myaccount.google.com/permissions")
 
 
@@ -364,7 +282,6 @@ def _update_config_cloud(provider: str, cloud_cfg: dict):
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
 
-        # Update watches already using this provider
         for w in cfg.get("watches", []):
             existing = w.get("cloud_config", {})
             if existing.get("provider") == provider or not existing:
@@ -372,7 +289,6 @@ def _update_config_cloud(provider: str, cloud_cfg: dict):
                 if cloud_cfg:
                     w["type"] = "cloud"
 
-        # Save a top-level default for new watches
         cfg[f"_cloud_default_{provider}"] = cloud_cfg
 
         import tempfile, os as _os
@@ -388,29 +304,14 @@ def _update_config_cloud(provider: str, cloud_cfg: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+# NOTE: Connect / disconnect Google Drive through the desktop app UI
+# (Settings → Cloud → Connect Google Drive).  This file is used as a
+# module only — running it directly is not needed in normal operation.
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"\n{SEP}")
-    print("  BackupSys — Connect Your Cloud Account")
+    print("  BackupSys — connect_cloud.py (developer / debug use only)")
+    print("  For normal use, connect Google Drive via the desktop app UI.")
     print(f"  This PC: {HERE}")
-    print(f"{SEP}")
-
+    print(f"{SEP}\n")
     check_connections()
-
-    do_dropbox = input("\n  Connect Dropbox?      [y/N] ").strip().lower() == "y"
-    do_gdrive  = input("  Connect Google Drive? [y/N] ").strip().lower() == "y"
-    disconnect_something = input("  Disconnect a provider? [y/N] ").strip().lower() == "y"
-
-    if do_dropbox:
-        connect_dropbox()
-
-    if do_gdrive:
-        connect_gdrive()
-
-    if disconnect_something:
-        provider = input("\n  Which provider to disconnect? (dropbox/gdrive): ").strip().lower()
-        if provider in ("dropbox", "gdrive"):
-            disconnect(provider)
-
-    header("Done")
-    check_connections()
-    print()
