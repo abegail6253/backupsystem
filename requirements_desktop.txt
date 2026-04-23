@@ -18,22 +18,39 @@ paramiko>=3.0.0
 # smbprotocol ships both smbprotocol.* (low-level) and smbclient.* (high-level)
 # -- both are used by transport_utils.py and desktop_app.py.
 # On Windows the app uses built-in UNC paths as the primary method;
-# smbprotocol is the fallback for Linux/macOS.
-# Uncomment the line below if you are on Linux/macOS:
-# smbprotocol>=1.0.0
+# smbprotocol is the cross-platform fallback and is always installed.
+smbprotocol>=1.0.0
 
-# --- Windows extras (optional but recommended on Windows) --------------------
-# Enables accurate "edited by" file-owner tracking in the change log.
-# Install on Windows with: pip install pywin32>=306
-# pywin32>=306
+# --- WebDAV / Nextcloud / ownCloud destination support -----------------------
+# Required for WebDAV destinations (Nextcloud, ownCloud, OneDrive via WebDAV).
+# The built-in urllib fallback is insufficient for edge cases.
+webdavclient3>=3.14.6
 
-# --- Cloud backup - Dropbox (optional) ---------------------------------------
-# dropbox>=11.0.0
+# --- Secure credential storage (recommended) ---------------------------------
+# Stores SFTP / FTP / SMB / SMTP passwords in the OS keyring instead of
+# plaintext in config.json.  Falls back gracefully if not installed.
+#   Windows  : Windows Credential Manager
+#   macOS    : macOS Keychain
+#   Linux    : SecretService (GNOME Keyring / KWallet)
+keyring>=24.0.0
+
+# --- Windows extras (strongly recommended on Windows) ------------------------
+# pywin32 enables two important features on Windows:
+#   1. Accurate "edited by" file-owner tracking in the change log
+#   2. VSS (Volume Shadow Copy) integration for backing up locked/open files
+#      (Outlook .pst, browser databases, running app databases, etc.)
+# The sys_platform marker means pip skips this automatically on Linux/macOS —
+# no need to comment/uncomment anything.
+pywin32>=306; sys_platform == "win32"
 
 # --- Cloud backup - Google Drive (optional) ----------------------------------
-# google-auth>=2.0.0
-# google-auth-oauthlib>=1.0.0
-# google-api-python-client>=2.0.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.0.0
 
 # --- Packaging to .exe (install separately, not needed at runtime) -----------
 # pyinstaller>=6.0.0
+
+# --- Development / testing (not needed at runtime) ---------------------------
+# pytest>=8.0.0
+# pytest-cov>=5.0.0
