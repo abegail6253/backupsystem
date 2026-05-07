@@ -795,6 +795,7 @@ def update_watch_meta(
     source_type:       Optional[str]  = None,   # ← "local" | "sftp" | "ftp"
     source_sftp_cfg:   Optional[dict] = None,   # ← SFTP source credentials
     source_ftp_cfg:    Optional[dict] = None,   # ← FTP source credentials
+    max_file_size_mb:  Optional[int]  = None,   # ← max individual file size filter (0 = unlimited)
 ):
     """Update watch metadata and optionally reset snapshot for full re-backup."""
     for w in cfg["watches"]:
@@ -827,6 +828,7 @@ def update_watch_meta(
             if source_type     is not None: w["source_type"]     = source_type.strip()
             if source_sftp_cfg is not None: w["source_sftp_cfg"] = dict(source_sftp_cfg)
             if source_ftp_cfg  is not None: w["source_ftp_cfg"]  = dict(source_ftp_cfg)
+            if max_file_size_mb is not None: w["max_file_size_mb"] = max(0, int(max_file_size_mb))
             if reset_snapshot   is not None and reset_snapshot:
                 w["last_snapshot"] = None
     save(cfg)
