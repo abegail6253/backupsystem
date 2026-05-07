@@ -1593,24 +1593,36 @@ def run_backup(
     # VSS, incremental logic) to work without any changes.
     _remote_source_temp: Optional[str] = None
     if source_type in ("sftp", "ftp", "ftps", "smb", "webdav"):
-        logger.info(f"[remote-src] Downloading {source_type.upper()} source: {source}")
-        _dl = _download_remote_source(
-            source_type=source_type,
-            remote_path=source,
-            sftp_cfg=source_sftp_cfg,
-            ftp_cfg=source_ftp_cfg,
-            smb_cfg=source_smb_cfg,
-            webdav_cfg=source_webdav_cfg,
-            progress_cb=scan_cb,
+        # ── SMB shortcut: if the UNC path is already accessible via Windows
+        # session (authenticated via Explorer/net use), treat as a plain local
+        # path — no download step needed. Much faster for LAN-to-LAN backups.
+        _smb_direct = (
+            source_type == "smb"
+            and os.name == "nt"
+            and (source.startswith("\\\\") or source.startswith("//"))
+            and Path(source).exists()
         )
-        if not _dl["ok"]:
-            result["error"] = f"Failed to download {source_type.upper()} source: {_dl['error']}"
-            return result
-        _remote_source_temp = _dl["temp_dir"]
-        logger.info(f"[remote-src] Downloaded {_dl['downloaded']} file(s) to {_remote_source_temp}")
-        # Override local source path for the rest of run_backup
-        source   = _remote_source_temp
-        src_path = Path(source)
+        if _smb_direct:
+            logger.info(f"[smb] UNC path directly accessible, skipping download: {source}")
+            src_path = Path(source)
+        else:
+            logger.info(f"[remote-src] Downloading {source_type.upper()} source: {source}")
+            _dl = _download_remote_source(
+                source_type=source_type,
+                remote_path=source,
+                sftp_cfg=source_sftp_cfg,
+                ftp_cfg=source_ftp_cfg,
+                smb_cfg=source_smb_cfg,
+                webdav_cfg=source_webdav_cfg,
+                progress_cb=scan_cb,
+            )
+            if not _dl["ok"]:
+                result["error"] = f"Failed to download {source_type.upper()} source: {_dl['error']}"
+                return result
+            _remote_source_temp = _dl["temp_dir"]
+            logger.info(f"[remote-src] Downloaded {_dl['downloaded']} file(s) to {_remote_source_temp}")
+            source   = _remote_source_temp
+            src_path = Path(source)
 
     # ── Pre-backup hook ────────────────────────────────────────────────────────
     if pre_backup_cmd:
