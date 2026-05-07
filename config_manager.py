@@ -796,6 +796,10 @@ def update_watch_meta(
     source_sftp_cfg:   Optional[dict] = None,   # ← SFTP source credentials
     source_ftp_cfg:    Optional[dict] = None,   # ← FTP source credentials
     max_file_size_mb:  Optional[int]  = None,   # ← max individual file size filter (0 = unlimited)
+    max_backup_bytes:  Optional[int]  = None,   # ← max total backup size in bytes (0 = unlimited)
+    pre_backup_cmd:    Optional[str]  = None,   # ← shell command to run before backup
+    post_backup_cmd:   Optional[str]  = None,   # ← shell command to run after backup
+    webdav_cfg:        Optional[dict] = None,   # ← WebDAV source credentials
 ):
     """Update watch metadata and optionally reset snapshot for full re-backup."""
     for w in cfg["watches"]:
@@ -828,7 +832,11 @@ def update_watch_meta(
             if source_type     is not None: w["source_type"]     = source_type.strip()
             if source_sftp_cfg is not None: w["source_sftp_cfg"] = dict(source_sftp_cfg)
             if source_ftp_cfg  is not None: w["source_ftp_cfg"]  = dict(source_ftp_cfg)
-            if max_file_size_mb is not None: w["max_file_size_mb"] = max(0, int(max_file_size_mb))
+            if max_file_size_mb  is not None: w["max_file_size_mb"]  = max(0, int(max_file_size_mb))
+            if max_backup_bytes  is not None: w["max_backup_bytes"]  = max(0, int(max_backup_bytes))
+            if pre_backup_cmd    is not None: w["pre_backup_cmd"]    = pre_backup_cmd.strip()
+            if post_backup_cmd   is not None: w["post_backup_cmd"]   = post_backup_cmd.strip()
+            if webdav_cfg        is not None: w["webdav_cfg"]        = dict(webdav_cfg)
             if reset_snapshot   is not None and reset_snapshot:
                 w["last_snapshot"] = None
     save(cfg)
