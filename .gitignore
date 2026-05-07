@@ -54,4 +54,5 @@ venv/
 # ── OS noise ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-Desktop.ini
+Desktop.iniconfig.backup.*.json
+config.backup.json
