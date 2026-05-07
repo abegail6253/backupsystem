@@ -2720,20 +2720,32 @@ def download_from_ftp(remote_dir: str, local_dest: str, ftp_config: dict,
                 ftp.close()
 
 
+def _unc_already_accessible(unc_path: str) -> bool:
+    """
+    Check if a UNC path is already accessible via Windows session credentials
+    (i.e. the user already authenticated via Explorer or net use).
+    Only works on Windows.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        return os.path.exists(unc_path)
+    except Exception:
+        return False
+
+
 def download_from_smb(remote_dir: str, local_dest: str, smb_config: dict,
                        progress_cb=None) -> dict:
     """
     Download a backup folder recursively from SMB/CIFS to local_dest.
-    Returns { status: "ok"|"error", downloaded: int, error: str|None }
 
+    On Windows, if the UNC path is already accessible (user authenticated via
+    Explorer or net use), copies files directly using os.walk — no credentials
+    needed.  Falls back to smbprotocol with explicit credentials otherwise.
+
+    Returns { status: "ok"|"error", downloaded: int, error: str|None }
     progress_cb(downloaded: int, filename: str) — called after each file is saved.
     """
-    try:
-        from smbclient import walk, open_file
-        import smbclient
-    except ImportError:
-        return {"status": "error", "downloaded": 0, "error": "smbprotocol not installed"}
-
     server    = smb_config.get("server", "").strip()
     share     = smb_config.get("share", "").strip()
     username  = (smb_config.get("username") or smb_config.get("user", "")).strip()
@@ -2755,7 +2767,48 @@ def download_from_smb(remote_dir: str, local_dest: str, smb_config: dict,
 
     if not server or not share:
         return {"status": "error", "downloaded": 0, "error": "SMB server/share not configured"}
-    # Allow guest access for open/passwordless shares
+
+    # ── Strategy 1: Use existing Windows session (no credentials needed) ──────
+    # If the UNC path is already mounted/accessible (e.g. user opened it in
+    # Explorer or ran net use), copy files directly without smbprotocol.
+    _unc_source = f"\\\\{server}\\{share}"
+    if remote_base:
+        _unc_source = f"{_unc_source}\\{remote_base}"
+
+    if _unc_already_accessible(_unc_source):
+        logger.info(f"[smb] UNC path accessible via Windows session, copying directly: {_unc_source}")
+        downloaded = 0
+        try:
+            import shutil
+            Path(local_dest).mkdir(parents=True, exist_ok=True)
+            for root, dirs, files in os.walk(_unc_source):
+                rel_root = os.path.relpath(root, _unc_source)
+                local_root = os.path.join(local_dest, rel_root) if rel_root != "." else local_dest
+                os.makedirs(local_root, exist_ok=True)
+                for fname in files:
+                    src_file = os.path.join(root, fname)
+                    dst_file = os.path.join(local_root, fname)
+                    try:
+                        shutil.copy2(src_file, dst_file)
+                        downloaded += 1
+                        if progress_cb:
+                            try:
+                                progress_cb(downloaded, fname)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"[smb] Failed to copy {src_file}: {e}")
+            return {"status": "ok", "downloaded": downloaded, "error": None}
+        except Exception as e:
+            logger.warning(f"[smb] Direct UNC copy failed ({e}), falling back to smbprotocol")
+
+    # ── Strategy 2: smbprotocol with explicit credentials ────────────────────
+    try:
+        from smbclient import walk, open_file
+        import smbclient
+    except ImportError:
+        return {"status": "error", "downloaded": 0, "error": "smbprotocol not installed"}
+
     if not username:
         username = "guest"
 

@@ -6340,12 +6340,22 @@ class AdminPanel(QDialog):
             dlg.smb_path_input.setText(watch.get("path", ""))
             smb_cfg = watch.get("smb_cfg", {})
             dlg.smb_user.setText(smb_cfg.get("user", ""))
-            dlg.smb_pass.setText(smb_cfg.get("pass", ""))
+            # Load password from credential store if available, else from config
+            try:
+                from credential_store import get_smb_password
+                _stored_pass = get_smb_password(watch.get("path", ""))
+                dlg.smb_pass.setText(_stored_pass or smb_cfg.get("pass", ""))
+            except Exception:
+                dlg.smb_pass.setText(smb_cfg.get("pass", ""))
             dlg.smb_domain.setText(smb_cfg.get("domain", ""))
         else:
             dlg.source_type.setCurrentIndex(0)
             dlg.path_input.setText(watch.get("path", ""))
         dlg.interval_spin.setValue(watch.get("interval_min", 0))
+        # Pre-fill destination if set on this watch
+        _watch_dest = watch.get("destination", "")
+        if _watch_dest:
+            dlg.dest_input.setText(_watch_dest)
         # Set compression combo box based on existing value
         current_compression = watch.get("compression", False)
         if current_compression is True or current_compression == 6:
