@@ -176,10 +176,12 @@ def _setup_logging():
     root.addHandler(fh)
 
     # Console handler (visible when running from terminal or during development)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.WARNING)   # Only warnings+ to console in production
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
+    # sys.stdout is None in --windowed PyInstaller builds, so guard against it.
+    if sys.stdout is not None:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.WARNING)
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
 
 _setup_logging()
 logger = logging.getLogger(__name__)
@@ -7351,7 +7353,11 @@ class WatchCard(QFrame):
         self._more_btn.setText("More ▾")
         self._more_btn.setFixedWidth(160)
         self._more_btn.setObjectName("secondary")
-        self._more_btn.setPopupMode(QToolButton.InstantPopup)
+        self._more_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+            if hasattr(QToolButton, "ToolButtonPopupMode")
+            else QToolButton.InstantPopup
+        )
         self._more_btn.setStyleSheet(
             "QToolButton { text-align:center; padding:4px 8px; }"
             "QToolButton::menu-indicator { image: none; }"
@@ -11846,7 +11852,14 @@ def _acquire_single_instance_lock():
 
 def main():
     import faulthandler
-    faulthandler.enable()
+    if sys.stderr is not None:
+        faulthandler.enable()
+    else:
+        try:
+            _fh_log = open(os.path.join(os.path.expanduser("~"), "backupsys_fault.log"), "a")
+            faulthandler.enable(file=_fh_log)
+        except Exception:
+            pass
     # ── Global crash handler — catches unhandled exceptions in the Qt main thread ──
     # Without this, crashes in the .exe produce no output (stdout is hidden).
     def _excepthook(exc_type, exc_value, exc_tb):
