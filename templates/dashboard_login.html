@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BackupSys — Sign In</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0f172a;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #e2e8f0;
+    }
+
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 40px 36px 36px;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+
+    .logo {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .logo-icon {
+      font-size: 36px;
+      line-height: 1;
+      display: block;
+      margin-bottom: 10px;
+    }
+    .logo h1 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #f1f5f9;
+      letter-spacing: -0.3px;
+    }
+    .logo p {
+      font-size: 13px;
+      color: #64748b;
+      margin-top: 4px;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: #94a3b8;
+      margin-bottom: 6px;
+    }
+
+    input[type="password"] {
+      width: 100%;
+      padding: 10px 14px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #f1f5f9;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input[type="password"]:focus {
+      border-color: #3b82f6;
+    }
+
+    .field { margin-bottom: 20px; }
+
+    .error {
+      background: #450a0a;
+      border: 1px solid #991b1b;
+      color: #fca5a5;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    button[type="submit"] {
+      width: 100%;
+      padding: 11px;
+      background: #3b82f6;
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+      margin-top: 4px;
+    }
+    button[type="submit"]:hover { background: #2563eb; }
+    button[type="submit"]:active { background: #1d4ed8; }
+
+    .hint {
+      text-align: center;
+      font-size: 12px;
+      color: #475569;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <span class="logo-icon">🛡️</span>
+      <h1>BackupSys</h1>
+      <p>Dashboard — sign in to continue</p>
+    </div>
+
+    {% if error %}
+    <div class="error">❌ {{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="/dashboard/login" autocomplete="off">
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password"
+               placeholder="Enter your dashboard password"
+               autofocus required>
+      </div>
+      <button type="submit">Sign in</button>
+    </form>
+
+    <p class="hint">
+      Set <code>BACKUPSYS_DASHBOARD_PASSWORD</code> or
+      <code>BACKUPSYS_API_KEY</code> as environment variables.
+    </p>
+  </div>
+</body>
+</html>

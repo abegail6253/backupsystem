@@ -1,3 +1,6 @@
+def _is_gdrive_ready(config):
+    """Return True if config is for Google Drive and has an access token."""
+    return config and config.get("provider") == "gdrive" and bool(config.get("access_token"))
 import os
 import uuid
 import shutil
@@ -7,11 +10,12 @@ import time
 import threading
 import difflib
 import fnmatch
+import subprocess
 import logging
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 # Optional encryption support
 try:
@@ -20,10 +24,22 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
 
+# Check whether the hazmat sub-package (AES-GCM) is functional.
+# Some installations have a broken kdf/ciphers sub-package despite Fernet working.
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM_TEST
+    _AESGCM_TEST(b"\x00" * 32)  # basic sanity check
+    HAZMAT_AVAILABLE = True
+    del _AESGCM_TEST
+except Exception:
+    HAZMAT_AVAILABLE = False
+
 # Optional transport/notification helpers
 try:
     from transport_utils import (
-        upload_to_sftp, upload_to_ftp, upload_to_smb, upload_to_https
+        upload_to_sftp, upload_to_ftp, upload_to_smb, upload_to_https, upload_to_rclone,
+        download_from_sftp, download_from_ftp,
+        check_remote_free_space,
     )
     TRANSPORT_AVAILABLE = True
 except ImportError:
@@ -38,6 +54,25 @@ except ImportError:
     NOTIFICATIONS_AVAILABLE = False
 
 MAX_EDIT_BYTES   = 5 * 1024 * 1024   # 5 MB – files larger than this refuse to open in editor
+# FERNET_MAX_BYTES: 200 MB was the old Fernet limit. AES-GCM streaming has no file size limit.
+
+
+def _resolve_compress_level(compress) -> int:
+    """Resolve compression parameter to gzip level (0-9).
+    
+    Args:
+        compress: bool or int - False/0 = off, True = level 6, 1-9 = gzip level
+        
+    Returns:
+        int: gzip compression level (0 = no compression, 1-9 = gzip levels)
+    """
+    if not compress:
+        return 0
+    if compress is True:
+        return 6
+    if isinstance(compress, int):
+        return max(0, min(9, compress))  # clamp to valid range
+    return 0  # fallback for unexpected types
 
 
 class BackupThrottler:
@@ -47,22 +82,52 @@ class BackupThrottler:
     Uses a sliding 1-second window so each window resets cleanly — no debt
     carries over from previous windows, preventing the 'giant sleep' bug that
     occurred when a large file reset bytes_sent to a non-zero value.
+    
+    Supports optional time-based schedule: each window can have different limits.
     """
-    def __init__(self, max_mbps: float = 100.0):
+    def __init__(self, max_mbps: float = 100.0, schedule: list = None):
+        self.max_mbps = max_mbps
+        self.schedule = schedule or []  # List of {"start": "HH:MM", "end": "HH:MM", "max_mbps": float}
         self.max_bytes_per_sec = int(max_mbps * 1024 * 1024)
         self.window_start  = time.time()
         self.window_bytes  = 0
 
+    def _get_current_limit(self) -> int:
+        """Get current bandwidth limit in bytes/sec, checking schedule windows."""
+        if not self.schedule:
+            return self.max_bytes_per_sec
+        
+        now = time.strftime("%H:%M")
+        for window in self.schedule:
+            start = window.get("start", "")
+            end = window.get("end", "")
+            max_mbps = window.get("max_mbps", 0.0)
+            if start and end and self._time_in_range(now, start, end):
+                return int(max_mbps * 1024 * 1024)
+        return self.max_bytes_per_sec
+    
+    def _time_in_range(self, current: str, start: str, end: str) -> bool:
+        """Check if current time (HH:MM) is within start-end range."""
+        def to_minutes(t):
+            h, m = map(int, t.split(":"))
+            return h * 60 + m
+        current_min, start_min, end_min = to_minutes(current), to_minutes(start), to_minutes(end)
+        if start_min <= end_min:
+            return start_min <= current_min <= end_min
+        else:
+            return current_min >= start_min or current_min <= end_min
+
     def throttle(self, bytes_copied: int):
         """Call after writing each chunk.  Thread-safe for single-writer use."""
-        if self.max_bytes_per_sec <= 0:
+        current_limit = self._get_current_limit()
+        if current_limit <= 0:
             return  # unlimited
 
         self.window_bytes += bytes_copied
         elapsed = time.time() - self.window_start
 
         # How long *should* it have taken to send window_bytes at our limit?
-        expected = self.window_bytes / self.max_bytes_per_sec
+        expected = self.window_bytes / current_limit
         wait = expected - elapsed
         if wait > 0:
             time.sleep(wait)
@@ -104,9 +169,33 @@ def _fix_path(path: str) -> str:
 
 
 def _is_excluded(rel_path: str, abs_path: Path, patterns: List[str]) -> bool:
-    """Return True if the file matches any exclude pattern."""
+    """Return True if the file should be excluded from the backup.
+
+    Patterns prefixed with '!' are include-only (whitelist) rules.
+    When at least one '!'-prefixed pattern is present the function operates in
+    *whitelist mode*: a file is excluded unless its name or relative path
+    matches at least one include pattern (fnmatch rules apply).
+
+    In the absence of any '!' patterns the function operates in the normal
+    *blacklist mode*: a file is excluded when its name, relative path, or any
+    path component matches any of the given patterns.
+
+    This mirrors the logic in watcher.py so that the file-system watcher and
+    the backup engine always agree on which files are in scope.
+    """
+    include_only = [p[1:] for p in patterns if p.startswith("!")]
+    exclude_only = [p      for p in patterns if not p.startswith("!")]
+
+    if include_only:
+        # Whitelist mode — exclude the file unless it matches an include rule.
+        return not any(
+            fnmatch.fnmatch(abs_path.name, pat) or fnmatch.fnmatch(rel_path, pat)
+            for pat in include_only
+        )
+
+    # Normal blacklist mode — unchanged behaviour.
     parts = Path(rel_path).parts
-    for pat in patterns:
+    for pat in exclude_only:
         if fnmatch.fnmatch(rel_path, pat):              return True
         if fnmatch.fnmatch(abs_path.name, pat):         return True
         if any(fnmatch.fnmatch(p, pat) for p in parts): return True
@@ -267,6 +356,8 @@ def build_snapshot(
     timeout_sec: int = 300,
     scan_cb: Optional[Callable] = None,
     cancel_event=None,
+    changed_paths: Optional[List[str]] = None,
+    skipped_symlinks: Optional[List[str]] = None,
 ) -> Dict[str, dict]:
     """
     Walk *path* and return a snapshot dict:
@@ -277,6 +368,10 @@ def build_snapshot(
     - Timeout protection for network shares
     - Unix: uses signal.alarm()
     - Windows: uses thread timeout
+    - changed_paths fast-path: when the watcher provides the exact set of
+      changed/added/deleted relative paths, skip the full rglob and instead
+      start from the previous snapshot, re-stat only changed files, and
+      remove any deleted ones. Falls back to full scan if previous is absent.
     """
 
     import os
@@ -316,6 +411,45 @@ def build_snapshot(
         # sources and cuts first-backup scan time to a fast directory walk only.
         _first_backup = not previous
 
+        # ── Watcher fast-path ─────────────────────────────────────────────
+        # When the watcher has tracked exactly which files changed, skip the
+        # expensive rglob and instead patch the previous snapshot in-place:
+        #   1. Start from a copy of the previous snapshot (all unchanged files
+        #      are inherited for free — no I/O needed).
+        #   2. Re-stat every path the watcher flagged as changed/added/deleted.
+        #   3. Remove entries whose file no longer exists on disk (deletions).
+        # This turns an O(all files) scan into an O(changed files) scan.
+        # We fall back to the full rglob if no previous snapshot exists (first
+        # backup) or if changed_paths is None/empty (scheduled full-scan).
+        if changed_paths and previous and not root.is_file():
+            snapshot.update(previous)  # inherit all unchanged entries
+            changed_set = set(changed_paths)
+            for rel in changed_set:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Backup cancelled by user")
+                fp = root / rel
+                if scan_cb:
+                    try:
+                        scan_cb(rel)
+                    except InterruptedError:
+                        raise
+                    except Exception:
+                        logger.debug("[suppressed] Exception ignored near: try: |                         scan_cb(rel) |                     except Interru", exc_info=True)
+                        pass
+                if not fp.exists() or fp.is_symlink():
+                    # File was deleted — remove from snapshot
+                    snapshot.pop(rel, None)
+                    continue
+                if exclude_patterns and _is_excluded(rel, fp, exclude_patterns):
+                    snapshot.pop(rel, None)
+                    continue
+                try:
+                    st = fp.stat()
+                    snapshot[rel] = {"hash": "", "size": st.st_size, "mtime": st.st_mtime}
+                except (IOError, OSError, PermissionError):
+                    snapshot.pop(rel, None)
+            return snapshot
+
         # -------------------------
         # Single File Case
         # -------------------------
@@ -323,7 +457,8 @@ def build_snapshot(
             try:
                 stat = root.stat()
                 snapshot[root.name] = {
-                    "hash": "" if _first_backup else hash_file(str(root), cancel_event=cancel_event),
+                    # Always skip hashing during scan — copy phase backfills it.
+                    "hash": "",
                     "size": stat.st_size,
                     "mtime": stat.st_mtime,
                 }
@@ -346,7 +481,18 @@ def build_snapshot(
                 raise InterruptedError("Backup cancelled by user")
 
             if fp.is_symlink():
-                continue  # skip symlinks to prevent loops and traversal
+                rel_sym = str(fp.relative_to(root))
+                try:
+                    target = os.readlink(str(fp))
+                    sym_detail = f" → {target}"
+                except OSError:
+                    sym_detail = " (broken symlink)"
+                logger.warning(
+                    f"[snapshot] Symlink skipped (not backed up): {rel_sym}{sym_detail}"
+                )
+                if skipped_symlinks is not None:
+                    skipped_symlinks.append(rel_sym)
+                continue
 
             if not fp.is_file():
                 continue
@@ -364,6 +510,7 @@ def build_snapshot(
                     except InterruptedError:
                         raise  # let cancel propagate — do NOT swallow
                     except Exception:
+                        logger.debug("[suppressed] Exception ignored near: try: |                         scan_cb(rel) |                     except Interru", exc_info=True)
                         pass
 
                 # Reuse previous entry if mtime+size unchanged (incremental fast path)
@@ -377,10 +524,13 @@ def build_snapshot(
                     continue
 
                 snapshot[rel] = {
-                    # First backup: leave hash empty — run_backup fills it in
-                    # while copying so each file is read only once.
-                    # Subsequent backups: only new/changed files reach here.
-                    "hash": "" if _first_backup else hash_file(str(fp), cancel_event=cancel_event),
+                    # Always leave hash empty during scan — run_backup fills it in
+                    # while copying so each file is read only once (not twice).
+                    # Previously, incremental backups hashed changed files here,
+                    # causing the UI to freeze on "Scanning: <filename>" while a
+                    # large file was being hashed. The copy phase already backfills
+                    # hashes into new_snapshot, so hashing here was redundant.
+                    "hash": "",
                     "size": stat.st_size,
                     "mtime": stat.st_mtime,
                 }
@@ -457,40 +607,50 @@ def build_snapshot(
                     signal.signal(signal.SIGALRM, old_handler)
 
 
-def diff_snapshots(old: Dict, new: Dict) -> List[dict]:
-    """Compare two snapshots and return a list of change records."""
+def diff_snapshots(old: Dict, new: Dict, max_deletes: int = 500) -> List[dict]:
+    """Compare two snapshots and return a list of change records.
+
+    max_deletes: cap the number of "deleted" entries recorded. When a stale
+    snapshot has thousands of old paths (e.g. user emptied the watched folder),
+    iterating all of them is slow and produces a huge changeset that is never
+    actually used for copying. We record up to max_deletes deletions and stop.
+    """
 
     changes = []
-    all_keys = set(old) | set(new)
 
-    for rel in sorted(all_keys):
-
+    # Added / modified — always check every new file (usually tiny set)
+    for rel, meta in new.items():
         if rel not in old:
             changes.append({
                 "type": "added",
                 "path": rel,
                 "old_hash": None,
-                "new_hash": new[rel]["hash"],
-                "size": new[rel]["size"],
+                "new_hash": meta["hash"],
+                "size": meta["size"],
             })
-
-        elif rel not in new:
-            changes.append({
-                "type": "deleted",
-                "path": rel,
-                "old_hash": old[rel]["hash"],
-                "new_hash": None,
-                "size": old[rel]["size"],
-            })
-
-        elif old[rel]["hash"] != new[rel]["hash"]:
+        elif old[rel]["hash"] != meta["hash"]:
             changes.append({
                 "type": "modified",
                 "path": rel,
                 "old_hash": old[rel]["hash"],
-                "new_hash": new[rel]["hash"],
-                "size": new[rel]["size"],
+                "new_hash": meta["hash"],
+                "size": meta["size"],
             })
+
+    # Deleted — cap at max_deletes to avoid blocking on stale snapshots
+    delete_count = 0
+    for rel, meta in old.items():
+        if rel not in new:
+            if delete_count >= max_deletes:
+                break
+            changes.append({
+                "type": "deleted",
+                "path": rel,
+                "old_hash": meta["hash"],
+                "new_hash": None,
+                "size": meta["size"],
+            })
+            delete_count += 1
 
     return changes
 
@@ -627,6 +787,7 @@ def _safe_size(path: str) -> int:
             try:
                 total += f.stat().st_size
             except Exception:
+                logger.debug('[suppressed] Exception ignored.', exc_info=True)
                 pass
     return total
 
@@ -645,7 +806,7 @@ def _human_size(n) -> str:
 # ─── Encryption helpers ──────────────────────────────────────────────────────
 
 def generate_encryption_key() -> str:
-    """Generate a new Fernet/AES encryption key (44 characters, URL-safe base64)."""
+    """Generate a new encryption key (44 characters, URL-safe base64)."""
     if not CRYPTO_AVAILABLE:
         raise RuntimeError("cryptography library not installed")
     return Fernet.generate_key().decode('utf-8')
@@ -675,17 +836,39 @@ _AES_CHUNK   = 1 * 1024 * 1024   # 1 MB plaintext per chunk
 
 
 def _derive_aes_key(raw_key_bytes: bytes) -> bytes:
-    """Derive a 32-byte AES-256 key from the Fernet key material via HKDF-SHA256."""
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.backends import default_backend
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b"BackupSys-AES-GCM-v1",
-        backend=default_backend(),
-    ).derive(raw_key_bytes)
+    """Derive a 32-byte AES-256 key via HKDF-SHA256 (RFC 5869).
+
+    Uses cryptography.hazmat HKDF when available; falls back to a pure-stdlib
+    HKDF implementation so the function works even if the cryptography package's
+    kdf sub-package is broken or missing.
+    """
+    try:
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.backends import default_backend
+        return HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"BackupSys-AES-GCM-v1",
+            backend=default_backend(),
+        ).derive(raw_key_bytes)
+    except (ImportError, Exception):
+        # Pure-stdlib HKDF-SHA256 (RFC 5869) — no external dependencies.
+        import hashlib, hmac
+        hash_len = 32  # SHA-256 output length
+        salt = b"\x00" * hash_len          # HKDF spec: salt defaults to HashLen zeros
+        info = b"BackupSys-AES-GCM-v1"
+        length = 32
+        # Extract
+        prk = hmac.new(salt, raw_key_bytes, hashlib.sha256).digest()
+        # Expand
+        t = b""
+        okm = b""
+        for i in range(1, -(-length // hash_len) + 1):  # ceil(length / hash_len)
+            t = hmac.new(prk, t + info + bytes([i]), hashlib.sha256).digest()
+            okm += t
+        return okm[:length]
 
 
 def _validate_key(key: str) -> bytes:
@@ -705,7 +888,7 @@ def _validate_key(key: str) -> bytes:
 
 
 def _encrypt_file(src_path: str, dest_path: str, key: str) -> str:
-    """Encrypt a file using streaming AES-256-GCM.
+    """Encrypt a file using streaming AES-256-GCM (or Fernet fallback).
 
     Processes the source in 1 MB chunks so arbitrarily large files are
     supported with constant ~2 MB RAM overhead.  Returns the SHA-256 hex
@@ -713,11 +896,16 @@ def _encrypt_file(src_path: str, dest_path: str, key: str) -> str:
 
     Legacy Fernet files written by earlier BackupSys versions are still
     decryptable via _decrypt_file() — only new writes use this format.
+    When the hazmat sub-package (AESGCM) is unavailable, falls back to
+    Fernet so encryption still works on broken cryptography installs.
     """
     if not CRYPTO_AVAILABLE:
         raise RuntimeError("cryptography library not installed")
 
     try:
+        if not HAZMAT_AVAILABLE:
+            raise ImportError("hazmat unavailable, use Fernet fallback")
+
         import struct
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -746,6 +934,8 @@ def _encrypt_file(src_path: str, dest_path: str, key: str) -> str:
                 idx_bytes = struct.pack("<Q", chunk_idx)[:12].ljust(12, b"\x00")
                 nonce = bytes(a ^ b for a, b in zip(nonce_seed, idx_bytes))
                 ciphertext = cipher.encrypt(nonce, plaintext, None)  # 16-byte GCM tag appended
+                if not isinstance(ciphertext, bytes):
+                    raise RuntimeError("AESGCM.encrypt did not return bytes — hazmat may be broken")
                 length_field = struct.pack("<I", len(ciphertext))
                 f_out.write(length_field)
                 out_hash.update(length_field)
@@ -760,12 +950,107 @@ def _encrypt_file(src_path: str, dest_path: str, key: str) -> str:
 
         return out_hash.hexdigest()
 
+    except (ImportError, RuntimeError) as _hazmat_err:
+        # Fallback: use Fernet (confirmed working even on broken hazmat installs)
+        logger.debug("AES-GCM unavailable (%s); falling back to Fernet encryption", _hazmat_err)
+        try:
+            _validate_key(key)
+            cipher_f = Fernet(key.encode())
+            with open(src_path, "rb") as f:
+                plaintext = f.read()
+            ciphertext_f = cipher_f.encrypt(plaintext)
+            h = hashlib.sha256(ciphertext_f).hexdigest()
+            with open(dest_path, "wb") as f:
+                f.write(ciphertext_f)
+            return h
+        except Exception as e_fernet:
+            raise RuntimeError(f"Encryption failed for {Path(src_path).name}: {e_fernet}")
+
     except Exception as e:
         raise RuntimeError(f"Encryption failed for {Path(src_path).name}: {e}")
 
 
+def _encrypt_bytes(data: bytes, key: str) -> bytes:
+    """Encrypt raw bytes with AES-256-GCM (same streaming format as _encrypt_file).
+
+    Used for small in-memory payloads like MANIFEST.json content.
+    Returns the complete ciphertext blob (header + chunks + EOF sentinel).
+    Falls back to Fernet when hazmat is unavailable.
+    """
+    if HAZMAT_AVAILABLE:
+        import struct
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        import io, os as _os
+
+        raw_key  = _validate_key(key)
+        aes_key  = _derive_aes_key(raw_key)
+        cipher   = AESGCM(aes_key)
+        nonce_seed = _os.urandom(12)
+
+        out = io.BytesIO()
+        out.write(_AES_MAGIC + nonce_seed)
+
+        for chunk_idx, offset in enumerate(range(0, len(data), _AES_CHUNK)):
+            plaintext = data[offset:offset + _AES_CHUNK]
+            idx_bytes = struct.pack("<Q", chunk_idx)[:12].ljust(12, b"\x00")
+            nonce     = bytes(a ^ b for a, b in zip(nonce_seed, idx_bytes))
+            ciphertext = cipher.encrypt(nonce, plaintext, None)
+            out.write(struct.pack("<I", len(ciphertext)))
+            out.write(ciphertext)
+
+        out.write(struct.pack("<I", 0))  # EOF sentinel
+        return out.getvalue()
+    else:
+        # Fernet fallback
+        _validate_key(key)
+        return Fernet(key.encode()).encrypt(data)
+
+
+def _decrypt_bytes(data: bytes, key: str) -> bytes:
+    """Decrypt bytes produced by _encrypt_bytes.
+
+    Supports both streaming AES-256-GCM format and Fernet fallback format.
+    Raises RuntimeError if decryption fails.
+    """
+    _validate_key(key)
+
+    if len(data) >= 8 and data[:8] == _AES_MAGIC:
+        # Streaming AES-256-GCM format
+        import struct
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        import io
+
+        raw_key = _validate_key(key)
+        aes_key = _derive_aes_key(raw_key)
+        cipher  = AESGCM(aes_key)
+
+        buf = io.BytesIO(data)
+        buf.read(8)           # skip magic
+        nonce_seed = buf.read(12)
+
+        out = io.BytesIO()
+        chunk_idx = 0
+        while True:
+            len_field = buf.read(4)
+            if len(len_field) < 4:
+                break
+            clen = struct.unpack("<I", len_field)[0]
+            if clen == 0:
+                break
+            ciphertext = buf.read(clen)
+            idx_bytes  = struct.pack("<Q", chunk_idx)[:12].ljust(12, b"\x00")
+            nonce      = bytes(a ^ b for a, b in zip(nonce_seed, idx_bytes))
+            out.write(cipher.decrypt(nonce, ciphertext, None))
+            chunk_idx += 1
+
+        return out.getvalue()
+    else:
+        # Fernet format (fallback path or legacy)
+        return Fernet(key.encode()).decrypt(data)
+
+
 def _decrypt_file(src_path: str, dest_path: str, key: str) -> None:
-    """Decrypt a file.  Auto-detects format: streaming AES-GCM (v2) or legacy Fernet (v1)."""
+    """Decrypt a file.  Auto-detects format: streaming AES-GCM (v2) or legacy/fallback Fernet (v1)."""
     if not CRYPTO_AVAILABLE:
         raise RuntimeError("cryptography library not installed")
 
@@ -775,6 +1060,12 @@ def _decrypt_file(src_path: str, dest_path: str, key: str) -> None:
 
         if magic == _AES_MAGIC:
             # ── Streaming AES-256-GCM ─────────────────────────────────────────
+            if not HAZMAT_AVAILABLE:
+                raise RuntimeError(
+                    "This backup was encrypted with AES-GCM but the hazmat "
+                    "sub-package is unavailable on this install. "
+                    "Please reinstall the cryptography package."
+                )
             import struct
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -800,7 +1091,7 @@ def _decrypt_file(src_path: str, dest_path: str, key: str) -> None:
                     f_out.write(plaintext)
                     chunk_idx += 1
         else:
-            # ── Legacy Fernet (v1) ────────────────────────────────────────────
+            # ── Fernet (v1 legacy or hazmat-fallback) ─────────────────────────
             _validate_key(key)
             cipher = Fernet(key.encode())
             with open(src_path, "rb") as f:
@@ -811,7 +1102,7 @@ def _decrypt_file(src_path: str, dest_path: str, key: str) -> None:
 
     except Exception as e:
         raise RuntimeError(f"Decryption failed for {Path(src_path).name}: {e}")
-def upload_to_gdrive(local_dir: str, cloud_config: dict) -> dict:
+def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Optional[set] = None) -> dict:
     """Upload backup folder to Google Drive using OAuth user credentials.
 
     Reuses existing folders/files rather than creating duplicates on every run.
@@ -858,11 +1149,14 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict) -> dict:
             }
             return service.files().create(body=meta, fields="id").execute()["id"]
 
-        # Upload a file — overwrite if it already exists, otherwise create
-        def _upload_file(fp: Path, parent_id: str):
+        # Upload a file — overwrite if it already exists, otherwise create.
+        # upload_name lets the caller specify a display name different from fp.name
+        # (used when decompressing .gz files so the original filename is preserved).
+        def _upload_file(fp: Path, parent_id: str, upload_name: str = ""):
+            name  = upload_name or fp.name
             media = MediaFileUpload(str(fp), resumable=True)
             q = (
-                f"name = {repr(fp.name)} "
+                f"name = {repr(name)} "
                 f"and \'{parent_id}\' in parents "
                 f"and trashed = false"
             )
@@ -874,7 +1168,7 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict) -> dict:
                     media_body=media,
                 ).execute()
             else:
-                meta = {"name": fp.name, "parents": [parent_id]}
+                meta = {"name": name, "parents": [parent_id]}
                 service.files().create(body=meta, media_body=media, fields="id").execute()
 
         # Resolve the top-level watch folder (reuse if exists)
@@ -893,12 +1187,79 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict) -> dict:
                 parent_id = _folder_cache[path_key]
             return parent_id
 
-        for fp in ld.rglob("*"):
-            if fp.is_file() and fp.name not in _SKIP:
-                rel       = fp.relative_to(ld)
-                parent_id = _get_or_create_folder(list(rel.parts[:-1]))
+        import gzip as _gzip
+        import tempfile as _tempfile
+
+        # ── Upfront cleanup: delete every .gz file from the GDrive folder ──
+        # Files backed up with compression are stored as .xlsx.gz, .docx.gz etc.
+        # We always upload the decompressed version, so any .gz already on
+        # GDrive (from previous runs before this fix, or re-runs) must be
+        # removed first. Running the sweep unconditionally at the start is
+        # more reliable than trying to delete after each individual upload.
+        try:
+            page_token = None
+            while True:
+                list_res = service.files().list(
+                    q=f"'{run_folder_id}' in parents and trashed = false",
+                    fields="nextPageToken, files(id, name)",
+                    pageToken=page_token,
+                    pageSize=100,
+                ).execute()
+                for gf in list_res.get("files", []):
+                    if gf["name"].endswith(".gz"):
+                        try:
+                            service.files().delete(fileId=gf["id"]).execute()
+                        except Exception:
+                            logger.debug('[suppressed] Exception ignored.', exc_info=True)
+                            pass
+                page_token = list_res.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception:
+            pass  # cleanup sweep is best-effort; never block the upload
+
+        # Build the iterable of files to upload.
+        # If allowed_rel_paths is provided (populated from the backup snapshot),
+        # only upload those specific files — this prevents stray folders that happen
+        # to exist in the destination (e.g. Monthly/Weekly leftover dirs) from being
+        # mirrored to GDrive.  Without the filter, rglob("*") would blindly upload
+        # everything, including directories that were never part of this backup.
+        if allowed_rel_paths is not None:
+            _candidates = []
+            for rel_str in allowed_rel_paths:
+                fp_candidate = ld / rel_str
+                if fp_candidate.is_file():
+                    _candidates.append(fp_candidate)
+        else:
+            _candidates = [fp for fp in ld.rglob("*") if fp.is_file()]
+
+        for fp in _candidates:
+            # Skip internal metadata and deletion markers
+            if fp.name in _SKIP or fp.name.endswith(".DELETED"):
+                continue
+
+            rel       = fp.relative_to(ld)
+            parent_id = _get_or_create_folder(list(rel.parts[:-1]))
+
+            # Decompress .gz files before uploading so Google Drive/Sheets
+            # can open them natively (e.g. "test sheet.xlsx.gz" → "test sheet.xlsx").
+            if fp.name.endswith(".gz"):
+                original_name = fp.name[:-3]   # strip .gz suffix
+                tmp_fd, tmp_path = _tempfile.mkstemp(suffix="_" + original_name)
+                os.close(tmp_fd)
+                try:
+                    with _gzip.open(str(fp), "rb") as f_in, open(tmp_path, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                    _upload_file(Path(tmp_path), parent_id, upload_name=original_name)
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            else:
                 _upload_file(fp, parent_id)
-                uploaded += 1
+
+            uploaded += 1
 
         return {"ok": True, "uploaded": uploaded, "folder_id": run_folder_id}
     except Exception as e:
@@ -1051,6 +1412,71 @@ def _vss_remap_source(source: str, device_path: str) -> str:
     return device_path + rel
 
 
+# ─── Remote source download helper ───────────────────────────────────────────
+
+def _download_remote_source(
+    source_type: str,
+    remote_path: str,
+    sftp_cfg:   Optional[dict] = None,
+    ftp_cfg:    Optional[dict] = None,
+    smb_cfg:    Optional[dict] = None,
+    webdav_cfg: Optional[dict] = None,
+    progress_cb=None,
+) -> dict:
+    """
+    Download a remote source directory to a local temp directory so the backup
+    engine can treat it as a plain local path.
+
+    source_type: "sftp" | "ftp" | "ftps" | "smb" | "webdav"
+    remote_path: path on the remote server (e.g. "/home/user/docs")
+    sftp_cfg / ftp_cfg / smb_cfg / webdav_cfg: connection credentials dict.
+
+    Returns:
+        {
+          "ok":         bool,
+          "temp_dir":   str,      # caller must rmtree when done; None on failure
+          "error":      str|None,
+          "downloaded": int,
+        }
+    """
+    import tempfile
+    import shutil
+
+    if not TRANSPORT_AVAILABLE:
+        return {"ok": False, "temp_dir": None,
+                "error": "transport_utils not available (install paramiko / ftplib / smbprotocol / webdavclient3 dependencies)"}
+
+    temp_dir = tempfile.mkdtemp(prefix="backupsys_src_")
+    try:
+        if source_type == "sftp":
+            result = download_from_sftp(remote_path, temp_dir, sftp_cfg or {}, progress_cb=progress_cb)
+        elif source_type in ("ftp", "ftps"):
+            result = download_from_ftp(remote_path, temp_dir, ftp_cfg or {}, progress_cb=progress_cb)
+        elif source_type == "smb":
+            from transport_utils import download_from_smb
+            result = download_from_smb(remote_path, temp_dir, smb_cfg or {}, progress_cb=progress_cb)
+        elif source_type == "webdav":
+            from transport_utils import download_from_webdav
+            result = download_from_webdav(remote_path, temp_dir, webdav_cfg or {}, progress_cb=progress_cb)
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {"ok": False, "temp_dir": None,
+                    "error": f"Unknown remote source type: {source_type!r}"}
+
+        if result.get("status") != "ok":
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {"ok": False, "temp_dir": None,
+                    "error": result.get("error", "Download failed"),
+                    "downloaded": result.get("downloaded", 0)}
+
+        return {"ok": True, "temp_dir": temp_dir,
+                "error": None, "downloaded": result.get("downloaded", 0)}
+
+    except Exception as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return {"ok": False, "temp_dir": None, "error": str(exc), "downloaded": 0}
+
+
 def run_backup(
     source: str,
     destination: str,
@@ -1063,23 +1489,32 @@ def run_backup(
     scan_cb: Optional[Callable[[str], None]] = None,
     exclude_patterns: Optional[List[str]] = None,
     encrypt_key: Optional[str] = None,
-    compress: bool = False,
+    compress: Union[bool, int] = False,
     throttler=None,
     cloud_config: Optional[Dict] = None,
     destinations: Optional[List[Dict]] = None,
     triggered_by: Optional[str] = None,
     cancel_event=None,
+    pause_event=None,
     sync_mode: bool = False,
     dry_run: bool = False,
     max_file_size_mb: float = 0,
-    pre_backup_cmd: Optional[str] = None,
-    post_backup_cmd: Optional[str] = None,
+    pre_backup_cmd: str = "",
+    post_backup_cmd: str = "",
+    verify_after: bool = False,
+    changed_paths: Optional[List[str]] = None,
+    verify_remote_upload: bool = False,
+    source_type: str = "local",             # "local" | "sftp" | "ftp" | "smb" | "webdav"
+    source_sftp_cfg:   Optional[Dict] = None,  # SFTP credentials when source_type="sftp"
+    source_ftp_cfg:    Optional[Dict] = None,  # FTP  credentials when source_type="ftp"
+    source_smb_cfg:    Optional[Dict] = None,  # SMB  credentials when source_type="smb"
+    source_webdav_cfg: Optional[Dict] = None,  # WebDAV credentials when source_type="webdav"
 ) -> dict:
     """
     Execute a backup from source → destination.
     progress_cb(copied, total, current_file) is called after each file copy.
     Tracks failed files for reporting.
-    Cloud upload result is persisted in MANIFEST.json and returned in result dict.
+    GDrive upload result is persisted in MANIFEST.json and returned in result dict.
 
     dry_run=True: scans source and builds the change list but copies nothing.
                   Returns immediately with status='dry_run' and the full changes list.
@@ -1090,6 +1525,23 @@ def run_backup(
 
     started = time.time()
     ts      = datetime.now().isoformat()
+
+    # Resolve compression level for backward compatibility
+    compress_level = _resolve_compress_level(compress)
+
+    # ── Sync mode: never compress ──────────────────────────────────────────
+    # In sync mode the destination is a direct mirror of the source — files
+    # must keep their original names and extensions (e.g. .xlsx, .docx) so
+    # they can be opened directly without any extra steps.  Compression
+    # would rename files to .xlsx.gz which breaks direct access.
+    # GDrive already decompresses on upload, so keeping sync uncompressed
+    # gives consistent behaviour both locally and in GDrive.
+    if sync_mode and compress_level > 0:
+        compress_level = 0
+        logger.info(
+            f"[backup] '{watch_name}': compression disabled for sync mode "
+            f"— files are stored with original extensions for direct access."
+        )
 
     source      = _fix_path(source)
     destination = _fix_path(destination)
@@ -1118,9 +1570,10 @@ def run_backup(
         "duration_s":    0.0,
         "incremental":   incremental,
         "progress":      0,
-        "compressed":    compress,
+        "compressed":    compress_level > 0,
         "encrypted":     bool(encrypt_key),
         "failed_files":  [],
+        "skipped_symlinks": [],      # symlinks found in source but not backed up
         "destinations_upload":  [],  # Will be populated if destinations are configured
         "triggered_by":  triggered_by or "auto",
     }
@@ -1132,32 +1585,38 @@ def run_backup(
     _vss_shadow_id = None
     _resume_path   = dest_root / f"_resume_{watch_id}.json"
 
-    # ── Pre-backup hook ────────────────────────────────────────────────────────
-    if pre_backup_cmd and pre_backup_cmd.strip():
-        logger.info(f"[hook] Running pre-backup command: {pre_backup_cmd}")
-        try:
-            import subprocess as _sp
-            _pre = _sp.run(
-                pre_backup_cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5-minute hard timeout
-            )
-            if _pre.stdout.strip():
-                logger.info(f"[hook] pre-backup stdout: {_pre.stdout.strip()}")
-            if _pre.stderr.strip():
-                logger.warning(f"[hook] pre-backup stderr: {_pre.stderr.strip()}")
-            if _pre.returncode != 0:
-                raise RuntimeError(
-                    f"Pre-backup command exited with code {_pre.returncode}: "
-                    f"{_pre.stderr.strip() or _pre.stdout.strip()}"
-                )
-            logger.info(f"[hook] Pre-backup command succeeded (exit 0)")
-        except Exception as _hook_err:
-            result["error"] = f"Pre-backup hook failed: {_hook_err}"
-            result["status"] = "failed"
+    # ── Remote source: download to a temp dir before processing ───────────────
+    # When source_type is "sftp", "ftp", "smb", or "webdav" we fetch the remote
+    # directory into a
+    # local temp dir and then treat that temp dir as the backup source.  This
+    # allows the rest of the engine (snapshot diffing, compression, encryption,
+    # VSS, incremental logic) to work without any changes.
+    _remote_source_temp: Optional[str] = None
+    if source_type in ("sftp", "ftp", "ftps", "smb", "webdav"):
+        logger.info(f"[remote-src] Downloading {source_type.upper()} source: {source}")
+        _dl = _download_remote_source(
+            source_type=source_type,
+            remote_path=source,
+            sftp_cfg=source_sftp_cfg,
+            ftp_cfg=source_ftp_cfg,
+            smb_cfg=source_smb_cfg,
+            webdav_cfg=source_webdav_cfg,
+            progress_cb=scan_cb,
+        )
+        if not _dl["ok"]:
+            result["error"] = f"Failed to download {source_type.upper()} source: {_dl['error']}"
             return result
+        _remote_source_temp = _dl["temp_dir"]
+        logger.info(f"[remote-src] Downloaded {_dl['downloaded']} file(s) to {_remote_source_temp}")
+        # Override local source path for the rest of run_backup
+        source   = _remote_source_temp
+        src_path = Path(source)
+
+    # ── Pre-backup hook ────────────────────────────────────────────────────────
+    if pre_backup_cmd:
+        _pre_cmd = subprocess.run(pre_backup_cmd, shell=True, capture_output=True, text=True)
+        if _pre_cmd.returncode != 0:
+            return {"ok": False, "error": f"Pre-backup command failed (exit {_pre_cmd.returncode}): {_pre_cmd.stderr}"}
 
     try:
         if not src_path.exists():
@@ -1206,6 +1665,7 @@ def run_backup(
                 try:
                     _resume_path.unlink()
                 except Exception:
+                    logger.debug("[suppressed] Exception ignored while deleting bad checkpoint.", exc_info=True)
                     pass
 
         if backup_dir is None:
@@ -1216,12 +1676,56 @@ def run_backup(
                 backup_dir = dest_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}__{safe_name}"
                 backup_dir.mkdir(parents=True, exist_ok=True)
 
+        # ── Auto-exclude backup output folders inside the source ────────────
+        # Prevents scanning backup output dirs (e.g. 20240101_123456__name)
+        # that were previously written into the watched source folder, and
+        # also excludes the destination folder itself if it is inside the source.
+        _excl = list(exclude_patterns or [])
+        try:
+            _src_resolved  = Path(_effective_source).resolve()
+            _dest_resolved = dest_root.resolve()
+            # Case 1: destination is inside source — exclude the top-level subdir
+            try:
+                _dest_rel = _dest_resolved.relative_to(_src_resolved)
+                _excl_top = _dest_rel.parts[0] if _dest_rel.parts else ""
+                if _excl_top and _excl_top not in _excl:
+                    _excl.append(_excl_top)
+                    logger.info(
+                        f"[snapshot] Auto-excluding dest subfolder '{_excl_top}' "
+                        f"from source scan"
+                    )
+            except ValueError:
+                pass  # dest not inside source
+
+            # Case 2: exclude backup output dirs (YYYYMMDD_HHMMSS*__<name>) that
+            # were previously created directly inside the source folder.
+            # Pattern: starts with 8 digits (date), underscore, 6 digits (time).
+            import re as _re
+            _backup_dir_pat = _re.compile(r"^\d{8}_\d{6}")
+            try:
+                for _child in _src_resolved.iterdir():
+                    if _child.is_dir() and _backup_dir_pat.match(_child.name):
+                        if _child.name not in _excl:
+                            _excl.append(_child.name)
+                            logger.info(
+                                f"[snapshot] Auto-excluding stale backup folder "
+                                f"'{_child.name}' from source scan"
+                            )
+            except Exception:
+                logger.debug('[suppressed] Exception ignored.', exc_info=True)
+                pass
+        except Exception:
+            logger.debug('[suppressed] Exception ignored.', exc_info=True)
+            pass
+
         new_snapshot = build_snapshot(
             _effective_source,
             previous=previous_snapshot,
-            exclude_patterns=exclude_patterns or [],
+            exclude_patterns=_excl,
             scan_cb=scan_cb,
             cancel_event=cancel_event,
+            changed_paths=changed_paths,
+            skipped_symlinks=result["skipped_symlinks"],
         )
 
         if incremental and previous_snapshot:
@@ -1282,7 +1786,7 @@ def run_backup(
         logger.info(
             f"[backup] '{watch_name}': {total} file(s) to process — "
             f"sync_mode={sync_mode}, incremental={incremental}, "
-            f"encrypt={bool(encrypt_key)}, compress={compress}"
+            f"encrypt={bool(encrypt_key)}, compress={compress_level}"
         )
         # Byte-level progress tracking for accurate ETA on large files.
         # total_bytes is pre-computed from the change list sizes; bytes_done
@@ -1304,6 +1808,19 @@ def run_backup(
         except Exception as e:
             print(f"[backup] ⚠ Could not check disk space: {e}", flush=True)
 
+        # Remote free-space check — runs before any files are copied so we
+        # abort early rather than failing halfway through a large upload.
+        if TRANSPORT_AVAILABLE and storage_type not in ("local", ""):
+            try:
+                _remote_space = check_remote_free_space(storage_type, cfg, needed)
+                if not _remote_space.get("ok") and not _remote_space.get("skipped"):
+                    result["status"] = "failed"
+                    result["error"]  = _remote_space["error"]
+                    return result
+            except Exception as _rsp_err:
+                # Non-fatal — log and continue; the upload itself will surface the real error
+                print(f"[backup] ⚠ Remote space check error (non-fatal): {_rsp_err}", flush=True)
+
         # Track hashes of every file actually written to backup_dir.
         # Keys are relative paths matching what validate_backup sees via rglob
         # (e.g. "subdir/file.txt" for plain/encrypt, "subdir/file.txt.gz" for
@@ -1317,11 +1834,11 @@ def run_backup(
             try:
                 if encrypt_key and CRYPTO_AVAILABLE:
                     _files_written_hashes[src_path.name] = _encrypt_file(source, str(backup_dir / src_path.name), encrypt_key)
-                elif compress:
+                elif compress_level > 0:
                     dest_gz = backup_dir / (src_path.name + '.gz')
                     with open(str(dest_gz), 'wb') as _raw_gz:
                         _hw = _HashingWriter(_raw_gz)
-                        with gzip.open(_hw, 'wb') as f_out:
+                        with gzip.open(_hw, 'wb', compresslevel=compress_level) as f_out:
                             with open(source, 'rb') as f_in:
                                 _sh.copyfileobj(f_in, f_out)
                     _files_written_hashes[src_path.name + '.gz'] = _hw.hexdigest()
@@ -1367,6 +1884,7 @@ def run_backup(
                 except InterruptedError:
                     raise
                 except Exception:
+                    logger.debug("[suppressed] Exception ignored near: _fsz = src_path.stat().st_size if src_path.exists() else 0 |                    ", exc_info=True)
                     pass
 
         # ── Directory source ───────────────────────────────
@@ -1380,6 +1898,10 @@ def run_backup(
             _is_network = _src_str.startswith("\\\\") or _dest_str.startswith("\\\\")
             _CHUNK      = 16 * 1024 * 1024 if _is_network else 4 * 1024 * 1024  # 16 MB for network, 4 MB local
             for entry in files_to_copy:
+                # ── Pause: wait if pause_event is not set ──────────────────
+                if pause_event is not None and not pause_event.is_set():
+                    pause_event.wait()
+
                 src_file  = src_path / entry["path"]
                 dest_file = backup_dir / entry["path"]
                 dest_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1405,7 +1927,7 @@ def run_backup(
                 # format differs from the source (we cannot compare sizes).
                 # Not applied for versioned (non-sync) mode because backup_dir
                 # is a fresh timestamped folder that must contain all files.
-                if sync_mode and not encrypt_key and not compress:
+                if sync_mode and not encrypt_key and compress_level == 0:
                     if _dest_already_identical(src_file, dest_file):
                         copied     += 1
                         bytes_done += entry.get("size", 0)
@@ -1416,6 +1938,7 @@ def run_backup(
                             except InterruptedError:
                                 raise
                             except Exception:
+                                logger.debug('[suppressed] Exception ignored.', exc_info=True)
                                 pass
                         if copied == 1:
                             logger.info(
@@ -1436,11 +1959,12 @@ def run_backup(
                             except OSError:
                                 raise
                             except Exception:
+                                logger.debug("[suppressed] Exception ignored near: if free < 100 * 1024 * 1024: |                                     raise OSError", exc_info=True)
                                 pass
 
                         if encrypt_key and CRYPTO_AVAILABLE:
                             _files_written_hashes[entry["path"]] = _encrypt_file(str(src_file), str(dest_file), encrypt_key)
-                        elif compress:
+                        elif compress_level > 0:
                             dest_gz = Path(str(dest_file) + '.gz')
                             dest_gz.parent.mkdir(parents=True, exist_ok=True)
                             # Chunked compress so cancel is checked periodically.
@@ -1449,9 +1973,13 @@ def run_backup(
                             _cmp_chunk_bytes = 0
                             with open(str(dest_gz), 'wb') as _raw_gz:
                                 _hw = _HashingWriter(_raw_gz)
-                                with gzip.open(_hw, 'wb') as f_out:
+                                with gzip.open(_hw, 'wb', compresslevel=compress_level) as f_out:
                                     with open(str(src_file), 'rb') as f_in:
                                         while True:
+                                            # ── Pause: wait if pause_event is not set ──────────────────
+                                            if pause_event is not None and not pause_event.is_set():
+                                                pause_event.wait()
+
                                             chunk = f_in.read(_CHUNK)
                                             if not chunk:
                                                 break
@@ -1461,6 +1989,7 @@ def run_backup(
                                                 try:
                                                     throttler.throttle(len(chunk))
                                                 except Exception:
+                                                    logger.debug("[suppressed] Exception ignored near: _cmp_chunk_bytes += len(chunk) |                                             if ", exc_info=True)
                                                     pass
                                             if progress_cb:
                                                 try:
@@ -1473,6 +2002,7 @@ def run_backup(
                                                 except InterruptedError:
                                                     raise
                                                 except Exception:
+                                                    logger.debug('[suppressed] Exception ignored.', exc_info=True)
                                                     pass
                             dest_file = dest_gz
                             _files_written_hashes[entry["path"] + ".gz"] = _hw.hexdigest()
@@ -1491,6 +2021,10 @@ def run_backup(
                             _chunk_bytes = 0  # bytes written so far for this file
                             with open(str(src_file), 'rb') as f_in, open(str(dest_file), 'wb') as f_out:
                                 while True:
+                                    # ── Pause: wait if pause_event is not set ──────────────────
+                                    if pause_event is not None and not pause_event.is_set():
+                                        pause_event.wait()
+
                                     chunk = f_in.read(_CHUNK)
                                     if not chunk:
                                         break
@@ -1502,6 +2036,7 @@ def run_backup(
                                         try:
                                             throttler.throttle(len(chunk))
                                         except Exception:
+                                            logger.debug("[suppressed] Exception ignored near: # Throttle per-chunk for smooth, even pacing |                                  ", exc_info=True)
                                             pass
                                     # Honour cancel request between chunks
                                     if progress_cb:
@@ -1516,6 +2051,7 @@ def run_backup(
                                         except InterruptedError:
                                             raise
                                         except Exception:
+                                            logger.debug('[suppressed] Exception ignored.', exc_info=True)
                                             pass
                             _src_hash = _h_src.hexdigest()
                             # Preserve original timestamps (shutil.copy2 behaviour)
@@ -1571,6 +2107,7 @@ def run_backup(
                     except InterruptedError:
                         raise
                     except Exception:
+                        logger.debug('[suppressed] Exception ignored.', exc_info=True)
                         pass
 
             # Write .DELETED markers — only in versioned (non-sync) mode.
@@ -1585,6 +2122,7 @@ def run_backup(
                             # Include in hash — validate_backup sees these via rglob
                             _files_written_hashes[c["path"] + ".DELETED"] = hash_file(str(marker))
                         except Exception:
+                            logger.debug("[suppressed] Exception ignored near: try: |                             marker.touch() |                             ", exc_info=True)
                             pass
 
         # ── Integrity hash ───────────────────
@@ -1626,7 +2164,7 @@ def run_backup(
         # minutes to re-scan).  For compressed backups the output size differs
         # from the source size, so fall back to a local disk scan only in that
         # case — compressed backup dirs are never on a remote path at this point.
-        if compress:
+        if compress_level > 0:
             total_size = _safe_size(str(backup_dir))
         else:
             total_size = total_bytes if total_bytes > 0 else bytes_done
@@ -1635,7 +2173,7 @@ def run_backup(
 
         # Calculate compression ratio
         compression_ratio = 0.0
-        if compress:
+        if compress_level > 0:
             uncompressed_est = sum(c.get("size", 0) for c in changes)
             actual_size = total_size  # already computed above for compress case
             if uncompressed_est > 0:
@@ -1643,15 +2181,15 @@ def run_backup(
 
         # ── Remote destination upload ──────────────────────────────────────────
         # Handles multiple destinations: cloud (GDrive), sftp, ftp, smb, https, webdav.
-        def _upload_to_destination(backup_dir_path: str, dest_config: dict, progress_cb) -> dict:
+        def _upload_to_destination(backup_dir_path: str, dest_config: dict, progress_cb, allowed_rel_paths=None) -> dict:
             """Upload backup to a single destination."""
             dest_type = dest_config.get("_dest_type", "")
-            if dest_type == "cloud":
+            if dest_type == "gdrive":
                 provider = dest_config.get("provider", "gdrive")
-                if provider == "gdrive" and dest_config.get("access_token"):
-                    return upload_to_gdrive(backup_dir_path, dest_config)
+                if _is_gdrive_ready(dest_config):
+                    return upload_to_gdrive(backup_dir_path, dest_config, allowed_rel_paths=allowed_rel_paths)
                 else:
-                    return {"ok": False, "error": f"Not connected — use the Connect button for {provider}"}
+                    return {"ok": False, "error": f"Not connected  use the Connect button for {provider}"}
             elif dest_type == "sftp" and TRANSPORT_AVAILABLE:
                 sftp_cfg = dest_config.get("sftp_config") or dest_config
                 return upload_to_sftp(backup_dir_path, sftp_cfg, progress_cb=progress_cb)
@@ -1672,50 +2210,86 @@ def run_backup(
                 from transport_utils import upload_to_webdav
                 webdav_cfg = dest_config.get("webdav_config") or dest_config
                 return upload_to_webdav(backup_dir_path, webdav_cfg, progress_cb=progress_cb)
+            elif dest_type == "rclone" and TRANSPORT_AVAILABLE:
+                rclone_cfg = dest_config.get("rclone_config") or dest_config
+                return upload_to_rclone(backup_dir_path, rclone_cfg, progress_cb=progress_cb)
             else:
                 return {"ok": False, "error": f"Unsupported destination type: {dest_type}"}
 
+        def _upload_progress(bytes_done, total_bytes, filename):
+            if progress_cb:
+                try:
+                    progress_cb(0, total or 1, filename, bytes_done, total_bytes)
+                except Exception:
+                    logger.debug("[suppressed] Exception ignored near: def _upload_progress(bytes_done, total_bytes, filename): |             if progre", exc_info=True)
+                    pass
+
+        # Build the set of relative paths that legitimately belong to this backup.
+        # Derived from new_snapshot (the full source file list), adjusted for
+        # compression (dest files get a .gz suffix when compress_level > 0).
+        # Passing this to upload_to_gdrive prevents stray folders/files that happen
+        # to exist in the backup destination (e.g. Monthly/Weekly dirs left over
+        # from a different tool) from being mirrored to GDrive.
+        _backup_rel_paths: Optional[set] = None
+        if new_snapshot:
+            if compress_level > 0:
+                _backup_rel_paths = {k + ".gz" for k in new_snapshot.keys()}
+            else:
+                _backup_rel_paths = set(new_snapshot.keys())
+
         cloud_upload_results = []
-        if destinations:
+        cloud_upload_result = None
+
+        # Skip cloud upload entirely when nothing was copied — avoids unnecessary
+        # network round-trips (token refresh + folder listing) on every scheduled
+        # backup that finds no changes, which was making each run feel slow.
+        _skip_upload = (copied == 0 and not sync_mode)
+        if _skip_upload:
+            logger.info(f"☁ Skipping cloud upload for {watch_name} — no files copied")
+
+        if not _skip_upload and destinations:
             # Multi-destination mode
             for dest in destinations:
                 dest_type = dest.get("dest_type")
                 dest_config = dest.get("config", {})
                 dest_config["_dest_type"] = dest_type
-                logger.info(f"📡 Uploading to {dest_type}: {watch_name}")
-                upload_result = _upload_to_destination(str(backup_dir), dest_config, _upload_progress)
-                cloud_upload_results.append({"dest_type": dest_type, **upload_result})
-        else:
+                logger.info(f" Uploading to {dest_type}: {watch_name}")
+                upload_result = _upload_to_destination(str(backup_dir), dest_config, _upload_progress, allowed_rel_paths=_backup_rel_paths)
+                cloud_upload_results.append({"dest_type": dest_type if dest_type != "cloud" else "gdrive", **upload_result})
+        elif not _skip_upload:
             # Legacy single destination mode
             cloud_upload_result = None
             _dest_type = (cloud_config or {}).get("_dest_type", "") or storage_type
 
-            if _dest_type == "cloud" and cloud_config:
+            if _dest_type == "gdrive" and cloud_config:
                 provider = cloud_config.get("provider", "gdrive")
-                logger.info(f"☁ Uploading backup to cloud ({provider}): {watch_name}")
-                if provider == "gdrive" and cloud_config.get("access_token"):
-                    cloud_upload_result = upload_to_gdrive(str(backup_dir), cloud_config)
+                logger.info(f" Uploading backup to gdrive ({provider}): {watch_name}")
+                if _is_gdrive_ready(cloud_config):
+                    cloud_upload_result = upload_to_gdrive(str(backup_dir), cloud_config, allowed_rel_paths=_backup_rel_paths)
                 else:
-                    cloud_upload_result = {"ok": False, "error": f"Not connected — use the Connect button for {provider}"}
+                    cloud_upload_result = {"ok": False, "error": f"Not connected  use the Connect button for {provider}"}
 
             elif _dest_type == "sftp" and TRANSPORT_AVAILABLE:
                 sftp_cfg = (cloud_config or {}).get("sftp_config") or cloud_config or {}
                 logger.info(f"📡 Uploading backup via SFTP: {watch_name}")
                 cloud_upload_result = upload_to_sftp(str(backup_dir), sftp_cfg,
-                                                     progress_cb=_upload_progress)
+                                                     progress_cb=_upload_progress,
+                                                     verify=verify_remote_upload)
 
             elif _dest_type == "ftp" and TRANSPORT_AVAILABLE:
                 ftp_cfg = (cloud_config or {}).get("ftp_config") or cloud_config or {}
                 logger.info(f"📡 Uploading backup via FTP: {watch_name}")
                 cloud_upload_result = upload_to_ftp(str(backup_dir), ftp_cfg,
-                                                    progress_cb=_upload_progress)
+                                                    progress_cb=_upload_progress,
+                                                    verify=verify_remote_upload)
 
             elif _dest_type == "ftps" and TRANSPORT_AVAILABLE:
                 ftp_cfg = dict((cloud_config or {}).get("ftp_config") or cloud_config or {})
                 ftp_cfg["use_tls"] = True  # enforce TLS for FTPS
                 logger.info(f"📡 Uploading backup via FTPS: {watch_name}")
                 cloud_upload_result = upload_to_ftp(str(backup_dir), ftp_cfg,
-                                                    progress_cb=_upload_progress)
+                                                    progress_cb=_upload_progress,
+                                                    verify=verify_remote_upload)
 
             elif _dest_type == "smb" and TRANSPORT_AVAILABLE:
                 smb_cfg = (cloud_config or {}).get("smb_config") or cloud_config or {}
@@ -1734,6 +2308,13 @@ def run_backup(
                 webdav_cfg = (cloud_config or {}).get("webdav_config") or cloud_config or {}
                 logger.info(f"📡 Uploading backup via WebDAV: {watch_name}")
                 cloud_upload_result = upload_to_webdav(str(backup_dir), webdav_cfg,
+                                                       progress_cb=_upload_progress,
+                                                       verify=verify_remote_upload)
+
+            elif _dest_type == "rclone" and TRANSPORT_AVAILABLE:
+                rclone_cfg = (cloud_config or {}).get("rclone_config") or cloud_config or {}
+                logger.info(f"📡 Uploading backup via rclone: {watch_name}")
+                cloud_upload_result = upload_to_rclone(str(backup_dir), rclone_cfg,
                                                        progress_cb=_upload_progress)
 
             if cloud_upload_result:
@@ -1745,6 +2326,13 @@ def run_backup(
                 logger.warning(f"⚠ Remote upload failed ({res.get('dest_type', '?')}): {res.get('error', 'Unknown error')}")
             else:
                 logger.info(f"☁ Remote upload complete ({res.get('dest_type', '?')}): {res.get('uploaded', '?')} files uploaded")
+                # Surface post-upload checksum warnings
+                warn_list = res.get("warnings") or res.get("verify_warnings", [])
+                if warn_list:
+                    for w_msg in warn_list:
+                        logger.warning(f"⚠ Remote verify ({res.get('dest_type', '?')}): {w_msg}")
+                    # Bubble warnings up so the UI can display them
+                    res["verify_warnings"] = warn_list
 
         result["destinations_upload"] = cloud_upload_results
 
@@ -1767,6 +2355,7 @@ def run_backup(
             "throughput_mbs":     round(throughput_mbs, 2),
             "total_size_bytes":   total_size,
             "failed_files":       result.get("failed_files", []),
+            "skipped_symlinks":   result.get("skipped_symlinks", []),
             "destinations_upload": cloud_upload_results,  # NEW: persisted in manifest
             "triggered_by":       triggered_by or "auto",
         }
@@ -1775,9 +2364,45 @@ def run_backup(
         # to avoid polluting the user's backed-up files.
         if not sync_mode:
             manifest_path = backup_dir / "MANIFEST.json"
-            with open(manifest_path, "w") as f:
-                json.dump(manifest, f, indent=2)
-            # Verify MANIFEST
+
+            if encrypt_key and CRYPTO_AVAILABLE:
+                # ── Encrypted manifest ────────────────────────────────────────
+                # Write the full manifest (including file paths and per-file
+                # hashes in "snapshot" and "changes") as an encrypted blob so
+                # that anyone with access to the backup destination cannot read
+                # the directory tree of a supposedly encrypted backup.
+                try:
+                    manifest_json = json.dumps(manifest, indent=2).encode()
+                    enc_blob = _encrypt_bytes(manifest_json, encrypt_key)
+                    enc_path = backup_dir / "MANIFEST.json.enc"
+                    enc_path.write_bytes(enc_blob)
+                except Exception as _enc_err:
+                    logger.warning("Could not encrypt MANIFEST — falling back to plaintext: %s", _enc_err)
+                    with open(manifest_path, "w") as f:
+                        json.dump(manifest, f, indent=2)
+                else:
+                    # Write a lightweight stub so BackupIndex (and old clients)
+                    # can still enumerate backups without the encryption key.
+                    # Sensitive fields (snapshot, changes) are intentionally omitted.
+                    _STUB_KEYS = {
+                        "backup_id", "watch_id", "watch_name", "source",
+                        "timestamp", "status", "incremental", "compressed",
+                        "encrypted", "compression_ratio", "files_copied",
+                        "duration_s", "throughput_mbs", "total_size_bytes",
+                        "triggered_by",
+                    }
+                    stub = {k: v for k, v in manifest.items() if k in _STUB_KEYS}
+                    stub["__note"] = (
+                        "Sensitive fields (file paths, per-file hashes) are stored "
+                        "in MANIFEST.json.enc — decrypt with the watch encryption key."
+                    )
+                    with open(manifest_path, "w") as f:
+                        json.dump(stub, f, indent=2)
+            else:
+                with open(manifest_path, "w") as f:
+                    json.dump(manifest, f, indent=2)
+
+            # Verify MANIFEST (always check the plaintext file — stub or full)
             try:
                 with open(manifest_path) as f:
                     json.load(f)
@@ -1801,6 +2426,14 @@ def run_backup(
             "progress":          100,
             "cloud_upload":      cloud_upload_result,
         })
+
+        _sym_count = len(result.get("skipped_symlinks", []))
+        if _sym_count:
+            logger.warning(
+                f"⚠ '{watch_name}': {_sym_count} symlink(s) were skipped and are NOT included "
+                f"in this backup. Check the log for the full list or review the backup result's "
+                f"'skipped_symlinks' field."
+            )
 
         logger.info(
             f"✅ Backup complete: {watch_name} | {_human_size(total_size)} | "
@@ -1889,6 +2522,7 @@ def run_backup(
                 )
                 logger.info(f"[resume] Checkpoint saved after failure — next run will resume")
             except Exception:
+                logger.debug('[suppressed] Exception ignored.', exc_info=True)
                 pass
         elif backup_dir is not None and Path(backup_dir).exists():
             shutil.rmtree(str(backup_dir), ignore_errors=True)
@@ -1898,46 +2532,60 @@ def run_backup(
         # Always clean up the VSS shadow copy, even on success or exception.
         if _vss_shadow_id:
             _vss_delete_snapshot(_vss_shadow_id)
+        # Clean up the remote-source temp dir downloaded earlier.
+        if _remote_source_temp:
+            try:
+                import shutil as _sh
+                _sh.rmtree(_remote_source_temp, ignore_errors=True)
+            except Exception:
+                logger.debug("[suppressed] Exception ignored near: if _remote_source_temp: |             try: |                 import shutil as _s", exc_info=True)
+                pass
         # On success: remove any stale resume checkpoint for this watch.
         if result.get("status") == "success":
             try:
                 if _resume_path.exists():
                     _resume_path.unlink()
             except Exception:
+                logger.debug('[suppressed] Exception ignored.', exc_info=True)
                 pass
         _backup_index.invalidate(destination)
 
     # ── Post-backup hook ───────────────────────────────────────────────────────
-    # Runs regardless of success/failure so callers can always do cleanup.
-    # A failing post-hook is logged but does NOT change result["status"].
-    if post_backup_cmd and post_backup_cmd.strip():
-        logger.info(f"[hook] Running post-backup command: {post_backup_cmd}")
+    if post_backup_cmd:
+        result_cmd = subprocess.run(post_backup_cmd, shell=True, capture_output=True, text=True)
+        if result_cmd.returncode != 0:
+            logger.warning(f"Post-backup command failed (exit {result_cmd.returncode}): {result_cmd.stderr}")
+
+    # ── Post-backup verification (test-restore to temp) ─────────────────────
+    result["verify_errors"] = []
+    result["verify_ok"]     = None
+    result["verify_report"] = None
+    if verify_after and result.get("status") == "success":
         try:
-            import subprocess as _sp
-            _post = _sp.run(
-                post_backup_cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env={**os.environ,
-                     "BACKUPSYS_STATUS":   result.get("status", ""),
-                     "BACKUPSYS_WATCH":    watch_name,
-                     "BACKUPSYS_WATCH_ID": watch_id},
+            logger.info(f"[verify] Starting test-restore verification for '{watch_name}'…")
+            vr = verify_restore_integrity(
+                backup_dir   = result.get("backup_dir", str(backup_dir)),
+                encrypt_key  = encrypt_key,
+                progress_cb  = progress_cb,
             )
-            if _post.stdout.strip():
-                logger.info(f"[hook] post-backup stdout: {_post.stdout.strip()}")
-            if _post.stderr.strip():
-                logger.warning(f"[hook] post-backup stderr: {_post.stderr.strip()}")
-            if _post.returncode != 0:
-                logger.warning(
-                    f"[hook] Post-backup command exited {_post.returncode} — "
-                    f"backup result is unchanged."
+            result["verify_ok"]     = vr["ok"]
+            result["verify_errors"] = vr["corrupted_files"] + vr["missing_files"]
+            result["verify_report"] = vr
+            if vr["ok"]:
+                logger.info(
+                    f"[verify] ✅ '{watch_name}': {vr['files_verified']} file(s) verified, "
+                    f"{vr['files_skipped']} existence-checked in {vr['duration_s']}s"
                 )
             else:
-                logger.info(f"[hook] Post-backup command succeeded (exit 0)")
-        except Exception as _ph:
-            logger.warning(f"[hook] Post-backup hook error (non-fatal): {_ph}")
+                logger.warning(
+                    f"[verify] ⚠ '{watch_name}': verification failed — "
+                    f"{vr['files_failed']} file(s) corrupt/missing "
+                    f"({len(vr['restore_errors'])} restore errors); "
+                    f"error={vr.get('error')}"
+                )
+        except Exception as _ve:
+            result["verify_errors"] = [f"Verification exception: {_ve}"]
+            result["verify_ok"]     = False
 
     return result
 
@@ -1959,15 +2607,69 @@ def export_backup_zip(backup_dir: str, tmp_dir: str) -> dict:
 
 # ─── Restore ──────────────────────────────────────────────────────────────────
 
-def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = False, encrypt_key: str = None) -> dict:
+def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = False,
+                   encrypt_key: str = None, progress_cb=None, overwrite: bool = True,
+                   remote_type: str = None, remote_cfg: dict = None) -> dict:
     """Restore files from a backup directory back to target_path.
-    
+
+    When backup_dir resides on a remote destination (SMB, WebDAV, rclone, SFTP,
+    FTP, or Google Drive) pass remote_type + remote_cfg and restore_backup() will
+    download the store to a local temp directory before restoring, then clean up.
+
     Args:
-        backup_dir: Path to the backup directory
-        target_path: Path where files should be restored
-        incremental_only: If True, only restore files that don't already exist at target
+        backup_dir: Path to the backup directory (local, or remote path when
+                    remote_type is set — e.g. the share sub-path for SMB/WebDAV).
+        target_path: Path where files should be restored.
+        incremental_only: If True, only restore files that don't already exist at target.
+        encrypt_key: Fernet key for decryption.
+        progress_cb: Optional callback(restored_count, total_files, filename).
+        overwrite: If True, overwrite existing files; if False, skip them.
+        remote_type: One of "sftp"|"ftp"|"ftps"|"smb"|"webdav"|"rclone"|"gdrive".
+                     When set, backup_dir is treated as the remote path.
+        remote_cfg: Credentials / config dict matching remote_type.
     """
     import gzip as _gz
+
+    # ── Optional: download from a remote destination before restoring ──────────
+    _restore_temp_dir: Optional[str] = None
+    if remote_type:
+        import tempfile, shutil as _sh2
+        _restore_temp_dir = tempfile.mkdtemp(prefix="backupsys_restore_")
+        cfg = remote_cfg or {}
+        try:
+            if remote_type in ("sftp", "ftps"):
+                _dl = download_from_sftp(backup_dir, _restore_temp_dir, cfg)
+            elif remote_type in ("ftp",):
+                _dl = download_from_ftp(backup_dir, _restore_temp_dir, cfg)
+            elif remote_type == "smb":
+                from transport_utils import download_from_smb
+                _dl = download_from_smb(backup_dir, _restore_temp_dir, cfg)
+            elif remote_type == "webdav":
+                from transport_utils import download_from_webdav
+                _dl = download_from_webdav(backup_dir, _restore_temp_dir, cfg)
+            elif remote_type == "rclone":
+                from transport_utils import download_from_rclone
+                _dl = download_from_rclone(backup_dir, _restore_temp_dir, cfg)
+            elif remote_type == "https":
+                from transport_utils import download_from_https
+                _dl = download_from_https(backup_dir, _restore_temp_dir, cfg)
+            elif remote_type == "gdrive":
+                _dl = download_from_gdrive(cfg, _restore_temp_dir)
+                if _dl.get("ok"):
+                    _dl["status"] = "ok"
+            else:
+                _sh2.rmtree(_restore_temp_dir, ignore_errors=True)
+                return {"ok": False, "files_restored": 0, "skipped": 0, "errors": [],
+                        "error": f"Unsupported remote_type for restore: {remote_type!r}"}
+            if _dl.get("status") != "ok":
+                _sh2.rmtree(_restore_temp_dir, ignore_errors=True)
+                return {"ok": False, "files_restored": 0, "skipped": 0, "errors": [],
+                        "error": f"Failed to download backup from {remote_type}: {_dl.get('error')}"}
+            backup_dir = _restore_temp_dir  # restore from the local copy
+        except Exception as _dl_err:
+            _sh2.rmtree(_restore_temp_dir, ignore_errors=True)
+            return {"ok": False, "files_restored": 0, "skipped": 0, "errors": [],
+                    "error": f"Remote download error: {_dl_err}"}
 
     backup_dir  = _fix_path(backup_dir)
     target_path = _fix_path(target_path)
@@ -1985,24 +2687,47 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
 
     try:
         manifest_p = bd / "MANIFEST.json"
-        if not manifest_p.exists():
-            result["error"] = "MANIFEST.json not found — cannot restore"
-            return result
+        enc_p      = bd / "MANIFEST.json.enc"
 
-        try:
-            with open(manifest_p) as f:
-                manifest = json.load(f)
-        except json.JSONDecodeError:
-            result["error"] = "MANIFEST.json is corrupted (invalid JSON) — cannot restore"
-            return result
-        except Exception as e:
-            result["error"] = f"Could not read MANIFEST.json: {e}"
+        # Prefer the encrypted manifest when we have a key — it contains the
+        # full snapshot and changes lists needed for a faithful restore.
+        if encrypt_key and CRYPTO_AVAILABLE and enc_p.exists():
+            try:
+                manifest = json.loads(_decrypt_bytes(enc_p.read_bytes(), encrypt_key))
+            except Exception as _dec_err:
+                # Encrypted manifest decryption failed — this almost certainly means the
+                # wrong key was supplied.  Do NOT fall back to the plaintext stub: the
+                # stub intentionally omits 'changes' (for security), so a silent fallback
+                # would appear to succeed while restoring nothing.  Fail loudly instead.
+                logger.warning(
+                    "Could not decrypt MANIFEST.json.enc (%s); wrong key or corrupted manifest",
+                    _dec_err,
+                )
+                result["error"] = (
+                    "MANIFEST.json.enc decryption failed — "
+                    "wrong encryption key or corrupted manifest"
+                )
+                result["errors"].append(result["error"])
+                return result
+        elif manifest_p.exists():
+            try:
+                with open(manifest_p) as f:
+                    manifest = json.load(f)
+            except json.JSONDecodeError:
+                result["error"] = "MANIFEST.json is corrupted (invalid JSON) — cannot restore"
+                return result
+            except Exception as e:
+                result["error"] = f"Could not read MANIFEST.json: {e}"
+                return result
+        else:
+            result["error"] = "MANIFEST.json not found — cannot restore"
             return result
 
         tp.mkdir(parents=True, exist_ok=True)
         restored = 0
         skipped  = 0
         snap     = manifest.get("snapshot", {})  # per-file hashes for integrity check
+        total_files = len([e for e in manifest.get("changes", []) if e.get("type") in ("added", "modified")])
 
         for entry in manifest.get("changes", []):
             etype = entry.get("type")
@@ -2013,8 +2738,8 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
                 gz_file  = bd / (rel + '.gz')
                 dst_file = tp / rel
 
-                # ── NEW: Skip if incremental_only and file already exists ──
-                if incremental_only and dst_file.exists():
+                # ── NEW: Skip if not overwrite and file already exists ──
+                if not overwrite and dst_file.exists():
                     skipped += 1
                     continue
 
@@ -2025,6 +2750,12 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
                         with _gz.open(str(gz_file), 'rb') as f_in, open(str(dst_file), 'wb') as f_out:
                             shutil.copyfileobj(f_in, f_out)
                         restored += 1
+                        if progress_cb:
+                            try:
+                                progress_cb(restored, total_files, rel)
+                            except Exception:
+                                logger.debug("[suppressed] Exception ignored near: restored += 1 |                         if progress_cb: |                       ", exc_info=True)
+                                pass
                     except Exception as e:
                         result["errors"].append(f"{rel}: {e}")
 
@@ -2057,6 +2788,12 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
                                     continue  # don't count as successfully restored
 
                         restored += 1
+                        if progress_cb:
+                            try:
+                                progress_cb(restored, total_files, rel)
+                            except Exception:
+                                logger.debug("[suppressed] Exception ignored near: restored += 1 |                         if progress_cb: |                       ", exc_info=True)
+                                pass
                     except Exception as e:
                         result["errors"].append(f"{rel}: {e}")
 
@@ -2069,6 +2806,7 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
                     try:
                         dst_file.unlink()
                     except Exception:
+                        logger.debug("[suppressed] Exception ignored near: dst_file = tp / rel |                 if dst_file.exists(): |                   ", exc_info=True)
                         pass
 
         result["ok"]             = True
@@ -2077,6 +2815,11 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
 
     except Exception as e:
         result["error"] = str(e)
+
+    # Clean up the temp dir we created for a remote download (if any)
+    if _restore_temp_dir:
+        import shutil as _sh3
+        _sh3.rmtree(_restore_temp_dir, ignore_errors=True)
 
     return result
 
@@ -2088,6 +2831,7 @@ def restore_full_chain(
     up_to_backup_id: Optional[str] = None,
     encrypt_key: Optional[str] = None,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    overwrite: bool = True,
 ) -> dict:
     """
     Restore the FULL incremental chain for a watch to target_path.
@@ -2105,6 +2849,7 @@ def restore_full_chain(
                           restores up to the most recent backup.
         encrypt_key:      Fernet key to decrypt encrypted backups.
         progress_cb:      Optional progress(step, total_steps, label) callback.
+        overwrite:        If True, overwrite existing files; if False, skip them.
 
     Returns a dict:
         ok, files_restored, steps_applied, skipped, errors, error
@@ -2156,13 +2901,14 @@ def restore_full_chain(
                 try:
                     progress_cb(step_idx + 1, total_steps, f"Applying {ts[:19]} ({bid[:8]}…)")
                 except Exception:
+                    logger.debug("[suppressed] Exception ignored near: if progress_cb: |                 try: |                     progress_cb(step_id", exc_info=True)
                     pass
 
             step_result = restore_backup(
                 backup_dir=backup_dir,
                 target_path=target_path,
-                incremental_only=False,
                 encrypt_key=encrypt_key,
+                overwrite=overwrite,
             )
 
             result["files_restored"] += step_result.get("files_restored", 0)
@@ -2326,6 +3072,7 @@ def preview_cleanup(destination: str, retention_days: int, watch_id: Optional[st
                     result["to_delete"].append(d.name)
                     result["freed_bytes"] += _safe_size(str(d))
             except Exception:
+                logger.debug("[suppressed] Exception ignored near: age_hours = (datetime.now().timestamp() - d.stat().st_mtime) / 3600 |           ", exc_info=True)
                 pass
             continue
         try:
@@ -2340,6 +3087,7 @@ def preview_cleanup(destination: str, retention_days: int, watch_id: Optional[st
                 result["to_delete"].append(d.name)
                 result["freed_bytes"] += _safe_size(str(d))
         except Exception:
+            logger.debug("[suppressed] Exception ignored near: continue |             if datetime.fromisoformat(ts_str) < cutoff: |            ", exc_info=True)
             pass
 
     result["freed_human"] = _human_size(result["freed_bytes"])
@@ -2424,6 +3172,206 @@ def cleanup_old_backups(destination: str, retention_days: int, watch_id: Optiona
             f"🗑 Deleted {result['deleted']} old backup(s) "
             f"(older than {retention_days}d), freed {result['freed_human']}"
         )
+
+    return result
+
+
+# ─── Restore Verification ─────────────────────────────────────────────────────
+
+def verify_restore_integrity(
+    backup_dir: str,
+    encrypt_key: Optional[str] = None,
+    progress_cb: Optional[Callable] = None,
+    keep_temp: bool = False,
+) -> dict:
+    """
+    Verify a backup by performing a full test-restore to a temporary directory
+    and comparing every restored file against the MANIFEST snapshot hashes.
+
+    Workflow:
+      1.  Load MANIFEST.json — fail fast if absent / corrupt.
+      2.  Create an OS temp directory (under the system temp root, never inside
+          the watched source or the backup destination).
+      3.  Call restore_backup() to restore all files into the temp dir.
+          This path exercises the full restore stack: decompression, decryption,
+          MANIFEST validation, and file-copy logic.
+      4.  For every entry in the manifest snapshot that carries a non-empty
+          stored hash, re-hash the restored file and compare byte-for-byte.
+      5.  Encrypted / compressed files whose snapshot hash is empty (normal —
+          the snapshot stores plaintext hashes but encrypted ciphertext is in
+          the backup dir) are *existence-checked* instead: the restore must
+          produce a non-empty file, but no hash comparison is performed.
+      6.  Delete the temp directory unless *keep_temp=True*.
+      7.  Return a detailed report dict.
+
+    Returns::
+
+        {
+          ok:              bool,   # True iff restore succeeded AND 0 errors
+          files_restored:  int,    # files restore_backup() copied
+          files_verified:  int,    # files hash-checked (has stored hash)
+          files_skipped:   int,    # files existence-checked (no stored hash)
+          files_failed:    int,    # verification failures
+          missing_files:   [str],  # expected in snapshot but absent after restore
+          corrupted_files: [str],  # restored but hash mismatch
+          restore_errors:  [str],  # errors from restore_backup()
+          error:           str|None,
+          temp_dir:        str,    # path used (deleted unless keep_temp=True)
+          duration_s:      float,
+        }
+    """
+    import tempfile as _tempfile
+
+    started  = time.time()
+    result: dict = {
+        "ok":              False,
+        "files_restored":  0,
+        "files_verified":  0,
+        "files_skipped":   0,
+        "files_failed":    0,
+        "missing_files":   [],
+        "corrupted_files": [],
+        "restore_errors":  [],
+        "error":           None,
+        "temp_dir":        "",
+        "duration_s":      0.0,
+    }
+
+    backup_dir = _fix_path(backup_dir)
+    bd         = Path(backup_dir)
+    tmp_dir    = None
+
+    try:
+        # ── 1. Load manifest ────────────────────────────────────────────────
+        manifest_p = bd / "MANIFEST.json"
+        if not manifest_p.exists():
+            result["error"] = "MANIFEST.json not found — cannot verify"
+            return result
+        try:
+            with open(manifest_p) as f:
+                manifest = json.load(f)
+        except json.JSONDecodeError as e:
+            result["error"] = f"MANIFEST.json is corrupted: {e}"
+            return result
+
+        snap        = manifest.get("snapshot", {})
+        is_enc      = manifest.get("encrypted", False)
+        is_cmp      = bool(manifest.get("compressed", False))
+        changes     = manifest.get("changes", [])
+        to_restore  = [c for c in changes if c.get("type") in ("added", "modified")]
+
+        if not to_restore and not snap:
+            # Empty backup (no files) — trivially OK
+            result.update({"ok": True, "duration_s": round(time.time() - started, 2)})
+            return result
+
+        # ── 2. Create temp dir ──────────────────────────────────────────────
+        tmp_dir = _tempfile.mkdtemp(prefix="backupsys_verify_")
+        result["temp_dir"] = tmp_dir
+
+        # ── 3. Restore to temp ──────────────────────────────────────────────
+        total_steps = len(to_restore)
+
+        def _restore_progress(restored, total, fname):
+            if progress_cb:
+                try:
+                    progress_cb(restored, total, f"Restoring: {fname}")
+                except Exception:
+                    logger.debug("[suppressed] Exception ignored near: def _restore_progress(restored, total, fname): |             if progress_cb: |  ", exc_info=True)
+                    pass
+
+        restore_result = restore_backup(
+            backup_dir=backup_dir,
+            target_path=tmp_dir,
+            encrypt_key=encrypt_key,
+            progress_cb=_restore_progress,
+            overwrite=True,
+        )
+
+        result["files_restored"] = restore_result.get("files_restored", 0)
+        result["restore_errors"] = list(restore_result.get("errors", []))
+
+        if not restore_result.get("ok", False):
+            result["error"] = restore_result.get("error") or "Restore step failed"
+            return result
+
+        # ── 4 & 5. Verify restored files ────────────────────────────────────
+        verified = 0
+        skipped  = 0
+        failed   = 0
+        missing  = []
+        corrupt  = []
+
+        for entry in to_restore:
+            rel = entry.get("path", "")
+            if not rel:
+                continue
+
+            restored_file = Path(tmp_dir) / rel
+            stored_hash   = snap.get(rel, {}).get("hash", "") if isinstance(snap.get(rel), dict) else ""
+
+            if progress_cb:
+                try:
+                    progress_cb(verified + skipped + failed, total_steps, f"Verifying: {rel}")
+                except Exception:
+                    logger.debug("[suppressed] Exception ignored near: if progress_cb: |                 try: |                     progress_cb(verifie", exc_info=True)
+                    pass
+
+            if not restored_file.exists():
+                # File should have been restored but isn't present
+                missing.append(rel)
+                failed += 1
+                continue
+
+            if stored_hash:
+                # Full hash comparison
+                actual_hash = hash_file(str(restored_file))
+                if actual_hash and actual_hash != stored_hash:
+                    corrupt.append(rel)
+                    failed += 1
+                    logger.warning(
+                        f"[verify-restore] Hash mismatch: {rel} "
+                        f"(expected {stored_hash[:12]}…, got {actual_hash[:12]}…)"
+                    )
+                else:
+                    verified += 1
+            else:
+                # Encrypted or compressed — existence + non-empty size check
+                if restored_file.stat().st_size == 0:
+                    corrupt.append(rel)
+                    failed += 1
+                    logger.warning(f"[verify-restore] Zero-byte file after restore: {rel}")
+                else:
+                    skipped += 1
+
+        result.update({
+            "ok":              (failed == 0 and not result["restore_errors"]),
+            "files_verified":  verified,
+            "files_skipped":   skipped,
+            "files_failed":    failed,
+            "missing_files":   missing,
+            "corrupted_files": corrupt,
+        })
+
+        logger.info(
+            f"[verify-restore] {bd.name}: "
+            f"{verified} verified, {skipped} existence-checked, {failed} failed "
+            f"({result['files_restored']} files restored to temp)"
+        )
+
+    except Exception as exc:
+        import traceback
+        result["error"] = str(exc)
+        logger.error(f"[verify-restore] Unexpected error: {exc}\n{traceback.format_exc()}")
+
+    finally:
+        result["duration_s"] = round(time.time() - started, 2)
+        if tmp_dir and not keep_temp:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                logger.debug('[suppressed] Exception ignored.', exc_info=True)
+                pass
 
     return result
 
@@ -2573,6 +3521,7 @@ def get_backup_by_id(destination: str, backup_id: str) -> Optional[Tuple[str, di
             if m.get("backup_id") == backup_id:
                 return str(d), m
         except Exception:
+            logger.debug('[suppressed] Exception ignored.', exc_info=True)
             pass
     return None
 
@@ -2810,3 +3759,71 @@ def prune_excess_backups(destination: str, watch_id: str, max_backups: int) -> d
         )
 
     return result
+
+# ─── Encryption Key Rotation ──────────────────────────────────────────────────
+
+def rotate_encryption_key(backup_dir, old_key, new_key, progress_cb=None):
+    """
+    Rotate encryption key for all .enc files in backup_dir.
+    Decrypts each .enc file with old_key, re-encrypts with new_key, replaces in place,
+    and updates the manifest.json hash entry for that file.
+    progress_cb(rel_path, idx, total) is called for progress updates if provided.
+    Returns: {ok: bool, files_rotated: int, errors: list}
+    """
+    import tempfile
+    backup_dir = _fix_path(backup_dir)
+    bd = Path(backup_dir)
+    errors = []
+    files_rotated = 0
+    manifest_path = bd / "MANIFEST.json"
+    # Load manifest
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except Exception as e:
+        return {"ok": False, "files_rotated": 0, "errors": [f"Failed to load manifest: {e}"]}
+
+    # Find all .enc files
+    enc_files = [f for f in bd.rglob("*.enc") if f.is_file()]
+    total = len(enc_files)
+    for idx, enc_file in enumerate(enc_files):
+        rel_path = str(enc_file.relative_to(bd))
+        try:
+            # Decrypt to temp file
+            with tempfile.NamedTemporaryFile(delete=False) as tmp_dec:
+                tmp_dec_path = tmp_dec.name
+            _decrypt_file(str(enc_file), tmp_dec_path, old_key)
+            # Encrypt to temp file
+            with tempfile.NamedTemporaryFile(delete=False) as tmp_enc:
+                tmp_enc_path = tmp_enc.name
+            new_hash = _encrypt_file(tmp_dec_path, tmp_enc_path, new_key)
+            # Replace original file with new encrypted file
+            os.replace(tmp_enc_path, str(enc_file))
+            os.remove(tmp_dec_path)
+            files_rotated += 1
+            # Update manifest hash if present
+            snap = manifest.get("snapshot", {})
+            if rel_path in snap:
+                snap[rel_path]["hash"] = new_hash
+        except Exception as e:
+            errors.append(f"{rel_path}: {e}")
+            # Clean up temp files if they exist
+            for p in [locals().get('tmp_dec_path'), locals().get('tmp_enc_path')]:
+                if p and os.path.exists(p):
+                    try: os.remove(p)
+                    except Exception:
+                        logger.debug("[suppressed] Exception ignored near: # Clean up temp files if they exist |             for p in [locals().get('tmp_de", exc_info=True)
+        if progress_cb:
+            try:
+                progress_cb(rel_path, idx + 1, total)
+            except Exception:
+                logger.debug("[suppressed] Exception ignored near: except Exception: pass |         if progress_cb: |             try: |           ", exc_info=True)
+                pass
+    # Save manifest
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+    except Exception as e:
+        errors.append(f"Failed to save manifest: {e}")
+        return {"ok": False, "files_rotated": files_rotated, "errors": errors}
+    return {"ok": len(errors) == 0, "files_rotated": files_rotated, "errors": errors}

@@ -152,12 +152,14 @@ def create_config():
             "notify_on_failure": True,
         },
         "dest_sftp": {
-            "host": "", "port": 22, "user": "", "pass": "",
-            "path": "/backups", "keyfile": "", "key_pass": "",
+            "host": "", "port": 22, "username": "",
+            "remote_path": "", "key_path": "", "key_passphrase": "",
         },
-        "dest_ftp": {},
-        "dest_smb": {},
-        "dest_https": {},
+        "dest_ftp": {"host": "", "port": 21, "username": "", "use_tls": True},
+        "dest_smb": {"server": "", "share": "", "username": "", "remote_path": ""},
+        "dest_https": {"url": "", "token": "", "verify_ssl": True},
+        "dest_webdav": {"url": "", "username": "", "webdav_root": "", "remote_path": "", "verify_ssl": True},
+        "dest_rclone": {"remote": "", "path": "/backups"},
         "default_exclude_patterns": [
             ".git", ".gitignore", "__pycache__", "node_modules",
             "*.pyc", "*.tmp", ".DS_Store", "Thumbs.db",
@@ -178,9 +180,17 @@ def offer_startup():
         return
     HDR("Step 5 — Windows startup (optional)")
 
-    ans = input("  Add BackupSys to Windows startup so it runs automatically? [y/N] ").strip().lower()
+    INF("BackupSys can be added to your Windows startup so it launches automatically")
+    INF("when you log in.  This is done by writing a value to the Windows Registry:")
+    INF("  HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+    INF("BackupSys will start minimised to the system tray — no window will appear.")
+    INF("You can remove this at any time from Settings → General → 'Start on login'")
+    INF("or via Windows Settings → Apps → Startup.")
+    print()
+
+    ans = input("  [ Opt-in ] Add BackupSys to Windows startup? [y/N] ").strip().lower()
     if ans != "y":
-        INF("Skipped. You can enable this later from the app's Settings → Startup.")
+        INF("Skipped. You can enable this later from the app's Settings → General → 'Start on login'.")
         return
 
     try:
@@ -263,6 +273,89 @@ def print_summary(all_ok: bool):
 """, "32"))
     else:
         WRN("Some packages are missing.  Check the pip output above and re-run setup_wizard.py.")
+
+
+# ── Programmatic entry point (called from desktop_app.py on first launch) ────
+def run_for_app() -> bool:
+    """
+    Non-interactive setup called by desktop_app.py when no config exists yet.
+
+    Performs only the file-creation steps safe to run from a GUI context
+    (no stdin, no sys.exit, no package installs):
+      - Creates a blank .env file if one does not exist
+      - Creates a starter config.json if one does not exist
+
+    Returns True on success, False if an exception occurred.
+    The caller (desktop_app.py) is responsible for showing any GUI feedback.
+    """
+    try:
+        create_env()
+        create_config()
+        return True
+    except Exception:
+        return False
+
+
+def offer_startup_gui() -> bool:
+    """
+    Write the platform startup entry without any stdin prompt.
+    Called by desktop_app.py after the user accepts a QMessageBox prompt.
+    Returns True if the entry was written, False if an error occurred.
+    """
+    try:
+        if sys.platform == "win32":
+            import winreg
+            pythonw = Path(sys.executable).parent / "pythonw.exe"
+            if not pythonw.exists():
+                pythonw = Path(sys.executable)
+            cmd = f'"{pythonw}" "{HERE / "desktop_app.py"}"'
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_SET_VALUE,
+            )
+            winreg.SetValueEx(key, "BackupSys", 0, winreg.REG_SZ, cmd)
+            winreg.CloseKey(key)
+        elif sys.platform == "darwin":
+            plist_dir = Path.home() / "Library" / "LaunchAgents"
+            plist_dir.mkdir(parents=True, exist_ok=True)
+            plist_lines = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+                ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+                '<plist version="1.0"><dict>',
+                '  <key>Label</key><string>com.backupsys.app</string>',
+                '  <key>ProgramArguments</key><array>',
+                f'    <string>{sys.executable}</string>',
+                f'    <string>{HERE / "desktop_app.py"}</string>',
+                '  </array>',
+                '  <key>RunAtLoad</key><true/>',
+                '  <key>KeepAlive</key><false/>',
+                '</dict></plist>',
+            ]
+            (plist_dir / "com.backupsys.app.plist").write_text(
+                "\n".join(plist_lines) + "\n", encoding="utf-8"
+            )
+        else:  # Linux / XDG
+            autostart = Path.home() / ".config" / "autostart"
+            autostart.mkdir(parents=True, exist_ok=True)
+            lines = [
+                "[Desktop Entry]",
+                "Type=Application",
+                "Name=BackupSys",
+                f"Exec={sys.executable} {HERE / 'desktop_app.py'}",
+                "Hidden=false",
+                "NoDisplay=false",
+                "X-GNOME-Autostart-enabled=true",
+            ]
+            (autostart / "backupsys.desktop").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8"
+            )
+        return True
+    except Exception:
+        return False
+
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

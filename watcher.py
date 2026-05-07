@@ -73,8 +73,8 @@ if WATCHDOG_AVAILABLE:
                 # Remove existing entry for this path if it exists
                 _pending[self.watch_id] = [e for e in bucket if e["path"] != src]
                 _pending[self.watch_id].append(entry)
-                # Cap memory usage — prune to half when over limit to avoid repeated single-trim under high churn
-                if len(_pending[self.watch_id]) > 5000:
+                # Cap memory usage — prune to 2500 when over limit
+                if len(_pending[self.watch_id]) > 2500:
                     _pending[self.watch_id] = _pending[self.watch_id][-2500:]
 
             if self.on_change:
@@ -121,6 +121,7 @@ class WatcherManager:
         self._debounce_timers:  Dict[str, threading.Timer]   = {}
         self._debounce_lock     = threading.Lock()
         self._running = True
+        self._watches:          Dict[str, str]               = {}  # watch_id -> path
 
     # ── Debounce helper ───────────────────────────────────────────────────────
 
@@ -163,11 +164,22 @@ class WatcherManager:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def start(self, watch_id: str, path: str, on_change: Optional[Callable] = None, exclude_patterns: Optional[List[str]] = None, interval_min: int = 0) -> bool:
+    def start(self, watch_id: str, path: str, on_change: Optional[Callable] = None, exclude_patterns: Optional[List[str]] = None, interval_min: int = 0, source_type: str = "local") -> bool:
         if watch_id in self._observers or watch_id in self._poll_threads:
             return True
 
         p = Path(path)
+
+        # Remote sources (sftp/ftp) can't be watched by watchdog — fall back
+        # to interval polling immediately instead of probing path existence.
+        if source_type in ("sftp", "ftp", "ftps"):
+            logger.info(
+                f"[watcher] Remote source ({source_type}) — using interval polling for: {path}"
+            )
+            self._start_polling(watch_id, path, on_change, exclude_patterns,
+                                interval_min=interval_min, source_type=source_type)
+            return True
+
         if not p.exists():
             return False
 
@@ -197,8 +209,28 @@ class WatcherManager:
         logger.warning(
             f"[watcher] watchdog unavailable — polling every 60s for: {path}"
         )
-        self._start_polling(watch_id, path, on_change, exclude_patterns, interval_min=interval_min)
+        self._start_polling(watch_id, path, on_change, exclude_patterns, interval_min=interval_min, source_type=source_type)
         return True
+
+    def add_watch(self, watch_id: str, path: str) -> bool:
+        """Add a watch for the given path. Returns True if successfully started."""
+        if watch_id in self._watches:
+            return True  # already watching
+        if self.start(watch_id, path):
+            self._watches[watch_id] = path
+            return True
+        return False
+
+    def remove_watch(self, watch_id: str):
+        """Remove a watch."""
+        self.stop(watch_id)
+        self._watches.pop(watch_id, None)
+
+    def flush(self, watch_id: str) -> List[dict]:
+        """Return pending events for the watch and clear the buffer."""
+        pending = self.get_pending(watch_id)
+        self.clear_pending(watch_id)
+        return pending
 
     def stop(self, watch_id: str):
         if watch_id in self._observers:
@@ -223,9 +255,9 @@ class WatcherManager:
         with _lock:
             _pending.pop(watch_id, None)
 
-    def restart(self, watch_id: str, path: str, on_change: Optional[Callable] = None, exclude_patterns: Optional[List[str]] = None) -> bool:
+    def restart(self, watch_id: str, path: str, on_change: Optional[Callable] = None, exclude_patterns: Optional[List[str]] = None, source_type: str = "local") -> bool:
         self.stop(watch_id)
-        return self.start(watch_id, path, on_change, exclude_patterns)
+        return self.start(watch_id, path, on_change, exclude_patterns, source_type=source_type)
 
     def stop_all(self):
         self._running = False
@@ -287,8 +319,12 @@ class WatcherManager:
 
     # ── internal ──────────────────────────────────────────────────────────────
 
-    def _start_polling(self, watch_id: str, path: str, on_change: Optional[Callable], exclude_patterns: Optional[List[str]] = None, interval_min: int = 0):
-        """Simple polling fallback — checks mtimes every 60 seconds."""
+    def _start_polling(self, watch_id: str, path: str, on_change: Optional[Callable], exclude_patterns: Optional[List[str]] = None, interval_min: int = 0, source_type: str = "local"):
+        """Simple polling fallback — checks mtimes every 60 seconds.
+        For remote source types (sftp/ftp) build_snapshot is skipped and the
+        poll just fires on_change every interval so the daemon re-downloads and
+        re-diffs on each tick.
+        """
         try:
             from backup_engine import build_snapshot, diff_snapshots
         except ImportError as e:
@@ -304,6 +340,33 @@ class WatcherManager:
         _debounced_cb = self._make_debounced_callback(watch_id, on_change)
 
         def _poll():
+            # ── Remote source: no local snapshot to diff — just signal backup ──
+            if source_type in ("sftp", "ftp", "ftps"):
+                # We can't snapshot a remote filesystem without downloading it
+                # first, which is the backup engine's job.  Instead we just wake
+                # up every interval and inject a synthetic "tick" event so the
+                # daemon knows it's time to trigger a new backup.
+                while not stop_event.is_set():
+                    poll_secs = max(60, interval_min * 60) if interval_min > 0 else 300
+                    stop_event.wait(poll_secs)
+                    if stop_event.is_set():
+                        break
+                    entry = {
+                        "type":      "remote_tick",
+                        "path":      path,
+                        "timestamp": datetime.now().isoformat(),
+                        "size":      0,
+                    }
+                    with _lock:
+                        _pending.setdefault(watch_id, [])
+                        _pending[watch_id].append(entry)
+                    if _debounced_cb:
+                        try:
+                            _debounced_cb(watch_id, entry)
+                        except Exception:
+                            pass
+                return
+
             snap = build_snapshot(path, exclude_patterns=_excl)
 
             while not stop_event.is_set():

@@ -25,6 +25,10 @@ backups/
 snapshots/
 logs/
 
+# ── API server runtime data ───────────────────────────────────────────────────
+backupsys.db
+backupsys_files/
+
 # ── Build artefacts ───────────────────────────────────────────────────────────
 dist/
 build/

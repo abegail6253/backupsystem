@@ -38,6 +38,7 @@ _DATA_DIR     = _HERE if _IS_PORTABLE else Path(os.environ.get("BACKUPSYS_DATA_D
 CONFIG_PATH   = _DATA_DIR / "config.json"
 QUEUE_PATH    = _DATA_DIR / "backup_queue.json"
 HISTORY_PATH  = _DATA_DIR / "history.json"
+BACKUP_HISTORY_PATH = _DATA_DIR / "backup_history.json"
 SNAPSHOTS_DIR = _DATA_DIR / "snapshots"
 _save_lock    = threading.Lock()
 
@@ -50,6 +51,7 @@ DEFAULT_CONFIG = {
     "dest_smb":            {},
     "dest_ftp":            {},
     "dest_https":          {},
+    "dest_rclone":         {"remote": "", "path": "/backups"},
     "auto_backup":         False,
     "interval_min":        30,
     "interval_unit":       "minutes",
@@ -60,11 +62,20 @@ DEFAULT_CONFIG = {
     "auto_retry":          False,
     "retry_delay_min":     5,
     "max_backup_mbps":     0.0,
+    "bandwidth_schedule":  [],     # List of {"start": "HH:MM", "end": "HH:MM", "max_mbps": float}
     "idle_threshold_cpu":  0,     # 0 = disabled; auto-backup only when CPU% < this value
+    "pause_on_metered":    False,  # Pause auto-backups on metered network connections (Windows only)
     "backup_schedule_times": [],   # e.g. ["02:00", "14:00"] — run at specific times of day
+    # ── Backup window — only START new auto-backups inside this time range ─
+    # Both fields are HH:MM strings.  Leave either blank to omit that bound.
+    # Example: start="02:00", end="06:00" → only back up between 2 am and 6 am.
+    # Overnight ranges work: start="22:00", end="06:00".
+    "backup_window_start": "",    # earliest time a new backup may be started (HH:MM or "")
+    "backup_window_end":   "",    # latest  time a new backup may be started (HH:MM or "")
     # ── Integrity check scheduler ──────────────────────────────────────────
     "integrity_check_enabled":       False,  # run scheduled hash-verification of stored backups
     "integrity_check_interval_days": 7,      # how many days between checks (per watch)
+    "low_disk_threshold_gb":         5.0,    # warn when backup destination has less than this many GB free
     "email_config": {
         "enabled":           False,
         "notify_on_success": False,   # ← send email on successful backup
@@ -77,6 +88,44 @@ DEFAULT_CONFIG = {
         "from_addr":         "",
         "to_addr":           "",
     },
+    # ── ntfy.sh / self-hosted ntfy push notifications ─────────────────────────
+    "ntfy_config": {
+        "enabled":           False,
+        "server":            "https://ntfy.sh",
+        "topic":             "",
+        "token":             "",        # optional Bearer auth token
+        "priority":          "default", # min/low/default/high/urgent
+        "notify_on_success": False,
+        "notify_on_failure": True,
+    },
+    # ── Telegram Bot notifications ─────────────────────────────────────────────
+    # Get a bot token from @BotFather on Telegram.
+    # Find your chat_id by messaging @userinfobot on Telegram.
+    "telegram_config": {
+        "enabled":           False,
+        "bot_token":         "",        # from @BotFather
+        "chat_id":           "",        # your user ID or group/channel chat_id
+        "parse_mode":        "HTML",    # HTML or MarkdownV2
+        "notify_on_success": False,
+        "notify_on_failure": True,
+    },
+    # ── Pushover notifications ─────────────────────────────────────────────────
+    # Register at https://pushover.net — free 30-day trial, one-time $5 per platform.
+    "pushover_config": {
+        "enabled":           False,
+        "user_key":          "",        # your Pushover user key
+        "api_token":         "",        # your application API token
+        "device":            "",        # optional: restrict to one device name
+        "priority":          0,         # -2 lowest … 1 high (int; 2=emergency not supported)
+        "sound":             "",        # optional sound name (cashregister, magic, …)
+        "notify_on_success": False,
+        "notify_on_failure": True,
+    },
+    # ── Scheduled force-full backup ───────────────────────────────────────────
+    # 0 = disabled.  N > 0 = force a full backup every N days regardless of
+    # the incremental chain length.  Applied per-watch; the watch-level
+    # force_full_interval_days overrides this global value when > 0.
+    "force_full_interval_days": 0,
     "default_exclude_patterns": [
         ".git", ".gitignore", "__pycache__", "node_modules",
         "*.pyc", "*.tmp", ".DS_Store", "Thumbs.db",
@@ -107,12 +156,38 @@ WATCH_TEMPLATE = {
     "skip_auto_backup": False,    # exclude from daemon without pausing manual backups
     "color":            "",       # optional color label (hex or empty)
     "interval_min":     0,
+    "schedule_times":   [],       # per-watch time-of-day schedule e.g. ["01:00", "13:00"]; [] = use global
     "retention_days":   0,        # 0 = use global interval; >0 = watch-specific interval
     "destinations":     [],       # list of {"dest_type": "sftp", "config": {...}}
     "cloud_config":     {},       # Google Drive OAuth credentials per-watch
     "smb_cfg":          {},       # SMB source credentials for UNC paths
     "encrypt_key":      "",       # Fernet key (44 chars, URL-safe base64); empty = no encryption
-    "last_integrity_check": None, # ISO timestamp of last scheduled integrity check, or None
+    "last_integrity_check":    None, # ISO timestamp of last scheduled integrity check, or None
+    # Scheduled force-full backup (per-watch override) ─────────────────────
+    # 0 = use global force_full_interval_days.  N > 0 = force full every N days
+    # for THIS watch specifically.  -1 = disable for this watch even if global > 0.
+    "force_full_interval_days": 0,
+    "last_force_full_at":       None, # ISO timestamp of last forced full backup, or None
+    # ── USB / external-drive trigger ─────────────────────────────────────────
+    # When a drive whose volume label or serial matches drive_trigger_label /
+    # drive_trigger_serial is connected, this watch is backed up automatically.
+    # Both fields are optional; if both are set, EITHER match fires the backup.
+    # drive_trigger_label  — case-insensitive volume label match  (e.g. "MY_BACKUP")
+    # drive_trigger_serial — Windows volume serial (decimal or 8-hex, e.g. "ABCD1234")
+    "drive_trigger_label":  "",   # empty = disabled
+    "drive_trigger_serial": "",   # empty = disabled
+    # ── Remote source (SFTP / FTP) ─────────────────────────────────────────
+    # source_type controls where BackupSys *reads* files from.
+    # "local" (default) — ordinary local path or UNC share.
+    # "sftp"            — download source from SFTP before each backup run.
+    # "ftp"             — download source from FTP/FTPS before each backup run.
+    # When source_type is non-local the `path` field is the remote path on the
+    # server (e.g. "/home/user/docs") and source_sftp_cfg / source_ftp_cfg hold
+    # the connection credentials.  The watcher falls back to interval polling
+    # because watchdog cannot monitor remote filesystems directly.
+    "source_type":     "local",  # "local" | "sftp" | "ftp"
+    "source_sftp_cfg": {},        # {host, port, username, password|key_path, key_passphrase}
+    "source_ftp_cfg":  {},        # {host, port, username, password, use_tls}
 }
 
 
@@ -215,6 +290,37 @@ def load_history() -> list:
     return []
 
 
+# ─── Persistent Backup History ────────────────────────────────────────────────
+
+def save_backup_history(entries: list):
+    """
+    Persist backup history log to disk (capped at 1000 backup records).
+    Called after each backup completes.
+    """
+    try:
+        BACKUP_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=BACKUP_HISTORY_PATH.parent, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(entries[-1000:], f)
+        os.replace(tmp, BACKUP_HISTORY_PATH)
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to save backup history: {e}")
+
+
+def load_backup_history() -> list:
+    """
+    Load persisted backup history from disk.
+    Called once on app startup.
+    """
+    if BACKUP_HISTORY_PATH.exists():
+        try:
+            with open(BACKUP_HISTORY_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load backup history: {e}")
+    return []
+
+
 # ─── Load / Save ──────────────────────────────────────────────────────────────
 
 _config_cache: dict = {"cfg": None, "mtime": 0.0}
@@ -245,6 +351,14 @@ def load() -> dict:
                 if k not in cfg_ec:
                     cfg_ec[k] = v
 
+            # Merge missing ntfy / telegram / pushover sub-keys from defaults
+            for _sub in ("ntfy_config", "telegram_config", "pushover_config"):
+                _defaults = DEFAULT_CONFIG.get(_sub, {})
+                _sub_cfg  = cfg.setdefault(_sub, {})
+                for k, v in _defaults.items():
+                    if k not in _sub_cfg:
+                        _sub_cfg[k] = v
+
             # Resolve relative destination paths to absolute (relative to config.json location)
             _dest = cfg.get("destination", "./backups")
             if _dest and not os.path.isabs(_dest):
@@ -254,12 +368,22 @@ def load() -> dict:
             cfg["interval_min"]   = max(1, int(cfg.get("interval_min",   30)))
             cfg["retention_days"] = max(0, int(cfg.get("retention_days", 0)))  # 0 = disabled (no auto-delete)
 
-            # Ensure schedule list is always a list of "HH:MM" strings
+            # Normalize schedule entries → list of {"time": "HH:MM", "days": int}
+            # Legacy plain strings are treated as all-days (bitmask 127).
+            def _norm_sched_entry(e):
+                if isinstance(e, str) and len(e) == 5:
+                    return {"time": e, "days": 127}
+                if isinstance(e, dict):
+                    t = e.get("time", "")
+                    if isinstance(t, str) and len(t) == 5:
+                        return {"time": t, "days": int(e.get("days", 127))}
+                return None
+
             sched = cfg.get("backup_schedule_times", [])
             if not isinstance(sched, list):
                 sched = []
             cfg["backup_schedule_times"] = [
-                s for s in sched if isinstance(s, str) and len(s) == 5
+                n for n in (_norm_sched_entry(s) for s in sched) if n is not None
             ]
 
             migrated = False
@@ -268,6 +392,14 @@ def load() -> dict:
                     if k not in w:
                         w[k] = list(v) if isinstance(v, list) else v
                         migrated = True
+
+                # Ensure per-watch schedule_times is always a clean list of {"time","days"} dicts
+                w_sched = w.get("schedule_times", [])
+                if not isinstance(w_sched, list):
+                    w_sched = []
+                w["schedule_times"] = [
+                    n for n in (_norm_sched_entry(s) for s in w_sched) if n is not None
+                ]
 
             # Migration: ensure ~$* is in default_exclude_patterns so Office lock
             # files are silently skipped on all existing installations.
@@ -303,6 +435,15 @@ def load() -> dict:
                 for w in cfg.get("watches", []):
                     if not w.get("encrypt_key"):
                         w["encrypt_key"] = global_env_key
+
+            # Webhook URL override via env var
+            env_webhook = os.environ.get("BACKUPSYS_WEBHOOK_URL", "").strip()
+            if env_webhook:
+                cfg["webhook_url"] = env_webhook
+
+            # Pause-on-metered override via env var
+            if os.environ.get("BACKUPSYS_PAUSE_ON_METERED", "").strip() == "1":
+                cfg["pause_on_metered"] = True
 
             with _cache_lock:
                 _config_cache["cfg"] = cfg
@@ -357,6 +498,9 @@ def save(cfg: dict):
                 json.dump(cfg, f, indent=2)
 
             os.replace(temp_path, CONFIG_PATH)
+            # Auto-backup: keep rotating copies so a corrupted/deleted config
+            # can be recovered without losing all watch settings.
+            _auto_backup_config()
 
         except Exception as e:
             try:
@@ -647,6 +791,10 @@ def update_watch_meta(
     sync_mode:         Optional[bool] = None,   # ← added: mirror/sync mode
     smb_cfg:           Optional[dict] = None,   # ← fix: was referenced in body but missing from signature
     destination:       Optional[str]  = None,   # ← per-watch destination override
+    schedule_times:    Optional[list] = None,   # ← per-watch time-of-day schedule e.g. ["01:00"]
+    source_type:       Optional[str]  = None,   # ← "local" | "sftp" | "ftp"
+    source_sftp_cfg:   Optional[dict] = None,   # ← SFTP source credentials
+    source_ftp_cfg:    Optional[dict] = None,   # ← FTP source credentials
 ):
     """Update watch metadata and optionally reset snapshot for full re-backup."""
     for w in cfg["watches"]:
@@ -661,11 +809,24 @@ def update_watch_meta(
             if interval_min     is not None: w["interval_min"]     = max(0, int(interval_min))
             if active           is not None: w["active"]           = bool(active)
             if retention_days   is not None: w["retention_days"]   = max(0, int(retention_days))  # ← added
-            if compression      is not None: w["compression"]      = bool(compression)            # ← added
+            if compression      is not None: w["compression"]      = compression            # ← updated to store int
             if smb_cfg          is not None: w["smb_cfg"]          = dict(smb_cfg)
             if encrypt_key      is not None: w["encrypt_key"]      = encrypt_key.strip()          # ← added
             if sync_mode        is not None: w["sync_mode"]        = bool(sync_mode)              # ← added
             if destination      is not None: w["destination"]      = destination.strip()           # ← per-watch destination
+            if schedule_times   is not None:                                                       # ← per-watch schedule
+                def _nsched(e):
+                    if isinstance(e, str) and len(e.strip()) == 5:
+                        return {"time": e.strip(), "days": 127}
+                    if isinstance(e, dict):
+                        t = e.get("time", "")
+                        if isinstance(t, str) and len(t) == 5:
+                            return {"time": t, "days": int(e.get("days", 127))}
+                    return None
+                w["schedule_times"] = [n for n in (_nsched(s) for s in schedule_times) if n is not None]
+            if source_type     is not None: w["source_type"]     = source_type.strip()
+            if source_sftp_cfg is not None: w["source_sftp_cfg"] = dict(source_sftp_cfg)
+            if source_ftp_cfg  is not None: w["source_ftp_cfg"]  = dict(source_ftp_cfg)
             if reset_snapshot   is not None and reset_snapshot:
                 w["last_snapshot"] = None
     save(cfg)
@@ -703,6 +864,7 @@ def clone_watch(cfg: dict, watch_id: str, new_name: str, new_path: str) -> Optio
             color=src.get("color", ""),
             encrypt_key=src.get("encrypt_key", ""),  # BUG FIX: persist in config too
             sync_mode=src.get("sync_mode", False),
+            schedule_times=src.get("schedule_times", []),
         )
         new_watch["max_backups"]      = src.get("max_backups", 0)
         new_watch["skip_auto_backup"] = src.get("skip_auto_backup", False)
@@ -711,6 +873,7 @@ def clone_watch(cfg: dict, watch_id: str, new_name: str, new_path: str) -> Optio
         new_watch["color"]            = src.get("color", "")
         new_watch["encrypt_key"]      = src.get("encrypt_key", "")  # BUG FIX: return dict too
         new_watch["sync_mode"]        = src.get("sync_mode", False)
+        new_watch["schedule_times"]   = list(src.get("schedule_times", []))
     return new_watch
 
 
@@ -751,3 +914,124 @@ def validate_destination(path: str) -> dict:
         return {"ok": False, "error": f"OS error: {e}"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ─── Auto Config Backup ───────────────────────────────────────────────────────
+# BackupSys rotates up to CONFIG_BACKUP_KEEP numbered copies of config.json
+# every time save() succeeds.  If config.json is deleted or corrupted, run
+# restore_config_backup(1) to recover the most recent good copy.
+#
+# Files written:  config.backup.1.json  (most recent)
+#                 config.backup.2.json
+#                 …
+#                 config.backup.5.json  (oldest)
+
+CONFIG_BACKUP_KEEP = 5   # number of rotating backups to keep
+
+
+def _auto_backup_config():
+    """
+    Rotate config backups: 1 = newest … CONFIG_BACKUP_KEEP = oldest.
+    Called automatically from save() after every successful write.
+    Safe to call even if the config file does not exist yet.
+    """
+    try:
+        if not CONFIG_PATH.exists():
+            return
+        parent = CONFIG_PATH.parent
+
+        # Shift existing backups: .5 → deleted, .4 → .5, …, .1 → .2
+        for n in range(CONFIG_BACKUP_KEEP, 0, -1):
+            src = parent / f"config.backup.{n}.json"
+            dst = parent / f"config.backup.{n + 1}.json"
+            if src.exists():
+                if n == CONFIG_BACKUP_KEEP:
+                    try:
+                        src.unlink()   # drop the oldest slot
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        import shutil as _sh
+                        _sh.copy2(str(src), str(dst))
+                    except Exception:
+                        pass
+
+        # Copy current config.json → config.backup.1.json
+        dest_bak = parent / "config.backup.1.json"
+        import shutil as _sh
+        _sh.copy2(str(CONFIG_PATH), str(dest_bak))
+        logger.debug("🗄  Config auto-backup written: config.backup.1.json")
+
+    except Exception as exc:
+        logger.warning(f"⚠️  Failed to write config auto-backup: {exc}")
+
+
+def list_config_backups() -> list:
+    """
+    Return a list of available config backups sorted from newest to oldest.
+    Each entry is a dict:
+        { "n": int, "path": str, "mtime": float, "mtime_iso": str, "size": int }
+    """
+    parent = CONFIG_PATH.parent
+    results = []
+    for n in range(1, CONFIG_BACKUP_KEEP + 1):
+        p = parent / f"config.backup.{n}.json"
+        if p.exists():
+            try:
+                st = p.stat()
+                from datetime import datetime as _dt
+                results.append({
+                    "n":        n,
+                    "path":     str(p),
+                    "mtime":    st.st_mtime,
+                    "mtime_iso": _dt.fromtimestamp(st.st_mtime).isoformat(),
+                    "size":     st.st_size,
+                })
+            except Exception:
+                pass
+    return results
+
+
+def restore_config_backup(n: int = 1) -> dict:
+    """
+    Restore backup number *n* (1 = most recent) over the current config.json.
+    Returns {"ok": True} on success or {"ok": False, "error": str} on failure.
+
+    The current (potentially corrupted) config.json is renamed to
+    config.corrupted.<timestamp>.json before the restore so it is not lost.
+    """
+    parent = CONFIG_PATH.parent
+    src = parent / f"config.backup.{n}.json"
+
+    if not src.exists():
+        return {"ok": False, "error": f"Backup #{n} not found: {src}"}
+
+    # Validate that it is parseable JSON before overwriting
+    try:
+        with open(src, encoding="utf-8") as f:
+            json.load(f)
+    except Exception as exc:
+        return {"ok": False, "error": f"Backup #{n} is not valid JSON: {exc}"}
+
+    # Preserve the current (bad) config
+    if CONFIG_PATH.exists():
+        bak_bad = CONFIG_PATH.with_suffix(f".corrupted.{int(time.time())}.json")
+        try:
+            import shutil as _sh
+            _sh.copy2(str(CONFIG_PATH), str(bak_bad))
+        except Exception:
+            pass
+
+    # Atomically replace
+    try:
+        import shutil as _sh
+        _sh.copy2(str(src), str(CONFIG_PATH))
+        # Invalidate the in-memory cache so the next load() reads the restored file
+        with _cache_lock:
+            _config_cache["cfg"]   = None
+            _config_cache["mtime"] = 0.0
+        logger.info(f"✅  Config restored from backup #{n}: {src.name}")
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}

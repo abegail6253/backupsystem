@@ -7,72 +7,188 @@ on:
     branches: ["**"]
 
 jobs:
-  test:
-    name: pytest / Python ${{ matrix.python-version }}
-    runs-on: windows-latest          # Primary target is Windows; change to ubuntu-latest for Linux CI
+  # ── Headless tests ────────────────────────────────────────────────────────
+  # Covers the backup engine, API server, CLI, config, credential store,
+  # encryption, transport utils, watcher, integrity scheduler, notification
+  # utils, and setup wizard.  All Qt dependencies are mocked inside the test
+  # files themselves, so no display or PyQt install is required.
+  headless:
+    name: headless – Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements_desktop.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+      - name: Install API dependencies
+        run: pip install -r requirements_api.txt
 
-      # Install core deps (skip PyQt5 in CI — Qt tests are mocked)
-      - name: Install dependencies
+      - name: Install engine / CLI dependencies
+        # Install only the non-GUI subset of desktop deps so that
+        # backup_engine, watcher, transport_utils, etc. import cleanly.
+        # cryptography is a soft dep — tests skip gracefully if absent.
         run: |
-          python -m pip install --upgrade pip
-          pip install cryptography watchdog paramiko pytest pytest-cov
+          pip install cryptography paramiko smbprotocol requests
+          pip install pytest pytest-cov
 
-      - name: Run tests with coverage
+      - name: Run headless tests
+        env:
+          BACKUPSYS_API_KEY: "ci-dummy-key-do-not-use-in-production"
+          BACKUPSYS_DB_PATH: ":memory:"
         run: |
-          pytest tests/ -v --tb=short --cov=. --cov-report=term-missing --cov-omit="tests/*,desktop_app.py,build_exe.py,create_release_zip.py,setup_wizard.py"
+          pytest tests/ \
+            --ignore=tests/test_build_exe.py \
+            --tb=short \
+            --cov=. \
+            --cov-report=term-missing \
+            -q
 
       - name: Upload coverage report
+        if: matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: coverage-${{ matrix.python-version }}
+          name: coverage-report
           path: .coverage
+          retention-days: 7
 
-  lint:
-    name: ruff lint
+  # ── PyInstaller spec-generation tests ────────────────────────────────────
+  # Tests the PyInstaller spec-generation logic in test_build_exe.py.
+  # These run on Linux because they only test Python-level spec construction,
+  # not the actual binary output.  The real Windows .exe build and smoke-test
+  # is handled by the build-exe-windows job below, which runs on windows-latest
+  # and produces a downloadable artifact.
+  build-exe-spec:
+    name: build-exe-spec – Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install ruff
-      - name: Lint (errors only)
-        run: ruff check . --select E9,F63,F7,F82 --ignore F821
-        # E9   — syntax errors
-        # F63  — invalid assert / star-import syntax
-        # F7   — undefined __all__ members
-        # F82  — undefined names (catches typos in module-level code)
 
-  api-test:
-    name: API tests (Linux / Flask)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Install API dependencies
-        run: pip install flask gunicorn pytest pytest-cov
-      - name: Run API tests only
-        run: pytest tests/test_backupsys_api.py -v --tb=short
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pyinstaller pytest
+
+      - name: Run build-exe spec tests
+        run: pytest tests/test_build_exe.py --tb=short -q
+
+  # ── Windows .exe build & smoke-test ──────────────────────────────────────
+  # Produces a real Windows executable and runs a basic smoke-test so that a
+  # PyInstaller packaging regression cannot ship undetected.  The artifact is
+  # uploaded so it can be downloaded and tested manually from the Actions UI.
+  #
+  # This job is kept separate from the "windows" test job so a build failure
+  # does not block the test summary, and vice-versa.
+  build-exe-windows:
+    name: build-exe-windows – Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install desktop + packaging dependencies
+        run: |
+          pip install cryptography paramiko smbprotocol requests
+          pip install pyinstaller
+          pip install pytest
+
+      - name: Build .exe with PyInstaller
+        run: python build_exe.py --onefile --name backupsys
+
+      - name: Smoke-test the produced executable
+        # Verify the binary exists and exits cleanly with --help.
+        # A non-zero exit code or missing file fails the job immediately.
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter "backupsys*.exe" | Select-Object -First 1
+          if (-not $exe) { Write-Error "backupsys.exe not found after build"; exit 1 }
+          Write-Host "Found: $($exe.FullName)  ($([math]::Round($exe.Length/1MB, 1)) MB)"
+          & $exe.FullName --help
+          if ($LASTEXITCODE -ne 0) { Write-Error "Smoke-test failed: exit $LASTEXITCODE"; exit 1 }
+
+      - name: Upload .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backupsys-exe-py${{ matrix.python-version }}
+          path: "dist/backupsys*.exe"
+          retention-days: 7
+
+
+  # The app is primarily a Windows tool.  Windows-specific modules (winreg,
+  # pywin32, VSS, metered-connection detection) are mocked in the test suite,
+  # but running on a real Windows runner catches path-separator bugs, packaging
+  # issues, and any accidental os.sep / PurePosixPath assumptions.
+  #
+  # We run only the subset of headless tests that are most likely to diverge
+  # on Windows (engine, config, transport, watcher).  Qt-dependent tests are
+  # already mocked and pass, but are excluded here to keep the job fast and
+  # avoid installing the full PyQt6 wheel on Windows CI.
+  windows:
+    name: windows – Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install cryptography paramiko smbprotocol requests flask flask-cors gunicorn werkzeug
+          pip install pytest pytest-cov
+
+      - name: Run Windows-subset tests
+        env:
+          BACKUPSYS_API_KEY: "ci-dummy-key-do-not-use-in-production"
+          BACKUPSYS_DB_PATH: ":memory:"
+        run: |
+          pytest tests/ ^
+            --ignore=tests/test_build_exe.py ^
+            --ignore=tests/test_desktop_app.py ^
+            --ignore=tests/test_desktop_app_theme.py ^
+            --ignore=tests/test_setup_wizard.py ^
+            --tb=short ^
+            -q

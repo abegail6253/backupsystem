@@ -32,10 +32,45 @@ Config shapes expected (mirrors config.json):
 
 import os
 import logging
+import subprocess
+import time
 from pathlib import Path
 from typing import Optional
+import hashlib
+import io
 
 logger = logging.getLogger(__name__)
+
+# ── Upload retry / exponential backoff ────────────────────────────────────────
+
+import random as _random
+
+def _retry_with_backoff(fn, *, max_retries: int = 3, base_delay: float = 2.0,
+                        max_delay: float = 60.0, label: str = "upload") -> object:
+    """
+    Call *fn()* up to *max_retries* additional times (i.e. 1 + max_retries total
+    attempts) using exponential backoff with full jitter on each retry.
+
+    Jitter formula:  sleep = uniform(0, min(base_delay * 2**attempt, max_delay))
+
+    Raises the last exception if every attempt fails.
+    Returns the return value of the first successful call.
+    """
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                cap   = min(base_delay * (2 ** attempt), max_delay)
+                delay = _random.uniform(0, cap)
+                logger.warning(
+                    f"[retry] {label}: attempt {attempt + 1}/{max_retries} failed "
+                    f"({exc.__class__.__name__}: {exc}) — retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+    raise last_exc
 
 # ── Optional keyring-backed credential store ──────────────────────────────────
 # If credential_store.py is present, passwords are read from the OS keyring
@@ -54,7 +89,8 @@ except ImportError:
 
 # ─── SFTP ─────────────────────────────────────────────────────────────────────
 
-def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None) -> dict:
+def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None, verify=False,
+                   max_retries: int = 3) -> dict:
     """
     Upload a backup folder to an SFTP server using Paramiko.
 
@@ -62,6 +98,7 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None) -> dict:
     Supports both password auth and private-key auth.
 
     progress_cb(bytes_done, total_bytes, filename) — optional, called per chunk.
+    verify — optional, if True, verify uploaded files by comparing MD5 of first 8192 bytes.
     """
     try:
         import paramiko
@@ -200,26 +237,32 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None) -> dict:
             remote_dir  = str(Path(remote_file).parent).replace("\\", "/")
             _mkdir_p(remote_dir)
             try:
-                with open(str(fp), "rb") as fh:
-                    if progress_cb:
-                        # Chunked so progress fires regularly on large files
-                        f_handle = sftp.open(remote_file, "wb")
-                        try:
-                            while True:
-                                chunk = fh.read(_SFTP_CHUNK)
-                                if not chunk:
-                                    break
-                                f_handle.write(chunk)
-                                _bytes_done += len(chunk)
-                                try:
-                                    progress_cb(_bytes_done, _total_bytes, fp.name)
-                                except Exception:
-                                    pass
-                        finally:
-                            f_handle.close()
-                    else:
-                        sftp.putfo(fh, remote_file, file_size=fp.stat().st_size)
-                        _bytes_done += fp.stat().st_size
+                def _do_upload_sftp():
+                    with open(str(fp), "rb") as fh:
+                        if progress_cb:
+                            f_handle = sftp.open(remote_file, "wb")
+                            try:
+                                while True:
+                                    chunk = fh.read(_SFTP_CHUNK)
+                                    if not chunk:
+                                        break
+                                    f_handle.write(chunk)
+                                    _bytes_done += len(chunk)
+                                    try:
+                                        progress_cb(_bytes_done, _total_bytes, fp.name)
+                                    except Exception:
+                                        pass
+                            finally:
+                                f_handle.close()
+                        else:
+                            sftp.putfo(fh, remote_file, file_size=fp.stat().st_size)
+                _retry_with_backoff(
+                    _do_upload_sftp,
+                    max_retries=max_retries,
+                    label=f"sftp:{rel}",
+                )
+                if not progress_cb:
+                    _bytes_done += fp.stat().st_size
                 uploaded += 1
             except Exception as e:
                 logger.warning(f"[sftp] Failed to upload {rel}: {e}")
@@ -227,6 +270,7 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None) -> dict:
         logger.info(f"[sftp] Uploaded {uploaded} file(s) to {host}:{remote_base}/{ld.name}")
 
         # ── Post-upload verification: remote file count must match local ──────
+        result = {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
         _expected = len(_all_files)
         if _expected > 0 and uploaded != _expected:
             _missing = _expected - uploaded
@@ -234,15 +278,29 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None) -> dict:
                 f"[sftp] Verification warning: expected {_expected} file(s), "
                 f"only {uploaded} confirmed uploaded ({_missing} may have failed silently)"
             )
-            return {
-                "ok": True,
-                "uploaded": uploaded,
-                "path": f"{remote_base}/{ld.name}",
-                "warning": f"{_missing} file(s) may not have uploaded correctly "
-                           f"({uploaded}/{_expected} confirmed)",
-            }
+            result["warning"] = f"{_missing} file(s) may not have uploaded correctly " \
+                               f"({uploaded}/{_expected} confirmed)"
 
-        return {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
+        if verify:
+            warnings = []
+            for fp in _all_files:
+                rel = fp.relative_to(ld)
+                remote_file = f"{remote_base}/{ld.name}/{str(rel).replace(os.sep, '/')}"
+                try:
+                    local_md5 = hashlib.md5()
+                    with open(str(fp), 'rb') as f:
+                        local_md5.update(f.read(8192))
+                    with sftp.open(remote_file, 'rb') as remote_f:
+                        remote_data = remote_f.read(8192)
+                    remote_md5 = hashlib.md5(remote_data)
+                    if local_md5.hexdigest() != remote_md5.hexdigest():
+                        warnings.append(f"MD5 mismatch for {rel}")
+                except Exception as e:
+                    warnings.append(f"Verification failed for {rel}: {e}")
+            if warnings:
+                result["warnings"] = warnings
+
+        return result
 
     except paramiko.AuthenticationException as e:
         return {"ok": False, "error": f"SFTP authentication failed: {e}"}
@@ -267,7 +325,8 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None) -> dict:
 
 # ─── FTP / FTPS ───────────────────────────────────────────────────────────────
 
-def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None) -> dict:
+def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None, verify=False,
+                  max_retries: int = 3) -> dict:
     """
     Upload a backup folder to an FTP/FTPS server using ftplib (stdlib).
 
@@ -275,6 +334,7 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None) -> dict:
     Recreates the full directory tree under remote_path/<backup_folder_name>/.
 
     progress_cb(bytes_done, total_bytes, filename) — optional, called per chunk.
+    verify — optional, if True, verify uploaded files by comparing MD5 of first 8192 bytes.
     """
     import ftplib
 
@@ -339,23 +399,29 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None) -> dict:
             _ftp_makedirs(remote_dir)
             try:
                 ftp.cwd("/" + remote_dir.lstrip("/"))
-                if progress_cb:
-                    # Wrap file in a callback-firing reader
-                    with open(fp, "rb") as _raw_f:
-                        def _cb_read(bs=_FTP_BLOCK, _f=_raw_f):
-                            chunk = _f.read(bs)
-                            if chunk:
-                                nonlocal _bytes_done
-                                _bytes_done += len(chunk)
-                                try:
-                                    progress_cb(_bytes_done, _total_bytes, fp.name)
-                                except Exception:
-                                    pass
-                            return chunk
-                        ftp.storbinary(f"STOR {fp.name}", type('R', (), {'read': _cb_read})(), blocksize=_FTP_BLOCK)
-                else:
-                    with open(fp, "rb") as f:
-                        ftp.storbinary(f"STOR {fp.name}", f, blocksize=_FTP_BLOCK)
+                def _do_upload_ftp():
+                    if progress_cb:
+                        with open(fp, "rb") as _raw_f:
+                            def _cb_read(bs=_FTP_BLOCK, _f=_raw_f):
+                                chunk = _f.read(bs)
+                                if chunk:
+                                    nonlocal _bytes_done
+                                    _bytes_done += len(chunk)
+                                    try:
+                                        progress_cb(_bytes_done, _total_bytes, fp.name)
+                                    except Exception:
+                                        pass
+                                return chunk
+                            ftp.storbinary(f"STOR {fp.name}", type('R', (), {'read': _cb_read})(), blocksize=_FTP_BLOCK)
+                    else:
+                        with open(fp, "rb") as f:
+                            ftp.storbinary(f"STOR {fp.name}", f, blocksize=_FTP_BLOCK)
+                _retry_with_backoff(
+                    _do_upload_ftp,
+                    max_retries=max_retries,
+                    label=f"ftp:{rel}",
+                )
+                if not progress_cb:
                     _bytes_done += fp.stat().st_size
                 uploaded += 1
             except Exception as e:
@@ -365,6 +431,7 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None) -> dict:
         logger.info(f"[ftp] {proto} uploaded {uploaded} file(s) to {host}:{remote_base}/{ld.name}")
 
         # ── Post-upload verification ──────────────────────────────────────────
+        result = {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
         _expected = len(_all_files)
         if _expected > 0 and uploaded != _expected:
             _missing = _expected - uploaded
@@ -372,15 +439,37 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None) -> dict:
                 f"[ftp] Verification warning: expected {_expected} file(s), "
                 f"only {uploaded} confirmed uploaded"
             )
-            return {
-                "ok": True,
-                "uploaded": uploaded,
-                "path": f"{remote_base}/{ld.name}",
-                "warning": f"{_missing} file(s) may not have uploaded correctly "
-                           f"({uploaded}/{_expected} confirmed)",
-            }
+            result["warning"] = f"{_missing} file(s) may not have uploaded correctly " \
+                               f"({uploaded}/{_expected} confirmed)"
 
-        return {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
+        if verify:
+            warnings = []
+            for fp in _all_files:
+                rel = fp.relative_to(ld)
+                parts = list(rel.parts)
+                remote_dir = f"{remote_base}/{ld.name}" + (
+                    ("/" + "/".join(parts[:-1])) if len(parts) > 1 else ""
+                )
+                try:
+                    ftp.cwd("/" + remote_dir.lstrip("/"))
+                    data = io.BytesIO()
+                    def cb(chunk):
+                        if data.tell() < 8192:
+                            data.write(chunk)
+                    ftp.retrbinary(f"RETR {fp.name}", cb)
+                    remote_data = data.getvalue()[:8192]
+                    remote_md5 = hashlib.md5(remote_data)
+                    local_md5 = hashlib.md5()
+                    with open(str(fp), 'rb') as f:
+                        local_md5.update(f.read(8192))
+                    if local_md5.hexdigest() != remote_md5.hexdigest():
+                        warnings.append(f"MD5 mismatch for {rel}")
+                except Exception as e:
+                    warnings.append(f"Verification failed for {rel}: {e}")
+            if warnings:
+                result["warnings"] = warnings
+
+        return result
 
     except ftplib.all_errors as e:
         return {"ok": False, "error": f"FTP error: {e}"}
@@ -398,7 +487,8 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None) -> dict:
 
 # ─── SMB / CIFS ───────────────────────────────────────────────────────────────
 
-def upload_to_smb(local_dir: str, smb_config: dict, progress_cb=None) -> dict:
+def upload_to_smb(local_dir: str, smb_config: dict, progress_cb=None,
+                  max_retries: int = 3) -> dict:
     """
     Upload a backup folder to an SMB/CIFS network share.
 
@@ -452,19 +542,28 @@ def upload_to_smb(local_dir: str, smb_config: dict, progress_cb=None) -> dict:
                 _smb_rel  = _smb_fp.relative_to(ld)
                 _smb_dest = remote_dir / _smb_rel
                 _smb_dest.parent.mkdir(parents=True, exist_ok=True)
-                with open(str(_smb_fp), "rb") as _src_f, open(str(_smb_dest), "wb") as _dst_f:
-                    while True:
-                        _buf = _src_f.read(_SMB_BUF)
-                        if not _buf:
-                            break
-                        _dst_f.write(_buf)
-                        _bytes_done += len(_buf)
-                        if progress_cb:
-                            try:
-                                progress_cb(_bytes_done, _total_bytes, _smb_fp.name)
-                            except Exception:
-                                pass
-                _sh.copystat(str(_smb_fp), str(_smb_dest))
+                def _do_smb_copy(_src=_smb_fp, _dst=_smb_dest):
+                    with open(str(_src), "rb") as _src_f, open(str(_dst), "wb") as _dst_f:
+                        while True:
+                            _buf = _src_f.read(_SMB_BUF)
+                            if not _buf:
+                                break
+                            _dst_f.write(_buf)
+                            if progress_cb:
+                                nonlocal _bytes_done
+                                _bytes_done += len(_buf)
+                                try:
+                                    progress_cb(_bytes_done, _total_bytes, _src.name)
+                                except Exception:
+                                    pass
+                    _sh.copystat(str(_src), str(_dst))
+                _retry_with_backoff(
+                    _do_smb_copy,
+                    max_retries=max_retries,
+                    label=f"smb:{_smb_rel}",
+                )
+                if not progress_cb:
+                    _bytes_done += _smb_fp.stat().st_size
                 uploaded += 1
             logger.info(f"[smb] Copied {uploaded} file(s) to {remote_dir}")
             return {"ok": True, "uploaded": uploaded, "path": str(remote_dir)}
@@ -555,7 +654,13 @@ def upload_to_smb(local_dir: str, smb_config: dict, progress_cb=None) -> dict:
         for fp in _all_files:
             rel = str(fp.relative_to(ld))
             try:
-                _smb_write_tracked(rel, fp)
+                def _do_smb_write(_fp=fp, _rel=rel):
+                    _smb_write_tracked(_rel, _fp)
+                _retry_with_backoff(
+                    _do_smb_write,
+                    max_retries=max_retries,
+                    label=f"smb:{rel}",
+                )
                 uploaded += 1
             except Exception as e:
                 logger.warning(f"[smb] Failed to upload {rel}: {e}")
@@ -573,7 +678,8 @@ def upload_to_smb(local_dir: str, smb_config: dict, progress_cb=None) -> dict:
 
 # ─── HTTPS (webhook / REST upload endpoint) ───────────────────────────────────
 
-def upload_to_https(local_dir: str, https_config: dict, progress_cb=None) -> dict:
+def upload_to_https(local_dir: str, https_config: dict, progress_cb=None,
+                    max_retries: int = 3) -> dict:
     """
     Upload each file in a backup folder to an HTTPS endpoint via multipart POST.
 
@@ -615,8 +721,14 @@ def upload_to_https(local_dir: str, https_config: dict, progress_cb=None) -> dic
 
     parsed    = urllib.parse.urlparse(url)
     host      = parsed.netloc
-    path_qs   = parsed.path + (("?" + parsed.query) if parsed.query else "")
-    use_https = parsed.scheme.lower() == "https"
+    # Always POST to /backup/upload regardless of whatever trailing path the
+    # user may have appended to the configured URL.  Strip any trailing slash
+    # from the configured path and append the canonical upload sub-path so
+    # upload and restore endpoints (GET /manifest, GET /files/<path>) share
+    # a common base URL.
+    _base_path = parsed.path.rstrip("/")
+    path_qs    = _base_path + "/backup/upload"
+    use_https  = parsed.scheme.lower() == "https"
 
     ld           = Path(local_dir)
     uploaded     = 0
@@ -673,23 +785,29 @@ def upload_to_https(local_dir: str, https_config: dict, progress_cb=None) -> dic
     for fp in _all_files:
         rel = str(fp.relative_to(ld)).replace("\\", "/")
         try:
-            conn = (
-                http.client.HTTPSConnection(host, context=ssl_ctx, timeout=120)
-                if use_https
-                else http.client.HTTPConnection(host, timeout=120)
+            def _do_https_upload(_fp=fp, _rel=rel):
+                conn = (
+                    http.client.HTTPSConnection(host, context=ssl_ctx, timeout=120)
+                    if use_https
+                    else http.client.HTTPConnection(host, timeout=120)
+                )
+                status = _stream_multipart(conn, _fp, _rel)
+                conn.close()
+                if status not in (200, 201, 202, 204):
+                    raise OSError(f"HTTP {status}")
+                return status
+            _retry_with_backoff(
+                _do_https_upload,
+                max_retries=max_retries,
+                label=f"https:{rel}",
             )
-            status = _stream_multipart(conn, fp, rel)
-            conn.close()
-            if status not in (200, 201, 202, 204):
-                errors.append(f"{rel}: HTTP {status}")
-            else:
-                uploaded    += 1
-                _bytes_done += fp.stat().st_size
-                if progress_cb:
-                    try:
-                        progress_cb(_bytes_done, _total_bytes, fp.name)
-                    except Exception:
-                        pass
+            uploaded    += 1
+            _bytes_done += fp.stat().st_size
+            if progress_cb:
+                try:
+                    progress_cb(_bytes_done, _total_bytes, fp.name)
+                except Exception:
+                    pass
         except Exception as e:
             errors.append(f"{rel}: {e}")
 
@@ -704,6 +822,485 @@ def upload_to_https(local_dir: str, https_config: dict, progress_cb=None) -> dic
         "errors":   errors[:20],
         "path":     url,
     }
+
+
+def upload_to_rclone(local_dir: str, rclone_config: dict, progress_cb=None,
+                     max_retries: int = 3) -> dict:
+    """
+    Upload a backup folder to an rclone remote using the installed rclone CLI.
+
+    rclone_config: { remote, path }
+    progress_cb(bytes_done, total_bytes, filename) — optional, called from rclone stderr lines.
+    """
+    remote_name = (rclone_config.get("remote") or rclone_config.get("remote_name", "")).strip()
+    remote_path = (rclone_config.get("path") or rclone_config.get("remote_path", "/backups")).strip()
+    if not remote_name:
+        return {"ok": False, "error": "Rclone remote name not configured"}
+
+    try:
+        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15)
+        if check.returncode != 0:
+            return {"ok": False, "error": "rclone not installed or not available in PATH"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "rclone not installed or not available in PATH"}
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to run rclone: {e}"}
+
+    dest = f"{remote_name}:{remote_path}" if remote_path else f"{remote_name}:"
+    cmd = ["rclone", "copy", str(Path(local_dir)), dest, "--progress"]
+    if os.name == "nt":
+        # ensure rclone uses POSIX-like paths internally when passed a Windows path
+        cmd[2] = str(Path(local_dir))
+
+    stderr_lines = []
+    def _do_rclone():
+        nonlocal stderr_lines
+        stderr_lines = []
+        try:
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
+        except FileNotFoundError:
+            raise RuntimeError("rclone not installed or not available in PATH")
+        if proc.stderr:
+            for line in proc.stderr:
+                stderr_lines.append(line.rstrip("\n"))
+                if progress_cb:
+                    try:
+                        progress_cb(0, None, line.rstrip("\n"))
+                    except Exception:
+                        pass
+        proc.wait(timeout=3600)
+        if proc.returncode != 0:
+            raise RuntimeError("rclone copy failed: " + "\n".join(stderr_lines[-10:]))
+
+    try:
+        _retry_with_backoff(
+            _do_rclone,
+            max_retries=max_retries,
+            label=f"rclone:{dest}",
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    # rclone doesn't expose exact per-file success count here, just assume success if exit 0
+    return {"ok": True, "uploaded": "rclone", "path": dest}
+
+
+# ─── Remote free-space check ──────────────────────────────────────────────────
+# Used by backup_engine.py before starting an upload to ensure the remote
+# destination has enough room.  Each transport is queried with its own protocol
+# where a reliable method exists; others fall through gracefully so a failed
+# space check never silently blocks a valid backup.
+
+def check_remote_free_space(dest_type: str, cfg: dict, needed_bytes: int) -> dict:
+    """Check free space on a remote backup destination before uploading.
+
+    Args:
+        dest_type:    One of: sftp, ftp, ftps, smb, webdav, rclone, cloud, https
+        cfg:          Full config dict (same structure as the watch/global config).
+        needed_bytes: Estimated bytes the backup will consume on the remote.
+
+    Returns:
+        {
+            "ok":    bool   — True = enough space (or check not supported),
+            "free":  int    — free bytes on remote (-1 = unknown),
+            "error": str    — human-readable message when ok=False,
+            "skipped": bool — True = transport doesn't support space queries,
+        }
+    """
+    _OK     = {"ok": True,  "free": -1, "error": "", "skipped": True}
+    _needed = max(int(needed_bytes * 1.1), 1)  # add 10 % headroom
+
+    # ── SFTP — statvfs() ──────────────────────────────────────────────────────
+    if dest_type == "sftp":
+        sftp_cfg     = cfg.get("dest_sftp", {})
+        host         = sftp_cfg.get("host", "").strip()
+        port         = int(sftp_cfg.get("port", 22))
+        username     = (sftp_cfg.get("username") or sftp_cfg.get("user", "")).strip()
+        password     = sftp_cfg.get("password") or sftp_cfg.get("pass", "")
+        key_path     = (sftp_cfg.get("key_path") or sftp_cfg.get("keyfile", "")).strip()
+        key_pass     = sftp_cfg.get("key_passphrase") or sftp_cfg.get("key_pass", "")
+        remote_path  = (sftp_cfg.get("remote_path") or sftp_cfg.get("path", "/")).rstrip("/") or "/"
+
+        if not host or not username:
+            return _OK  # not configured — let the upload itself report the error
+
+        try:
+            import paramiko
+            transport = paramiko.Transport((host, port))
+            transport.connect()
+            if key_path and Path(key_path).exists():
+                for key_cls in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey):
+                    try:
+                        pkey = key_cls.from_private_key_file(key_path, password=key_pass or None)
+                        transport.auth_publickey(username, pkey)
+                        break
+                    except Exception:
+                        continue
+            else:
+                transport.auth_password(username, password)
+
+            if not transport.is_authenticated():
+                transport.close()
+                return _OK
+
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            try:
+                stat = sftp.statvfs(remote_path)
+                free = stat.f_bavail * stat.f_frsize
+            except (AttributeError, IOError):
+                # Server doesn't support statvfs — fall back to root
+                try:
+                    stat = sftp.statvfs("/")
+                    free = stat.f_bavail * stat.f_frsize
+                except Exception:
+                    sftp.close(); transport.close()
+                    return _OK
+            sftp.close()
+            transport.close()
+
+            if free < _needed:
+                return {
+                    "ok":      False,
+                    "free":    free,
+                    "error":   (
+                        f"SFTP remote has insufficient space. "
+                        f"Need ~{_human_size(_needed)}, only {_human_size(free)} free on {host}."
+                    ),
+                    "skipped": False,
+                }
+            return {"ok": True, "free": free, "error": "", "skipped": False}
+
+        except ImportError:
+            return _OK  # paramiko not installed; upload will catch the error
+        except Exception as e:
+            logger.warning("[space-check] SFTP statvfs failed (non-fatal): %s", e)
+            return _OK
+
+    # ── FTP / FTPS — AVBL command (RFC draft extension) ──────────────────────
+    if dest_type in ("ftp", "ftps"):
+        ftp_cfg     = cfg.get("dest_ftp", {})
+        host        = ftp_cfg.get("host", "").strip()
+        port        = int(ftp_cfg.get("port", 21))
+        username    = (ftp_cfg.get("username") or ftp_cfg.get("user", "")).strip()
+        password    = ftp_cfg.get("password") or ftp_cfg.get("pass", "")
+        use_tls     = bool(ftp_cfg.get("use_tls", dest_type == "ftps"))
+
+        if not host:
+            return _OK
+        try:
+            import ftplib
+            ftp_cls = ftplib.FTP_TLS if use_tls else ftplib.FTP
+            with ftp_cls(timeout=15) as ftp:
+                ftp.connect(host, port, timeout=15)
+                if use_tls:
+                    ftp.prot_p()
+                # AVBL is a non-standard but widely supported extension
+                try:
+                    resp = ftp.sendcmd("AVBL")
+                    free = int(resp.split()[-1])
+                    if free < _needed:
+                        return {
+                            "ok":      False,
+                            "free":    free,
+                            "error":   (
+                                f"FTP remote has insufficient space. "
+                                f"Need ~{_human_size(_needed)}, only {_human_size(free)} free on {host}."
+                            ),
+                            "skipped": False,
+                        }
+                    return {"ok": True, "free": free, "error": "", "skipped": False}
+                except Exception:
+                    return _OK  # AVBL not supported by this server
+        except Exception as e:
+            logger.warning("[space-check] FTP AVBL check failed (non-fatal): %s", e)
+            return _OK
+
+    # ── SMB — UNC disk_usage on Windows; skipped on Linux ────────────────────
+    if dest_type == "smb":
+        smb_cfg     = cfg.get("dest_smb", {})
+        server      = smb_cfg.get("server", "").strip()
+        share       = smb_cfg.get("share", "").strip()
+        username    = smb_cfg.get("username", "").strip()
+        password    = smb_cfg.get("password", "")
+        domain      = smb_cfg.get("domain", "")
+
+        if not server or not share:
+            return _OK
+
+        if os.name == "nt":
+            import subprocess, shutil as _sh
+            unc_root = f"\\\\{server}\\{share}"
+            if username:
+                net_user = f"{domain}\\{username}" if domain else username
+                try:
+                    subprocess.run(
+                        ["net", "use", unc_root, f"/user:{net_user}", password],
+                        capture_output=True, timeout=15, check=False,
+                    )
+                except Exception:
+                    pass
+            try:
+                usage = _sh.disk_usage(unc_root)
+                free  = usage.free
+                if free < _needed:
+                    return {
+                        "ok":      False,
+                        "free":    free,
+                        "error":   (
+                            f"SMB share has insufficient space. "
+                            f"Need ~{_human_size(_needed)}, only {_human_size(free)} free on "
+                            f"\\\\{server}\\{share}."
+                        ),
+                        "skipped": False,
+                    }
+                return {"ok": True, "free": free, "error": "", "skipped": False}
+            except Exception as e:
+                logger.warning("[space-check] SMB disk_usage failed (non-fatal): %s", e)
+                return _OK
+        # Linux SMB space query via smbprotocol QueryFSSize
+        try:
+            import smbprotocol.connection, smbprotocol.session, smbprotocol.tree
+            import smbprotocol.query_info as smb_qi
+            import uuid as _uuid
+            conn_id = _uuid.uuid4()
+            conn    = smbprotocol.connection.Connection(conn_id, server, 445)
+            conn.connect(timeout=15)
+            session = smbprotocol.session.Session(
+                conn, username=username, password=password, require_encryption=False
+            )
+            session.connect()
+            unc  = f"\\\\{server}\\{share}"
+            tree = smbprotocol.tree.TreeConnect(session, unc)
+            tree.connect()
+            # FILE_FS_SIZE_INFORMATION = InfoClass 3
+            try:
+                raw = tree.query_info(
+                    smbprotocol.query_info.InfoType.SMB2_0_INFO_FILESYSTEM,
+                    smbprotocol.query_info.FileSystemInformationClass.FileFsSizeInformation,
+                    output_buffer_length=24,
+                )
+                # Structure: total_allocation_units(8) + available_units(8) + sectors_per_unit(4) + bytes_per_sector(4)
+                import struct as _struct
+                _ta, _aa, _spu, _bps = _struct.unpack_from("<QQII", raw)
+                free = _aa * _spu * _bps
+                tree.disconnect(); session.disconnect(); conn.disconnect()
+                if free < _needed:
+                    return {
+                        "ok":      False,
+                        "free":    free,
+                        "error":   (
+                            f"SMB share has insufficient space. "
+                            f"Need ~{_human_size(_needed)}, only {_human_size(free)} free on "
+                            f"\\\\{server}\\{share}."
+                        ),
+                        "skipped": False,
+                    }
+                return {"ok": True, "free": free, "error": "", "skipped": False}
+            except Exception:
+                tree.disconnect(); session.disconnect(); conn.disconnect()
+                return _OK
+        except ImportError:
+            return _OK
+        except Exception as e:
+            logger.warning("[space-check] SMB FileFsSizeInformation failed (non-fatal): %s", e)
+            return _OK
+
+    # ── WebDAV — DAV:quota-available-bytes PROPFIND ───────────────────────────
+    if dest_type == "webdav":
+        webdav_cfg  = cfg.get("dest_webdav", {})
+        url_base    = (webdav_cfg.get("url") or "").rstrip("/")
+        username    = (webdav_cfg.get("username") or webdav_cfg.get("user", "")).strip()
+        password    = webdav_cfg.get("password") or webdav_cfg.get("pass", "")
+        verify_ssl  = webdav_cfg.get("verify_ssl", True)
+        webdav_root = (webdav_cfg.get("webdav_root") or "").rstrip("/")
+
+        if not url_base:
+            return _OK
+
+        try:
+            import urllib.request as _ur, urllib.error, ssl, base64 as _b64
+            _creds = _b64.b64encode(f"{username}:{password}".encode()).decode()
+            _auth  = f"Basic {_creds}"
+            _ctx   = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+
+            propfind_body = (
+                b'<?xml version="1.0" encoding="utf-8"?>'
+                b'<D:propfind xmlns:D="DAV:">'
+                b'<D:prop>'
+                b'<D:quota-available-bytes/>'
+                b'<D:quota-used-bytes/>'
+                b'</D:prop>'
+                b'</D:propfind>'
+            )
+            target = url_base + webdav_root + "/"
+            req = _ur.Request(
+                target,
+                data=propfind_body,
+                headers={
+                    "Authorization":  _auth,
+                    "Content-Type":   "application/xml; charset=utf-8",
+                    "Depth":          "0",
+                },
+                method="PROPFIND",
+            )
+            try:
+                with _ur.urlopen(req, context=_ctx, timeout=15) as resp:
+                    body = resp.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+
+            import re
+            m = re.search(r"<[^>]*quota-available-bytes[^>]*>(\d+)<", body)
+            if not m:
+                return _OK  # server doesn't expose quota
+            free = int(m.group(1))
+            if free < _needed:
+                return {
+                    "ok":      False,
+                    "free":    free,
+                    "error":   (
+                        f"WebDAV server has insufficient space. "
+                        f"Need ~{_human_size(_needed)}, only {_human_size(free)} free."
+                    ),
+                    "skipped": False,
+                }
+            return {"ok": True, "free": free, "error": "", "skipped": False}
+
+        except Exception as e:
+            logger.warning("[space-check] WebDAV PROPFIND quota check failed (non-fatal): %s", e)
+            return _OK
+
+    # ── rclone — `rclone about <remote>: --json` ─────────────────────────────
+    if dest_type == "rclone":
+        rclone_cfg  = cfg.get("dest_rclone", {})
+        remote_name = (rclone_cfg.get("remote") or rclone_cfg.get("remote_name", "")).strip()
+        if not remote_name:
+            return _OK
+        try:
+            import subprocess, json as _json
+            result = subprocess.run(
+                ["rclone", "about", f"{remote_name}:", "--json"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return _OK  # rclone about not supported for this remote
+            info = _json.loads(result.stdout)
+            free = info.get("free", -1)
+            if free == -1:
+                return _OK  # remote doesn't report free space
+            free = int(free)
+            if free < _needed:
+                return {
+                    "ok":      False,
+                    "free":    free,
+                    "error":   (
+                        f"rclone remote '{remote_name}' has insufficient space. "
+                        f"Need ~{_human_size(_needed)}, only {_human_size(free)} free."
+                    ),
+                    "skipped": False,
+                }
+            return {"ok": True, "free": free, "error": "", "skipped": False}
+        except FileNotFoundError:
+            return _OK  # rclone not installed
+        except Exception as e:
+            logger.warning("[space-check] rclone about failed (non-fatal): %s", e)
+            return _OK
+
+    # All other types (https, cloud/gdrive) — no standard way to query
+    return _OK
+
+
+def _human_size(n: int) -> str:
+    """Human-readable byte size (duplicated here so transport_utils is self-contained)."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+# ─── Google Drive quota ───────────────────────────────────────────────────────
+
+def get_gdrive_quota(cloud_config: dict) -> dict:
+    """Fetch Google Drive storage quota for the connected account.
+
+    Calls the Drive API v3 /about endpoint.  Silently refreshes the access
+    token if needed (same logic used in upload_to_gdrive).
+
+    Returns:
+        {
+            "ok":         bool,
+            "limit":      int   — total storage in bytes (-1 = unlimited),
+            "usage":      int   — total bytes used across all Google products,
+            "drive_used": int   — bytes used specifically in Drive (excl. Trash),
+            "free":       int   — limit - usage  (-1 when limit is unknown),
+            "error":      str,
+        }
+    """
+    import urllib.request as _ur, json as _json
+
+    access_token  = cloud_config.get("access_token", "").strip()
+    refresh_token = cloud_config.get("refresh_token", "").strip()
+    client_id     = cloud_config.get("client_id", "").strip()
+    client_secret = cloud_config.get("client_secret", "").strip()
+
+    if not access_token:
+        return {"ok": False, "limit": -1, "usage": -1, "drive_used": -1, "free": -1,
+                "error": "No access token — connect Google Drive first."}
+
+    def _fetch(token: str) -> dict:
+        req = _ur.Request(
+            "https://www.googleapis.com/drive/v3/about?fields=storageQuota",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with _ur.urlopen(req, timeout=15) as resp:
+            return _json.loads(resp.read())
+
+    def _refresh() -> str | None:
+        if not (refresh_token and client_id and client_secret):
+            return None
+        import urllib.parse
+        data = urllib.parse.urlencode({
+            "client_id":     client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type":    "refresh_token",
+        }).encode()
+        try:
+            req = _ur.Request("https://oauth2.googleapis.com/token", data=data)
+            tokens = _json.loads(_ur.urlopen(req, timeout=15).read())
+            return tokens.get("access_token", "")
+        except Exception:
+            return None
+
+    try:
+        try:
+            data = _fetch(access_token)
+        except Exception:
+            # Token may be expired — try a silent refresh
+            new_token = _refresh()
+            if not new_token:
+                raise
+            data = _fetch(new_token)
+
+        sq = data.get("storageQuota", {})
+        limit      = int(sq["limit"])      if "limit"      in sq else -1
+        usage      = int(sq["usage"])      if "usage"      in sq else -1
+        drive_used = int(sq.get("usageInDrive", 0))
+        free       = (limit - usage) if (limit != -1 and usage != -1) else -1
+
+        return {
+            "ok":         True,
+            "limit":      limit,
+            "usage":      usage,
+            "drive_used": drive_used,
+            "free":       free,
+            "error":      "",
+        }
+
+    except Exception as e:
+        return {"ok": False, "limit": -1, "usage": -1, "drive_used": -1, "free": -1,
+                "error": str(e)}
 
 
 # ─── Test-connection helpers ──────────────────────────────────────────────────
@@ -963,6 +1560,35 @@ def test_https_connection(https_config: dict) -> dict:
     except Exception as e:
         return {"ok": False, "message": str(e)}
 
+
+def test_rclone_connection(rclone_config: dict) -> dict:
+    """
+    Verify that rclone is installed and the configured remote:path is reachable.
+    Returns { ok: bool, message: str }.
+    """
+    remote_name = (rclone_config.get("remote") or rclone_config.get("remote_name", "")).strip()
+    remote_path = (rclone_config.get("path") or rclone_config.get("remote_path", "/backups")).strip()
+    if not remote_name:
+        return {"ok": False, "message": "Rclone remote name not configured"}
+
+    try:
+        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15)
+        if check.returncode != 0:
+            return {"ok": False, "message": "rclone not installed or not available in PATH"}
+    except FileNotFoundError:
+        return {"ok": False, "message": "rclone not installed or not available in PATH"}
+    except Exception as e:
+        return {"ok": False, "message": f"Failed to run rclone: {e}"}
+
+    dest = f"{remote_name}:{remote_path}" if remote_path else f"{remote_name}:"
+    try:
+        proc = subprocess.run(["rclone", "lsd", dest], capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            return {"ok": True, "message": f"✅ rclone can access {dest}"}
+        return {"ok": False, "message": proc.stderr.strip() or proc.stdout.strip() or f"Failed to list {dest}"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
 # ─── Remote Retention Cleanup ─────────────────────────────────────────────────
 
 from datetime import datetime, timedelta
@@ -1163,10 +1789,206 @@ def cleanup_remote_smb(smb_config: dict, retention_days: int, watch_id: str = ""
             result["ok"] = False
             result["error"] = str(e)
     else:
-        result["ok"] = False
-        result["error"] = "SMB retention cleanup on Linux requires smbprotocol — not yet implemented"
+        # Linux/Unix: use smbclient for cross-platform SMB access
+        try:
+            import smbclient
+        except ImportError:
+            result["ok"] = False
+            result["error"] = "smbprotocol not installed — run: pip install smbprotocol"
+            return result
+
+        try:
+            # Register SMB session
+            smbclient.register_session(server, username=username, password=password, 
+                                     domain=domain if domain else None)
+
+            # Build the remote path for listing
+            remote_path = f"\\\\{server}\\{share}"
+            if remote_base:
+                remote_path = f"{remote_path}\\{remote_base}"
+
+            def _calculate_size(remote_dir_path):
+                """Recursively calculate total size of a remote directory."""
+                total_size = 0
+                try:
+                    for root, dirs, files in smbclient.walk(remote_dir_path):
+                        for fname in files:
+                            try:
+                                file_path = f"{root}\\{fname}"
+                                # Get file attributes to check size
+                                attr = smbclient.stat(file_path)
+                                total_size += getattr(attr, 'st_size', 0)
+                            except Exception:
+                                pass  # Skip files we can't stat
+                except Exception:
+                    pass  # Skip directories we can't walk
+                return total_size
+
+            def _rm_rf(remote_dir_path):
+                """Recursively delete a remote directory depth-first."""
+                try:
+                    # Walk the directory tree depth-first
+                    dirs_to_delete = []
+                    for root, dirs, files in smbclient.walk(remote_dir_path):
+                        # Delete files first
+                        for fname in files:
+                            file_path = f"{root}\\{fname}"
+                            try:
+                                smbclient.remove(file_path)
+                            except Exception as e:
+                                result["errors"].append(f"Failed to delete file {file_path}: {e}")
+                        
+                        # Collect directories for later deletion (depth-first)
+                        for dirname in dirs:
+                            dirs_to_delete.append(f"{root}\\{dirname}")
+                    
+                    # Delete directories in reverse order (depth-first)
+                    for dir_path in reversed(dirs_to_delete):
+                        try:
+                            smbclient.rmdir(dir_path)
+                        except Exception as e:
+                            result["errors"].append(f"Failed to delete directory {dir_path}: {e}")
+                    
+                    # Finally delete the root directory
+                    try:
+                        smbclient.rmdir(remote_dir_path)
+                    except Exception as e:
+                        result["errors"].append(f"Failed to delete root directory {remote_dir_path}: {e}")
+                        
+                except Exception as e:
+                    result["errors"].append(f"Failed to walk/delete {remote_dir_path}: {e}")
+
+            # List entries in the remote backup directory
+            try:
+                entries = list(smbclient.scandir(remote_path))
+            except Exception as e:
+                result["ok"] = False
+                result["error"] = f"Failed to list SMB directory: {e}"
+                return result
+
+            for entry in entries:
+                entry_name = entry.name
+                # Skip if not a directory
+                if not entry.is_dir():
+                    continue
+                    
+                # Filter by watch_id prefix if specified
+                if watch_id and watch_id not in entry_name:
+                    continue
+                    
+                # Parse timestamp from entry name
+                ts = _parse_backup_ts(entry_name)
+                if ts and ts < cutoff:
+                    remote_dir_path = f"{remote_path}\\{entry_name}"
+                    
+                    # Calculate size before deletion
+                    result["freed_bytes"] += _calculate_size(remote_dir_path)
+                    
+                    # Recursively delete the directory
+                    _rm_rf(remote_dir_path)
+                    
+                    result["deleted"] += 1
+                    logger.info(f"[smb-retention] Deleted old backup: {remote_dir_path}")
+
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = f"SMB cleanup error: {e}"
 
     return result
+
+
+def cleanup_rclone_backups(rclone_config: dict, retention_days: int, watch_id: str = "") -> dict:
+    """
+    Delete backup folders older than retention_days from an rclone remote.
+
+    Strategy:
+      1. Use `rclone lsd <remote>:<path>` to list top-level directories.
+      2. Filter to folders whose names start with a timestamp matching the
+         BackupSys naming convention  (YYYYMMDD_HHMMSS_...).
+      3. Optionally filter by watch_id prefix if supplied.
+      4. Delete each expired folder with `rclone purge` (removes the entire
+         folder tree in one call — much faster than `rclone delete`).
+
+    This is a best-effort operation.  Individual purge failures are collected
+    and reported but do not abort the rest of the cleanup.
+
+    Returns { ok, deleted, freed_bytes, remote_count, error }.
+    freed_bytes is always 0 — rclone does not expose freed-space statistics.
+    """
+    remote_name = (rclone_config.get("remote") or rclone_config.get("remote_name", "")).strip()
+    remote_path = (rclone_config.get("path") or rclone_config.get("remote_path", "/backups")).strip()
+    if not remote_name:
+        return {"ok": False, "deleted": 0, "freed_bytes": 0,
+                "error": "rclone remote name not configured"}
+    if retention_days <= 0:
+        return {"ok": True, "deleted": 0, "freed_bytes": 0, "remote_count": 0,
+                "error": ""}
+
+    base = f"{remote_name}:{remote_path}" if remote_path else f"{remote_name}:"
+
+    # ── 1. Check rclone availability ─────────────────────────────────────────
+    try:
+        subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return {"ok": False, "deleted": 0, "freed_bytes": 0,
+                "error": "rclone not installed or not available in PATH"}
+    except Exception as e:
+        return {"ok": False, "deleted": 0, "freed_bytes": 0, "error": str(e)}
+
+    # ── 2. List immediate sub-directories ────────────────────────────────────
+    try:
+        proc = subprocess.run(
+            ["rclone", "lsd", base],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode != 0:
+            return {"ok": False, "deleted": 0, "freed_bytes": 0,
+                    "error": f"rclone lsd failed: {proc.stderr.strip()[:200]}"}
+    except Exception as e:
+        return {"ok": False, "deleted": 0, "freed_bytes": 0, "error": str(e)}
+
+    # rclone lsd output format:  "          -1 YYYY-MM-DD HH:MM:SS        -1 folder_name"
+    folder_names = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 4)
+        if len(parts) == 5:
+            folder_names.append(parts[4])
+
+    remote_count = len(folder_names)
+    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    deleted = 0
+    errors = []
+
+    for name in folder_names:
+        # Optional: only touch folders that belong to this watch
+        if watch_id and not name.startswith(watch_id):
+            continue
+        ts = _parse_backup_ts(name)
+        if ts is None:
+            continue                    # not a BackupSys folder — skip safely
+        if ts >= cutoff:
+            continue                    # still within retention window
+
+        target = f"{base}/{name}"
+        try:
+            result = subprocess.run(
+                ["rclone", "purge", target],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0:
+                deleted += 1
+            else:
+                errors.append(f"{name}: {result.stderr.strip()[:120]}")
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+
+    return {
+        "ok":           len(errors) == 0,
+        "deleted":      deleted,
+        "freed_bytes":  0,              # rclone does not report freed bytes
+        "remote_count": remote_count,
+        "error":        "; ".join(errors) if errors else "",
+    }
 
 
 def cleanup_remote_backups(cfg: dict, retention_days: int, watch_id: str = "") -> dict:
@@ -1186,12 +2008,164 @@ def cleanup_remote_backups(cfg: dict, retention_days: int, watch_id: str = "") -
     elif dest_type == "https":
         return {"ok": True, "deleted": 0, "freed_bytes": 0,
                 "error": "HTTPS retention skipped — no standard delete API"}
+    elif dest_type == "webdav":
+        return cleanup_remote_webdav(cfg.get("dest_webdav", {}), retention_days, watch_id)
+    elif dest_type == "rclone":
+        return cleanup_rclone_backups(cfg.get("dest_rclone", {}), retention_days, watch_id)
     else:
         return {"ok": True, "deleted": 0, "freed_bytes": 0}
 
 # ─── WebDAV / Nextcloud / ownCloud ────────────────────────────────────────────
 
-def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None) -> dict:
+def cleanup_remote_webdav(webdav_config: dict, retention_days: int, watch_id: str = "") -> dict:
+    """
+    Delete old backup folders from a WebDAV server (Nextcloud, ownCloud, generic).
+
+    Strategy
+    --------
+    1. PROPFIND Depth:1 on the remote backup root to list child collections.
+    2. For each child whose name matches the BackupSys timestamp pattern
+       (``YYYYMMDD_HHMMSS_…``) and is older than *retention_days*, send DELETE.
+    3. Falls back to parsing ``<D:getlastmodified>`` when the folder name carries
+       no timestamp (e.g. custom names).
+
+    Returns ``{ok, deleted, freed_bytes, errors}``.  ``freed_bytes`` is best-effort
+    (populated from ``<D:getcontentlength>`` if the server returns it for
+    collections; 0 otherwise — most DAV servers omit it for directories).
+    """
+    import base64 as _b64
+    import xml.etree.ElementTree as _ET
+    from email.utils import parsedate_to_datetime
+
+    url_base    = (webdav_config.get("url") or "").rstrip("/")
+    username    = (webdav_config.get("username") or webdav_config.get("user", "")).strip()
+    password    = _cred_webdav(webdav_config) if _CRED_STORE else (
+                      webdav_config.get("password") or webdav_config.get("pass", ""))
+    remote_path = (webdav_config.get("remote_path") or "/backups").strip("/")
+    verify_ssl  = webdav_config.get("verify_ssl", True)
+    webdav_root = (webdav_config.get("webdav_root") or "").rstrip("/")
+
+    if not url_base:
+        return {"ok": False, "deleted": 0, "freed_bytes": 0, "error": "WebDAV URL not configured"}
+    if not username:
+        return {"ok": False, "deleted": 0, "freed_bytes": 0, "error": "WebDAV username not configured"}
+
+    _auth = "Basic " + _b64.b64encode(f"{username}:{password}".encode()).decode()
+
+    def _ctx():
+        return ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+
+    def _request(method: str, path: str, body: bytes = None,
+                 extra_headers: dict = None) -> tuple:
+        """Send *method* to *path*, return (status_code, response_bytes)."""
+        full = url_base + webdav_root + "/" + path.lstrip("/")
+        headers = {"Authorization": _auth}
+        if body is not None:
+            headers["Content-Type"]   = "application/xml; charset=utf-8"
+            headers["Content-Length"] = str(len(body))
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(full, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, context=_ctx(), timeout=60) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, b""
+
+    # ── PROPFIND Depth:1 to list child collections ────────────────────────────
+    propfind_body = (
+        b'<?xml version="1.0" encoding="UTF-8"?>'
+        b'<D:propfind xmlns:D="DAV:">'
+        b'  <D:prop>'
+        b'    <D:displayname/>'
+        b'    <D:resourcetype/>'
+        b'    <D:getlastmodified/>'
+        b'    <D:getcontentlength/>'
+        b'  </D:prop>'
+        b'</D:propfind>'
+    )
+    status, body = _request(
+        "PROPFIND", remote_path + "/", propfind_body,
+        extra_headers={"Depth": "1"},
+    )
+    if status not in (207,):
+        return {
+            "ok": False, "deleted": 0, "freed_bytes": 0,
+            "error": f"PROPFIND returned HTTP {status} — check URL/credentials",
+        }
+
+    # ── Parse 207 Multi-Status XML ────────────────────────────────────────────
+    DAV = "DAV:"
+    try:
+        root_el = _ET.fromstring(body)
+    except _ET.ParseError as exc:
+        return {"ok": False, "deleted": 0, "freed_bytes": 0,
+                "error": f"Failed to parse PROPFIND response: {exc}"}
+
+    result  = {"ok": True, "deleted": 0, "freed_bytes": 0, "errors": []}
+    cutoff  = datetime.now() - timedelta(days=retention_days)
+    base_href = (webdav_root + "/" + remote_path).rstrip("/") + "/"
+
+    for response_el in root_el.iter(f"{{{DAV}}}response"):
+        href_el = response_el.find(f"{{{DAV}}}href")
+        if href_el is None:
+            continue
+        href = href_el.text or ""
+
+        # Skip the collection itself (the root we just listed)
+        if href.rstrip("/") == base_href.rstrip("/"):
+            continue
+
+        # Only interested in collections (directories)
+        res_type = response_el.find(f".//{{{DAV}}}resourcetype/{{{DAV}}}collection")
+        if res_type is None:
+            continue
+
+        # Derive folder name from href
+        folder_name = href.rstrip("/").rsplit("/", 1)[-1]
+
+        if watch_id and watch_id not in folder_name:
+            continue
+
+        # Prefer timestamp encoded in folder name; fall back to getlastmodified
+        ts = _parse_backup_ts(folder_name)
+        if ts is None:
+            lm_el = response_el.find(f".//{{{DAV}}}getlastmodified")
+            if lm_el is not None and lm_el.text:
+                try:
+                    ts = parsedate_to_datetime(lm_el.text).replace(tzinfo=None)
+                except Exception:
+                    pass
+        if ts is None or ts >= cutoff:
+            continue
+
+        # Accumulate freed_bytes from getcontentlength (usually 0 for collections)
+        cl_el = response_el.find(f".//{{{DAV}}}getcontentlength")
+        if cl_el is not None and cl_el.text:
+            try:
+                result["freed_bytes"] += int(cl_el.text)
+            except ValueError:
+                pass
+
+        # DELETE the expired collection (recursive on most WebDAV servers)
+        del_path = href if href.startswith("/") else ("/" + href)
+        del_status, _ = _request("DELETE", del_path)
+        if del_status in (200, 204, 404):   # 404 = already gone, treat as success
+            result["deleted"] += 1
+            logger.info(f"[webdav-retention] Deleted old backup: {href}")
+        else:
+            msg = f"DELETE {href} returned HTTP {del_status}"
+            result["errors"].append(msg)
+            logger.warning(f"[webdav-retention] {msg}")
+
+    if result["errors"]:
+        result["ok"] = False
+        result["error"] = "; ".join(result["errors"])
+    return result
+
+
+def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None,
+                     max_retries: int = 3, verify: bool = False) -> dict:
     """
     Upload a backup folder to a WebDAV server (Nextcloud, ownCloud, etc.).
 
@@ -1208,6 +2182,9 @@ def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None) -> d
                      Nextcloud: /remote.php/dav/files/<USERNAME>/
                      ownCloud:  /remote.php/webdav/
                      Plain:     leave empty (server root)
+
+    verify — if True, re-downloads the first 8 KB of each uploaded file and
+             compares its MD5 against the local copy to detect silent corruption.
 
     Returns { ok: bool, uploaded: int, path: str, error: str }
     """
@@ -1371,22 +2348,75 @@ def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None) -> d
 
                 remote_file = dest_root + "/" + "/".join(parts)
                 _prog = [0]
-                if _put_file(remote_file, fp, _prog):
+                def _do_webdav_put(_rf=remote_file, _fp=fp):
+                    _p = [0]
+                    ok = _put_file(_rf, _fp, _p)
+                    if not ok:
+                        raise OSError(f"PUT failed for {_fp.name}")
+                try:
+                    _retry_with_backoff(
+                        _do_webdav_put,
+                        max_retries=max_retries,
+                        label=f"webdav:{'/'.join(parts)}",
+                    )
                     uploaded += 1
-                else:
-                    logger.warning(f"[webdav] Failed to upload {fp.name}")
+                except Exception:
+                    logger.warning(f"[webdav] Failed to upload {fp.name} after {max_retries} retries")
 
     except Exception as e:
         logger.error(f"[webdav] Upload failed: {e}")
         return {"ok": False, "uploaded": uploaded, "path": dest_root, "error": str(e)}
 
     ok = uploaded > 0 or len([f for f in ld.rglob("*") if f.is_file() and f.name not in _SKIP]) == 0
-    return {
+    result = {
         "ok":       ok,
         "uploaded": uploaded,
         "path":     dest_root,
         "error":    None if ok else "No files uploaded",
     }
+
+    # ── Post-upload checksum verification ─────────────────────────────────────
+    # Re-downloads the first 8 KB of each uploaded file via HTTP GET and
+    # compares the MD5 against the local copy, catching silent corruption or
+    # truncated transfers that file-count checks would miss.
+    if verify and ok:
+        verify_warnings = []
+        # Resolve a concrete SSL context (handle the case where _ssl_ctx is a lambda)
+        _verify_ssl_ctx = _ssl_ctx if isinstance(_ssl_ctx, ssl.SSLContext) else ssl._create_unverified_context()
+        _all_verify_files = [f for f in ld.rglob("*") if f.is_file() and f.name not in _SKIP]
+        for fp in _all_verify_files:
+            rel         = fp.relative_to(ld)
+            remote_file = dest_root + "/" + str(rel).replace(os.sep, "/")
+            full_url    = url_base + webdav_root + "/" + remote_file.lstrip("/")
+            try:
+                local_md5 = hashlib.md5()
+                with open(str(fp), "rb") as lf:
+                    local_md5.update(lf.read(8192))
+
+                req = urllib.request.Request(full_url, method="GET")
+                req.add_header("Authorization", _auth)
+                req.add_header("Range", "bytes=0-8191")
+                with urllib.request.urlopen(req, context=_verify_ssl_ctx, timeout=30) as resp:
+                    remote_chunk = resp.read(8192)
+                remote_md5 = hashlib.md5(remote_chunk)
+
+                if local_md5.hexdigest() != remote_md5.hexdigest():
+                    verify_warnings.append(f"MD5 mismatch for {rel}")
+                    logger.warning(f"[webdav] Verify: MD5 mismatch for {rel}")
+            except Exception as ve:
+                verify_warnings.append(f"Verification failed for {rel}: {ve}")
+                logger.warning(f"[webdav] Verify error for {rel}: {ve}")
+
+        if verify_warnings:
+            result["warnings"] = verify_warnings
+            logger.warning(
+                f"[webdav] Post-upload verification: {len(verify_warnings)} file(s) "
+                f"may be corrupted or missing on the remote server"
+            )
+        else:
+            logger.info(f"[webdav] Post-upload verification: all {len(_all_verify_files)} file(s) OK")
+
+    return result
 
 
 def test_webdav_connection(webdav_config: dict) -> dict:
@@ -1428,3 +2458,620 @@ def test_webdav_connection(webdav_config: dict) -> dict:
         return {"ok": False, "error": f"HTTP {e.code}: {e.reason}"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def test_gdrive_connection(cloud_config: dict) -> dict:
+    """
+    Verify a Google Drive connection by checking the saved access token against
+    Google's tokeninfo endpoint.  If the token is within 5 minutes of expiry (or
+    already invalid), a silent refresh is attempted using the refresh token.
+
+    cloud_config keys (all optional — falls back to QSettings values):
+        access_token   — current OAuth access token
+        refresh_token  — OAuth refresh token used for silent renewal
+        client_id      — Google OAuth client ID
+        client_secret  — Google OAuth client secret
+
+    Returns { ok: bool, detail: str }  where detail is a human-readable message
+    shown directly in the UI (e.g. "Connected · expires in 58 min" or the error).
+    """
+    import urllib.request as _ur
+    import urllib.parse
+    import json as _json
+
+    access_token  = (cloud_config.get("access_token")  or "").strip()
+    refresh_token = (cloud_config.get("refresh_token") or "").strip()
+    client_id     = (cloud_config.get("client_id")     or "").strip()
+    client_secret = (cloud_config.get("client_secret") or "").strip()
+
+    if not access_token:
+        return {"ok": False, "detail": "No access token — connect Google Drive first"}
+
+    def _check_token(token: str):
+        """Hit tokeninfo; return (ok, expires_in_seconds, error_str)."""
+        try:
+            req  = _ur.Request(
+                f"https://www.googleapis.com/oauth2/v1/tokeninfo?access_token={token}"
+            )
+            resp = _ur.urlopen(req, timeout=10)
+            info = _json.loads(resp.read())
+            exp  = int(info.get("expires_in", 0))
+            return True, exp, None
+        except Exception as exc:
+            return False, 0, str(exc)
+
+    def _refresh(r_token: str, c_id: str, c_secret: str):
+        """Attempt a silent token refresh; return new access_token or None."""
+        if not (r_token and c_id and c_secret):
+            return None
+        try:
+            data = urllib.parse.urlencode({
+                "client_id":     c_id,
+                "client_secret": c_secret,
+                "refresh_token": r_token,
+                "grant_type":    "refresh_token",
+            }).encode()
+            resp   = _ur.urlopen(
+                _ur.Request("https://oauth2.googleapis.com/token", data=data), timeout=15
+            )
+            tokens = _json.loads(resp.read())
+            return tokens.get("access_token") or None
+        except Exception:
+            return None
+
+    ok, expires_in, err = _check_token(access_token)
+
+    if ok and expires_in >= 300:
+        mins = expires_in // 60
+        return {"ok": True, "detail": f"Connected · token valid, expires in {mins} min"}
+
+    if ok and expires_in < 300:
+        # Token about to expire — try silent refresh
+        new_token = _refresh(refresh_token, client_id, client_secret)
+        if new_token:
+            return {"ok": True, "detail": "Connected · token refreshed successfully"}
+        return {
+            "ok": False,
+            "detail": f"Token expires in {expires_in}s and could not be refreshed — reconnect Google Drive",
+        }
+
+    # Token is invalid — try silent refresh before reporting failure
+    new_token = _refresh(refresh_token, client_id, client_secret)
+    if new_token:
+        return {"ok": True, "detail": "Connected · token was expired but refreshed successfully"}
+
+    return {
+        "ok": False,
+        "detail": f"Token invalid and refresh failed — reconnect Google Drive ({err or 'unknown error'})",
+    }
+
+
+# ─── DOWNLOAD FUNCTIONS (Remote Restore) ──────────────────────────────────────
+
+def download_from_sftp(remote_dir: str, local_dest: str, sftp_config: dict,
+                        progress_cb=None) -> dict:
+    """
+    Download a backup folder recursively from SFTP to local_dest.
+    Preserves folder structure.
+    Returns { status: "ok"|"error", downloaded: int, error: str|None }
+
+    progress_cb(downloaded: int, filename: str) — called after each file is saved.
+    """
+    try:
+        import paramiko
+    except ImportError:
+        return {"status": "error", "downloaded": 0, "error": "paramiko not installed"}
+
+    host       = sftp_config.get("host", "").strip()
+    port       = int(sftp_config.get("port", 22))
+    username   = (sftp_config.get("username") or sftp_config.get("user", "")).strip()
+    password   = _cred_sftp(sftp_config) if _CRED_STORE else (sftp_config.get("password") or sftp_config.get("pass", ""))
+    key_path   = (sftp_config.get("key_path") or sftp_config.get("keyfile", "")).strip()
+    key_pass   = sftp_config.get("key_passphrase") or ""
+
+    if not host:
+        return {"status": "error", "downloaded": 0, "error": "SFTP host not configured"}
+    if not username:
+        return {"status": "error", "downloaded": 0, "error": "SFTP username not configured"}
+
+    transport = None
+    sftp = None
+    downloaded = 0
+
+    try:
+        _WIN_SIZE = 33 * 1024 * 1024
+        _PKT_SIZE = 32 * 1024
+
+        transport = paramiko.Transport((host, port))
+        transport.default_window_size = _WIN_SIZE
+        transport.default_max_packet_size = _PKT_SIZE
+        transport.connect()
+
+        if key_path and Path(key_path).exists():
+            pkey = None
+            for key_cls in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey):
+                try:
+                    pkey = key_cls.from_private_key_file(key_path, password=key_pass or None)
+                    break
+                except paramiko.ssh_exception.PasswordRequiredException:
+                    return {"status": "error", "downloaded": 0, "error": "Key passphrase required"}
+            if not pkey:
+                return {"status": "error", "downloaded": 0, "error": "Could not load private key"}
+            transport.auth_publickey(username, pkey)
+        else:
+            transport.auth_password(username, password)
+
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        Path(local_dest).mkdir(parents=True, exist_ok=True)
+
+        def _download_dir(remote_path, local_path):
+            nonlocal downloaded
+            Path(local_path).mkdir(parents=True, exist_ok=True)
+            try:
+                for item in sftp.listdir_attr(remote_path):
+                    remote_item = f"{remote_path}/{item.filename}".replace("//", "/")
+                    local_item = os.path.join(local_path, item.filename)
+                    import stat
+                    if stat.S_ISDIR(item.st_mode):
+                        _download_dir(remote_item, local_item)
+                    else:
+                        try:
+                            sftp.get(remote_item, local_item)
+                            downloaded += 1
+                            if progress_cb:
+                                try:
+                                    progress_cb(downloaded, item.filename)
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.warning(f"[sftp] Failed to download {remote_item}: {e}")
+            except Exception as e:
+                logger.warning(f"[sftp] Failed to list {remote_path}: {e}")
+
+        _download_dir(remote_dir, local_dest)
+        return {"status": "ok", "downloaded": downloaded, "error": None}
+
+    except paramiko.AuthenticationException as e:
+        return {"status": "error", "downloaded": 0, "error": f"SFTP auth failed: {e}"}
+    except Exception as e:
+        return {"status": "error", "downloaded": 0, "error": f"SFTP error: {e}"}
+    finally:
+        if sftp:
+            sftp.close()
+        if transport:
+            transport.close()
+
+
+def download_from_ftp(remote_dir: str, local_dest: str, ftp_config: dict,
+                       progress_cb=None) -> dict:
+    """
+    Download a backup folder recursively from FTP/FTPS to local_dest.
+    Returns { status: "ok"|"error", downloaded: int, error: str|None }
+
+    progress_cb(downloaded: int, filename: str) — called after each file is saved.
+    """
+    try:
+        from ftplib import FTP, FTP_TLS, all_errors
+    except ImportError:
+        return {"status": "error", "downloaded": 0, "error": "ftplib not available"}
+
+    host       = ftp_config.get("host", "").strip()
+    port       = int(ftp_config.get("port", 21))
+    username   = (ftp_config.get("username") or ftp_config.get("user", "")).strip()
+    password   = _cred_ftp(ftp_config) if _CRED_STORE else (ftp_config.get("password") or ftp_config.get("pass", ""))
+    use_tls    = ftp_config.get("use_tls", True)
+
+    if not host:
+        return {"status": "error", "downloaded": 0, "error": "FTP host not configured"}
+    if not username:
+        return {"status": "error", "downloaded": 0, "error": "FTP username not configured"}
+
+    ftp = None
+    downloaded = 0
+
+    try:
+        FTP_Class = FTP_TLS if use_tls else FTP
+        ftp = FTP_Class()
+        ftp.connect(host, port, timeout=30)
+        ftp.login(username, password)
+        if use_tls:
+            ftp.prot_p()
+
+        Path(local_dest).mkdir(parents=True, exist_ok=True)
+
+        def _download_dir(remote_path, local_path):
+            nonlocal downloaded
+            Path(local_path).mkdir(parents=True, exist_ok=True)
+            try:
+                ftp.cwd(remote_path)
+                items = ftp.mlsd()
+                for name, facts in items:
+                    if name in (".", ".."):
+                        continue
+                    remote_item = f"{remote_path}/{name}".replace("//", "/")
+                    local_item = os.path.join(local_path, name)
+                    if facts.get("type") == "dir":
+                        _download_dir(remote_item, local_item)
+                    else:
+                        try:
+                            with open(local_item, "wb") as local_fh:
+                                ftp.retrbinary(f"RETR {name}", local_fh.write)
+                            downloaded += 1
+                            if progress_cb:
+                                try:
+                                    progress_cb(downloaded, name)
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.warning(f"[ftp] Failed to download {name}: {e}")
+            except Exception as e:
+                logger.warning(f"[ftp] Failed to list {remote_path}: {e}")
+
+        _download_dir(remote_dir, local_dest)
+        return {"status": "ok", "downloaded": downloaded, "error": None}
+
+    except Exception as e:
+        return {"status": "error", "downloaded": 0, "error": f"FTP error: {e}"}
+    finally:
+        if ftp:
+            try:
+                ftp.quit()
+            except:
+                ftp.close()
+
+
+def download_from_smb(remote_dir: str, local_dest: str, smb_config: dict,
+                       progress_cb=None) -> dict:
+    """
+    Download a backup folder recursively from SMB/CIFS to local_dest.
+    Returns { status: "ok"|"error", downloaded: int, error: str|None }
+
+    progress_cb(downloaded: int, filename: str) — called after each file is saved.
+    """
+    try:
+        from smbclient import walk, open_file
+        import smbclient
+    except ImportError:
+        return {"status": "error", "downloaded": 0, "error": "smbprotocol not installed"}
+
+    server    = smb_config.get("server", "").strip()
+    share     = smb_config.get("share", "").strip()
+    username  = (smb_config.get("username") or smb_config.get("user", "")).strip()
+    password  = _cred_smb(smb_config) if _CRED_STORE else (smb_config.get("password") or smb_config.get("pass", ""))
+    domain    = smb_config.get("domain", "")
+    remote_base = (smb_config.get("remote_path") or "/backups").lstrip("/")
+
+    if not server or not share:
+        return {"status": "error", "downloaded": 0, "error": "SMB server/share not configured"}
+    if not username:
+        return {"status": "error", "downloaded": 0, "error": "SMB username not configured"}
+
+    downloaded = 0
+
+    try:
+        smbclient.register_session(server, username=username, password=password)
+        Path(local_dest).mkdir(parents=True, exist_ok=True)
+
+        def _download_dir(remote_path, local_path):
+            nonlocal downloaded
+            Path(local_path).mkdir(parents=True, exist_ok=True)
+            try:
+                for root, dirs, files in walk(f"\\\\{server}\\{share}\\{remote_path}"):
+                    for fname in files:
+                        remote_file = os.path.join(root, fname)
+                        rel = os.path.relpath(remote_file, f"\\\\{server}\\{share}\\{remote_path}")
+                        local_file = os.path.join(local_path, rel)
+                        os.makedirs(os.path.dirname(local_file), exist_ok=True)
+                        try:
+                            with open_file(remote_file, mode="rb") as remote_fh:
+                                with open(local_file, "wb") as local_fh:
+                                    CHUNK = 16 * 1024 * 1024
+                                    while True:
+                                        chunk = remote_fh.read(CHUNK)
+                                        if not chunk:
+                                            break
+                                        local_fh.write(chunk)
+                            downloaded += 1
+                            if progress_cb:
+                                try:
+                                    progress_cb(downloaded, fname)
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.warning(f"[smb] Failed to download {remote_file}: {e}")
+            except Exception as e:
+                logger.warning(f"[smb] Failed to walk {remote_path}: {e}")
+
+        _download_dir(remote_base, local_dest)
+        return {"status": "ok", "downloaded": downloaded, "error": None}
+
+    except Exception as e:
+        return {"status": "error", "downloaded": 0, "error": f"SMB error: {e}"}
+
+
+def download_from_rclone(remote_dir: str, local_dest: str, rclone_config: dict, progress_cb=None) -> dict:
+    """
+    Download a backup folder from an rclone remote to local_dest.
+    remote_dir is the path on the remote, e.g. "/backups/20240101_120000"
+    Returns { status: "ok"|"error", downloaded: int, error: str|None }
+    """
+    remote_name = (rclone_config.get("remote") or rclone_config.get("remote_name", "")).strip()
+    remote_path = (rclone_config.get("path") or rclone_config.get("remote_path", "/backups")).strip()
+    if not remote_name:
+        return {"status": "error", "downloaded": 0, "error": "Rclone remote name not configured"}
+
+    try:
+        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15)
+        if check.returncode != 0:
+            return {"status": "error", "downloaded": 0, "error": "rclone not installed or not available in PATH"}
+    except FileNotFoundError:
+        return {"status": "error", "downloaded": 0, "error": "rclone not installed or not available in PATH"}
+    except Exception as e:
+        return {"status": "error", "downloaded": 0, "error": f"Failed to run rclone: {e}"}
+
+    # remote_dir is like "/backups/20240101_120000", so source is remote_name:remote_path/remote_dir
+    # But remote_path might be "/backups", and remote_dir "/backups/20240101_120000", so need to combine properly
+    source = f"{remote_name}:{remote_dir.lstrip('/')}"
+    cmd = ["rclone", "copy", source, str(Path(local_dest)), "--progress"]
+    if os.name == "nt":
+        cmd[3] = str(Path(local_dest))
+
+    stderr_lines = []
+    try:
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
+    except FileNotFoundError:
+        return {"status": "error", "downloaded": 0, "error": "rclone not installed or not available in PATH"}
+    except Exception as e:
+        return {"status": "error", "downloaded": 0, "error": str(e)}
+
+    try:
+        if proc.stderr:
+            for line in proc.stderr:
+                stderr_lines.append(line.rstrip("\n"))
+                if progress_cb:
+                    try:
+                        progress_cb(line.rstrip("\n"))
+                    except Exception:
+                        pass
+        proc.wait(timeout=3600)
+    except Exception as e:
+        proc.kill()
+        return {"status": "error", "downloaded": 0, "error": f"rclone failed: {e}"}
+
+    if proc.returncode != 0:
+        return {"status": "error", "downloaded": 0, "error": "rclone copy failed: " + "\n".join(stderr_lines[-10:])}
+
+    # rclone doesn't report exact file count, so return success with 0 (meaning unknown)
+    return {"status": "ok", "downloaded": 0, "error": None}
+
+
+def download_from_webdav(remote_dir: str, local_dest: str, webdav_config: dict,
+                          progress_cb=None) -> dict:
+    """
+    Download a backup folder recursively from WebDAV to local_dest.
+    Returns { status: "ok"|"error", downloaded: int, error: str|None }
+
+    progress_cb(downloaded: int, filename: str) — called after each file is saved.
+    """
+    import ssl
+    import urllib.request
+    import urllib.error
+    import base64 as _b64
+    import xml.etree.ElementTree as ET
+
+    url_base    = (webdav_config.get("url") or "").rstrip("/")
+    username    = (webdav_config.get("username") or webdav_config.get("user", "")).strip()
+    password    = _cred_webdav(webdav_config) if _CRED_STORE else (webdav_config.get("password") or webdav_config.get("pass", ""))
+    remote_path = (webdav_config.get("remote_path") or "/backups").strip("/")
+    verify_ssl  = webdav_config.get("verify_ssl", True)
+    webdav_root = (webdav_config.get("webdav_root") or "").rstrip("/")
+
+    if not url_base:
+        return {"status": "error", "downloaded": 0, "error": "WebDAV URL not configured"}
+    if not username:
+        return {"status": "error", "downloaded": 0, "error": "WebDAV username not configured"}
+
+    _creds = _b64.b64encode(f"{username}:{password}".encode()).decode()
+    _auth = f"Basic {_creds}"
+    downloaded = 0
+
+    try:
+        Path(local_dest).mkdir(parents=True, exist_ok=True)
+
+        def _propfind(path):
+            """Send PROPFIND, return list of resources."""
+            full = url_base + webdav_root + "/" + path.lstrip("/")
+            req = urllib.request.Request(
+                full,
+                data=b'<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:displayname/><D:resourcetype/></D:prop></D:propfind>',
+                headers={"Authorization": _auth, "Depth": "1", "Content-Type": "application/xml"},
+                method="PROPFIND",
+            )
+            try:
+                ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+                with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+                    xml_text = resp.read().decode("utf-8", errors="ignore")
+                    root = ET.fromstring(xml_text)
+                    ns = {"d": "DAV:"}
+                    items = []
+                    for response in root.findall("d:response", ns):
+                        href = response.findtext("d:href", "", ns)
+                        is_dir = response.find("d:propstat/d:prop/d:resourcetype/d:collection", ns) is not None
+                        items.append({"href": href, "is_dir": is_dir})
+                    return items
+            except Exception as e:
+                logger.warning(f"[webdav] PROPFIND {path} failed: {e}")
+                return []
+
+        def _get_file(remote_file, local_file):
+            """GET a single file."""
+            full = url_base + webdav_root + "/" + remote_file.lstrip("/")
+            req = urllib.request.Request(full, headers={"Authorization": _auth}, method="GET")
+            try:
+                ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+                with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+                    with open(local_file, "wb") as local_fh:
+                        local_fh.write(resp.read())
+                return True
+            except Exception as e:
+                logger.warning(f"[webdav] GET {remote_file}: {e}")
+                return False
+
+        def _download_dir(remote_path_rel, local_path_rel):
+            nonlocal downloaded
+            local_full = os.path.join(local_dest, local_path_rel)
+            Path(local_full).mkdir(parents=True, exist_ok=True)
+            items = _propfind(remote_path_rel)
+            for item in items:
+                href = item["href"].rstrip("/")
+                name = href.split("/")[-1]
+                if not name:
+                    continue
+                remote_sub = f"{remote_path_rel}/{name}".lstrip("/")
+                local_sub = os.path.join(local_path_rel, name) if local_path_rel else name
+                if item["is_dir"]:
+                    _download_dir(remote_sub, local_sub)
+                else:
+                    local_file_full = os.path.join(local_dest, local_sub)
+                    if _get_file(remote_sub, local_file_full):
+                        downloaded += 1
+                        if progress_cb:
+                            try:
+                                progress_cb(downloaded, name)
+                            except Exception:
+                                pass
+
+        _download_dir(remote_path, "")
+        return {"status": "ok", "downloaded": downloaded, "error": None}
+
+    except Exception as e:
+        return {"status": "error", "downloaded": 0, "error": f"WebDAV error: {e}"}
+
+
+def download_from_https(remote_dir: str, local_dest: str, https_config: dict,
+                         progress_cb=None) -> dict:
+    """
+    Download a backup folder from an HTTPS API endpoint via GET requests.
+    
+    The server is expected to provide a manifest listing files at:
+        GET {api_url}/manifest
+    And individual files at:
+        GET {api_url}/files/{filename}
+    
+    Both endpoints use Bearer token authentication.
+    
+    https_config: { url, token, headers(dict), verify_ssl(=true) }
+    
+    Returns { status: "ok"|"error", downloaded: int, error: str|None }
+
+    progress_cb(downloaded: int, filename: str) — called after each file is saved.
+    """
+    import ssl
+    import json as _json
+    
+    url        = https_config.get("url", "").strip()
+    token      = https_config.get("token", "").strip()
+    extra_hdrs = https_config.get("headers", {}) or {}
+    verify_ssl = bool(https_config.get("verify_ssl", True))
+    
+    if not url:
+        return {"status": "error", "downloaded": 0, "error": "HTTPS download URL not configured"}
+    
+    # Remove trailing slash for consistency
+    url = url.rstrip("/")
+    
+    ssl_ctx = ssl.create_default_context()
+    if not verify_ssl:
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
+    
+    downloaded = 0
+    errors     = []
+    
+    try:
+        Path(local_dest).mkdir(parents=True, exist_ok=True)
+        
+        # Prepare headers
+        hdrs = {"Accept": "application/json"}
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
+        hdrs.update(extra_hdrs)
+        
+        # Fetch manifest to get list of files
+        try:
+            # Pass the backup folder name so the server knows which snapshot
+            # to list.  remote_dir is the backup folder name (e.g.
+            # "mywatch_20260504_120000") — URL-encode it for safety.
+            import urllib.parse as _uparse
+            _bdir_q = _uparse.urlencode({"backup_dir": remote_dir})
+            manifest_url = f"{url}/manifest?{_bdir_q}"
+            req = urllib.request.Request(manifest_url, headers=hdrs)
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=30) as resp:
+                manifest_data = _json.loads(resp.read().decode('utf-8'))
+            
+            # Manifest should be a dict with "files" list
+            # Each file entry should have "path" and optionally "size"
+            files_to_download = manifest_data.get("files", [])
+            if not isinstance(files_to_download, list):
+                files_to_download = []
+                
+        except Exception as e:
+            logger.warning(f"[https] Failed to fetch manifest: {e}")
+            return {"status": "error", "downloaded": 0, "error": f"Failed to fetch manifest: {e}"}
+        
+        # Download each file
+        for file_entry in files_to_download:
+            if isinstance(file_entry, str):
+                file_path = file_entry
+            else:
+                file_path = file_entry.get("path", "")
+            
+            if not file_path:
+                continue
+            
+            local_file = os.path.join(local_dest, file_path.replace("/", os.sep))
+            os.makedirs(os.path.dirname(local_file), exist_ok=True)
+            
+            try:
+                # Prepare file download request.
+                # The server stores files under /files/<backup_dir>/<rel_path>.
+                _rel_fwd = file_path.replace(os.sep, "/")
+                file_url = f"{url}/files/{remote_dir}/{_rel_fwd}"
+                req = urllib.request.Request(file_url, headers=hdrs)
+                
+                # Download with streaming (16 MB chunks)
+                _CHUNK = 16 * 1024 * 1024
+                with urllib.request.urlopen(req, context=ssl_ctx, timeout=120) as resp:
+                    with open(local_file, "wb") as f_out:
+                        while True:
+                            chunk = resp.read(_CHUNK)
+                            if not chunk:
+                                break
+                            f_out.write(chunk)
+                
+                downloaded += 1
+                if progress_cb:
+                    try:
+                        progress_cb(downloaded, file_path)
+                    except Exception:
+                        pass
+                logger.debug(f"[https] Downloaded {file_path}")
+                
+            except Exception as e:
+                error_msg = f"{file_path}: {e}"
+                errors.append(error_msg)
+                logger.warning(f"[https] Failed to download {error_msg}")
+        
+        if errors:
+            logger.warning(f"[https] {len(errors)} file(s) failed to download: {errors[:5]}")
+        
+        ok = downloaded > 0 or (downloaded == 0 and not files_to_download)
+        logger.info(f"[https] Downloaded {downloaded} file(s) from {url}")
+        return {
+            "status":     "ok" if ok else "error",
+            "downloaded": downloaded,
+            "error":      None if ok else (errors[0] if errors else "No files downloaded"),
+        }
+    
+    except Exception as e:
+        return {"status": "error", "downloaded": 0, "error": f"HTTPS error: {e}"}

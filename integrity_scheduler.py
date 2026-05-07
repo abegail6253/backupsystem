@@ -102,7 +102,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from PyQt5.QtCore import QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ except ImportError:
     _BACKEND_AVAILABLE = False
 
 if TYPE_CHECKING:
-    from PyQt5.QtWidgets import QWidget
+    from PyQt6.QtWidgets import QWidget
 
 
 # ── Worker ────────────────────────────────────────────────────────────────────
@@ -218,6 +218,7 @@ class IntegrityScheduler:
     sched = IntegrityScheduler(parent_widget)
     sched.watch_result.connect(my_slot)
     sched.run_finished.connect(my_other_slot)
+    sched.disk_space_warning.connect(my_disk_space_slot)
     sched.start()
     ...
     sched.stop()
@@ -226,6 +227,7 @@ class IntegrityScheduler:
     # Forwarded from IntegrityWorker (see class docstring above)
     watch_result  = pyqtSignal(str, dict)
     run_finished  = pyqtSignal(dict)
+    disk_space_warning = pyqtSignal(float)  # free_gb
 
     # How often the scheduler timer ticks (milliseconds).
     _TICK_MS = 30 * 60 * 1000  # 30 minutes
@@ -244,15 +246,17 @@ class IntegrityScheduler:
         #
         # PyQt signals must live on a QObject, so we piggy-back on parent.
         # We use a bridge pattern: create a tiny private QObject to host them.
-        from PyQt5.QtCore import QObject
+        from PyQt6.QtCore import QObject
 
         class _SignalBridge(QObject):
             watch_result = pyqtSignal(str, dict)
             run_finished = pyqtSignal(dict)
+            disk_space_warning = pyqtSignal(float)
 
         self._bridge = _SignalBridge(parent)
         self.watch_result = self._bridge.watch_result
         self.run_finished = self._bridge.run_finished
+        self.disk_space_warning = self._bridge.disk_space_warning
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -274,6 +278,36 @@ class IntegrityScheduler:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    def check_disk_space(self):
+        """Check if backup destination has low disk space and emit warning if needed."""
+        try:
+            cfg = config_manager.load()
+        except Exception as exc:
+            logger.warning("check_disk_space: could not load config: %s", exc)
+            return
+
+        # Only check local destinations
+        if cfg.get("dest_type", "local") != "local":
+            return
+
+        destination = cfg.get("destination", "./backups")
+        threshold_gb = cfg.get("low_disk_threshold_gb", 5.0)
+
+        try:
+            import shutil
+            usage = shutil.disk_usage(destination)
+            free_gb = usage.free / (1024 ** 3)  # Convert bytes to GB
+
+            if free_gb < threshold_gb:
+                logger.warning(
+                    "Low disk space on backup destination: %.1f GB free (threshold: %.1f GB)",
+                    free_gb, threshold_gb
+                )
+                self.disk_space_warning.emit(free_gb)
+
+        except Exception as exc:
+            logger.warning("check_disk_space: failed to check disk usage: %s", exc)
+
     def _tick(self, force: bool = False):
         """Called every 30 min (and once at startup).  Decides whether to run."""
         if not _BACKEND_AVAILABLE:
@@ -283,6 +317,9 @@ class IntegrityScheduler:
         if self._worker and self._worker.isRunning():
             logger.debug("IntegrityScheduler: worker still running — skipping tick")
             return
+
+        # Check disk space regardless of whether integrity checks are enabled
+        self.check_disk_space()
 
         try:
             cfg = config_manager.load()
@@ -355,11 +392,17 @@ class IntegrityScheduler:
 
 
 def _resolve_dest(watch: dict, cfg: dict) -> str:
-    """Return the effective destination path for a watch."""
-    # Per-watch override takes priority
-    if watch.get("dest_override"):
-        return watch["dest_override"]
-    return cfg.get("destination", "./backups")
+    """Return the effective local destination path for a watch.
+
+    Per-watch ``destination`` overrides the global value.  Remote
+    destinations (SFTP, FTP, WebDAV, rclone, Google Drive) store their
+    backups locally first; the local path is what validate_backup needs.
+    """
+    # Per-watch destination overrides global destination
+    per_watch = (watch.get("destination") or "").strip()
+    if per_watch:
+        return per_watch
+    return (cfg.get("destination") or "./backups").strip()
 
 
 # ── Admin Panel UI helper ──────────────────────────────────────────────────────
@@ -379,7 +422,7 @@ def build_integrity_settings_section(parent_widget, cfg: dict):
         # In _save_general():
         cfg.update(get_integrity_vals())
     """
-    from PyQt5.QtWidgets import (
+    from PyQt6.QtWidgets import (
         QGroupBox, QVBoxLayout, QHBoxLayout,
         QCheckBox, QSpinBox, QLabel,
     )

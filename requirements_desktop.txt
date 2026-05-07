@@ -2,29 +2,30 @@
 # Install with: pip install -r requirements_desktop.txt
 
 # --- Core backup engine dependencies -----------------------------------------
-watchdog>=3.0.0,<4.0
-cryptography>=41.0.0
-python-dotenv>=1.0.0
-psutil>=5.9.0
+watchdog>=3.0.0,<5.0
+cryptography>=41.0.0,<45.0
+python-dotenv>=1.0.0,<2.0
+psutil>=5.9.0,<7.0
 
 # --- Desktop UI ---------------------------------------------------------------
-PyQt5>=5.15.0
-PyQt5-sip>=12.11.0
+PyQt6>=6.6.0,<7.0
 
 # --- SFTP / FTPS destination support -----------------------------------------
-paramiko>=3.0.0
+paramiko>=3.0.0,<4.0
 
 # --- SMB / CIFS network share support ----------------------------------------
 # smbprotocol ships both smbprotocol.* (low-level) and smbclient.* (high-level)
 # -- both are used by transport_utils.py and desktop_app.py.
 # On Windows the app uses built-in UNC paths as the primary method;
 # smbprotocol is the cross-platform fallback and is always installed.
-smbprotocol>=1.0.0
+smbprotocol>=1.0.0,<2.0
 
 # --- WebDAV / Nextcloud / ownCloud destination support -----------------------
-# Required for WebDAV destinations (Nextcloud, ownCloud, OneDrive via WebDAV).
-# The built-in urllib fallback is insufficient for edge cases.
-webdavclient3>=3.14.6
+# webdavclient3 is required for full Nextcloud / ownCloud compatibility
+# (chunked uploads, lock handling, edge-case auth flows).
+# transport_utils.py falls back to the built-in urllib client if it is absent,
+# but webdavclient3 is strongly recommended and installed by default.
+webdavclient3>=3.14.6,<4.0
 
 # --- Secure credential storage (recommended) ---------------------------------
 # Stores SFTP / FTP / SMB / SMTP passwords in the OS keyring instead of
@@ -32,7 +33,7 @@ webdavclient3>=3.14.6
 #   Windows  : Windows Credential Manager
 #   macOS    : macOS Keychain
 #   Linux    : SecretService (GNOME Keyring / KWallet)
-keyring>=24.0.0
+keyring>=24.0.0,<26.0
 
 # --- Windows extras (strongly recommended on Windows) ------------------------
 # pywin32 enables two important features on Windows:
@@ -43,10 +44,22 @@ keyring>=24.0.0
 # no need to comment/uncomment anything.
 pywin32>=306; sys_platform == "win32"
 
+# --- rclone destination support (system dependency, NOT a pip package) -------
+# If you use the "rclone" destination type, you must install rclone separately:
+#   Windows : https://rclone.org/downloads/ (or: winget install Rclone.Rclone)
+#   macOS   : brew install rclone
+#   Linux   : sudo apt install rclone  /  sudo dnf install rclone
+# After installing, configure a named remote with: rclone config
+# BackupSys calls rclone as a subprocess — no Python package is needed.
+# Without rclone on PATH, selecting the "rclone" destination will fail with
+# a "rclone not found" error at backup time.
+
 # --- Cloud backup - Google Drive (optional) ----------------------------------
-google-auth>=2.0.0
-google-auth-oauthlib>=1.0.0
-google-api-python-client>=2.0.0
+# Floors raised to match pyproject.toml [project.optional-dependencies].desktop
+# so `pip install backupsys[desktop]` and a direct `pip install -r` are consistent.
+google-auth>=2.28.0,<3.0
+google-auth-oauthlib>=1.2.0,<2.0
+google-api-python-client>=2.120.0,<3.0
 
 # --- Packaging to .exe (install separately, not needed at runtime) -----------
 # pyinstaller>=6.0.0
@@ -54,3 +67,6 @@ google-api-python-client>=2.0.0
 # --- Development / testing (not needed at runtime) ---------------------------
 # pytest>=8.0.0
 # pytest-cov>=5.0.0
+#
+# Install both for local development:
+#   pip install pytest pytest-cov

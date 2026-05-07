@@ -48,6 +48,20 @@ CONFIG_PATH  = SCRIPT_DIR / "config.json"
 ICON_PATH    = SCRIPT_DIR / ICON_FILE
 SNAP_DIR     = SCRIPT_DIR / "snapshots"
 
+# ── Auto-generate icon.ico from icon_256.png if needed ───────────────────────
+# PyInstaller requires a .ico file; only PNGs are checked in. Pillow converts
+# it once here so the build is self-contained and no manual step is needed.
+if not ICON_PATH.exists():
+    png_path = SCRIPT_DIR / "icon_256.png"
+    if png_path.exists():
+        try:
+            from PIL import Image as _PILImage
+            _PILImage.open(png_path).save(str(ICON_PATH))
+            print(f"✅ Generated {ICON_FILE} from {png_path.name}")
+        except Exception as _e:
+            print(f"⚠  Could not auto-generate {ICON_FILE}: {_e}")
+            print("   pip install Pillow  — or place icon.ico manually.")
+
 # Verify the main entry point exists before invoking PyInstaller
 if not MAIN_PATH.exists():
     print(f"❌ Cannot find {MAIN_FILE} in {SCRIPT_DIR}")
@@ -82,10 +96,30 @@ _BLANK_CONFIG = {
         "from_addr": "", "to_addr": "",
         "notify_on_success": False, "notify_on_failure": True
     },
+    "pause_on_metered": False,
+    "force_full_interval_days": 0,
+    "ntfy_config": {
+        "enabled": False, "server": "https://ntfy.sh", "topic": "", "token": "",
+        "priority": "default", "notify_on_success": False, "notify_on_failure": True,
+    },
+    "telegram_config": {
+        "enabled": False, "bot_token": "", "chat_id": "", "parse_mode": "HTML",
+        "notify_on_success": False, "notify_on_failure": True,
+    },
+    "pushover_config": {
+        "enabled": False, "user_key": "", "api_token": "", "device": "",
+        "priority": 0, "sound": "", "notify_on_success": False, "notify_on_failure": True,
+    },
     "dest_sftp":  {"host": "", "port": 22, "username": "", "password": "", "remote_path": ""},
     "dest_ftp":   {"host": "", "port": 21, "username": "", "password": "", "use_tls": True},
     "dest_smb":   {"server": "", "share": "", "username": "", "password": "", "remote_path": ""},
     "dest_https": {"url": "", "token": "", "verify_ssl": True},
+    "dest_webdav": {
+        "url": "", "username": "", "password": "", "webdav_root": "",
+        "remote_path": "", "verify_ssl": True,
+    },
+    "dest_rclone": {"remote": "", "path": "/backups"},
+    "dest_cloud":  {"provider": "gdrive", "folder_id": "", "folder_name": "My Drive (root)"},
 }
 
 import json as _json
@@ -169,6 +203,15 @@ args = [
     "--hidden-import", "smbprotocol.session",
     "--hidden-import", "smbprotocol.tree",
     "--hidden-import", "smbprotocol.open",
+    # Google Drive OAuth (dynamic plugin loading — not detected by static analysis)
+    "--collect-all",    "google_auth_oauthlib",
+    "--collect-all",    "googleapiclient",
+    "--hidden-import",  "google.auth.transport.requests",
+    # OS keyring / saved-password storage
+    "--hidden-import",  "keyring",
+    "--hidden-import",  "keyring.backends.Windows",
+    # WebDAV / Nextcloud destination
+    "--collect-all",    "webdavclient3",
     str(MAIN_PATH),
 ]
 

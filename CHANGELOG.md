@@ -5,6 +5,289 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [1.1.8] — 2026-05-04
+
+### Security & Reliability
+- **`/backup/upload` rate limiting** — The upload endpoint now has its own
+  sliding-window rate limiter (default 30 req / 60 s per IP), independent of
+  the event endpoint.  Tune via `BACKUPSYS_UPLOAD_RATE_LIMIT` and
+  `BACKUPSYS_UPLOAD_RATE_WINDOW_SEC` environment variables.
+
+- **Flask `MAX_CONTENT_LENGTH` enforced at stream level** — Previously the
+  250 MB per-file cap was checked via `request.content_length`, which clients
+  using chunked transfer encoding could bypass by omitting the header entirely.
+  `app.config['MAX_CONTENT_LENGTH']` is now set so Werkzeug enforces the limit
+  before the view function runs.  A JSON `@app.errorhandler(413)` is registered
+  so chunked-upload rejections return `{"error": "..."}` instead of an HTML page.
+
+- **Total server-side storage quota** — New `BACKUPSYS_STORAGE_QUOTA_BYTES`
+  environment variable (default: 0 = unlimited).  When set, the upload handler
+  sums all bytes in `FILES_DIR` and rejects new uploads with HTTP 507 once the
+  quota is reached, preventing a single client from filling the disk with
+  thousands of small files.
+
+- **`WEB_CONCURRENCY` > 1 startup warning** — If a hosting platform injects
+  `WEB_CONCURRENCY` > 1 into the environment, the server now logs a loud
+  WARNING at startup naming the actual multiplied effective rate limit, rather
+  than silently allowing proportionally more traffic per client.
+
+- **`.env` auto-load for API server** — `backupsys_api.py` now calls
+  `load_dotenv()` at import time (via `python-dotenv`, added to
+  `requirements_api.txt`).  Values in a `.env` file are picked up without
+  needing to `source` it manually before starting gunicorn.
+
+- **`pyproject.toml` desktop extras completed** — `pip install backupsys[desktop]`
+  previously silently omitted `watchdog`, `psutil`, `python-dotenv`, `keyring`,
+  `webdavclient3`, and `pywin32` (Windows).  All are now listed in
+  `[project.optional-dependencies].desktop` with correct platform markers.
+
+### Known Limitations
+- **Server-side restore not implemented** — `POST /restore` returns HTTP 501.
+  Restore is desktop/CLI-only in this version: use `GET /manifest` +
+  `GET /files/<path>` to reconstruct a backup locally.  A future release will
+  add a headless restore path.  This limitation is now documented in the README
+  under *Known Limitations*.
+
+### Added
+- **Day-of-week scheduling** — `backup_schedule_times` (global) and `schedule_times`
+  (per-watch) now store `{"time": "HH:MM", "days": <bitmask>}` objects instead of
+  plain strings.  The `days` field is a 7-bit bitmask (bit 0 = Monday … bit 6 = Sunday;
+  127 = every day).  The Settings and Edit Watch UIs now show a row of Mon–Sun
+  checkboxes alongside each HH:MM entry so you can restrict a fire-time to weekdays,
+  weekends, or any custom combination.  Existing plain `"HH:MM"` entries in
+  `config.json` are migrated transparently on first load (treated as `days: 127`).
+
+- **Cross-watch file search** — A new **🔍 File Search** tab in the History window
+  lets you search for any filename or path fragment across every watch's backup
+  snapshots simultaneously.  The search scans all `MANIFEST.json` files in the
+  configured destination(s) and returns the watch name, backup date, relative
+  path, file size, and backup directory for each hit.  Results are sortable by
+  any column.  Optionally filter to a single watch via the dropdown.  Per-watch
+  destination overrides are also searched.
+
+- **`backupsys_api.py`** — Flask backend deployable to Railway, Render, or
+  Fly.io.  Provides authenticated backup-event ingestion (`POST /backup/event`),
+  event history (`GET /backup/events`), admin stats (`GET /admin/stats`), an
+  OTP flow (`POST /otp/request` + `/otp/verify`), and a connectivity ping
+  (`POST /ping`).  Features: HMAC-SHA256 request signing, 1 OTP/60 s rate
+  limiting, 5-attempt lockout (15 min), rotating event log (1 000 rows),
+  SQLite persistence with WAL mode, per-request API log table.  Replaces the
+  stub that was described in the v1.0.0 changelog but never shipped.
+
+### Fixed
+- **`GITHUB_REPO` / `GITHUB_RELEASES_URL` constants in `desktop_app.py`** —
+  The GitHub repo URL was previously hardcoded as a string literal at line 5910.
+  Moved to two named constants at the top of the constants block so the repo
+  can be changed without hunting through the codebase.  `GITHUB_REPO` is the
+  `owner/repo` slug; `GITHUB_RELEASES_URL` is derived from it automatically.
+
+- **rclone retention now actually runs** — `cleanup_remote_backups()` in
+  `transport_utils.py` previously returned a static "skipped" result for
+  rclone destinations.  Replaced with a new `cleanup_rclone_backups()` function
+  that uses `rclone lsd` to list backup folders, identifies folders older than
+  `retention_days` by their `YYYYMMDD_HHMMSS` name prefix, and deletes them
+  with `rclone purge`.  Partial failures (per-folder purge errors) are
+  collected and reported without aborting the rest of the cleanup.  The amber
+  "retention not supported" warning label in the global settings is updated to
+  a blue informational note reflecting the new behaviour.
+
+- **Per-watch bandwidth override in Edit Watch dialog** — The bandwidth throttle
+  schedule was previously only configurable in global settings.  The Edit Watch
+  dialog now includes a dedicated "Bandwidth Override" group with a max MB/s
+  spinner (0 = use global) and a per-watch schedule table (start/end/limit
+  rows).  `BackupWorker` now picks the per-watch values when `max_backup_mbps >
+  0`, falling back to global otherwise.  Values are persisted to the watch dict
+  as `max_backup_mbps` and `bandwidth_schedule`.
+
+- **Backup Queue panel in History window** — `backup_queue.json` was persisted
+  by `config_manager.py` but had no GUI representation.  A third "Queue" tab is
+  now shown in the History window displaying all pending items (watch name,
+  triggered-by reason, queued-at timestamp).  The tab label shows the live item
+  count.  A Refresh button re-reads the JSON from disk.  `MainWindow._open_history()`
+  now passes the current queue to `HistoryWindow`.
+
+- **Flask API `machine_id` tracking** — All desktop clients previously shared
+  one `BACKUPSYS_API_KEY` with no way to distinguish which machine sent an
+  event.  `_send_webhook()` now includes a `machine_id` field (resolved via
+  `socket.gethostname()`) in every payload.  `POST /backup/event` accepts and
+  stores `machine_id`.  `GET /backup/events` supports a `?machine_id=` query
+  filter.  `GET /admin/stats` now returns a `machines` array with per-machine
+  totals, failure counts, and last-seen timestamps.  A zero-downtime SQLite
+  migration (`ALTER TABLE ADD COLUMN`) ensures existing databases are upgraded
+  on first start without data loss.
+
+- **`_is_excluded` in `backup_engine.py` did not honour `!`-prefixed include
+  patterns** — `watcher.py` supports a whitelist syntax where patterns
+  prefixed with `!` mean "only back up files matching this name/glob".  The
+  backup engine's `_is_excluded()` had no knowledge of this prefix and treated
+  `!*.docx` as a literal exclude glob, causing the watcher and the engine to
+  disagree on which files were in scope.  Fixed: `_is_excluded()` now splits
+  patterns into `include_only` (prefix `!` stripped) and `exclude_only` lists.
+  When any include-only pattern is present the function operates in whitelist
+  mode — files are excluded unless they match at least one include rule.
+  Otherwise the original blacklist behaviour is unchanged.  This fix is
+  consistent with the `watcher.py` logic and applies to `build_snapshot()`,
+  the watcher fast-path, and `estimate_backup_size()`.
+
+## [1.1.5] — 2026-04-24
+
+### Fixed
+- **`AttributeError: 'HistoryWindow' object has no attribute '_filter'`** — clicking
+  "Clear dates" in the History window crashed the app. `_clear_dates()` called
+  `self._filter()` which does not exist; the correct method is `self._filter_changes()`.
+  One-line rename fix.
+
+- **`RuntimeError: wrapped C/C++ object of type QComboBox has been deleted`** — opening
+  the Admin panel crashed immediately on `_load_values()` when trying to call
+  `self.dest_type_combo.setCurrentIndex(idx)`.  Root cause: `_build_ui()` created the
+  `QTabWidget` and all intermediate container widgets (`general_inner`, `general`,
+  `watches_tab`, `cloud_tab`, `notif_inner`, `notif_scroll`) as bare local variables.
+  When `_build_ui()` returned, Python's garbage collector was free to delete these objects
+  because no Python-level reference kept them alive — even though Qt's C++ side still
+  owned the widget tree.  This invalidated the C++ wrapper for `dest_type_combo` (which
+  lives inside `general_inner`) before `_load_values()` even ran.
+
+  Fix: all seven intermediate container objects are now stored on `self` (`self._tabs`,
+  `self._general_inner`, `self._general_scroll`, `self._watches_tab`, `self._cloud_tab`,
+  `self._notif_inner`, `self._notif_scroll`) so Python keeps their wrappers alive for
+  the lifetime of the dialog.  Local aliases (e.g. `tabs = self._tabs`) are kept so the
+  rest of `_build_ui()` is unchanged.
+
+## [1.1.4] — 2026-04-24
+
+### Fixed
+- **`AttributeError: 'HistoryWindow' object has no attribute 'table'`** — clicking the
+  **History** button crashed the app immediately.  `HistoryWindow._build_ui()` was
+  missing three things:
+
+  1. **`self.tabs = QTabWidget()` never created** — `_build_change_history_tab()` calls
+     `self.tabs.addTab(...)` but the `QTabWidget` instance was never instantiated in
+     `_build_ui()`, so any access to `self.tabs` raised `AttributeError`.
+
+  2. **`_build_change_history_tab()` never called** — `_build_ui()` called only
+     `_build_backup_history_tab()`.  Because `_build_change_history_tab()` is what
+     creates `self.table`, it was never set on the object, causing the crash when
+     `_populate_changes()` tried to use it immediately after.
+
+  3. **`_build_backup_history_tab()` never added its tab** — the method built its
+     widget but never called `self.tabs.addTab(tab, "Backup History")`, so the Backup
+     History tab would have been silently absent from the UI even if the crash were
+     otherwise avoided.
+
+  Fix: `_build_ui()` now creates `self.tabs`, adds it to the layout, and calls both
+  builder methods in order (Change History first, Backup History second).
+  `_build_backup_history_tab()` now concludes with `self.tabs.addTab(tab, "Backup
+  History")`.
+
+## [1.1.3] — 2026-04-24
+
+### Fixed
+- **`NameError: name 'QPlainTextEdit' is not defined`** — clicking the **Logs** button
+  crashed the app with an unhandled exception because `QPlainTextEdit` was used in
+  `LogViewerDialog._build_ui()` (line 8595) but was never included in the top-level
+  `from PyQt5.QtWidgets import (...)` block.  Added to the main import.
+
+- **`QDateEdit` and `QDate` also missing from imports** — the backup history filter UI
+  (`HistoryDialog`) instantiates `QDateEdit` and calls `QDate.currentDate()` / `QDate(y,
+  m, d)` (lines 7922–7934, 8222–8223).  Neither was in the import block: `QDateEdit`
+  belongs in `PyQt5.QtWidgets` and `QDate` belongs in `PyQt5.QtCore`.  Both added.
+  Without this fix, opening the History panel would have triggered the same crash class.
+
+
+### Fixed
+- **`config.template.json` still missing `dest_rclone` block** — the v1.1.1 changelog
+  entry claimed this was fixed, but the block was absent from the released file.
+  Added `dest_rclone` with `remote`, `path`, and a `__note` explaining how to obtain
+  the remote name from `rclone config`.
+
+- **Google Drive missing from watch-level destination combo** — the `dest_type_combo`
+  in Settings listed Local, SMB, SFTP, FTPS, FTP, HTTPS, rclone, and WebDAV, but Google
+  Drive was accessible only through the separate Settings → Cloud tab, creating an
+  inconsistent and confusing experience.  Added "Google Drive" as index 8 in the combo.
+  Selecting it shows a concise panel directing users to the Cloud tab for OAuth setup and
+  watch assignment.  The `idx_map` (load) and `dest_map` (save) are updated accordingly,
+  and the "cloud"/"gdrive" dest_type values now correctly map to index 8 so existing
+  configs round-trip without resetting.
+
+- **README destination list incomplete** — the header and `dest_type` config table
+  omitted FTP/FTPS, WebDAV/Nextcloud/ownCloud, rclone, and Google Drive.  Both are now
+  updated to list every supported destination type.
+
+
+## [1.1.1] — 2026-04-24
+
+### Fixed
+- **CLI: `rclone` destination silently ignored** — `backupsys_cli.py` cmd_backup now
+  correctly builds the `rclone` cloud config from `dest_rclone` in `config.json` when
+  `dest_type` is `rclone`.  Previously the rclone config was never passed to
+  `backup_engine.run_backup`, so backups ran locally and the rclone upload step was
+  never reached.
+
+- **Remote retention skipped for WebDAV and rclone** — `cleanup_remote_backups()` in
+  `transport_utils.py` handled SFTP / FTP / SMB retention but fell into a bare `else`
+  for all other types, returning `ok=True, deleted=0` for WebDAV and rclone.  Both now
+  have explicit named cases with informative skip messages (matching the existing HTTPS
+  behaviour), and will no longer silently suppress retention warnings.
+
+- **`config.template.json` missing `dest_rclone` block** — every other destination
+  (SFTP, FTP, SMB, HTTPS, WebDAV) had a template section; rclone was absent.  Added
+  `dest_rclone` with `remote`, `path`, and a `__note` explaining where to get the
+  remote name from `rclone config`.
+
+- **Pre-existing syntax errors** — two bugs introduced upstream were corrected:
+  a stray `)` on line 1178 of `backup_engine.py` that prematurely closed the
+  `run_backup()` signature, and escaped single-quote sequences (`\'`) inside
+  double-quoted f-strings in `desktop_app.py` that caused a parse error.
+
+### Added
+- **CLI `restore` command** — headless / SSH / WSL / Task Scheduler users can now
+  restore backups without opening the GUI:
+  ```
+  python backupsys_cli.py restore --watch "My Documents" --target C:\Restored
+  python backupsys_cli.py restore --watch "My Documents" --target C:\Restored --backup-id bk_abc123
+  python backupsys_cli.py restore --watch "My Documents" --target C:\Restored --full-chain
+  python backupsys_cli.py restore --watch "My Documents" --target C:\Restored --no-overwrite
+  ```
+  Supports single-snapshot and full incremental-chain restores, encrypted and
+  compressed backups, and the same `--watch` name/ID resolution used by `backup`.
+
+- **`APP_VERSION` out of sync with CHANGELOG** — `desktop_app.py` reported
+  `"1.1.0"` while the changelog had advanced to `1.1.5`. The in-app version
+  label, update-check comparison, and User-Agent header were all showing a
+  stale version. Bumped to `"1.1.5"`.
+
+- **`is_metered_connection()` false positives on public Wi-Fi** — the previous
+  implementation queried `Get-NetConnectionProfile.NetworkCategory` and treated
+  `"Public"` as metered. `NetworkCategory` is a *Windows Firewall profile*
+  setting (Public / Private / Domain) and has nothing to do with data billing.
+  Any coffee-shop or hotel Wi-Fi would match, causing auto-backups to be silently
+  skipped on unlimited connections. Fixed by switching to the correct WinRT API:
+  `NetworkInformation.GetInternetConnectionProfile().GetConnectionCost()`.
+  A connection is now only considered metered when `NetworkCostType` is
+  `Fixed` (data-capped) or `Variable` (pay-per-byte).
+
+- **`config.template.json` missing `dest_rclone` block** — rclone is a fully
+  supported destination type but the config template had no example entry.
+  Added a `dest_rclone` block with `remote`, `path`, and a `__examples` map
+  covering common rclone remotes.
+
+- **`setup_wizard.py` used legacy SFTP key names** — the wizard wrote
+  `dest_sftp` using old keys (`user`, `pass`, `path`, `keyfile`, `key_pass`)
+  that differed from the canonical names in `config.template.json` and the
+  Settings UI (`username`, `remote_path`, `key_path`, `key_passphrase`).
+  Fixed to use canonical names. Also expanded the previously empty `dest_ftp`,
+  `dest_smb`, and `dest_https` stubs, and added missing `dest_webdav` and
+  `dest_rclone` blocks so wizard-generated configs match `config.template.json`.
+
+- **README stale `.env` instruction** — the Environment Variables section
+  referenced `"rename _env → .env"`. No `_env` file is included in releases;
+  the file ships as `.env.example`. Removed the stale reference.
+
+- **Duplicate `[1.0.0]` section in CHANGELOG** — the initial-release entry
+  appeared twice. The second copy was a stale paste artifact. Removed.
+
+---
+
 ## [1.1.0] — 2026-04-23 (patch: improvements)
 
 ### Added
@@ -46,11 +329,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **v1.0.x → v1.1.0 migration notice** — first launch after upgrading shows a one-time
   dialog listing everything that changed and confirming no manual migration is needed.
 
-- **IP-based rate limiting on all Flask API endpoints** — `send-otp`, `verify-otp`,
-  `gdrive/exchange`, and `gdrive/refresh` are now rate-limited per IP using a sliding
-  window.  Limits are configurable via environment variables
-  (`BACKUPSYS_RATE_WINDOW`, `BACKUPSYS_RATE_MAX_OTP`, etc.).
-
 ### Fixed
 - `smbprotocol` is now an unconditional dependency (was commented out, causing silent
   SMB failures on fresh installs on any platform).
@@ -65,7 +343,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [1.1.0] — 2026-04-23
+## [1.0.1] — 2026-04-23
 
 ### Added
 - **Dry-run / preview mode** — `backup_engine.run_backup(..., dry_run=True)` scans the
@@ -186,7 +464,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [1.0.1] — 2026-04-23
+## [1.0.2] — 2026-04-23
 
 ### Fixed
 - **Version mismatch** — `APP_VERSION` in `desktop_app.py` was `"2.0"`;
@@ -317,44 +595,3 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `config.template.json` — removed plaintext `"password"` fields from
   `dest_sftp`, `dest_ftp`, `dest_smb`, replaced with `__password_note`
   guidance strings.
-
----
-
-## [1.0.0] — 2026-04-22
-
-### Added
-- Initial release.
-- PyQt5 system tray app with dashboard, per-watch cards, backup history window.
-- Incremental snapshot-based backups with full-chain restore.
-- Per-watch Fernet (AES-128-CBC + HMAC-SHA256) encryption with 200 MB RAM
-  guard and 50 MB soft warning.
-- gzip compression (runs before encryption to maximise size reduction).
-- I/O throttling via sliding-window `BackupThrottler` (configurable MB/s).
-- Multi-destination support: local, SFTP, FTP/FTPS, SMB/CIFS, HTTPS API,
-  Google Drive (OAuth 2.0).
-- File-system watching via `watchdog` with polling fallback for network shares.
-- Interval-based and time-of-day (`backup_schedule_times`) auto-backup
-  scheduler — tick every 5 s, fires within ±5 s of scheduled time.
-- Per-watch `skip_auto_backup` flag to opt individual watches out of global
-  auto-backup without deactivating them.
-- Email notifications (SMTP / STARTTLS / SSL) with App Password support.
-- Webhook notifications (JSON POST) — compatible with Slack, Discord, n8n,
-  Zapier, Make, and custom endpoints.
-- `backupsys_api.py` Flask backend deployable to Railway — HMAC-stored OTPs,
-  rate limiting (1 OTP/60 s), attempt lockout (5 tries), SQLite persistence.
-- `IntegrityScheduler` — weekly background backup validation with configurable
-  interval and UI result display.
-- Admin panel with password protection (PBKDF2-HMAC-SHA256 + 16-byte salt,
-  260 000 iterations), connection test buttons for every destination type.
-- `setup_wizard.py` — guided first-run helper that checks Python version,
-  installs requirements, writes starter `config.json`, optionally adds to
-  Windows startup.
-- `build_exe.py` — PyInstaller packaging to standalone `.exe`.
-- `create_release_zip.py` — allowlist-based release packager that blocks
-  every file that could contain secrets or runtime state.
-- Rotating log files (2 MB × 5 files) to `logs/backupsys.log`.
-- Single-instance lock to prevent duplicate tray apps.
-- Weak API key warning shown at startup if `BACKUPSYS_API_KEY` is unset or
-  looks like a placeholder.
-- `.env` / `_env` auto-loader at startup (before `config_manager.load()`).
-- `privacy.html` privacy policy.

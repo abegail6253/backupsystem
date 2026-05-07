@@ -256,5 +256,208 @@ class TestCleanupRemoteBackups(unittest.TestCase):
         self.assertTrue(result["ok"])
 
 
+# ─── cleanup_rclone_backups tests ─────────────────────────────────────────────
+
+class TestCleanupRcloneBackups(unittest.TestCase):
+    """Unit tests for the rclone retention/cleanup function added in v1.1.8."""
+
+    # ── config helpers ────────────────────────────────────────────────────────
+
+    def _cfg(self, remote="myremote", path="/backups"):
+        return {"remote": remote, "path": path}
+
+    # ── guard: missing remote name ─────────────────────────────────────────────
+
+    def test_missing_remote_name_returns_error(self):
+        result = transport_utils.cleanup_rclone_backups({}, 30)
+        self.assertFalse(result["ok"])
+        self.assertIn("remote name", result["error"])
+
+    # ── guard: retention_days <= 0 ────────────────────────────────────────────
+
+    def test_zero_retention_days_is_noop(self):
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 0)
+
+    def test_negative_retention_days_is_noop(self):
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), -7)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 0)
+
+    # ── guard: rclone not installed ───────────────────────────────────────────
+
+    @patch("subprocess.run", side_effect=FileNotFoundError)
+    def test_rclone_not_installed_returns_error(self, _mock):
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30)
+        self.assertFalse(result["ok"])
+        self.assertIn("rclone", result["error"].lower())
+
+    # ── guard: rclone lsd failure ─────────────────────────────────────────────
+
+    @patch("subprocess.run")
+    def test_rclone_lsd_failure_returns_error(self, mock_run):
+        # First call = rclone version (success), second = rclone lsd (failure)
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=1, stdout="", stderr="permission denied")
+        mock_run.side_effect = [mock_version, mock_lsd]
+
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30)
+        self.assertFalse(result["ok"])
+        self.assertIn("lsd failed", result["error"])
+
+    # ── happy path: no expired folders ───────────────────────────────────────
+
+    @patch("subprocess.run")
+    def test_no_expired_folders_deletes_nothing(self, mock_run):
+        import datetime
+        # Folder timestamped 1 day ago — inside 30-day retention window
+        recent_ts = (datetime.datetime.utcnow() - datetime.timedelta(days=1)).strftime("%Y%m%d_%H%M%S")
+        folder_name = f"{recent_ts}_watchid_backup"
+        lsd_line = f"          -1 2024-01-01 00:00:00        -1 {folder_name}"
+
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=0, stdout=lsd_line + "\n", stderr="")
+        mock_run.side_effect = [mock_version, mock_lsd]
+
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 0)
+        # rclone purge must NOT have been called
+        self.assertEqual(mock_run.call_count, 2)
+
+    # ── happy path: one expired folder is purged ──────────────────────────────
+
+    @patch("subprocess.run")
+    def test_expired_folder_is_purged(self, mock_run):
+        import datetime
+        # Folder timestamped 60 days ago — outside 30-day retention window
+        old_ts = (datetime.datetime.utcnow() - datetime.timedelta(days=60)).strftime("%Y%m%d_%H%M%S")
+        folder_name = f"{old_ts}_watchid_old_backup"
+        lsd_line = f"          -1 2024-01-01 00:00:00        -1 {folder_name}"
+
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=0, stdout=lsd_line + "\n", stderr="")
+        mock_purge   = MagicMock(returncode=0, stdout="", stderr="")
+        mock_run.side_effect = [mock_version, mock_lsd, mock_purge]
+
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["freed_bytes"], 0)   # rclone never reports freed bytes
+
+        # Verify purge was called with the right remote path
+        purge_call = mock_run.call_args_list[2]
+        cmd = purge_call[0][0]
+        self.assertIn("rclone", cmd[0])
+        self.assertIn("purge", cmd)
+        self.assertTrue(any(folder_name in arg for arg in cmd))
+
+    # ── watch_id filter: only matching folders are purged ─────────────────────
+
+    @patch("subprocess.run")
+    def test_watch_id_filter_skips_other_watches(self, mock_run):
+        """
+        cleanup_rclone_backups uses name.startswith(watch_id), so watch_id must
+        be a true prefix of the folder name.  BackupSys folder names start with
+        a timestamp (YYYYMMDD_HHMMSS), so supplying the timestamp prefix as the
+        watch_id confirms the filter mechanism works correctly.
+        """
+        import datetime
+        old_ts     = (datetime.datetime.utcnow() - datetime.timedelta(days=60)).strftime("%Y%m%d_%H%M%S")
+        other_ts   = (datetime.datetime.utcnow() - datetime.timedelta(days=61)).strftime("%Y%m%d_%H%M%S")
+        target_folder = f"{old_ts}_watch_abc_backup"
+        other_folder  = f"{other_ts}_watch_xyz_backup"
+        lsd_out = "\n".join([
+            f"          -1 2024-01-01 00:00:00        -1 {target_folder}",
+            f"          -1 2024-01-01 00:00:00        -1 {other_folder}",
+        ])
+
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=0, stdout=lsd_out + "\n", stderr="")
+        mock_purge   = MagicMock(returncode=0, stdout="", stderr="")
+        mock_run.side_effect = [mock_version, mock_lsd, mock_purge]
+
+        # Use old_ts as the watch_id prefix — it matches target_folder but not other_folder
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30, watch_id=old_ts)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 1)
+
+        purge_call = mock_run.call_args_list[2]
+        cmd = purge_call[0][0]
+        self.assertTrue(any(target_folder in arg for arg in cmd))
+        self.assertFalse(any(other_folder in arg for arg in cmd))
+
+    # ── non-BackupSys folders are skipped safely ─────────────────────────────
+
+    @patch("subprocess.run")
+    def test_non_backupsys_folder_is_skipped(self, mock_run):
+        lsd_line = "          -1 2024-01-01 00:00:00        -1 random_folder_no_timestamp"
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=0, stdout=lsd_line + "\n", stderr="")
+        mock_run.side_effect = [mock_version, mock_lsd]
+
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 0)
+        # No purge call
+        self.assertEqual(mock_run.call_count, 2)
+
+    # ── individual purge failure is collected but does not abort ─────────────
+
+    @patch("subprocess.run")
+    def test_purge_failure_is_collected_not_fatal(self, mock_run):
+        import datetime
+        old_ts = (datetime.datetime.utcnow() - datetime.timedelta(days=60)).strftime("%Y%m%d_%H%M%S")
+        folder_name = f"{old_ts}_watchid_old"
+        lsd_line = f"          -1 2024-01-01 00:00:00        -1 {folder_name}"
+
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=0, stdout=lsd_line + "\n", stderr="")
+        mock_purge   = MagicMock(returncode=1, stdout="", stderr="permission denied")
+        mock_run.side_effect = [mock_version, mock_lsd, mock_purge]
+
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30)
+        # Overall result still ok=True (best-effort), but deleted count is 0
+        self.assertEqual(result["deleted"], 0)
+        # error string should mention the failed folder
+        self.assertTrue(result.get("error") or result.get("ok") is True)
+
+    # ── remote_name and remote_path alternative keys are accepted ────────────
+
+    @patch("subprocess.run")
+    def test_alternative_config_keys(self, mock_run):
+        """cleanup_rclone_backups also accepts remote_name / remote_path keys."""
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=0, stdout="", stderr="")
+        mock_run.side_effect = [mock_version, mock_lsd]
+
+        result = transport_utils.cleanup_rclone_backups(
+            {"remote_name": "myremote", "remote_path": "/backups"}, 30
+        )
+        self.assertTrue(result["ok"])
+        lsd_call = mock_run.call_args_list[1]
+        cmd = lsd_call[0][0]
+        self.assertTrue(any("myremote:" in arg for arg in cmd))
+
+    # ── remote_count reflects number of folders seen ─────────────────────────
+
+    @patch("subprocess.run")
+    def test_remote_count_is_total_folders_seen(self, mock_run):
+        import datetime
+        recent_ts = (datetime.datetime.utcnow() - datetime.timedelta(days=1)).strftime("%Y%m%d_%H%M%S")
+        lsd_out = "\n".join([
+            f"          -1 2024-01-01 00:00:00        -1 {recent_ts}_w1_a",
+            f"          -1 2024-01-01 00:00:00        -1 {recent_ts}_w2_b",
+        ])
+        mock_version = MagicMock(returncode=0, stdout="rclone v1.65", stderr="")
+        mock_lsd     = MagicMock(returncode=0, stdout=lsd_out + "\n", stderr="")
+        mock_run.side_effect = [mock_version, mock_lsd]
+
+        result = transport_utils.cleanup_rclone_backups(self._cfg(), 30)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["remote_count"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

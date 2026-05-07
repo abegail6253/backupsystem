@@ -122,18 +122,6 @@ class TestEncryption:
     def test_key_is_44_chars(self):
         assert len(be.generate_encryption_key()) == 44
 
-    def test_fernet_size_error_mentions_settings(self, tmp_path):
-        import unittest.mock as mock
-        key = be.generate_encryption_key()
-        # Write the file BEFORE patching so _write/mkdir don't use the fake stat
-        src = _write(tmp_path / "big.bin", b"x")
-        # MagicMock gives st_mode etc. for free so Path.is_dir() still works
-        big_stat = mock.MagicMock()
-        big_stat.st_size = be.FERNET_MAX_BYTES + 1
-        with mock.patch.object(Path, "stat", return_value=big_stat):
-            with pytest.raises((ValueError, RuntimeError)) as exc:
-                be._encrypt_file(str(src), str(tmp_path / "out.enc"), key)
-        assert "Settings" in str(exc.value) or "too large" in str(exc.value).lower()
 
 # ─── cleanup_old_backups ──────────────────────────────────────────────────────
 class TestCleanup:

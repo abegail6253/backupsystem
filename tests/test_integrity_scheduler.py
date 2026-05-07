@@ -103,7 +103,7 @@ import integrity_scheduler as isch
 
 class TestResolveDest:
     def test_uses_watch_override_first(self):
-        watch = {"dest_override": "/custom/dest"}
+        watch = {"destination": "/custom/dest"}
         cfg   = {"destination": "/global/dest"}
         assert isch._resolve_dest(watch, cfg) == "/custom/dest"
 
@@ -116,7 +116,7 @@ class TestResolveDest:
         assert isch._resolve_dest({}, {}) == "./backups"
 
     def test_empty_override_falls_through(self):
-        watch = {"dest_override": ""}
+        watch = {"destination": ""}
         cfg   = {"destination": "/global"}
         # Empty string is falsy — should use global
         assert isch._resolve_dest(watch, cfg) == "/global"
@@ -404,3 +404,110 @@ class TestIntegritySchedulerTick:
 
         # load() should not even have been called
         mock_cm.load.assert_not_called()
+
+
+# ─── IntegrityScheduler.check_disk_space ──────────────────────────────────────
+
+class TestIntegritySchedulerDiskSpace:
+    def _make_sched(self):
+        """Build an IntegrityScheduler with mocked Qt."""
+        parent = MagicMock()
+        sched  = object.__new__(isch.IntegrityScheduler)
+        sched._parent = parent
+        sched.disk_space_warning = MagicMock()
+        return sched
+
+    @patch("integrity_scheduler.config_manager.load")
+    def test_scheduler_can_be_instantiated(self, mock_load):
+        """Test that the scheduler can be instantiated without errors when given a mock config loader."""
+        mock_load.return_value = {"low_disk_threshold_gb": 5}
+        sched = self._make_sched()
+        # Should not raise any exceptions
+        assert sched is not None
+
+    @patch("shutil.disk_usage")
+    @patch("integrity_scheduler.config_manager.load")
+    def test_check_disk_space_no_warning_above_threshold(self, mock_load, mock_disk_usage):
+        """Test that check_disk_space() returns no warning when free space is above the threshold."""
+        # Mock config with 5GB threshold
+        mock_load.return_value = {
+            "dest_type": "local",
+            "destination": "/backups",
+            "low_disk_threshold_gb": 5.0
+        }
+        # Mock disk usage: 10GB free (above threshold)
+        mock_disk_usage.return_value = MagicMock(free=10 * 1024**3)  # 10GB in bytes
+
+        sched = self._make_sched()
+        sched.check_disk_space()
+
+        # Should not emit warning
+        sched.disk_space_warning.emit.assert_not_called()
+
+    @patch("shutil.disk_usage")
+    @patch("integrity_scheduler.config_manager.load")
+    def test_check_disk_space_emits_warning_below_threshold(self, mock_load, mock_disk_usage):
+        """Test that check_disk_space() emits a warning when free space is below low_disk_threshold_gb."""
+        # Mock config with 5GB threshold
+        mock_load.return_value = {
+            "dest_type": "local",
+            "destination": "/backups",
+            "low_disk_threshold_gb": 5.0
+        }
+        # Mock disk usage: 2GB free (below threshold)
+        mock_disk_usage.return_value = MagicMock(free=2 * 1024**3)  # 2GB in bytes
+
+        sched = self._make_sched()
+        sched.check_disk_space()
+
+        # Should emit warning with free space value
+        sched.disk_space_warning.emit.assert_called_once_with(2.0)
+
+    @patch("integrity_scheduler.config_manager.load")
+    def test_check_disk_space_skips_non_local_destinations(self, mock_load):
+        """Test that check_disk_space() only checks local destinations."""
+        # Mock config with SMB destination
+        mock_load.return_value = {
+            "dest_type": "smb",
+            "destination": "\\\\server\\share",
+            "low_disk_threshold_gb": 5.0
+        }
+
+        sched = self._make_sched()
+        sched.check_disk_space()
+
+        # Should not attempt disk usage check for non-local destinations
+        # (shutil.disk_usage should not be called, but we can't easily test that
+        # without patching it, so we just verify no warning is emitted)
+        sched.disk_space_warning.emit.assert_not_called()
+
+    @patch("integrity_scheduler.config_manager.load")
+    def test_check_disk_space_handles_config_load_error(self, mock_load):
+        """Test that check_disk_space() handles config loading errors gracefully."""
+        # Mock config loading failure
+        mock_load.side_effect = RuntimeError("Config load failed")
+
+        sched = self._make_sched()
+        sched.check_disk_space()
+
+        # Should not crash and not emit warning
+        sched.disk_space_warning.emit.assert_not_called()
+
+    @patch("shutil.disk_usage")
+    @patch("integrity_scheduler.config_manager.load")
+    def test_check_disk_space_handles_disk_usage_error(self, mock_load, mock_disk_usage):
+        """Test that check_disk_space() handles disk usage check errors gracefully."""
+        # Mock config
+        mock_load.return_value = {
+            "dest_type": "local",
+            "destination": "/backups",
+            "low_disk_threshold_gb": 5.0
+        }
+        # Mock disk usage failure
+        mock_disk_usage.side_effect = OSError("Disk access failed")
+
+        sched = self._make_sched()
+        sched.check_disk_space()
+
+        # Should not crash and not emit warning
+        sched.disk_space_warning.emit.assert_not_called()

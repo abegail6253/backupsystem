@@ -1,6 +1,6 @@
 """
 Backup System  · Windows Desktop App
-PyQt5-based system tray app with dashboard + admin panel.
+PyQt6-based system tray app with dashboard + admin panel.
 Place this file in the same folder as backup_engine.py, config_manager.py, watcher.py
 """
 
@@ -14,7 +14,7 @@ import urllib.request
 import socket
 import logging
 import time as _time_mod
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -86,36 +86,43 @@ def _load_dotenv():
 
 _load_dotenv()
 
-# ── API-key strength check ─────────────────────────────────────────────────────
-# Warn at startup if BACKUPSYS_API_KEY is missing or looks like a placeholder.
-# The actual dialog is shown from MainWindow.__init__ once Qt is ready.
-_WEAK_API_KEY_PATTERNS = {
-    "", "mysecretkey123", "replace-with-a-random-secret",
-    "your-api-key", "changeme", "secret", "test",
-}
+# ── Startup validation: GDrive credentials ────────────────────────────────────
+# Check immediately after .env is loaded so the user gets a clear log warning
+# rather than a cryptic dialog later when they click "Connect to Google Drive".
+def _warn_missing_gdrive_env() -> None:
+    """Log a clear warning if the GDrive OAuth credentials are absent."""
+    missing = [
+        k for k in ("GDRIVE_CLIENT_ID", "GDRIVE_CLIENT_SECRET")
+        if not os.environ.get(k, "").strip()
+    ]
+    if missing:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "GDrive credentials not found in environment: %s.  "
+            "Google Drive backups will fail when you click 'Connect'.  "
+            "Create a .env file next to this script (see .env.example) and "
+            "add your OAuth client ID and secret from Google Cloud Console.",
+            ", ".join(missing),
+        )
 
-def _api_key_is_weak() -> bool:
-    key = os.environ.get("BACKUPSYS_API_KEY", "").strip()
-    if key.lower() in _WEAK_API_KEY_PATTERNS:
-        return True
-    if len(key) < 20:
-        return True
-    return False
+_warn_missing_gdrive_env()
 
-
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QSystemTrayIcon, QMenu, QAction,
+from PyQt6.QtGui import QAction
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QSystemTrayIcon, QMenu,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea,
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
     QFileDialog, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QStackedWidget, QProgressBar, QTextEdit,
     QSplitter, QComboBox, QGroupBox, QTabWidget, QToolButton, QStyle,
-    QRadioButton
+    QRadioButton, QTimeEdit, QListWidget, QListWidgetItem, QAbstractItemView,
+    QPlainTextEdit, QDateEdit
 )
-from PyQt5.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QSize, QSettings, QPoint, QRectF
+from PyQt6.QtCore import (
+    Qt, QTimer, QThread, QObject, pyqtSignal, QSize, QSettings, QPoint, QRectF, QTime,
+    QDate
 )
-from PyQt5.QtGui import (
+from PyQt6.QtGui import (
     QIcon, QFont, QColor, QPalette, QPixmap, QPainter, QBrush,
     QLinearGradient, QFontDatabase
 )
@@ -134,13 +141,16 @@ except ImportError as e:
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME        = "Backup System"
-APP_VERSION     = "1.1.0"
+APP_VERSION     = "1.1.8"
 ADMIN_PASS_KEY  = "admin_password_hash"
 SETTINGS_ORG    = "BackupSystem"
 SETTINGS_APP    = "BackupSystem"
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 TRAY_ICON_SIZE  = 64
-BACKUPSYS_API_URL = os.environ.get("BACKUPSYS_API_URL", "")
+
+# ── Update check — change these two lines if you fork or rename the repo ───────
+GITHUB_REPO          = "abegail6253/backupsystem"   # "<owner>/<repo>"
+GITHUB_RELEASES_URL  = f"https://github.com/{GITHUB_REPO}/releases"
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 def _setup_logging():
@@ -299,11 +309,14 @@ QTabWidget::pane {
 QTabBar::tab {
     background-color: #1a1d23;
     color: #6b7280;
-    padding: 8px 10px;
-    min-width: 80px;
+    padding: 8px 16px;
+    min-width: 120px;
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
     font-weight: 600;
+}
+QTabBar::tab:first {
+    margin-left: 8px;
 }
 QTabBar::tab:selected {
     background-color: #22262f;
@@ -388,6 +401,7 @@ QPushButton[objectName="secondary"] {
     background-color: #e5e7eb;
     color: #374151;
     border: 1px solid #d1d5db;
+    font-size: 13px;
 }
 QPushButton[objectName="secondary"]:hover { background-color: #d1d5db; }
 QPushButton[objectName="danger"] {
@@ -425,10 +439,12 @@ QTabBar::tab {
     background: #e5e7eb;
     color: #374151;
     padding: 6px 16px;
+    min-width: 120px;
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
     margin-right: 2px;
 }
+QTabBar::tab:first { margin-left: 8px; }
 QTabBar::tab:selected { background: #2563eb; color: #ffffff; }
 QTabBar::tab:hover    { background: #d1d5db; }
 QHeaderView::section {
@@ -465,20 +481,55 @@ QMenu::separator { background-color: #e5e7eb; height: 1px; margin: 4px 8px; }
 """
 
 
-def _detect_os_theme() -> str:
-    """Return 'dark' or 'light' based on the Windows registry colour preference.
-    Falls back to 'dark' on non-Windows or if the registry key is unavailable."""
+
+def is_metered_connection() -> bool:
+    """Detect if the current network connection is metered on Windows.
+
+    Uses the WinRT NetworkInformation API (via PowerShell) to query the real
+    metered/cost status of the active internet connection profile.  Returns
+    False on non-Windows platforms or when the query fails for any reason.
+
+    NetworkCostType values returned by GetConnectionCost():
+      Unrestricted (1) — unlimited connection, never metered
+      Fixed (2)        — data-capped plan, treated as metered
+      Variable (3)     — pay-per-byte plan, treated as metered
+      Unknown (0)      — cost unknown; treated as NOT metered (safe default)
+
+    NOTE: NetworkCategory (Public/Private/Domain) is a *firewall profile*
+    setting and is completely unrelated to whether a connection is metered.
+    An earlier implementation used NetworkCategory == "Public" as a proxy,
+    which caused false positives on any public Wi-Fi that is not actually
+    metered.  This implementation uses the correct API.
+    """
+    if sys.platform != "win32":
+        return False
     try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        import subprocess
+        # Load the WinRT Windows.Networking.Connectivity namespace and query
+        # the active internet connection profile's cost type.  Exit code 1
+        # means metered (Fixed or Variable), exit code 0 means not metered.
+        ps_script = (
+            "try {"
+            "  $nil=[Windows.Networking.Connectivity.NetworkInformation,"
+            "        Windows.Networking.Connectivity,"
+            "        ContentType=WindowsRuntime];"
+            "  $p=[Windows.Networking.Connectivity.NetworkInformation]"
+            "       ::GetInternetConnectionProfile();"
+            "  if ($p -eq $null) { exit 0 }"
+            "  $ct=$p.GetConnectionCost().NetworkCostType;"
+            "  if ($ct -eq 'Fixed' -or $ct -eq 'Variable') { exit 1 }"
+            "  exit 0"
+            "} catch { exit 0 }"
         )
-        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-        winreg.CloseKey(key)
-        return "light" if val == 1 else "dark"
+        result = subprocess.run(
+            ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps_script],
+            capture_output=True,
+            timeout=6,
+        )
+        return result.returncode == 1
     except Exception:
-        return "dark"   # safe default on Linux/macOS or if registry unavailable
+        pass
+    return False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Tray Icon Generator ────────────────────────────────────────────────────────
@@ -487,17 +538,17 @@ def _detect_os_theme() -> str:
 def make_tray_icon(status: str = "ok") -> QIcon:
     """Generate a simple colored tray icon."""
     pix = QPixmap(TRAY_ICON_SIZE, TRAY_ICON_SIZE)
-    pix.fill(Qt.transparent)
+    pix.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pix)
-    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     color = {"ok": "#22c55e", "warn": "#f59e0b", "error": "#ef4444", "busy": "#2563eb"}.get(status, "#22c55e")
     painter.setBrush(QBrush(QColor(color)))
-    painter.setPen(Qt.NoPen)
+    painter.setPen(Qt.PenStyle.NoPen)
     painter.drawRoundedRect(4, 4, TRAY_ICON_SIZE - 8, TRAY_ICON_SIZE - 8, 12, 12)
     painter.setPen(QColor("white"))
-    f = QFont("Segoe UI", 26, QFont.Bold)
+    f = QFont("Segoe UI", 26, QFont.Weight.Bold)
     painter.setFont(f)
-    painter.drawText(pix.rect(), Qt.AlignCenter, "B")
+    painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "B")
     painter.end()
     return QIcon(pix)
 
@@ -548,11 +599,11 @@ def _get_editor_info(filepath: str) -> dict:
 # ── Remote Upload Helpers (SFTP / FTPS / FTP / SMB / HTTPS) ───────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# All upload logic lives in transport_utils.py.  These thin wrappers exist so
-# the rest of desktop_app.py can call _upload_sftp / _upload_ftp / etc. without
-# knowing which module provides the implementation.  If transport_utils cannot
-# be imported (e.g. a packaging edge case) a clear error dict is returned
-# instead of crashing — but in normal use the module is always present.
+# All upload logic lives in transport_utils.py.  Uploads are handled directly
+# through backup_engine._upload_to_destination() which calls transport_utils
+# functions.  If transport_utils cannot be imported (e.g. a packaging edge case)
+# a clear error dict is returned instead of crashing — but in normal use the
+# module is always present.
 # ──────────────────────────────────────────────────────────────────────────────
 
 from transport_utils import (
@@ -564,29 +615,62 @@ from transport_utils import (
 _TRANSPORT_UTILS_AVAILABLE = True
 
 
-def _upload_sftp(local_dir: str, sftp_cfg: dict, proto: str = "sftp") -> dict:
-    """Upload a backup folder to an SFTP server via transport_utils."""
-    return _tu_sftp(local_dir, sftp_cfg)
-
-
-def _upload_ftp(local_dir: str, ftp_cfg: dict) -> dict:
-    """Upload a backup folder to an FTP/FTPS server via transport_utils."""
-    return _tu_ftp(local_dir, ftp_cfg)
-
-
-def _ensure_smb_mounted(_smb_cfg: dict):
-    """No-op shim — SMB mounting is handled inside transport_utils.upload_to_smb."""
+def _ensure_smb_mounted(smb_cfg: dict):
+    """
+    Ensure SMB share is accessible and mounted if needed.
+    
+    smb_cfg: { path, user, pass, domain }
+    Returns: (ok: bool, error_msg: str)
+    """
+    import subprocess
+    import os
+    
+    path = smb_cfg.get("path", "").strip()
+    user = smb_cfg.get("user", "").strip()
+    password = smb_cfg.get("pass", "")
+    domain = smb_cfg.get("domain", "").strip()
+    
+    if not path:
+        return False, "SMB path not provided"
+    
+    # Normalize path to UNC format
+    path = path.replace("/", "\\")
+    if not path.startswith("\\\\"):
+        return False, "SMB path must start with \\\\"
+    
+    # Extract server and share from UNC path
+    parts = path.strip("\\").split("\\")
+    if len(parts) < 2:
+        return False, "Invalid SMB path format"
+    server = parts[0]
+    share = parts[1]
+    
+    unc_root = f"\\\\{server}\\{share}"
+    
+    # Try to authenticate if credentials provided
+    if user:
+        net_user = f"{domain}\\{user}" if domain else user
+        try:
+            result = subprocess.run(
+                ["net", "use", unc_root, f"/user:{net_user}", password],
+                capture_output=True, text=True, timeout=15, check=False
+            )
+            # net use returns 0 on success, 2 if already connected
+            if result.returncode not in (0, 2):
+                return False, f"Failed to authenticate with SMB share: {result.stderr.strip()}"
+        except subprocess.TimeoutExpired:
+            return False, "Timeout authenticating with SMB share"
+        except Exception as e:
+            return False, f"SMB authentication error: {e}"
+    
+    # Check if the share is accessible
+    try:
+        if not os.path.exists(unc_root):
+            return False, f"SMB share {unc_root} is not accessible"
+    except Exception as e:
+        return False, f"Cannot access SMB share: {e}"
+    
     return True, ""
-
-
-def _upload_smb(local_dir: str, smb_cfg: dict) -> dict:
-    """Upload a backup folder to a Windows SMB share via transport_utils."""
-    return _tu_smb(local_dir, smb_cfg)
-
-
-def _upload_https(local_dir: str, api_cfg: dict) -> dict:
-    """Upload a backup folder to a custom HTTPS API endpoint via transport_utils."""
-    return _tu_https(local_dir, api_cfg)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -601,6 +685,19 @@ try:
     _NOTIFICATION_UTILS_AVAILABLE = True
 except ImportError:
     _NOTIFICATION_UTILS_AVAILABLE = False
+
+try:
+    from notification_utils import (
+        dispatch_telegram as _nu_dispatch_telegram,
+        dispatch_pushover as _nu_dispatch_pushover,
+        dispatch_ntfy     as _nu_dispatch_ntfy,
+    )
+    _NOTIFICATION_DISPATCH_AVAILABLE = True
+except ImportError:
+    _NOTIFICATION_DISPATCH_AVAILABLE = False
+    _nu_dispatch_telegram = None
+    _nu_dispatch_pushover = None
+    _nu_dispatch_ntfy     = None
 
 
 def _send_email_notification(cfg: dict, subject: str, body: str):
@@ -673,6 +770,13 @@ def _send_webhook(cfg: dict, result: dict):
     if result.get("status") == "success" and not cfg.get("webhook_on_success", False):
         return
 
+    # Resolve machine hostname once; fall back to a safe placeholder.
+    try:
+        import socket as _socket
+        _machine_id = _socket.gethostname()
+    except Exception:
+        _machine_id = "unknown"
+
     payload = {
         "event":         "backup_" + result.get("status", "unknown"),
         "status":        result.get("status", ""),
@@ -685,6 +789,7 @@ def _send_webhook(cfg: dict, result: dict):
         "timestamp":     result.get("timestamp", ""),
         "error":         result.get("error"),
         "triggered_by":  result.get("triggered_by", ""),
+        "machine_id":    _machine_id,
     }
 
     if _NOTIFICATION_UTILS_AVAILABLE:
@@ -706,22 +811,275 @@ def _send_webhook(cfg: dict, result: dict):
         logger.warning(f"\u26a0 Webhook failed ({url}): {e}")
 
 
+
+class ScheduleTableWidget(QWidget):
+    """Compact table widget for day-of-week + time-of-day backup scheduling.
+
+    Each row stores one scheduled time together with a 7-bit day bitmask
+    (bit 0 = Monday … bit 6 = Sunday, 127 = every day).  Replaces the old
+    plain-text HH:MM comma-separated QLineEdit.
+    """
+
+    _DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # Table: Time | Mon | Tue | Wed | Thu | Fri | Sat | Sun | Remove
+        self._table = QTableWidget(0, 9)
+        self._table.setHorizontalHeaderLabels(
+            ["Time (HH:MM)"] + self._DAY_LABELS + [""]
+        )
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1, 8):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setMaximumHeight(160)
+        layout.addWidget(self._table)
+
+        add_btn = QPushButton("＋ Add time")
+        add_btn.setObjectName("secondary")
+        add_btn.setFixedWidth(110)
+        add_btn.clicked.connect(lambda: self._add_row())
+        layout.addWidget(add_btn)
+
+    def _add_row(self, time_str: str = "", days: int = 127):
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+
+        # Time cell — editable QLineEdit inside the cell
+        time_edit = QLineEdit(time_str)
+        time_edit.setPlaceholderText("HH:MM")
+        time_edit.setMaxLength(5)
+        time_edit.setFixedWidth(70)
+        time_edit.setStyleSheet("background: #1e2128; color: #e8eaf0; border: 1px solid #374151; padding: 2px 4px;")
+        self._table.setCellWidget(row, 0, time_edit)
+
+        # Day checkboxes
+        for col, bit in enumerate(range(7), start=1):
+            cb = QCheckBox()
+            cb.setChecked(bool(days & (1 << bit)))
+            wrapper = QWidget()
+            wl = QHBoxLayout(wrapper)
+            wl.setContentsMargins(4, 0, 4, 0)
+            wl.addWidget(cb)
+            self._table.setCellWidget(row, col, wrapper)
+
+        # Remove button
+        rm_btn = QPushButton("✕")
+        rm_btn.setObjectName("secondary")
+        rm_btn.setFixedSize(28, 24)
+        rm_btn.clicked.connect(lambda _, r=row: self._remove_row(r))
+        self._table.setCellWidget(row, 8, rm_btn)
+        self._table.setRowHeight(row, 32)
+
+    def _remove_row(self, row: int):
+        # Re-wire remove buttons after deletion
+        self._table.removeRow(row)
+        for r in range(self._table.rowCount()):
+            btn = self._table.cellWidget(r, 8)
+            if btn:
+                try:
+                    btn.clicked.disconnect()
+                except Exception:
+                    pass
+                btn.clicked.connect(lambda _, rr=r: self._remove_row(rr))
+
+    def get_entries(self) -> list:
+        """Return list of {"time": "HH:MM", "days": int} dicts."""
+        entries = []
+        for row in range(self._table.rowCount()):
+            te = self._table.cellWidget(row, 0)
+            t = te.text().strip() if te else ""
+            if len(t) != 5 or t[2] != ":":
+                continue
+            days = 0
+            for col, bit in enumerate(range(7), start=1):
+                wrapper = self._table.cellWidget(row, col)
+                if wrapper:
+                    cb = wrapper.findChild(QCheckBox)
+                    if cb and cb.isChecked():
+                        days |= (1 << bit)
+            entries.append({"time": t, "days": days if days else 127})
+        return entries
+
+    def set_entries(self, entries: list):
+        """Populate the table from a list of {"time", "days"} dicts or plain "HH:MM" strings."""
+        while self._table.rowCount():
+            self._table.removeRow(0)
+        for e in entries:
+            if isinstance(e, str):
+                self._add_row(e, 127)
+            elif isinstance(e, dict):
+                self._add_row(e.get("time", ""), int(e.get("days", 127)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Drive Trigger Monitor ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DriveTriggerMonitor(QObject):
+    """
+    Detects when a USB / external drive is connected and emits drive_connected
+    with (label, serial, mount_point) so MainWindow can fire triggered backups.
+
+    Strategy (two-layer):
+      1. Windows:  WM_DEVICECHANGE message posted to the main window's HWND.
+                   nativeEvent() on MainWindow re-emits drive_connected via a
+                   signal so it arrives safely on the Qt main thread.
+                   DriveTriggerMonitor itself is used only on non-Windows.
+      2. Fallback (macOS / Linux / when win32api not available):
+                   Poll QStorageInfo every 3 s for newly mounted volumes.
+
+    The monitor is always started; on Windows the HWND approach is preferred
+    and the polling loop also runs as a belt-and-suspenders fallback for the
+    brief window between plug-in and WM_DEVICECHANGE delivery.
+
+    Emitted signal fields
+    ---------------------
+    drive_connected(label: str, serial: str, mount_point: str)
+        label       — volume label  (may be empty on some filesystems)
+        serial      — volume serial as 8-char uppercase hex  (Windows) or
+                      "" on macOS/Linux where the concept doesn't exist
+        mount_point — root path of the newly mounted volume
+    """
+
+    drive_connected = pyqtSignal(str, str, str)   # label, serial, mount_point
+
+    _POLL_INTERVAL_MS = 3_000   # polling cadence in milliseconds
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._known_roots: set = set()
+        self._running = True
+        self._timer = QTimer(self)
+        self._timer.setInterval(self._POLL_INTERVAL_MS)
+        self._timer.timeout.connect(self._poll)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self):
+        """Seed known roots then start polling timer on main thread."""
+        try:
+            self._known_roots = set(self._snapshot().keys())
+        except Exception:
+            self._known_roots = set()
+        self._timer.start()
+
+    def stop(self):
+        self._running = False
+        self._timer.stop()
+
+    def quit(self):
+        self.stop()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _snapshot() -> dict:
+        """Return {root_path: (label, serial)} for all currently mounted volumes.
+        Uses only thread-safe OS APIs — QStorageInfo must NOT be called from
+        background threads as it accesses Qt internals without locking.
+        """
+        result = {}
+        if os.name == "nt":
+            import ctypes
+            bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+            for i in range(26):
+                if bitmask & (1 << i):
+                    root = f"{chr(65 + i)}:\\"
+                    label, serial = "", ""
+                    try:
+                        vol_name   = ctypes.create_unicode_buffer(261)
+                        serial_num = ctypes.c_ulong()
+                        ctypes.windll.kernel32.GetVolumeInformationW(
+                            root, vol_name, 261,
+                            ctypes.byref(serial_num),
+                            None, None, None, 0
+                        )
+                        label  = vol_name.value or ""
+                        serial = f"{serial_num.value & 0xFFFFFFFF:08X}"
+                    except Exception:
+                        pass
+                    result[root] = (label, serial)
+        else:
+            # Linux/macOS: parse /proc/mounts or use os.popen
+            try:
+                import subprocess
+                out = subprocess.check_output(
+                    ["mount"], text=True, timeout=3
+                )
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        mp = parts[2]
+                        result[mp] = ("", "")
+            except Exception:
+                pass
+        return result
+
+    # ── Timer slot (runs on main thread) ─────────────────────────────────────
+
+    def _poll(self):
+        """Called by QTimer every _POLL_INTERVAL_MS ms on the main thread."""
+        if not self._running:
+            return
+        try:
+            current = self._snapshot()
+            new_roots = set(current.keys()) - self._known_roots
+            self._known_roots = set(current.keys())
+            for root in new_roots:
+                label, serial = current[root]
+                logger.info(
+                    f"[drive-trigger] New volume detected: label={label!r} "
+                    f"serial={serial!r} root={root!r}"
+                )
+                self.drive_connected.emit(label, serial, root)
+        except Exception as exc:
+            logger.debug(f"[drive-trigger] Poll error: {exc}")
+
+
 class BackupWorker(QThread):
     # current, total, fname, elapsed_s, is_scanning, bytes_done, total_bytes
     progress    = pyqtSignal(int, int, str, float, bool, int, int)
     finished    = pyqtSignal(dict)               # result dict
     log_message = pyqtSignal(str)                # status text
 
-    def __init__(self, watch: dict, cfg: dict, triggered_by: str = "manual"):
+    def __init__(self, watch: dict, cfg: dict, triggered_by: str = "manual", changed_paths=None):
         super().__init__()   # BUG FIX: was super().__init__(self)  · passing self as own parent
-        self.watch        = watch
-        self.cfg          = cfg
-        self.triggered_by = triggered_by
-        self._stop_event  = threading.Event()   # set this to interrupt retry sleep or signal cancel
+        self.watch         = watch
+        self.cfg           = cfg
+        self.triggered_by  = triggered_by
+        self.changed_paths = changed_paths  # watcher-tracked changed files for fast scan
+        self._stop_event   = threading.Event()   # set this to interrupt retry sleep or signal cancel
+        self._pause_event  = threading.Event()   # set = running, cleared = paused
+        self._pause_event.set()                  # FIX: must start SET (running); cleared only on pause()
+        self.pre_backup_cmd  = watch.get("pre_backup_cmd", "")
+        self.post_backup_cmd = watch.get("post_backup_cmd", "")
+        self.verify_remote_uploads = bool(cfg.get("verify_remote_uploads", False))
+        self.verify_after          = bool(cfg.get("verify_after", False))
 
     def request_stop(self):
         """Signal the worker to abort at the next opportunity (retry sleep or between attempts)."""
         self._stop_event.set()
+
+    def pause(self):
+        """Pause the backup. Worker will wait at file boundaries."""
+        self._pause_event.clear()
+
+    def resume(self):
+        """Resume a paused backup."""
+        self._pause_event.set()
 
     def run(self):
         w   = self.watch
@@ -743,6 +1101,71 @@ class BackupWorker(QThread):
         # GDrive is correctly detected as "new" for the GDrive destination.
         dest_type = cfg.get("dest_type", "local")
         snapshot = config_manager.load_snapshot(w["id"], dest_type)
+
+        # ── Scheduled force-full backup ──────────────────────────────────────
+        # If force_full_interval_days is set (globally or per-watch) and enough
+        # days have elapsed since the last forced full, discard the snapshot so
+        # this run becomes a full backup.
+        _force_full_interval = int(
+            w.get("force_full_interval_days") or
+            cfg.get("force_full_interval_days") or 0
+        )
+        if _force_full_interval > 0 and snapshot:
+            import datetime as _dt
+            _last_ff_str = w.get("last_force_full_at") or ""
+            _do_force_full = False
+            if not _last_ff_str:
+                # Never done a forced full — force one now
+                _do_force_full = True
+            else:
+                try:
+                    _last_ff = _dt.datetime.fromisoformat(_last_ff_str.replace("Z", "+00:00"))
+                    _last_ff = _last_ff.replace(tzinfo=None)  # work in naive UTC
+                    _elapsed_days = (_dt.datetime.utcnow() - _last_ff).days
+                    _do_force_full = _elapsed_days >= _force_full_interval
+                except Exception:
+                    _do_force_full = True  # unparseable timestamp → force full to be safe
+            if _do_force_full:
+                self.log_message.emit(
+                    f"🔄 {w['name']}: scheduled force-full every {_force_full_interval}d — "
+                    f"discarding snapshot to run a full backup."
+                )
+                snapshot = {}
+                # Record the timestamp so the interval resets from today
+                for _ww in cfg.get("watches", []):
+                    if _ww["id"] == w["id"]:
+                        _ww["last_force_full_at"] = _dt.datetime.utcnow().isoformat() + "Z"
+                        break
+                try:
+                    config_manager.save(cfg)
+                except Exception:
+                    pass  # non-fatal; next run will re-evaluate based on stale timestamp
+
+
+        # If the snapshot lists files that no longer exist on disk, it is stale
+        # (e.g. user emptied and refilled the folder). A stale snapshot causes:
+        #   (a) misleading "Scanning (1/N)" progress where N is the old count
+        #   (b) a huge diff marking thousands of files as "deleted"
+        # Fast check: sample up to 20 paths from the snapshot; if more than
+        # half are missing, the snapshot is stale — discard it so the next
+        # backup builds a fresh one without scanning ghost files.
+        if snapshot:
+            try:
+                import pathlib as _pl
+                _src_root = _pl.Path(w.get("path", ""))
+                _sample_keys = list(snapshot.keys())[:20]
+                _missing = sum(
+                    1 for _k in _sample_keys
+                    if not (_src_root / _k).exists()
+                )
+                if _sample_keys and _missing > len(_sample_keys) // 2:
+                    self.log_message.emit(
+                        f"[snapshot] Stale snapshot detected ({_missing}/{len(_sample_keys)} "
+                        f"sampled files missing) — resetting for clean scan"
+                    )
+                    snapshot = {}
+            except Exception:
+                pass  # guard failure is non-fatal
 
         # Track when the copy phase begins so we can compute ETA.
         _copy_start: list  = [None]   # list so the inner closure can mutate it
@@ -775,6 +1198,9 @@ class BackupWorker(QThread):
         # For scanning ETA: use previous snapshot file count as estimated total.
         # This gives a meaningful ETA on repeat backups. First-time backups
         # will show elapsed time only (no estimate available).
+        # Cap at 0 so a stale snapshot (e.g. after user deleted most files)
+        # doesn't make the scan appear stuck at "Scanning (1/10000)".
+        # We reset the estimate to the actual count once scan finishes.
         _estimated_scan_total = len(snapshot)   # 0 on first backup
         _scan_count: list = [0]
         _scan_start: list = [_time_mod.time()]
@@ -784,12 +1210,21 @@ class BackupWorker(QThread):
             if self._stop_event.is_set():
                 raise InterruptedError("Backup cancelled by user")
             _scan_count[0] += 1
+            # If we've already found more files than the old snapshot had,
+            # the snapshot was stale — stop using it as the total estimate.
+            _est = _estimated_scan_total if _scan_count[0] <= _estimated_scan_total else 0
             elapsed = _time_mod.time() - _scan_start[0]
-            self.progress.emit(_scan_count[0], _estimated_scan_total, fname, elapsed, True, 0, 0)
+            self.progress.emit(_scan_count[0], _est, fname, elapsed, True, 0, 0)
 
-        # Honour the bandwidth throttle setting
-        max_mbps  = cfg.get("max_backup_mbps", 0.0)
-        throttler = backup_engine.BackupThrottler(max_mbps) if max_mbps and max_mbps > 0 else None
+        # Honour the bandwidth throttle setting.
+        # Per-watch value (max_backup_mbps > 0) takes precedence over the global cfg value.
+        watch_max_mbps   = float(w.get("max_backup_mbps", 0.0))
+        watch_schedule   = w.get("bandwidth_schedule", [])
+        global_max_mbps  = float(cfg.get("max_backup_mbps", 0.0))
+        global_schedule  = cfg.get("bandwidth_schedule", [])
+        max_mbps = watch_max_mbps if watch_max_mbps > 0 else global_max_mbps
+        schedule = watch_schedule if watch_max_mbps > 0 else global_schedule
+        throttler = backup_engine.BackupThrottler(max_mbps, schedule) if max_mbps > 0 else None
 
         auto_retry   = cfg.get("auto_retry", False)
         retry_delay  = max(1, int(cfg.get("retry_delay_min", 5))) * 60
@@ -850,14 +1285,33 @@ class BackupWorker(QThread):
                         _cloud_cfg = {**cfg.get("dest_https", {}), "_dest_type": "https"}
                     elif _dest_type == "webdav":
                         _cloud_cfg = {**cfg.get("dest_webdav", {}), "_dest_type": "webdav"}
-                    elif _dest_type == "cloud":
+                    elif _dest_type == "rclone":
+                        _cloud_cfg = {**cfg.get("dest_rclone", {}), "_dest_type": "rclone"}
+                    elif _dest_type == "gdrive":
                         _w_cloud = w.get("cloud_config") or {}
                         if _w_cloud:
-                            _cloud_cfg = {**_w_cloud, "_dest_type": "cloud"}
-                    _destinations = None  # Use legacy cloud_config
+                            _cloud_cfg = {**_w_cloud, "_dest_type": "gdrive"}
+
+                    # BUG FIX: Per-watch cloud_config should ALWAYS apply, even when
+                    # the global dest_type is "local". Previously, GDrive assignments
+                    # saved in the GDrive tab were silently ignored unless the user also
+                    # changed the global dest_type to "gdrive".
+                    if _cloud_cfg is None:
+                        _w_cloud = w.get("cloud_config") or {}
+                        if _w_cloud and _w_cloud.get("access_token"):
+                            _cloud_cfg = {**_w_cloud, "_dest_type": "gdrive"}
+
+                    _destinations = None  # Use legacy gdrive_config
                 else:
                     _dest_type = "local"  # For legacy compatibility
                     _cloud_cfg = None
+
+                # ── Resolve source type and credentials ───────────────────────
+                _src_type = w.get("type", "local")
+                _src_smb_cfg    = w.get("smb_cfg", {}) if _src_type == "smb" else None
+                _src_webdav_cfg = w.get("webdav_cfg", {}) if _src_type == "webdav" else None
+                _src_sftp_cfg   = w.get("sftp_cfg", {}) if _src_type in ("sftp", "ftps") else None
+                _src_ftp_cfg    = w.get("ftp_cfg", {}) if _src_type == "ftp" else None
 
                 result = backup_engine.run_backup(
                     source            = w["path"],
@@ -877,10 +1331,19 @@ class BackupWorker(QThread):
                     triggered_by      = self.triggered_by,
                     throttler         = throttler,
                     cancel_event      = self._stop_event,
+                    pause_event       = self._pause_event,
                     sync_mode         = w.get("sync_mode", False),
                     max_file_size_mb  = w.get("max_file_size_mb", 0),
-                    pre_backup_cmd    = w.get("pre_backup_cmd") or None,
-                    post_backup_cmd   = w.get("post_backup_cmd") or None,
+                    pre_backup_cmd    = self.pre_backup_cmd,
+                    post_backup_cmd   = self.post_backup_cmd,
+                    changed_paths     = self.changed_paths or None,
+                    verify_remote_upload = self.verify_remote_uploads,
+                    source_type       = _src_type,
+                    source_sftp_cfg   = _src_sftp_cfg,
+                    source_ftp_cfg    = _src_ftp_cfg,
+                    source_smb_cfg    = _src_smb_cfg,
+                    source_webdav_cfg = _src_webdav_cfg,
+                    verify_after      = self.verify_after,
                 )
             except InterruptedError:
                 # User pressed ▶ Cancel  · treat as a clean cancellation not a failure
@@ -908,7 +1371,17 @@ class BackupWorker(QThread):
             )
 
             # ── Email notification on success ──────────────────────────
-            ec = cfg.get("email_config", {})
+            # Build effective config with per-watch notification overrides applied.
+            _notify_ov = w.get("notify_overrides", {})
+            _eff_cfg = dict(cfg)
+            if _notify_ov.get("webhook_url"):
+                _eff_cfg = {**_eff_cfg, "webhook_url": _notify_ov["webhook_url"]}
+            if _notify_ov.get("ntfy_topic"):
+                _nc = dict(_eff_cfg.get("ntfy_config", {}))
+                _nc["topic"] = _notify_ov["ntfy_topic"]
+                _eff_cfg = {**_eff_cfg, "ntfy_config": _nc}
+
+            ec = _eff_cfg.get("email_config", {})
             if ec.get("enabled") and ec.get("notify_on_success"):
                 try:
                     # Use notification_utils rich format when available
@@ -932,22 +1405,57 @@ class BackupWorker(QThread):
                         f"Triggered by:  {self.triggered_by}\n"
                         f"Timestamp:     {result['timestamp']}\n"
                     )
-                _send_email_notification(cfg, subject, body)
+                _send_email_notification(_eff_cfg, subject, body)
 
             # ── Webhook notification ───────────────────────────────────
-            _send_webhook(cfg, result)
+            _send_webhook(_eff_cfg, result)
+
+            # ── ntfy push notification ─────────────────────────────────
+            if _NOTIFICATION_DISPATCH_AVAILABLE:
+                try:
+                    _nu_dispatch_ntfy(_eff_cfg, {**result, "watch_name": w["name"]})
+                except Exception as _ntfy_exc:
+                    logger.warning("ntfy dispatch error: %s", _ntfy_exc)
+            else:
+                logger.debug("dispatch_ntfy unavailable (notification_utils missing or broken)")
+
+            # ── Telegram + Pushover notifications ──────────────────────
+            if _NOTIFICATION_DISPATCH_AVAILABLE:
+                try:
+                    _nu_dispatch_telegram(_eff_cfg, {**result, "watch_name": w["name"]})
+                    _nu_dispatch_pushover(_eff_cfg, {**result, "watch_name": w["name"]})
+                except Exception as _tg_exc:
+                    logger.warning("Telegram/Pushover dispatch error: %s", _tg_exc)
+            else:
+                logger.debug("dispatch_telegram/dispatch_pushover unavailable (notification_utils missing or broken)")
 
             # ── Remote upload result (surfaced from backup_engine.run_backup) ──
             # The engine handles all SFTP/FTP/FTPS/SMB/HTTPS/GDrive uploads
             # internally and stores the outcome in result["cloud_upload"].
             dest_type = cfg.get("dest_type", "local")
-            if dest_type not in ("local",):
+            # BUG FIX: also show upload result when watch has per-watch cloud_config (e.g. GDrive)
+            _has_watch_cloud = bool((w.get("cloud_config") or {}).get("access_token"))
+            if dest_type not in ("local",) or _has_watch_cloud:
                 upload_res = result.get("cloud_upload") or {}
                 if upload_res.get("ok"):
+                    # FIX: use the actual provider name, not the global dest_type.
+                    # When global dest_type is "local" but per-watch GDrive is set,
+                    # dest_type.upper() was incorrectly showing "LOCAL upload done".
+                    _provider = (w.get("cloud_config") or {}).get("provider", dest_type).upper()
                     self.log_message.emit(
-                        f"☁  {dest_type.upper()} upload done: "
+                        f"☁  {_provider} upload done: "
                         f"{upload_res.get('uploaded', 0)} file(s)"
                     )
+                    # ── Post-upload verification warnings ──────────────────────
+                    _verify_warns = upload_res.get("warnings") or upload_res.get("verify_warnings", [])
+                    if _verify_warns:
+                        for _vw in _verify_warns:
+                            self.log_message.emit(f"⚠ Remote verify ({_provider}): {_vw}")
+                        self.log_message.emit(
+                            f"⚠ {_provider}: {len(_verify_warns)} file(s) failed post-upload "
+                            f"checksum verification — transfer may be corrupted. "
+                            f"Re-running the backup is recommended."
+                        )
                 elif upload_res:
                     _err_msg = upload_res.get("error", "unknown error")
                     self.log_message.emit(f"⚠ {dest_type.upper()} upload failed: {_err_msg}")
@@ -970,7 +1478,17 @@ class BackupWorker(QThread):
             self.log_message.emit(f"⚠ {w['name']}: {result.get('error', 'unknown error')}")
 
             # ── Email + webhook on failure ─────────────────────────────
-            ec = cfg.get("email_config", {})
+            # Apply per-watch notification overrides (same logic as success block).
+            _notify_ov = w.get("notify_overrides", {})
+            _eff_cfg = dict(cfg)
+            if _notify_ov.get("webhook_url"):
+                _eff_cfg = {**_eff_cfg, "webhook_url": _notify_ov["webhook_url"]}
+            if _notify_ov.get("ntfy_topic"):
+                _nc = dict(_eff_cfg.get("ntfy_config", {}))
+                _nc["topic"] = _notify_ov["ntfy_topic"]
+                _eff_cfg = {**_eff_cfg, "ntfy_config": _nc}
+
+            ec = _eff_cfg.get("email_config", {})
             if ec.get("enabled") and ec.get("notify_on_failure", True):
                 try:
                     from notification_utils import build_backup_email as _bld_email
@@ -989,8 +1507,25 @@ class BackupWorker(QThread):
                         f"Triggered: {self.triggered_by}\n"
                         f"Timestamp: {result.get('timestamp', '')}\n"
                     )
-                _send_email_notification(cfg, subject, body)
-            _send_webhook(cfg, result)
+                _send_email_notification(_eff_cfg, subject, body)
+            _send_webhook(_eff_cfg, result)
+            # ── ntfy push notification ─────────────────────────────────
+            if _NOTIFICATION_DISPATCH_AVAILABLE:
+                try:
+                    _nu_dispatch_ntfy(_eff_cfg, {**result, "watch_name": w["name"]})
+                except Exception as _ntfy_exc:
+                    logger.warning("ntfy dispatch error: %s", _ntfy_exc)
+            else:
+                logger.debug("dispatch_ntfy unavailable (notification_utils missing or broken)")
+            # ── Telegram + Pushover notifications ──────────────────────
+            if _NOTIFICATION_DISPATCH_AVAILABLE:
+                try:
+                    _nu_dispatch_telegram(_eff_cfg, {**result, "watch_name": w["name"]})
+                    _nu_dispatch_pushover(_eff_cfg, {**result, "watch_name": w["name"]})
+                except Exception as _tg_exc:
+                    logger.warning("Telegram/Pushover dispatch error: %s", _tg_exc)
+            else:
+                logger.debug("dispatch_telegram/dispatch_pushover unavailable (notification_utils missing or broken)")
 
         self.finished.emit(result)
 
@@ -1045,41 +1580,36 @@ class PasswordDialog(QDialog):
         layout.setContentsMargins(24, 24, 24, 24)
 
         icon_lbl = QLabel("🔒")
-        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_lbl.setStyleSheet("font-size: 36px;")
         layout.addWidget(icon_lbl)
 
         self.title_lbl = QLabel("Admin Access Required" if self.mode == "verify" else "Set Admin Password")
         self.title_lbl.setObjectName("heading")
-        self.title_lbl.setAlignment(Qt.AlignCenter)
+        self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.title_lbl)
 
         self.sub_lbl = QLabel("Enter the admin password to continue" if self.mode == "verify"
                              else "Choose a password to protect admin settings")
         self.sub_lbl.setObjectName("subheading")
-        self.sub_lbl.setAlignment(Qt.AlignCenter)
+        self.sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.sub_lbl)
 
         self.pw_input = QLineEdit()
-        self.pw_input.setEchoMode(QLineEdit.Password)
+        self.pw_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.pw_input.setPlaceholderText("Password")
         layout.addWidget(self.pw_input)
 
         self.pw_confirm = QLineEdit()
-        self.pw_confirm.setEchoMode(QLineEdit.Password)
+        self.pw_confirm.setEchoMode(QLineEdit.EchoMode.Password)
         self.pw_confirm.setPlaceholderText("Confirm password")
         self.pw_confirm.setVisible(self.mode != "verify")
         layout.addWidget(self.pw_confirm)
 
         self.error_lbl = QLabel("")
         self.error_lbl.setObjectName("status_err")
-        self.error_lbl.setAlignment(Qt.AlignCenter)
+        self.error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.error_lbl)
-
-        if BACKUPSYS_API_URL and self.mode == "verify":
-            self.otp_btn = QPushButton("Login with OTP")
-            self.otp_btn.clicked.connect(self._otp_login)
-            layout.addWidget(self.otp_btn)
 
         btn_row = QHBoxLayout()
         self.forgot_btn = QPushButton("Forgot password?")
@@ -1139,9 +1669,9 @@ class PasswordDialog(QDialog):
             self,
             "Reset Admin Password",
             "This will remove the existing admin password and let you set a new one. Continue?",
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
@@ -1209,29 +1739,6 @@ class PasswordDialog(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         return bool(s.value(ADMIN_PASS_KEY, ""))
 
-    def _otp_login(self):
-        from PyQt5.QtWidgets import QInputDialog
-        try:
-            # Send OTP
-            req = urllib.request.Request(f"{BACKUPSYS_API_URL}/send-otp", method="POST", headers={"Content-Type": "application/json", "X-API-Key": os.environ.get("BACKUPSYS_API_KEY", "")})
-            with urllib.request.urlopen(req, data=json.dumps({}).encode()) as response:
-                if response.getcode() != 200:
-                    self.error_lbl.setText("Failed to send OTP")
-                    return
-            # Prompt for OTP
-            otp, ok = QInputDialog.getText(self, "OTP Login", "Enter the OTP code sent to your email:")
-            if not ok or not otp:
-                return
-            # Verify OTP
-            req = urllib.request.Request(f"{BACKUPSYS_API_URL}/verify-otp", method="POST", headers={"Content-Type": "application/json", "X-API-Key": os.environ.get("BACKUPSYS_API_KEY", "")})
-            with urllib.request.urlopen(req, data=json.dumps({"otp": otp}).encode()) as response:
-                if response.getcode() == 200:
-                    self.accept()
-                else:
-                    self.error_lbl.setText("Invalid OTP")
-        except Exception as e:
-            self.error_lbl.setText(f"OTP error: {str(e)}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Add Watch Dialog ───────────────────────────────────────────────────────────
@@ -1266,7 +1773,11 @@ class AddWatchDialog(QDialog):
 
         # Source type selector
         self.source_type = QComboBox()
-        self.source_type.addItems(["Local / Mapped Drive", "Network Share (SMB)"])
+        self.source_type.addItems([
+            "Local / Mapped Drive",
+            "Network Share (SMB)",
+            "WebDAV / Nextcloud",
+        ])
         self.source_type.currentIndexChanged.connect(self._on_source_type_changed)
         form.addRow("Source Type:", self.source_type)
 
@@ -1299,7 +1810,7 @@ class AddWatchDialog(QDialog):
         self.smb_user.setPlaceholderText("Username (optional)")
         self.smb_pass = QLineEdit()
         self.smb_pass.setPlaceholderText("Password (optional)")
-        self.smb_pass.setEchoMode(QLineEdit.Password)
+        self.smb_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.smb_domain = QLineEdit()
         self.smb_domain.setPlaceholderText("Domain (optional)")
         smb_cred_row.addWidget(self.smb_user)
@@ -1313,6 +1824,33 @@ class AddWatchDialog(QDialog):
 
         self.smb_widget.setVisible(False)
         form.addRow("SMB Path:", self.smb_widget)
+
+        # WebDAV source row
+        self.webdav_widget = QWidget()
+        webdav_layout = QVBoxLayout(self.webdav_widget)
+        webdav_layout.setContentsMargins(0, 0, 0, 0)
+        webdav_layout.setSpacing(6)
+
+        self.webdav_url = QLineEdit()
+        self.webdav_url.setPlaceholderText("https://cloud.example.com/remote.php/dav/files/user/")
+        webdav_layout.addWidget(self.webdav_url)
+
+        webdav_cred_row = QHBoxLayout()
+        self.webdav_user = QLineEdit()
+        self.webdav_user.setPlaceholderText("Username")
+        self.webdav_pass = QLineEdit()
+        self.webdav_pass.setPlaceholderText("Password / App token")
+        self.webdav_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        webdav_cred_row.addWidget(self.webdav_user)
+        webdav_cred_row.addWidget(self.webdav_pass)
+        webdav_layout.addLayout(webdav_cred_row)
+
+        webdav_help = QLabel("Example: https://nextcloud.example.com/remote.php/dav/files/alice/Docs")
+        webdav_help.setStyleSheet("color:#6b7280; font-size:10px;")
+        webdav_layout.addWidget(webdav_help)
+
+        self.webdav_widget.setVisible(False)
+        form.addRow("WebDAV URL:", self.webdav_widget)
 
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(0, 1440)
@@ -1336,14 +1874,106 @@ class AddWatchDialog(QDialog):
         dest_row.addWidget(dest_browse_btn)
         form.addRow("Destination:", dest_widget)
 
-        self.compress_check = QCheckBox("Enable compression")
-        form.addRow("", self.compress_check)
+        self.compress_combo = QComboBox()
+        self.compress_combo.addItem("Off", 0)
+        self.compress_combo.addItem("Fast (level 1)", 1)
+        self.compress_combo.addItem("Balanced (level 6)", 6)
+        self.compress_combo.addItem("Best (level 9)", 9)
+        self.compress_combo.setCurrentIndex(2)  # Default to "Balanced (level 6)"
+        form.addRow("Compression:", self.compress_combo)
 
         # Sync mode is always ON — files are copied directly into the destination.
         # No versioned timestamped subfolders are created.
         self._sync_mode = True
 
         layout.addLayout(form)
+
+        # ── "More Options…" collapsible section ──────────────────────────────
+        self._more_btn = QPushButton("▸  More Options…")
+        self._more_btn.setObjectName("secondary")
+        self._more_btn.setCheckable(True)
+        self._more_btn.setChecked(False)
+        self._more_btn.toggled.connect(self._toggle_more_options)
+        layout.addWidget(self._more_btn)
+
+        self._more_widget = QWidget()
+        self._more_widget.setVisible(False)
+        more_form = QFormLayout(self._more_widget)
+        more_form.setSpacing(10)
+        more_form.setContentsMargins(0, 4, 0, 4)
+
+        # Schedule times
+        self.add_schedule_widget = ScheduleTableWidget()
+        more_form.addRow("Schedule times:", self.add_schedule_widget)
+
+        # Retention
+        self.add_retention_spin = QSpinBox()
+        self.add_retention_spin.setRange(0, 365)
+        self.add_retention_spin.setValue(0)
+        self.add_retention_spin.setSuffix(" days  (0 = use global)")
+        more_form.addRow("Retention:", self.add_retention_spin)
+
+        # Max backups
+        self.add_max_backups_spin = QSpinBox()
+        self.add_max_backups_spin.setRange(0, 9999)
+        self.add_max_backups_spin.setValue(0)
+        self.add_max_backups_spin.setSuffix("  (0 = unlimited)")
+        more_form.addRow("Max backups:", self.add_max_backups_spin)
+
+        # Max file size
+        self.add_max_file_size_spin = QSpinBox()
+        self.add_max_file_size_spin.setRange(0, 100000)
+        self.add_max_file_size_spin.setValue(0)
+        self.add_max_file_size_spin.setSuffix(" MB  (0 = no limit)")
+        self.add_max_file_size_spin.setToolTip(
+            "Files larger than this are skipped during backup. Set to 0 to back up all files."
+        )
+        more_form.addRow("Skip files over:", self.add_max_file_size_spin)
+
+        # Exclude patterns
+        self.add_excl_edit = QTextEdit()
+        self.add_excl_edit.setMaximumHeight(80)
+        self.add_excl_edit.setPlaceholderText(
+            "One glob per line, e.g.  *.tmp  or  __pycache__"
+        )
+        more_form.addRow("Exclusions:", self.add_excl_edit)
+
+        # Encryption key
+        enc_container = QWidget()
+        enc_row = QHBoxLayout(enc_container)
+        enc_row.setContentsMargins(0, 0, 0, 0)
+        self.add_encrypt_input = QLineEdit()
+        self.add_encrypt_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.add_encrypt_input.setPlaceholderText("44-char encryption key  (leave blank to disable)")
+        enc_show = QCheckBox("Show")
+        enc_show.toggled.connect(
+            lambda on: self.add_encrypt_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
+            )
+        )
+        enc_gen = QPushButton("Generate")
+        enc_gen.setObjectName("secondary")
+        enc_gen.setMaximumWidth(80)
+        enc_gen.clicked.connect(self._generate_encrypt_key)
+        enc_row.addWidget(self.add_encrypt_input)
+        enc_row.addWidget(enc_show)
+        enc_row.addWidget(enc_gen)
+        more_form.addRow("Encrypt key:", enc_container)
+
+        # Pre / post backup commands
+        self.add_pre_cmd_input = QLineEdit()
+        self.add_pre_cmd_input.setPlaceholderText(
+            "Command to run before backup  (e.g. net stop myservice)"
+        )
+        more_form.addRow("Pre-backup:", self.add_pre_cmd_input)
+
+        self.add_post_cmd_input = QLineEdit()
+        self.add_post_cmd_input.setPlaceholderText(
+            "Command to run after backup  (e.g. net start myservice)"
+        )
+        more_form.addRow("Post-backup:", self.add_post_cmd_input)
+
+        layout.addWidget(self._more_widget)
 
         self.error_lbl = QLabel("")
         self.error_lbl.setObjectName("status_err")
@@ -1360,9 +1990,24 @@ class AddWatchDialog(QDialog):
         btn_row.addWidget(self._submit_btn)
         layout.addLayout(btn_row)
 
+    def _toggle_more_options(self, checked: bool):
+        self._more_widget.setVisible(checked)
+        self._more_btn.setText(
+            "▾  More Options…" if checked else "▸  More Options…"
+        )
+        self.adjustSize()
+
+    def _generate_encrypt_key(self):
+        import secrets, base64
+        raw = secrets.token_bytes(33)   # 33 bytes → 44 base64 chars
+        key = base64.urlsafe_b64encode(raw).decode()[:44]
+        self.add_encrypt_input.setText(key)
+        self.add_encrypt_input.setEchoMode(QLineEdit.EchoMode.Normal)
+
     def _on_source_type_changed(self, idx):
         self.local_widget.setVisible(idx == 0)
         self.smb_widget.setVisible(idx == 1)
+        self.webdav_widget.setVisible(idx == 2)
 
     def _browse_dest(self):
         """Browse for a per-watch destination folder."""
@@ -1377,7 +2022,7 @@ class AddWatchDialog(QDialog):
         folder_btn = msg.addButton("Folder", QMessageBox.AcceptRole)
         file_btn   = msg.addButton("File",   QMessageBox.AcceptRole)
         msg.addButton("Cancel", QMessageBox.RejectRole)
-        msg.exec_()
+        msg.exec()
         clicked = msg.clickedButton()
         if clicked == folder_btn:
             path = QFileDialog.getExistingDirectory(self, "Select Folder to Watch")
@@ -1591,9 +2236,9 @@ class AddWatchDialog(QDialog):
             reply = QMessageBox.warning(
                 self, "Warning  · Review Before Adding",
                 msg + "\n\nDo you want to add this watch anyway?",
-                QMessageBox.Yes | QMessageBox.Cancel
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
             )
-            if reply != QMessageBox.Yes:
+            if reply != QMessageBox.StandardButton.Yes:
                 return False
 
         return True
@@ -1612,16 +2257,28 @@ class AddWatchDialog(QDialog):
             self.error_lbl.setText("Name is required.")
             return
 
-        is_smb = self.source_type.currentIndex() == 1
+        src_idx   = self.source_type.currentIndex()
+        is_smb    = src_idx == 1
+        is_webdav = src_idx == 2
 
         if is_smb:
             path_str = self.smb_path_input.text().strip().replace("/", "\\")
-            # SMB must start with // or \\\
             if not path_str:
                 self.error_lbl.setText("SMB path is required.")
                 return
             if not (path_str.startswith("//") or path_str.startswith("\\\\")):
                 self.error_lbl.setText("SMB path must start with // or \\\\ (e.g. //server/share)")
+                return
+        elif is_webdav:
+            path_str = self.webdav_url.text().strip()
+            if not path_str:
+                self.error_lbl.setText("WebDAV URL is required.")
+                return
+            if not path_str.startswith(("http://", "https://")):
+                self.error_lbl.setText("WebDAV URL must start with http:// or https://")
+                return
+            if not self.webdav_user.text().strip():
+                self.error_lbl.setText("WebDAV username is required.")
                 return
         else:
             path_str = self.path_input.text().strip()
@@ -1635,7 +2292,6 @@ class AddWatchDialog(QDialog):
                 "domain": self.smb_domain.text().strip(),
             })
             if not ok:
-                # In edit mode, allow saving even if SMB isn't reachable right now
                 if self._edit_watch_id:
                     pass   # path unchanged — don't block save on connectivity
                 else:
@@ -1646,19 +2302,49 @@ class AddWatchDialog(QDialog):
             self.accept()
 
     def get_values(self):
-        is_smb = self.source_type.currentIndex() == 1
-        path   = self.smb_path_input.text().strip() if is_smb else self.path_input.text().strip()
+        src_idx   = self.source_type.currentIndex()
+        is_smb    = src_idx == 1
+        is_webdav = src_idx == 2
+
+        if is_smb:
+            path     = self.smb_path_input.text().strip()
+            src_type = "smb"
+        elif is_webdav:
+            path     = self.webdav_url.text().strip()
+            src_type = "webdav"
+        else:
+            path     = self.path_input.text().strip()
+            src_type = "local"
+
+        excl = [
+            ln.strip() for ln in self.add_excl_edit.toPlainText().splitlines()
+            if ln.strip()
+        ]
+
         return {
-            "name":         self.name_input.text().strip(),
-            "path":         path,
-            "interval_min": self.interval_spin.value(),
-            "compression":  self.compress_check.isChecked(),
-            "sync_mode":    True,
-            "destination":  self.dest_input.text().strip(),
-            "is_smb":       is_smb,
-            "smb_user":     self.smb_user.text().strip() if is_smb else "",
-            "smb_pass":     self.smb_pass.text() if is_smb else "",
-            "smb_domain":   self.smb_domain.text().strip() if is_smb else "",
+            "name":             self.name_input.text().strip(),
+            "path":             path,
+            "interval_min":     self.interval_spin.value(),
+            "compression":      self.compress_combo.currentData(),
+            "sync_mode":        True,
+            "destination":      self.dest_input.text().strip(),
+            "source_type":      src_type,
+            "is_smb":           is_smb,
+            "smb_user":         self.smb_user.text().strip() if is_smb else "",
+            "smb_pass":         self.smb_pass.text() if is_smb else "",
+            "smb_domain":       self.smb_domain.text().strip() if is_smb else "",
+            "is_webdav":        is_webdav,
+            "webdav_user":      self.webdav_user.text().strip() if is_webdav else "",
+            "webdav_pass":      self.webdav_pass.text() if is_webdav else "",
+            # Advanced fields (from "More Options…" expander)
+            "schedule_times":   self.add_schedule_widget.get_entries(),
+            "retention_days":   self.add_retention_spin.value(),
+            "max_backups":      self.add_max_backups_spin.value(),
+            "max_file_size_mb": self.add_max_file_size_spin.value(),
+            "exclude_patterns": excl,
+            "encrypt_key":      self.add_encrypt_input.text().strip(),
+            "pre_backup_cmd":   self.add_pre_cmd_input.text().strip(),
+            "post_backup_cmd":  self.add_post_cmd_input.text().strip(),
         }
 
 
@@ -1676,6 +2362,7 @@ class _DestinationEntryDialog(QDialog):
         ("smb",    "Network Share (SMB)"),
         ("https",  "HTTPS API"),
         ("webdav", "WebDAV / Nextcloud"),
+        ("rclone", "rclone"),
     ]
 
     def __init__(self, parent=None, existing: dict = None):
@@ -1709,11 +2396,17 @@ class _DestinationEntryDialog(QDialog):
         self._sftp_port = QSpinBox(); self._sftp_port.setRange(1, 65535); self._sftp_port.setValue(22)
         self._sftp_user = QLineEdit(); self._sftp_user.setPlaceholderText("username")
         self._sftp_pass = QLineEdit(); self._sftp_pass.setPlaceholderText("password")
-        self._sftp_pass.setEchoMode(QLineEdit.Password)
+        self._sftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self._sftp_path = QLineEdit(); self._sftp_path.setPlaceholderText("/remote/backup/path")
         sl.addRow("Host:", self._sftp_host); sl.addRow("Port:", self._sftp_port)
         sl.addRow("User:", self._sftp_user); sl.addRow("Password:", self._sftp_pass)
         sl.addRow("Remote Path:", self._sftp_path)
+        
+        # Test button for SFTP
+        self._sftp_test_btn = QPushButton("Test Connection")
+        self._sftp_test_btn.clicked.connect(self._test_sftp_connection)
+        sl.addRow("", self._sftp_test_btn)
+        
         form.addRow("", self._sftp_widget)
 
         # ── FTP (plain) ──────────────────────────────────────────────────────
@@ -1724,14 +2417,21 @@ class _DestinationEntryDialog(QDialog):
         self._ftp_port = QSpinBox(); self._ftp_port.setRange(1, 65535); self._ftp_port.setValue(21)
         self._ftp_user = QLineEdit(); self._ftp_user.setPlaceholderText("username")
         self._ftp_pass = QLineEdit(); self._ftp_pass.setPlaceholderText("password")
-        self._ftp_pass.setEchoMode(QLineEdit.Password)
+        self._ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self._ftp_path = QLineEdit(); self._ftp_path.setPlaceholderText("/remote/path")
         _ftp_warn = QLabel("⚠ FTP sends credentials in plaintext — use FTPS/SFTP when possible.")
         _ftp_warn.setWordWrap(True)
         _ftp_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
         fl.addRow("Host:", self._ftp_host); fl.addRow("Port:", self._ftp_port)
         fl.addRow("User:", self._ftp_user); fl.addRow("Password:", self._ftp_pass)
-        fl.addRow("Remote Path:", self._ftp_path); fl.addRow("", _ftp_warn)
+        fl.addRow("Remote Path:", self._ftp_path)
+        
+        # Test button for FTP
+        self._ftp_test_btn = QPushButton("Test Connection")
+        self._ftp_test_btn.clicked.connect(self._test_ftp_connection)
+        fl.addRow("", self._ftp_test_btn)
+        
+        fl.addRow("", _ftp_warn)
         form.addRow("", self._ftp_widget)
         self._ftp_widget.setVisible(False)
 
@@ -1743,11 +2443,17 @@ class _DestinationEntryDialog(QDialog):
         self._smb_share  = QLineEdit(); self._smb_share.setPlaceholderText("backups")
         self._smb_user   = QLineEdit(); self._smb_user.setPlaceholderText("username (optional)")
         self._smb_pass   = QLineEdit(); self._smb_pass.setPlaceholderText("password (optional)")
-        self._smb_pass.setEchoMode(QLineEdit.Password)
+        self._smb_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self._smb_path   = QLineEdit(); self._smb_path.setPlaceholderText("subfolder (optional)")
         ml.addRow("Server:", self._smb_server); ml.addRow("Share:", self._smb_share)
         ml.addRow("User:", self._smb_user);     ml.addRow("Password:", self._smb_pass)
         ml.addRow("Path:", self._smb_path)
+        
+        # Test button for SMB
+        self._smb_test_btn = QPushButton("Test Connection")
+        self._smb_test_btn.clicked.connect(self._test_smb_connection)
+        ml.addRow("", self._smb_test_btn)
+        
         form.addRow("", self._smb_widget)
         self._smb_widget.setVisible(False)
 
@@ -1757,10 +2463,16 @@ class _DestinationEntryDialog(QDialog):
         hl2.setContentsMargins(0, 0, 0, 0); hl2.setSpacing(4)
         self._https_url   = QLineEdit(); self._https_url.setPlaceholderText("https://api.example.com/backup")
         self._https_token = QLineEdit(); self._https_token.setPlaceholderText("Bearer token (optional)")
-        self._https_token.setEchoMode(QLineEdit.Password)
+        self._https_token.setEchoMode(QLineEdit.EchoMode.Password)
         self._https_ssl   = QCheckBox("Verify SSL certificate"); self._https_ssl.setChecked(True)
         hl2.addRow("URL:", self._https_url); hl2.addRow("Auth Token:", self._https_token)
         hl2.addRow("", self._https_ssl)
+        
+        # Test button for HTTPS
+        self._https_test_btn = QPushButton("Test Connection")
+        self._https_test_btn.clicked.connect(self._test_https_connection)
+        hl2.addRow("", self._https_test_btn)
+        
         form.addRow("", self._https_widget)
         self._https_widget.setVisible(False)
 
@@ -1771,15 +2483,66 @@ class _DestinationEntryDialog(QDialog):
         self._wdav_url  = QLineEdit(); self._wdav_url.setPlaceholderText("https://nextcloud.example.com")
         self._wdav_user = QLineEdit(); self._wdav_user.setPlaceholderText("username")
         self._wdav_pass = QLineEdit(); self._wdav_pass.setPlaceholderText("password")
-        self._wdav_pass.setEchoMode(QLineEdit.Password)
+        self._wdav_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self._wdav_path = QLineEdit(); self._wdav_path.setPlaceholderText("/backups")
         self._wdav_root = QLineEdit(); self._wdav_root.setPlaceholderText("/remote.php/dav/files/username/")
         self._wdav_ssl  = QCheckBox("Verify SSL certificate"); self._wdav_ssl.setChecked(True)
         wl2.addRow("URL:", self._wdav_url);       wl2.addRow("User:", self._wdav_user)
         wl2.addRow("Password:", self._wdav_pass); wl2.addRow("Remote Path:", self._wdav_path)
         wl2.addRow("DAV Root:", self._wdav_root); wl2.addRow("", self._wdav_ssl)
+        
+        # Test button for WebDAV
+        self._webdav_test_btn = QPushButton("Test Connection")
+        self._webdav_test_btn.clicked.connect(self._test_webdav_connection)
+        wl2.addRow("", self._webdav_test_btn)
+        
         form.addRow("", self._webdav_widget)
         self._webdav_widget.setVisible(False)
+
+        # ── rclone ────────────────────────────────────────────────────────────
+        self._rclone_widget = QWidget()
+        rl2 = QFormLayout(self._rclone_widget)
+        rl2.setContentsMargins(0, 0, 0, 0); rl2.setSpacing(6)
+
+        # Remote picker (populated by Detect Remotes)
+        _rclone_picker_row = QHBoxLayout()
+        self._rclone_picker_combo = QComboBox()
+        self._rclone_picker_combo.setPlaceholderText("— detect remotes first —")
+        self._rclone_picker_combo.setMinimumWidth(140)
+        self._rclone_picker_combo.currentTextChanged.connect(self._on_rclone_picker_changed)
+        _rclone_detect_btn = QPushButton("🔍 Detect Remotes")
+        _rclone_detect_btn.setObjectName("secondary")
+        _rclone_detect_btn.setToolTip("Run 'rclone listremotes' to find configured remotes")
+        _rclone_detect_btn.clicked.connect(self._detect_rclone_remotes)
+        _rclone_config_btn = QPushButton("⚙ rclone config…")
+        _rclone_config_btn.setObjectName("secondary")
+        _rclone_config_btn.setToolTip("Open a terminal running 'rclone config' to add / edit remotes")
+        _rclone_config_btn.clicked.connect(self._launch_rclone_config)
+        _rclone_picker_row.addWidget(self._rclone_picker_combo, stretch=1)
+        _rclone_picker_row.addWidget(_rclone_detect_btn)
+        _rclone_picker_row.addWidget(_rclone_config_btn)
+        rl2.addRow("Pick remote:", _rclone_picker_row)
+
+        self._rclone_remote = QLineEdit(); self._rclone_remote.setPlaceholderText("myremote")
+        self._rclone_path   = QLineEdit(); self._rclone_path.setPlaceholderText("/backups")
+        rl2.addRow("Remote name:", self._rclone_remote)
+        rl2.addRow("Remote path:", self._rclone_path)
+
+        _rclone_note = QLabel(
+            "Click 'Detect Remotes' to list remotes from your rclone config, or type a name "
+            "manually. Use 'rclone config…' to add a new provider (70+ supported)."
+        )
+        _rclone_note.setWordWrap(True)
+        _rclone_note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        rl2.addRow("", _rclone_note)
+
+        _rclone_test_btn = QPushButton("Test Connection")
+        _rclone_test_btn.setObjectName("secondary")
+        _rclone_test_btn.clicked.connect(self._test_rclone_dest)
+        rl2.addRow("", _rclone_test_btn)
+
+        form.addRow("", self._rclone_widget)
+        self._rclone_widget.setVisible(False)
 
         layout.addLayout(form)
 
@@ -1805,6 +2568,7 @@ class _DestinationEntryDialog(QDialog):
         self._smb_widget.setVisible(type_key == "smb")
         self._https_widget.setVisible(type_key == "https")
         self._webdav_widget.setVisible(type_key == "webdav")
+        self._rclone_widget.setVisible(type_key == "rclone")
         if type_key == "sftp":
             self._sftp_port.setValue(22)
         elif type_key == "ftps":
@@ -1848,6 +2612,9 @@ class _DestinationEntryDialog(QDialog):
             self._wdav_path.setText(cfg.get("remote_path", ""))
             self._wdav_root.setText(cfg.get("webdav_root", ""))
             self._wdav_ssl.setChecked(cfg.get("verify_ssl", True))
+        elif type_key == "rclone":
+            self._rclone_remote.setText(cfg.get("remote", ""))
+            self._rclone_path.setText(cfg.get("path", ""))
 
     def _submit(self):
         dest = self.get_dest()
@@ -1923,10 +2690,236 @@ class _DestinationEntryDialog(QDialog):
                 "verify_ssl": self._wdav_ssl.isChecked(),
             }
 
+        elif type_key == "rclone":
+            remote = self._rclone_remote.text().strip()
+            if not remote:
+                return {}
+            config = {
+                "remote": remote,
+                "path": self._rclone_path.text().strip() or "/backups",
+            }
+
         else:
             return {}
 
         return {"dest_type": type_key, "config": config}
+
+    def _test_sftp_connection(self):
+        cfg = {
+            "host":     self._sftp_host.text().strip(),
+            "port":     self._sftp_port.value(),
+            "user":     self._sftp_user.text().strip(),
+            "pass":     self._sftp_pass.text(),
+            "path":     self._sftp_path.text().strip(),
+        }
+        if not cfg["host"]:
+            QMessageBox.warning(self, "Missing", "Please enter an SFTP host first.")
+            return
+        try:
+            from transport_utils import test_sftp_connection
+            result = test_sftp_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "SFTP Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "SFTP  ·  Connected ✓",
+                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+        else:
+            QMessageBox.critical(self, "SFTP  ·  Failed",
+                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
+
+    def _test_ftp_connection(self):
+        cfg = {
+            "host": self._ftp_host.text().strip(),
+            "port": self._ftp_port.value(),
+            "user": self._ftp_user.text().strip(),
+            "pass": self._ftp_pass.text(),
+            "path": self._ftp_path.text().strip(),
+        }
+        if not cfg["host"]:
+            QMessageBox.warning(self, "Missing", "Please enter an FTP host first.")
+            return
+        try:
+            from transport_utils import test_ftp_connection
+            result = test_ftp_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "FTP Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "FTP  ·  Connected ✓",
+                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+        else:
+            QMessageBox.critical(self, "FTP  ·  Failed",
+                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
+
+    def _test_smb_connection(self):
+        # Build UNC path from server and share
+        server = self._smb_server.text().strip()
+        share = self._smb_share.text().strip()
+        if not server or not share:
+            QMessageBox.warning(self, "Missing", "Please enter both SMB server and share.")
+            return
+        cfg = {
+            "path":   f"\\\\{server}\\{share}",
+            "user":   self._smb_user.text().strip(),
+            "pass":   self._smb_pass.text(),
+            "domain": "",  # Dialog doesn't have domain field
+        }
+        try:
+            from transport_utils import test_smb_connection
+            result = test_smb_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "SMB Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "SMB  ·  Connected ✓",
+                f"Successfully connected to:\n{cfg['path']}")
+        else:
+            QMessageBox.critical(self, "SMB  ·  Failed",
+                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
+
+    def _test_https_connection(self):
+        cfg = {
+            "url":        self._https_url.text().strip(),
+            "token":      self._https_token.text().strip(),
+            "verify_ssl": self._https_ssl.isChecked(),
+        }
+        if not cfg["url"]:
+            QMessageBox.warning(self, "Missing", "Please enter an endpoint URL first.")
+            return
+        try:
+            from transport_utils import test_https_connection
+            result = test_https_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "HTTPS Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "HTTPS  ·  Connected ✓",
+                f"Endpoint reachable:\n{cfg['url']}\n\nHTTP status: {result.get('status_code', 'n/a')}")
+        else:
+            QMessageBox.critical(self, "HTTPS  ·  Failed",
+                f'Could not reach endpoint:\n\n{result.get("error", "Unknown error")}')
+
+    def _test_webdav_connection(self):
+        cfg = {
+            "url":         self._wdav_url.text().strip(),
+            "username":    self._wdav_user.text().strip(),
+            "password":    self._wdav_pass.text(),
+            "webdav_root": self._wdav_root.text().strip(),
+            "verify_ssl":  self._wdav_ssl.isChecked(),
+        }
+        if not cfg["url"]:
+            QMessageBox.warning(self, "Missing", "Please enter the WebDAV URL first.")
+            return
+        try:
+            from transport_utils import test_webdav_connection
+            result = test_webdav_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "WebDAV Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "WebDAV  ·  Connected ✓",
+                f"WebDAV server reachable:\n{cfg['url']}\n\n"
+                "PROPFIND succeeded — credentials and URL are correct.")
+        else:
+            QMessageBox.critical(self, "WebDAV  ·  Failed",
+                f'Could not connect:\n\n{result.get("error", "Unknown error")}\n\n'
+                "Tips:\n"
+                "• Nextcloud DAV root: /remote.php/dav/files/<USERNAME>/\n"
+                "• ownCloud DAV root: /remote.php/webdav/\n"
+                "• Plain WebDAV: leave DAV root empty")
+
+    # ── rclone helpers ─────────────────────────────────────────────────────
+
+    def _detect_rclone_remotes(self):
+        """Run 'rclone listremotes' and populate the picker combo."""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["rclone", "listremotes"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except FileNotFoundError:
+            QMessageBox.critical(
+                self, "rclone not found",
+                "rclone is not installed or not on PATH.\n\n"
+                "Download it from https://rclone.org/downloads/ and re-try.",
+            )
+            return
+        except subprocess.TimeoutExpired:
+            QMessageBox.warning(self, "Timeout", "rclone listremotes timed out after 10 s.")
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
+            return
+
+        remotes = [r.rstrip(":").strip() for r in proc.stdout.splitlines() if r.strip()]
+        if not remotes:
+            QMessageBox.information(
+                self, "No remotes found",
+                "rclone reported no configured remotes.\n\n"
+                "Click '⚙ rclone config…' to add one.",
+            )
+            return
+
+        self._rclone_picker_combo.clear()
+        self._rclone_picker_combo.addItems(remotes)
+        # Pre-select the currently configured remote if it's in the list
+        current = self._rclone_remote.text().strip()
+        if current in remotes:
+            self._rclone_picker_combo.setCurrentText(current)
+
+    def _on_rclone_picker_changed(self, text: str):
+        """Fill the Remote name field when the user picks from the combo."""
+        if text:
+            self._rclone_remote.setText(text)
+
+    def _launch_rclone_config(self):
+        """Open a terminal running 'rclone config' so the user can add providers."""
+        import subprocess, sys
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(
+                    ["cmd.exe", "/k", "rclone config"],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            elif sys.platform == "darwin":
+                subprocess.Popen(
+                    ["open", "-a", "Terminal", "--args", "rclone", "config"]
+                )
+            else:
+                for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+                    try:
+                        subprocess.Popen([term, "-e", "rclone config"])
+                        break
+                    except FileNotFoundError:
+                        continue
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Could not open terminal",
+                f"Please open a terminal manually and run:\n    rclone config\n\nError: {exc}",
+            )
+
+    def _test_rclone_dest(self):
+        cfg = {
+            "remote": self._rclone_remote.text().strip(),
+            "path":   self._rclone_path.text().strip(),
+        }
+        if not cfg["remote"]:
+            QMessageBox.warning(self, "Missing", "Please enter an rclone remote name first.")
+            return
+        try:
+            from transport_utils import test_rclone_connection
+            result = test_rclone_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "rclone Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "rclone  ·  Connected ✓",
+                f"{result.get('message', 'rclone can access the remote')}")
+        else:
+            QMessageBox.critical(self, "rclone  ·  Failed",
+                f"Could not connect:\n\n{result.get('message', 'Unknown error')}")
 
     @staticmethod
     def dest_label(dest: dict) -> str:
@@ -1945,9 +2938,10 @@ class _DestinationEntryDialog(QDialog):
 class EditWatchDialog(QDialog):
     """Edit per-watch settings: name, interval, compression, retention, max_backups, exclusions."""
 
-    def __init__(self, watch: dict, parent=None):
+    def __init__(self, watch: dict, dest_type: str = "local", parent=None):
         super().__init__(parent)
-        self.watch = watch
+        self.watch     = watch
+        self.dest_type = dest_type
         self.setWindowTitle(f"Edit Watch  · {watch.get('name', '')}")
         self.setMinimumWidth(500)
         self._build_ui()
@@ -1977,17 +2971,82 @@ class EditWatchDialog(QDialog):
         self.interval_spin.setSuffix(" min  (0 = use global)")
         form.addRow("Interval:", self.interval_spin)
 
+        self.watch_schedule_widget = ScheduleTableWidget()
+        _w_sched = self.watch.get("schedule_times", [])
+        self.watch_schedule_widget.set_entries(_w_sched)
+        form.addRow("Schedule times:", self.watch_schedule_widget)
+
         self.retention_spin = QSpinBox()
         self.retention_spin.setRange(0, 365)
         self.retention_spin.setValue(self.watch.get("retention_days", 0))
         self.retention_spin.setSuffix(" days  (0 = use global)")
         form.addRow("Retention:", self.retention_spin)
 
+        _watch_has_rclone = (
+            self.dest_type == "rclone" or
+            any(d.get("dest_type") == "rclone"
+                for d in self.watch.get("destinations", []))
+        )
+        if _watch_has_rclone:
+            _rclone_ret_note = QLabel(
+                "⚠ rclone destination detected — BackupSys retention policies apply "
+                "best-effort only. If rclone is unavailable at cleanup time, old backup "
+                "folders are left in place. Consider also enabling server-side retention "
+                "policies on your storage provider or NAS as a safety net."
+            )
+            _rclone_ret_note.setStyleSheet(
+                "color: #f59e0b; font-size: 11px; "
+                "background: #2d2200; border: 1px solid #78450a; "
+                "border-radius: 4px; padding: 4px 6px;"
+            )
+            _rclone_ret_note.setWordWrap(True)
+            form.addRow("", _rclone_ret_note)
+
         self.max_backups_spin = QSpinBox()
         self.max_backups_spin.setRange(0, 9999)
         self.max_backups_spin.setValue(self.watch.get("max_backups", 0))
         self.max_backups_spin.setSuffix("  (0 = unlimited)")
         form.addRow("Max backups:", self.max_backups_spin)
+
+        self.force_full_interval_spin = QSpinBox()
+        self.force_full_interval_spin.setRange(0, 3650)
+        self.force_full_interval_spin.setValue(int(self.watch.get("force_full_interval_days", 0)))
+        self.force_full_interval_spin.setSuffix(" days  (0 = use global / disabled)")
+        self.force_full_interval_spin.setToolTip(
+            "Force a full backup every N days for this watch, regardless of the "
+            "incremental chain length.  0 = inherit the global setting (or disabled "
+            "if the global setting is also 0).  -1 disables forced-full even when "
+            "the global setting is active."
+        )
+        form.addRow("Force full every:", self.force_full_interval_spin)
+
+        # ── Drive trigger ──────────────────────────────────────────────────────
+        self.drive_trigger_label_input = QLineEdit()
+        self.drive_trigger_label_input.setText(self.watch.get("drive_trigger_label", ""))
+        self.drive_trigger_label_input.setPlaceholderText("MY_BACKUP  (case-insensitive volume label)")
+        self.drive_trigger_label_input.setToolTip(
+            "Back up this watch automatically when a drive with this volume label "
+            "is connected.  Leave blank to disable.  Case-insensitive."
+        )
+        form.addRow("Drive trigger (label):", self.drive_trigger_label_input)
+
+        self.drive_trigger_serial_input = QLineEdit()
+        self.drive_trigger_serial_input.setText(self.watch.get("drive_trigger_serial", ""))
+        self.drive_trigger_serial_input.setPlaceholderText("ABCD1234  (8-char hex serial — Windows only)")
+        self.drive_trigger_serial_input.setToolTip(
+            "Back up this watch automatically when a drive with this volume serial "
+            "is connected.  Find the serial with:  vol C:  (or the drive letter) "
+            "in CMD.  Either label OR serial match triggers the backup."
+        )
+        form.addRow("Drive trigger (serial):", self.drive_trigger_serial_input)
+
+        _dt_note = QLabel(
+            "💡 Tip: use volume label for portability across machines; use serial "
+            "to distinguish two drives with the same label."
+        )
+        _dt_note.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        _dt_note.setWordWrap(True)
+        form.addRow("", _dt_note)
 
         self.max_file_size_spin = QDoubleSpinBox()
         self.max_file_size_spin.setRange(0, 100000)
@@ -2012,9 +3071,22 @@ class EditWatchDialog(QDialog):
         )
         form.addRow("Storage quota:", self.max_backup_bytes_spin)
 
-        self.compress_check = QCheckBox("Enable gzip compression")
-        self.compress_check.setChecked(self.watch.get("compression", False))
-        form.addRow("", self.compress_check)
+        self.compress_combo = QComboBox()
+        self.compress_combo.addItem("Off", 0)
+        self.compress_combo.addItem("Fast (level 1)", 1)
+        self.compress_combo.addItem("Balanced (level 6)", 6)
+        self.compress_combo.addItem("Best (level 9)", 9)
+        # Set current index based on existing compression value
+        current_compression = self.watch.get("compression", False)
+        if current_compression is True or current_compression == 6:
+            self.compress_combo.setCurrentIndex(2)  # Balanced
+        elif current_compression == 1:
+            self.compress_combo.setCurrentIndex(1)  # Fast
+        elif current_compression == 9:
+            self.compress_combo.setCurrentIndex(3)  # Best
+        else:
+            self.compress_combo.setCurrentIndex(0)  # Off
+        form.addRow("Compression:", self.compress_combo)
 
         # Per-watch destination
         edit_dest_widget = QWidget()
@@ -2038,7 +3110,7 @@ class EditWatchDialog(QDialog):
         form.addRow("Destination:", edit_dest_widget)
 
         # ── Multi-destinations (proper list widget) ─────────────────────────────
-        from PyQt5.QtWidgets import QListWidget, QListWidgetItem
+        from PyQt6.QtWidgets import QListWidget, QListWidgetItem
         dest_list_group = QGroupBox("Additional Destinations")
         dest_list_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
         dest_list_outer = QVBoxLayout(dest_list_group)
@@ -2055,7 +3127,7 @@ class EditWatchDialog(QDialog):
         self._dest_list_widget.setAlternatingRowColors(True)
         for _d in self.watch.get("destinations", []):
             _item = QListWidgetItem(_DestinationEntryDialog.dest_label(_d))
-            _item.setData(Qt.UserRole, _d)
+            _item.setData(Qt.ItemDataRole.UserRole, _d)
             self._dest_list_widget.addItem(_item)
         dest_list_outer.addWidget(self._dest_list_widget)
 
@@ -2091,9 +3163,7 @@ class EditWatchDialog(QDialog):
         hooks_layout.setContentsMargins(8, 10, 8, 8)
 
         _hook_note = QLabel(
-            "Commands run as a shell process before/after each backup.\n"
-            "Pre-hook failure aborts the backup. Post-hook failure is logged only.\n"
-            "Post-hook receives BACKUPSYS_STATUS / BACKUPSYS_WATCH env vars."
+            "Runs a shell command before/after backup. If pre-command fails, backup is skipped."
         )
         _hook_note.setStyleSheet("color:#6b7280; font-size:10px;")
         _hook_note.setWordWrap(True)
@@ -2112,11 +3182,49 @@ class EditWatchDialog(QDialog):
         hooks_layout.addRow("Post-backup:", self.post_cmd_input)
         form.addRow("", hooks_group)
 
+        # ── Per-watch Notification Overrides ────────────────────────────────
+        _pn = self.watch.get("notify_overrides", {})
+        notify_ov_group = QGroupBox("Notification Overrides (optional)")
+        notify_ov_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
+        notify_ov_layout = QFormLayout(notify_ov_group)
+        notify_ov_layout.setSpacing(6)
+        notify_ov_layout.setContentsMargins(8, 10, 8, 8)
+
+        _pn_note = QLabel(
+            "Leave blank to use the global settings. "
+            "Set a value here to override for this watch only."
+        )
+        _pn_note.setStyleSheet("color:#6b7280; font-size:10px;")
+        _pn_note.setWordWrap(True)
+        notify_ov_layout.addRow(_pn_note)
+
+        self.watch_webhook_input = QLineEdit(_pn.get("webhook_url", ""))
+        self.watch_webhook_input.setPlaceholderText(
+            "https://hooks.slack.com/…  or  https://discord.com/api/webhooks/…"
+        )
+        self.watch_webhook_input.setToolTip(
+            "Override the global webhook URL for this watch only.\n"
+            "Useful for routing alerts to a specific Slack channel or Discord server."
+        )
+        notify_ov_layout.addRow("Webhook URL:", self.watch_webhook_input)
+
+        self.watch_ntfy_topic_input = QLineEdit(_pn.get("ntfy_topic", ""))
+        self.watch_ntfy_topic_input.setPlaceholderText(
+            "e.g.  my-critical-watch-alerts"
+        )
+        self.watch_ntfy_topic_input.setToolTip(
+            "Override the global ntfy topic for this watch only.\n"
+            "The server URL and token are still taken from global ntfy settings."
+        )
+        notify_ov_layout.addRow("ntfy topic:", self.watch_ntfy_topic_input)
+
+        form.addRow("", notify_ov_group)
+
         # ── Encryption ──────────────────────────────────────────────────────
         enc_row = QHBoxLayout()
         self.encrypt_input = QLineEdit(self.watch.get("encrypt_key", ""))
-        self.encrypt_input.setEchoMode(QLineEdit.Password)
-        self.encrypt_input.setPlaceholderText("44-char Fernet key  (leave blank to disable)")
+        self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.encrypt_input.setPlaceholderText("44-char encryption key  (leave blank to disable)")
         self.encrypt_input.setToolTip(
             "AES encryption key for this watch.\n"
             "Generate one: python -c \"from backup_engine import generate_encryption_key; print(generate_encryption_key())\"\n"
@@ -2132,12 +3240,30 @@ class EditWatchDialog(QDialog):
         show_key_btn.setCheckable(True)
         show_key_btn.toggled.connect(
             lambda on: self.encrypt_input.setEchoMode(
-                QLineEdit.Normal if on else QLineEdit.Password
+                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
             )
         )
+        rotate_key_btn = QPushButton("🔄 Rotate…")
+        rotate_key_btn.setObjectName("secondary")
+        rotate_key_btn.setToolTip(
+            "Re-encrypt all existing backups for this watch with a new key.\n"
+            "The old key must match what was used when the backups were created."
+        )
+        rotate_key_btn.clicked.connect(self._rotate_key)
         enc_row.addWidget(self.encrypt_input)
         enc_row.addWidget(gen_key_btn)
         enc_row.addWidget(show_key_btn)
+        copy_key_btn = QPushButton("📋")
+        copy_key_btn.setObjectName("secondary")
+        copy_key_btn.setFixedWidth(36)
+        copy_key_btn.setToolTip("Copy key to clipboard")
+        copy_key_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(self.encrypt_input.text().strip())
+            if self.encrypt_input.text().strip()
+            else None
+        )
+        enc_row.addWidget(copy_key_btn)
+        enc_row.addWidget(rotate_key_btn)
         form.addRow("Encrypt key:", enc_row)
 
         self.color_input = QLineEdit(self.watch.get("color", ""))
@@ -2150,8 +3276,8 @@ class EditWatchDialog(QDialog):
         pick_color_btn.setFixedWidth(36)
         pick_color_btn.setToolTip("Open color picker")
         def _pick_color():
-            from PyQt5.QtWidgets import QColorDialog
-            from PyQt5.QtGui import QColor
+            from PyQt6.QtWidgets import QColorDialog
+            from PyQt6.QtGui import QColor
             current = self.color_input.text().strip()
             initial = QColor(current) if current else QColor("#2563eb")
             chosen = QColorDialog.getColor(initial, self, "Pick a label color")
@@ -2180,6 +3306,81 @@ class EditWatchDialog(QDialog):
         self.excl_edit.setPlainText("\n".join(self.watch.get("exclude_patterns", [])))
         form.addRow("Exclusions:", self.excl_edit)
 
+        # Include-only (whitelist) patterns
+        incl_label = QLabel(
+            "Include-only patterns  (one per line, e.g. <code>*.docx</code>):<br>"
+            "<span style='color:#6b7280; font-size:11px;'>"
+            "When set, <b>only</b> files matching these patterns are backed up. "
+            "Leave blank to back up everything (minus exclusions).</span>"
+        )
+        incl_label.setTextFormat(Qt.TextFormat.RichText)
+        incl_label.setWordWrap(True)
+        incl_label.setStyleSheet("color:#9ca3af;")
+        form.addRow("", incl_label)
+        # Load: strip leading "!" that the engine uses internally
+        _raw_excl = [p for p in self.watch.get("exclude_patterns", []) if not p.startswith("!")]
+        _raw_incl = [p[1:] for p in self.watch.get("exclude_patterns", []) if p.startswith("!")]
+        self.excl_edit.setPlainText("\n".join(_raw_excl))
+        self.incl_edit = QTextEdit()
+        self.incl_edit.setMaximumHeight(80)
+        self.incl_edit.setPlaceholderText("e.g.\n*.docx\n*.xlsx\n*.pdf")
+        self.incl_edit.setPlainText("\n".join(_raw_incl))
+        form.addRow("Include only:", self.incl_edit)
+
+        # ── Per-watch bandwidth override ─────────────────────────────────────
+        bw_group = QGroupBox("Bandwidth Override  (leave at 0 to use global setting)")
+        bw_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
+        bw_outer = QVBoxLayout(bw_group)
+        bw_outer.setSpacing(6)
+        bw_outer.setContentsMargins(8, 12, 8, 8)
+
+        bw_form = QFormLayout()
+        bw_form.setSpacing(8)
+        self._watch_bw_spin = QDoubleSpinBox()
+        self._watch_bw_spin.setRange(0.0, 1000.0)
+        self._watch_bw_spin.setDecimals(1)
+        self._watch_bw_spin.setSuffix(" MB/s  (0 = use global)")
+        self._watch_bw_spin.setValue(float(self.watch.get("max_backup_mbps", 0.0)))
+        bw_form.addRow("Max bandwidth:", self._watch_bw_spin)
+        bw_outer.addLayout(bw_form)
+
+        bw_sched_lbl = QLabel("Per-watch schedule (optional — overrides max bandwidth during time windows):")
+        bw_sched_lbl.setStyleSheet("color:#6b7280; font-size:10px;")
+        bw_outer.addWidget(bw_sched_lbl)
+
+        self._watch_bw_table = QTableWidget()
+        self._watch_bw_table.setColumnCount(3)
+        self._watch_bw_table.setHorizontalHeaderLabels(["Start (HH:MM)", "End (HH:MM)", "Max MB/s"])
+        self._watch_bw_table.horizontalHeader().setStretchLastSection(False)
+        self._watch_bw_table.setColumnWidth(0, 110)
+        self._watch_bw_table.setColumnWidth(1, 110)
+        self._watch_bw_table.setColumnWidth(2, 90)
+        self._watch_bw_table.setMaximumHeight(120)
+        self._watch_bw_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        bw_outer.addWidget(self._watch_bw_table)
+
+        bw_btn_row = QHBoxLayout()
+        _bw_add = QPushButton("Add Rule")
+        _bw_add.setObjectName("secondary")
+        _bw_add.clicked.connect(self._watch_bw_add_rule)
+        _bw_remove = QPushButton("Remove Rule")
+        _bw_remove.setObjectName("secondary")
+        _bw_remove.clicked.connect(self._watch_bw_remove_rule)
+        bw_btn_row.addWidget(_bw_add)
+        bw_btn_row.addWidget(_bw_remove)
+        bw_btn_row.addStretch()
+        bw_outer.addLayout(bw_btn_row)
+
+        # Populate saved schedule
+        for rule in self.watch.get("bandwidth_schedule", []):
+            self._watch_bw_add_rule_data(
+                rule.get("start", "00:00"),
+                rule.get("end", "06:00"),
+                rule.get("max_mbps", 0.0),
+            )
+
+        layout.addWidget(bw_group)
+
         layout.addLayout(form)
 
         self.error_lbl = QLabel("")
@@ -2197,6 +3398,38 @@ class EditWatchDialog(QDialog):
         btn_row.addWidget(save)
         layout.addLayout(btn_row)
 
+    def _watch_bw_add_rule(self):
+        """Add a blank bandwidth schedule row to the per-watch table."""
+        self._watch_bw_add_rule_data("00:00", "06:00", 0.0)
+
+    def _watch_bw_add_rule_data(self, start: str, end: str, max_mbps: float):
+        """Insert one row into the per-watch bandwidth schedule table."""
+        row = self._watch_bw_table.rowCount()
+        self._watch_bw_table.insertRow(row)
+        self._watch_bw_table.setItem(row, 0, QTableWidgetItem(start))
+        self._watch_bw_table.setItem(row, 1, QTableWidgetItem(end))
+        self._watch_bw_table.setItem(row, 2, QTableWidgetItem(str(max_mbps)))
+
+    def _watch_bw_remove_rule(self):
+        """Remove the selected row from the per-watch bandwidth schedule table."""
+        row = self._watch_bw_table.currentRow()
+        if row >= 0:
+            self._watch_bw_table.removeRow(row)
+
+    def _watch_bw_get_schedule(self) -> list:
+        """Read the per-watch bandwidth schedule table into a list of dicts."""
+        rules = []
+        for r in range(self._watch_bw_table.rowCount()):
+            def _cell(c, _r=r):
+                item = self._watch_bw_table.item(_r, c)
+                return item.text().strip() if item else ""
+            try:
+                mbps = float(_cell(2))
+            except ValueError:
+                mbps = 0.0
+            rules.append({"start": _cell(0), "end": _cell(1), "max_mbps": mbps})
+        return rules
+
     def _submit(self):
         name = self.name_input.text().strip()
         if not name:
@@ -2210,49 +3443,195 @@ class EditWatchDialog(QDialog):
         self.accept()
 
     def _generate_key(self):
-        """Generate a new Fernet encryption key and populate the field."""
+        """Generate a new encryption key and populate the field."""
         try:
             if BACKEND_AVAILABLE:
                 key = backup_engine.generate_encryption_key()
             else:
                 from cryptography.fernet import Fernet
                 key = Fernet.generate_key().decode()
-            self.encrypt_input.setEchoMode(QLineEdit.Normal)
+            self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Normal)
             self.encrypt_input.setText(key)
+            QApplication.clipboard().setText(key)
             QMessageBox.information(
                 self, "Key Generated",
-                f"A new encryption key has been generated and placed in the field.\n\n"
-                f"⚠ IMPORTANT: Copy and store this key somewhere safe!\n"
+                f"A new encryption key has been generated and copied to your clipboard.\n\n"
+                f"⚠ IMPORTANT: Save this key somewhere safe!\n"
                 f"Without it you cannot restore your encrypted backups.\n\n{key}"
             )
         except Exception as e:
             self.error_lbl.setText(f"Key generation failed: {e}")
 
+    def _rotate_key(self):
+        """Rotate the encryption key: re-encrypt all existing backups for this watch."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QLineEdit, QLabel, QDialogButtonBox, QProgressDialog
+        from PyQt6.QtCore import Qt
+
+        old_key = self.watch.get("encrypt_key", "").strip()
+        if not old_key:
+            QMessageBox.warning(self, "Key Rotation",
+                "This watch has no encryption key set. Enable encryption first, then rotate.")
+            return
+
+        # Dialog to collect new key
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Rotate Encryption Key")
+        dlg.setMinimumWidth(480)
+        vlay = QVBoxLayout(dlg)
+        vlay.addWidget(QLabel(
+            "<b>Re-encrypt all backups for this watch with a new key.</b><br><br>"
+            "The current key (shown below) will be used to decrypt existing files.<br>"
+            "Enter or generate a new key; all backups will be re-encrypted in place.<br>"
+            "<span style='color:#f59e0b;'>⚠  This cannot be undone. Keep the new key safe.</span>"
+        ))
+        fl = QFormLayout()
+        old_key_lbl = QLineEdit(old_key)
+        old_key_lbl.setReadOnly(True)
+        old_key_lbl.setEchoMode(QLineEdit.EchoMode.Password)
+        fl.addRow("Current key (read-only):", old_key_lbl)
+
+        new_key_edit = QLineEdit()
+        new_key_edit.setPlaceholderText("44-char new key")
+        fl.addRow("New key:", new_key_edit)
+        gen_btn = QPushButton("Generate new key")
+        gen_btn.setObjectName("secondary")
+        def _gen():
+            try:
+                if BACKEND_AVAILABLE:
+                    k = backup_engine.generate_encryption_key()
+                else:
+                    from cryptography.fernet import Fernet
+                    k = Fernet.generate_key().decode()
+                new_key_edit.setText(k)
+                new_key_edit.setEchoMode(QLineEdit.EchoMode.Normal)
+            except Exception as e:
+                QMessageBox.warning(dlg, "Error", str(e))
+        gen_btn.clicked.connect(_gen)
+        fl.addRow("", gen_btn)
+        vlay.addLayout(fl)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        vlay.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_key = new_key_edit.text().strip()
+        if not new_key:
+            QMessageBox.warning(self, "Key Rotation", "New key cannot be empty.")
+            return
+        if len(new_key) != 44:
+            QMessageBox.warning(self, "Key Rotation",
+                f"New key must be exactly 44 characters (got {len(new_key)}).")
+            return
+        if new_key == old_key:
+            QMessageBox.information(self, "Key Rotation", "New key is the same as the current key — nothing to do.")
+            return
+
+        # Find backup directories for this watch
+        dest = ""
+        watch_id = self.watch.get("id", "")
+        try:
+            if hasattr(self, "_parent_cfg"):
+                dest = self._parent_cfg.get("destination", "")
+            elif self.parent() and hasattr(self.parent(), "cfg"):
+                dest = self.parent().cfg.get("destination", "")
+        except Exception:
+            pass
+
+        if not dest:
+            QMessageBox.warning(self, "Key Rotation",
+                "Could not determine backup destination. Save the watch first, then rotate.")
+            return
+
+        if not BACKEND_AVAILABLE:
+            QMessageBox.critical(self, "Key Rotation", "Backend not available — cannot rotate key.")
+            return
+
+        backups = backup_engine.list_backups(dest, watch_id)
+        if not backups:
+            # No existing backups — just update the key in the field
+            self.encrypt_input.setText(new_key)
+            QMessageBox.information(self, "Key Rotation",
+                "No existing backups found — key updated in the field.\n"
+                "Click Save Changes to apply.")
+            return
+
+        reply = QMessageBox.question(self, "Confirm Key Rotation",
+            f"<b>{len(backups)} backup snapshot(s)</b> will be re-encrypted in place.<br><br>"
+            "This may take a while depending on backup size.<br>"
+            "The app will be unresponsive during rotation.<br><br>"
+            "Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        progress = QProgressDialog("Rotating encryption key…", None, 0, len(backups), self)
+        progress.setWindowTitle("Key Rotation")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setValue(0)
+        progress.show()
+
+        errors = []
+        for i, b in enumerate(backups):
+            bd = b.get("backup_dir", "")
+            if not bd:
+                continue
+            progress.setLabelText(f"Rotating snapshot {i+1}/{len(backups)}…\n{bd}")
+            from PyQt6.QtWidgets import QApplication
+            QApplication.processEvents()
+
+            def _prog(rel, idx, total, _i=i, _total=len(backups)):
+                pass  # per-file progress would need a nested dialog; omit for simplicity
+
+            result = backup_engine.rotate_encryption_key(bd, old_key, new_key, _prog)
+            if not result.get("ok"):
+                errors.extend(result.get("errors", []))
+            progress.setValue(i + 1)
+            QApplication.processEvents()
+
+        progress.close()
+
+        if errors:
+            QMessageBox.warning(self, "Key Rotation — Partial Errors",
+                f"Key rotation completed with {len(errors)} error(s):\n\n" +
+                "\n".join(errors[:10]) +
+                (f"\n…and {len(errors)-10} more" if len(errors) > 10 else ""))
+        else:
+            QMessageBox.information(self, "Key Rotation Complete",
+                f"All {len(backups)} snapshot(s) re-encrypted successfully.\n\n"
+                f"New key has been placed in the field — click Save Changes to apply.")
+
+        self.encrypt_input.setText(new_key)
+        self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Normal)
+
     def _add_destination(self):
         """Open the destination entry dialog and append the result to the list."""
-        from PyQt5.QtWidgets import QListWidgetItem
+        from PyQt6.QtWidgets import QListWidgetItem
         dlg = _DestinationEntryDialog(self)
-        if dlg.exec_() == QDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             dest = dlg.get_dest()
             if dest:
                 item = QListWidgetItem(_DestinationEntryDialog.dest_label(dest))
-                item.setData(Qt.UserRole, dest)
+                item.setData(Qt.ItemDataRole.UserRole, dest)
                 self._dest_list_widget.addItem(item)
 
     def _edit_destination(self):
         """Open the entry dialog pre-filled with the selected destination."""
-        from PyQt5.QtWidgets import QListWidgetItem
+        from PyQt6.QtWidgets import QListWidgetItem
         row = self._dest_list_widget.currentRow()
         if row < 0:
             QMessageBox.information(self, "Edit Destination", "Select a destination from the list first.")
             return
-        existing = self._dest_list_widget.item(row).data(Qt.UserRole)
+        existing = self._dest_list_widget.item(row).data(Qt.ItemDataRole.UserRole)
         dlg = _DestinationEntryDialog(self, existing=existing)
-        if dlg.exec_() == QDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             dest = dlg.get_dest()
             if dest:
                 item = QListWidgetItem(_DestinationEntryDialog.dest_label(dest))
-                item.setData(Qt.UserRole, dest)
+                item.setData(Qt.ItemDataRole.UserRole, dest)
                 self._dest_list_widget.takeItem(row)
                 self._dest_list_widget.insertItem(row, item)
                 self._dest_list_widget.setCurrentRow(row)
@@ -2268,34 +3647,54 @@ class EditWatchDialog(QDialog):
             ln.strip() for ln in self.excl_edit.toPlainText().splitlines()
             if ln.strip()
         ]
+        # Merge include-only patterns as "!pattern" entries understood by the engine
+        incl = [
+            "!" + ln.strip() for ln in self.incl_edit.toPlainText().splitlines()
+            if ln.strip()
+        ]
+        combined_patterns = excl + incl
         tags = [t.strip() for t in self.tags_input.text().split(",") if t.strip()]
         destinations = []
         try:
             for _i in range(self._dest_list_widget.count()):
                 _item = self._dest_list_widget.item(_i)
                 if _item:
-                    destinations.append(_item.data(Qt.UserRole))
+                    destinations.append(_item.data(Qt.ItemDataRole.UserRole))
         except Exception:
             pass
         return {
-            "name":             self.name_input.text().strip(),
-            "interval_min":     self.interval_spin.value(),
-            "retention_days":   self.retention_spin.value(),
-            "max_backups":      self.max_backups_spin.value(),
-            "max_file_size_mb": int(self.max_file_size_spin.value()),
-            "max_backup_bytes": int(self.max_backup_bytes_spin.value()) * 1024 * 1024,
-            "compression":      self.compress_check.isChecked(),
-            "sync_mode":        True,
-            "destination":      self.dest_input.text().strip(),
-            "destinations":     destinations,
-            "skip_auto_backup": self.skip_auto_check.isChecked(),
-            "color":            self.color_input.text().strip(),
-            "notes":            self.notes_input.text().strip(),
-            "tags":             tags,
-            "exclude_patterns": excl,
-            "encrypt_key":      self.encrypt_input.text().strip(),
-            "pre_backup_cmd":   self.pre_cmd_input.text().strip(),
-            "post_backup_cmd":  self.post_cmd_input.text().strip(),
+            "name":               self.name_input.text().strip(),
+            "interval_min":       self.interval_spin.value(),
+            "schedule_times":     self.watch_schedule_widget.get_entries(),
+            "retention_days":     self.retention_spin.value(),
+            "max_backups":        self.max_backups_spin.value(),
+            "max_file_size_mb":   int(self.max_file_size_spin.value()),
+            "max_backup_bytes":   int(self.max_backup_bytes_spin.value()) * 1024 * 1024,
+            "compression":        self.compress_combo.currentData(),
+            "sync_mode":          True,
+            "destination":        self.dest_input.text().strip(),
+            "destinations":       destinations,
+            "skip_auto_backup":   self.skip_auto_check.isChecked(),
+            "color":              self.color_input.text().strip(),
+            "notes":              self.notes_input.text().strip(),
+            "tags":               tags,
+            "exclude_patterns":   combined_patterns,
+            "encrypt_key":        self.encrypt_input.text().strip(),
+            "pre_backup_cmd":     self.pre_cmd_input.text().strip(),
+            "post_backup_cmd":    self.post_cmd_input.text().strip(),
+            # Per-watch bandwidth — 0 means "use global"
+            "max_backup_mbps":    self._watch_bw_spin.value(),
+            "bandwidth_schedule": self._watch_bw_get_schedule(),
+            # Scheduled force-full backup
+            "force_full_interval_days": self.force_full_interval_spin.value(),
+            # Drive trigger
+            "drive_trigger_label":  self.drive_trigger_label_input.text().strip(),
+            "drive_trigger_serial": self.drive_trigger_serial_input.text().strip().upper(),
+            # Per-watch notification overrides (blank = use global)
+            "notify_overrides": {
+                "webhook_url": self.watch_webhook_input.text().strip(),
+                "ntfy_topic":  self.watch_ntfy_topic_input.text().strip(),
+            },
         }
 
 
@@ -2312,6 +3711,11 @@ class AdminPanel(QDialog):
         self.setWindowTitle("Admin Settings  · Backup System")
         self.setMinimumSize(880, 580)
         self.setModal(True)
+        # Cache OAuth credentials once at init — avoids re-reading .env on
+        # every GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET property access.
+        _creds = self._load_env_credentials()
+        self._gdrive_client_id     = _creds["GDRIVE_CLIENT_ID"]
+        self._gdrive_client_secret = _creds["GDRIVE_CLIENT_SECRET"]
         self._build_ui()
         self._load_values()
 
@@ -2333,17 +3737,20 @@ class AdminPanel(QDialog):
         close_btn = QPushButton("✕")
         close_btn.setObjectName("secondary")
         close_btn.setFixedSize(32, 32)
+        close_btn.setStyleSheet("padding: 0px; font-size: 15px;")
         close_btn.clicked.connect(self.close)
         hl.addWidget(close_btn)
         layout.addWidget(header)
 
-        tabs = QTabWidget()
+        self._tabs = QTabWidget()
+        tabs = self._tabs
         tabs.tabBar().setExpanding(False)
-        tabs.tabBar().setElideMode(Qt.ElideNone)
+        tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
         tabs.setContentsMargins(16, 16, 16, 16)
 
         # ── Tab 1: General ─────────────────────────────────────────────────
-        general_inner = QWidget()
+        self._general_inner = QWidget()
+        general_inner = self._general_inner
         gl = QVBoxLayout(general_inner)
         gl.setSpacing(16)
         gl.setContentsMargins(20, 20, 20, 20)
@@ -2355,7 +3762,17 @@ class AdminPanel(QDialog):
         dest_type_row = QHBoxLayout()
         dest_type_row.addWidget(QLabel("Type:"))
         self.dest_type_combo = QComboBox()
-        self.dest_type_combo.addItems(["Local / Mapped Drive", "Network Share (SMB)", "SFTP", "FTPS", "FTP", "HTTPS API", "WebDAV / Nextcloud"])
+        self.dest_type_combo.addItems([
+            "Local / Mapped Drive",
+            "Network Share (SMB)",
+            "SFTP",
+            "FTPS",
+            "FTP",
+            "HTTPS API",
+            "rclone",
+            "WebDAV / Nextcloud",
+            "Google Drive",
+        ])
         self.dest_type_combo.currentIndexChanged.connect(self._on_dest_type_changed)
         dest_type_row.addWidget(self.dest_type_combo, stretch=1)
         dg_main.addLayout(dest_type_row)
@@ -2384,7 +3801,7 @@ class AdminPanel(QDialog):
         dsl.addWidget(self.dest_smb_path)
         smb_creds = QHBoxLayout()
         self.dest_smb_user   = QLineEdit(); self.dest_smb_user.setPlaceholderText("Username")
-        self.dest_smb_pass   = QLineEdit(); self.dest_smb_pass.setPlaceholderText("Password"); self.dest_smb_pass.setEchoMode(QLineEdit.Password)
+        self.dest_smb_pass   = QLineEdit(); self.dest_smb_pass.setPlaceholderText("Password"); self.dest_smb_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.dest_smb_domain = QLineEdit(); self.dest_smb_domain.setPlaceholderText("Domain")
         smb_creds.addWidget(self.dest_smb_user)
         smb_creds.addWidget(self.dest_smb_pass)
@@ -2405,7 +3822,7 @@ class AdminPanel(QDialog):
         self.sftp_host = QLineEdit(); self.sftp_host.setPlaceholderText("192.168.1.100 or hostname")
         self.sftp_port = QSpinBox();  self.sftp_port.setRange(1, 65535); self.sftp_port.setValue(22)
         self.sftp_user = QLineEdit(); self.sftp_user.setPlaceholderText("username")
-        self.sftp_pass = QLineEdit(); self.sftp_pass.setPlaceholderText("password"); self.sftp_pass.setEchoMode(QLineEdit.Password)
+        self.sftp_pass = QLineEdit(); self.sftp_pass.setPlaceholderText("password"); self.sftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.sftp_path = QLineEdit(); self.sftp_path.setPlaceholderText("/remote/backup/path")
         self.sftp_keyfile = QLineEdit(); self.sftp_keyfile.setPlaceholderText("Path to private key file (optional)")
         sftp_key_row = QHBoxLayout()
@@ -2415,7 +3832,7 @@ class AdminPanel(QDialog):
             QFileDialog.getOpenFileName(self, "Select Key File")[0] or self.sftp_keyfile.text()
         ))
         sftp_key_row.addWidget(sftp_browse_key)
-        self.sftp_key_pass = QLineEdit(); self.sftp_key_pass.setPlaceholderText("Passphrase (if key is password-protected)"); self.sftp_key_pass.setEchoMode(QLineEdit.Password)
+        self.sftp_key_pass = QLineEdit(); self.sftp_key_pass.setPlaceholderText("Passphrase (if key is password-protected)"); self.sftp_key_pass.setEchoMode(QLineEdit.EchoMode.Password)
         sfl.addRow("Host:", self.sftp_host)
         sfl.addRow("Port:", self.sftp_port)
         sfl.addRow("User:", self.sftp_user)
@@ -2438,7 +3855,7 @@ class AdminPanel(QDialog):
         self.ftp_host = QLineEdit(); self.ftp_host.setPlaceholderText("192.168.1.100 or hostname")
         self.ftp_port = QSpinBox();  self.ftp_port.setRange(1, 65535); self.ftp_port.setValue(21)
         self.ftp_user = QLineEdit(); self.ftp_user.setPlaceholderText("username")
-        self.ftp_pass = QLineEdit(); self.ftp_pass.setPlaceholderText("password"); self.ftp_pass.setEchoMode(QLineEdit.Password)
+        self.ftp_pass = QLineEdit(); self.ftp_pass.setPlaceholderText("password"); self.ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.ftp_path = QLineEdit(); self.ftp_path.setPlaceholderText("/remote/backup/path")
         ftpl.addRow("Host:",        self.ftp_host)
         ftpl.addRow("Port:",        self.ftp_port)
@@ -2462,7 +3879,7 @@ class AdminPanel(QDialog):
         htal.setContentsMargins(0, 0, 0, 0)
         htal.setSpacing(4)
         self.https_url   = QLineEdit(); self.https_url.setPlaceholderText("https://backup.company.com/api/upload")
-        self.https_token = QLineEdit(); self.https_token.setPlaceholderText("Bearer token (optional)"); self.https_token.setEchoMode(QLineEdit.Password)
+        self.https_token = QLineEdit(); self.https_token.setPlaceholderText("Bearer token (optional)"); self.https_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.https_verify_ssl = QCheckBox("Verify SSL certificate")
         self.https_verify_ssl.setChecked(True)
         htal.addRow("Endpoint URL:", self.https_url)
@@ -2482,12 +3899,64 @@ class AdminPanel(QDialog):
         self.dest_https_widget.setVisible(False)
         dg_main.addWidget(self.dest_https_widget)
 
+        # ── rclone destination ───────────────────────────────────────────────
+        self.dest_rclone_widget = QWidget()
+        rcl = QFormLayout(self.dest_rclone_widget)
+        rcl.setContentsMargins(0, 0, 0, 0)
+        rcl.setSpacing(6)
+
+        # ── In-app remote picker ─────────────────────────────────────────
+        rclone_picker_row = QHBoxLayout()
+        self.rclone_picker_combo = QComboBox()
+        self.rclone_picker_combo.setPlaceholderText("— detect remotes first —")
+        self.rclone_picker_combo.setMinimumWidth(160)
+        self.rclone_picker_combo.currentTextChanged.connect(self._on_rclone_picker_changed)
+        rclone_detect_btn = QPushButton("🔍 Detect Remotes")
+        rclone_detect_btn.setObjectName("secondary")
+        rclone_detect_btn.setToolTip("Run 'rclone listremotes' to find configured remotes")
+        rclone_detect_btn.clicked.connect(self._detect_rclone_remotes)
+        rclone_config_btn = QPushButton("⚙ rclone config…")
+        rclone_config_btn.setObjectName("secondary")
+        rclone_config_btn.setToolTip("Open a terminal running 'rclone config' to add / edit remotes")
+        rclone_config_btn.clicked.connect(self._launch_rclone_config)
+        rclone_picker_row.addWidget(self.rclone_picker_combo, stretch=1)
+        rclone_picker_row.addWidget(rclone_detect_btn)
+        rclone_picker_row.addWidget(rclone_config_btn)
+        rcl.addRow("Pick remote:", rclone_picker_row)
+
+        self.rclone_remote = QLineEdit(); self.rclone_remote.setPlaceholderText("myremote")
+        self.rclone_path = QLineEdit(); self.rclone_path.setPlaceholderText("/backups")
+        rcl.addRow("Remote name:", self.rclone_remote)
+        rcl.addRow("Remote path:", self.rclone_path)
+        rclone_note = QLabel(
+            "Click \u2018Detect Remotes\u2019 to list remotes from your rclone config, or type a name "
+            "manually. Use \u2018rclone config\u2026\u2019 to add a new provider (70+ supported)."
+        )
+        rclone_note.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        rclone_note.setWordWrap(True)
+        rcl.addRow("", rclone_note)
+        rclone_retention_warn = QLabel(
+            "\u2139 BackupSys applies retention policies to rclone destinations by running "
+            "rclone purge on expired backup folders. "
+            "If rclone is not available at cleanup time, old folders are left in place. "
+            "You can also configure server-side lifecycle rules as a secondary safety net."
+        )
+        rclone_retention_warn.setStyleSheet("color: #60a5fa; font-size: 11px;")
+        rclone_retention_warn.setWordWrap(True)
+        rcl.addRow("", rclone_retention_warn)
+        rclone_test_btn = QPushButton("Test Connection")
+        rclone_test_btn.setObjectName("secondary")
+        rclone_test_btn.clicked.connect(self._test_rclone)
+        rcl.addRow("", rclone_test_btn)
+        self.dest_rclone_widget.setVisible(False)
+        dg_main.addWidget(self.dest_rclone_widget)
+
         # ── WebDAV / Nextcloud destination ─────────────────────────────────
         self.dest_webdav_widget = QWidget()
         wdvl = QFormLayout(self.dest_webdav_widget)
         self.webdav_url  = QLineEdit(); self.webdav_url.setPlaceholderText("https://nextcloud.example.com")
         self.webdav_user = QLineEdit(); self.webdav_user.setPlaceholderText("username")
-        self.webdav_pass = QLineEdit(); self.webdav_pass.setPlaceholderText("password"); self.webdav_pass.setEchoMode(QLineEdit.Password)
+        self.webdav_pass = QLineEdit(); self.webdav_pass.setPlaceholderText("password"); self.webdav_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.webdav_path = QLineEdit(); self.webdav_path.setPlaceholderText("/backups")
         self.webdav_root = QLineEdit(); self.webdav_root.setPlaceholderText("/remote.php/dav/files/username/  (Nextcloud)")
         self.webdav_ssl  = QCheckBox("Verify SSL certificate"); self.webdav_ssl.setChecked(True)
@@ -2501,11 +3970,40 @@ class AdminPanel(QDialog):
         wdvl.addRow("Remote path:", self.webdav_path)
         wdvl.addRow("DAV root:",    self.webdav_root)
         wdvl.addRow("",             self.webdav_ssl)
+        webdav_retention_warn = QLabel(
+            "⚠ BackupSys enforces retention on WebDAV destinations by sending "
+            "PROPFIND + DELETE requests against the remote backup folder. "
+            "This requires the server to support standard DAV collection DELETE. "
+            "Nextcloud and ownCloud both do. "
+            "If your server restricts DELETE, old backups will accumulate — "
+            "consider enabling server-side retention rules as a safety net."
+        )
+        webdav_retention_warn.setStyleSheet("color: #f59e0b; font-size: 11px;")
+        webdav_retention_warn.setWordWrap(True)
+        wdvl.addRow("",             webdav_retention_warn)
         wdvl.addRow("",             wdv_btn_row)
         self.dest_webdav_widget.setVisible(False)
         dg_main.addWidget(self.dest_webdav_widget)
 
-        gl.addWidget(dest_group)
+        # ── Google Drive destination ──────────────────────────────────────────
+        self.dest_gdrive_widget = QWidget()
+        gdl = QVBoxLayout(self.dest_gdrive_widget)
+        gdl.setContentsMargins(0, 4, 0, 4)
+        gdrive_info = QLabel(
+            "<b>Google Drive</b> is configured in the <b>Cloud</b> tab of Settings.<br>"
+            "Connect your account there, then assign this watch to Google Drive.<br>"
+            "Once assigned the <i>dest_type</i> for this watch is managed automatically."
+        )
+        gdrive_info.setWordWrap(True)
+        gdrive_info.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        gdl.addWidget(gdrive_info)
+        self.dest_gdrive_widget.setVisible(False)
+        dg_main.addWidget(self.dest_gdrive_widget)
+
+        gl.addWidget(dest_group)  # BUG FIX: dest_group was never added to gl, causing Qt to GC
+                                  # the C++ QGroupBox (and all children, including dest_type_combo)
+                                  # as soon as _build_ui() returned, making _load_values() crash
+                                  # with "wrapped C/C++ object of type QComboBox has been deleted"
 
         sched_group = QGroupBox("Schedule & Limits")
         sg = QFormLayout(sched_group)
@@ -2521,32 +4019,53 @@ class AdminPanel(QDialog):
         self.interval_unit.currentIndexChanged.connect(self._on_interval_unit_changed)
         interval_row.addWidget(self.interval_unit)
         sg.addRow("Interval:", interval_row)
+        self.seconds_warning_label = QLabel(
+            "⚠️  Seconds mode is for testing only — do not use in production. "
+            "Backups will run every few seconds and may hammer your filesystem."
+        )
+        self.seconds_warning_label.setStyleSheet("color: #c0392b; font-weight: bold;")
+        self.seconds_warning_label.setWordWrap(True)
+        self.seconds_warning_label.setVisible(False)
+        sg.addRow("", self.seconds_warning_label)
         self.retention_spin = QSpinBox()
         self.retention_spin.setRange(0, 36500)  # 0 = keep forever, no limit on max
         self.retention_spin.setSuffix(" days  (0 = keep forever)")
         self.retention_spin.setSpecialValueText("0 — Keep forever (no auto-delete)")
         sg.addRow("Retention:", self.retention_spin)
 
-        # Scheduled backup times
-        sched_row = QHBoxLayout()
-        self.schedule_times_input = QLineEdit()
-        self.schedule_times_input.setPlaceholderText("e.g. 02:00, 14:00  (leave blank to use interval only)")
-        self.schedule_times_input.setToolTip(
-            "Comma-separated HH:MM times to run a full backup every day.\n"
-            "These fire in addition to the regular interval.\n"
-            "Example: 02:00, 14:00 backs up at 2 AM and 2 PM daily."
-        )
-        sched_row.addWidget(self.schedule_times_input)
-        sg.addRow("Run at times:", sched_row)
+        # Disk space alert threshold
+        self.disk_alert_spin = QSpinBox()
+        self.disk_alert_spin.setRange(0, 1000)
+        self.disk_alert_spin.setSuffix(" GB")
+        self.disk_alert_spin.setSpecialValueText("0 — Disabled")
+        sg.addRow("Alert when free space below:", self.disk_alert_spin)
 
-        # Backup window stop time
+        # Scheduled backup times (day-of-week aware)
+        self.schedule_times_widget = ScheduleTableWidget()
+        self.schedule_times_widget.setToolTip(
+            "Add one row per scheduled time.\n"
+            "Tick the day checkboxes to restrict which days of the week each time fires.\n"
+            "Leave all days ticked to run every day (the original behaviour)."
+        )
+        sg.addRow("Run at times:", self.schedule_times_widget)
+
+        # Backup window — start and stop times
+        self.backup_window_start_input = QLineEdit()
+        self.backup_window_start_input.setPlaceholderText("e.g. 01:00  (leave blank for no start limit)")
+        self.backup_window_start_input.setToolTip(
+            "If set, auto-backups will not START before this time each day.\n"
+            "Combine with Stop by to define a quiet-hours window.\n"
+            "Example: Start after 01:00 + Stop by 06:00 = backups only between 1 AM and 6 AM."
+        )
+        sg.addRow("Start after:", self.backup_window_start_input)
+
         window_row = QHBoxLayout()
         self.backup_window_end_input = QLineEdit()
         self.backup_window_end_input.setPlaceholderText("e.g. 06:00  (leave blank for no cutoff)")
         self.backup_window_end_input.setToolTip(
             "If set, auto-backups that START after this time are skipped until the next day.\n"
             "Useful to avoid backups running into business hours.\n"
-            "Example: set Run at times to 02:00 and Stop by to 06:00."
+            "Example: set Start after to 01:00 and Stop by to 06:00."
         )
         window_row.addWidget(self.backup_window_end_input)
         sg.addRow("Stop by:", window_row)
@@ -2556,6 +4075,33 @@ class AdminPanel(QDialog):
         self.bw_spin.setSuffix(" MB/s  (0 = unlimited)")
         self.bw_spin.setValue(0.0)
         sg.addRow("Max bandwidth:", self.bw_spin)
+
+        # Bandwidth schedule table
+        bw_sched_label = QLabel("Schedule (optional — overrides max bandwidth during time windows):")
+        sg.addRow("", bw_sched_label)
+        self.bw_table = QTableWidget()
+        self.bw_table.setColumnCount(3)
+        self.bw_table.setHorizontalHeaderLabels(["Start (HH:MM)", "End (HH:MM)", "Max MB/s"])
+        self.bw_table.horizontalHeader().setStretchLastSection(False)
+        self.bw_table.setColumnWidth(0, 120)
+        self.bw_table.setColumnWidth(1, 120)
+        self.bw_table.setColumnWidth(2, 100)
+        self.bw_table.setMaximumHeight(150)
+        self.bw_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        sg.addRow("", self.bw_table)
+        
+        # Bandwidth schedule buttons
+        btn_row = QHBoxLayout()
+        add_bw_btn = QPushButton("Add Schedule Rule")
+        add_bw_btn.setMinimumWidth(150)
+        add_bw_btn.clicked.connect(self._add_bw_rule)
+        remove_bw_btn = QPushButton("Remove Rule")
+        remove_bw_btn.setMinimumWidth(110)
+        remove_bw_btn.clicked.connect(self._remove_bw_rule)
+        btn_row.addWidget(add_bw_btn)
+        btn_row.addWidget(remove_bw_btn)
+        btn_row.addStretch()
+        sg.addRow("", btn_row)
 
         # System idle threshold
         self.idle_spin = QSpinBox()
@@ -2568,6 +4114,43 @@ class AdminPanel(QDialog):
         )
         self.idle_spin.setValue(0)
         sg.addRow("Idle threshold:", self.idle_spin)
+
+        # Metered connection pause
+        self.metered_check = QCheckBox("Pause auto-backups on metered connections (Windows only)")
+        self.metered_check.setToolTip(
+            "When enabled, scheduled backups are skipped if Windows detects a metered network\n"
+            "(e.g. mobile hotspot, cellular connection). Check only applies on Windows.\n"
+            "Non-Windows systems will ignore this setting."
+        )
+        sg.addRow("", self.metered_check)
+
+        # Battery pause
+        self.battery_check = QCheckBox("Pause auto-backups when running on battery")
+        self.battery_check.setToolTip(
+            "When enabled, scheduled backups are skipped while the laptop is unplugged.\n"
+            "Backups resume automatically once the power adapter is reconnected.\n"
+            "Uses psutil.sensors_battery() \u2014 works on Windows, macOS, and Linux."
+        )
+        sg.addRow("", self.battery_check)
+
+        # Remote upload verification
+        self.verify_remote_cb = QCheckBox("Verify remote uploads after transfer (SFTP / FTP / WebDAV)")
+        self.verify_remote_cb.setToolTip(
+            "After each remote upload, BackupSys re-reads the first 8 KB of every file\n"
+            "and compares its MD5 against the local copy.\n"
+            "Catches silent corruption and truncated transfers.\n"
+            "Adds a small overhead — enable for critical or slow/unreliable connections."
+        )
+        sg.addRow("", self.verify_remote_cb)
+
+        self.verify_after_cb = QCheckBox("Verify backup integrity after each backup (local)")
+        self.verify_after_cb.setToolTip(
+            "After each backup completes successfully, BackupSys will re-read every\n"
+            "copied file and compare its checksum against the source.\n"
+            "Detects silent write errors and storage corruption.\n"
+            "Adds extra time proportional to backup size — recommended for critical data."
+        )
+        sg.addRow("", self.verify_after_cb)
 
         # Auto-retry
         retry_row = QHBoxLayout()
@@ -2582,7 +4165,69 @@ class AdminPanel(QDialog):
 
         gl.addWidget(sched_group)
 
-        startup_group = QGroupBox("Windows Startup")
+        # ── Integrity Checks ───────────────────────────────────────────────
+        integ_group = QGroupBox("Integrity Checks")
+        integ_layout = QVBoxLayout(integ_group)
+        integ_layout.setSpacing(8)
+        self.integrity_enabled_cb = QCheckBox("Enable scheduled backup integrity checks")
+        self.integrity_enabled_cb.setToolTip(
+            "Periodically re-hashes each watch's most recent backup and compares\n"
+            "it against the stored SHA-256 and manifest.  Failures trigger email\n"
+            "and webhook notifications using your existing notification settings."
+        )
+        integ_layout.addWidget(self.integrity_enabled_cb)
+        integ_row = QHBoxLayout()
+        integ_row.addWidget(QLabel("Check every"))
+        self.integrity_interval_spin = QSpinBox()
+        self.integrity_interval_spin.setRange(1, 365)
+        self.integrity_interval_spin.setSuffix(" day(s)")
+        self.integrity_interval_spin.setFixedWidth(110)
+        integ_row.addWidget(self.integrity_interval_spin)
+        integ_row.addStretch()
+        integ_layout.addLayout(integ_row)
+        _integ_note = QLabel(
+            "Each watch is checked on its own independent timer.\n"
+            "Requires at least one completed backup before the first check fires."
+        )
+        _integ_note.setStyleSheet("color: #888; font-size: 11px;")
+        integ_layout.addWidget(_integ_note)
+        self._run_integrity_btn = QPushButton("🔍  Run Integrity Check Now")
+        self._run_integrity_btn.setToolTip(
+            "Immediately run an integrity check on all watches, bypassing the\n"
+            "scheduled interval. Useful after a restore or when troubleshooting."
+        )
+        self._run_integrity_btn.clicked.connect(self._trigger_integrity_check_now)
+        integ_layout.addWidget(self._run_integrity_btn)
+        gl.addWidget(integ_group)
+
+        # ── Global Scheduled Force-Full Backup ──────────────────────────────
+        ff_group = QGroupBox("Scheduled Force-Full Backup")
+        ff_layout = QVBoxLayout(ff_group)
+        ff_layout.setSpacing(8)
+        ff_row = QHBoxLayout()
+        ff_row.addWidget(QLabel("Force full backup every"))
+        self.force_full_global_spin = QSpinBox()
+        self.force_full_global_spin.setRange(0, 3650)
+        self.force_full_global_spin.setSuffix(" days  (0 = disabled)")
+        self.force_full_global_spin.setFixedWidth(160)
+        self.force_full_global_spin.setToolTip(
+            "Discard the incremental snapshot and run a full backup every N days "
+            "across all watches.  Individual watches can override this in their "
+            "own settings (Watch Settings → Force full every)."
+        )
+        ff_row.addWidget(self.force_full_global_spin)
+        ff_row.addStretch()
+        ff_layout.addLayout(ff_row)
+        _ff_note = QLabel(
+            "0 = disabled (default).  Set e.g. 7 to force a full backup weekly.\n"
+            "Per-watch overrides take priority; set −1 on a watch to exempt it."
+        )
+        _ff_note.setStyleSheet("color: #888; font-size: 11px;")
+        ff_layout.addWidget(_ff_note)
+        gl.addWidget(ff_group)
+
+        # ── Startup / Auto-launch ───────────────────────────────────────────
+        startup_group = QGroupBox("Startup")
         stl = QVBoxLayout(startup_group)
         self.startup_check = QCheckBox("Start with Windows (runs in background)")
         self.startup_check.stateChanged.connect(self._toggle_startup)
@@ -2630,24 +4275,18 @@ class AdminPanel(QDialog):
         thl.addWidget(QLabel("Choose a colour theme (takes effect immediately):"))
         theme_row = QHBoxLayout()
         _s_theme = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        _cur = _s_theme.value("theme", "")   # "", "dark", or "light"
-        self.theme_auto  = QRadioButton("Follow OS")
+        _cur = _s_theme.value("theme", "dark")   # "dark" or "light"
         self.theme_dark  = QRadioButton("Dark")
         self.theme_light = QRadioButton("Light")
-        # QButtonGroup ensures the three radio buttons are mutually exclusive
-        # even though they share a QVBoxLayout rather than a QGroupBox.
-        from PyQt5.QtWidgets import QButtonGroup
+        from PyQt6.QtWidgets import QButtonGroup
         self._theme_btn_group = QButtonGroup(self)
-        self._theme_btn_group.addButton(self.theme_auto)
         self._theme_btn_group.addButton(self.theme_dark)
         self._theme_btn_group.addButton(self.theme_light)
-        if _cur == "dark":
-            self.theme_dark.setChecked(True)
-        elif _cur == "light":
+        if _cur == "light":
             self.theme_light.setChecked(True)
         else:
-            self.theme_auto.setChecked(True)
-        for rb in (self.theme_auto, self.theme_dark, self.theme_light):
+            self.theme_dark.setChecked(True)
+        for rb in (self.theme_dark, self.theme_light):
             rb.toggled.connect(self._apply_theme)
             theme_row.addWidget(rb)
         theme_row.addStretch()
@@ -2670,18 +4309,29 @@ class AdminPanel(QDialog):
         )
         export_btn.clicked.connect(self._export_config)
         footer_row.addWidget(export_btn)
+
+        import_btn = QPushButton("📥 Import Config…")
+        import_btn.setObjectName("secondary")
+        import_btn.setToolTip(
+            "Load a previously exported config file and merge it into your current configuration.\n"
+            "Passwords will need to be re-entered."
+        )
+        import_btn.clicked.connect(self._import_config)
+        footer_row.addWidget(import_btn)
         footer_row.addStretch()
         gl.addLayout(footer_row)
 
-        general = QScrollArea()
+        self._general_scroll = QScrollArea()
+        general = self._general_scroll
         general.setWidget(general_inner)
         general.setWidgetResizable(True)
-        general.setFrameShape(QFrame.NoFrame)
-        general.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        general.setFrameShape(QFrame.Shape.NoFrame)
+        general.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         tabs.addTab(general, "General")
 
         # ── Tab 2: Watches ──────────────────────────────────────────────────
-        watches_tab = QWidget()
+        self._watches_tab = QWidget()
+        watches_tab = self._watches_tab
         wl = QVBoxLayout(watches_tab)
         wl.setContentsMargins(20, 20, 20, 20)
         wl.setSpacing(12)
@@ -2704,11 +4354,11 @@ class AdminPanel(QDialog):
             "Next Backup", "Runs", "Failed", "Size", "History", "Destination", "", ""
         ])
         for col in range(11):
-            self.watch_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        self.watch_table.horizontalHeader().setSectionResizeMode(1,  QHeaderView.Stretch)
-        self.watch_table.horizontalHeader().setSectionResizeMode(10, QHeaderView.Stretch)
-        self.watch_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.Fixed)
-        self.watch_table.horizontalHeader().setSectionResizeMode(12, QHeaderView.Fixed)
+            self.watch_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.watch_table.horizontalHeader().setSectionResizeMode(1,  QHeaderView.ResizeMode.Stretch)
+        self.watch_table.horizontalHeader().setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
+        self.watch_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Fixed)
+        self.watch_table.horizontalHeader().setSectionResizeMode(12, QHeaderView.ResizeMode.Fixed)
         self.watch_table.horizontalHeader().setMinimumSectionSize(60)
         self.watch_table.horizontalHeader().resizeSection(11, 90)
         self.watch_table.horizontalHeader().resizeSection(12, 110)  # was 80 — too narrow for "🗑 Remove"
@@ -2716,16 +4366,17 @@ class AdminPanel(QDialog):
         self.watch_table.viewport().setMouseTracking(True)
         self.watch_table.verticalHeader().setVisible(False)
         self.watch_table.verticalHeader().setDefaultSectionSize(44)
-        self.watch_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.watch_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.watch_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.watch_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.watch_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.watch_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.watch_table.setMinimumHeight(160)
         wl.addWidget(self.watch_table)
 
         tabs.addTab(watches_tab, "Watches")
 
         # ── Tab 3: Cloud ────────────────────────────────────────────────────
-        cloud_tab = QWidget()
+        self._cloud_tab = QWidget()
+        cloud_tab = self._cloud_tab
         cl = QVBoxLayout(cloud_tab)
         cl.setContentsMargins(20, 20, 20, 20)
         cl.setSpacing(16)
@@ -2756,6 +4407,10 @@ class AdminPanel(QDialog):
         self.gd_status_lbl = QLabel("Not connected")
         self.gd_status_lbl.setObjectName("status_err")
         gd_text.addWidget(self.gd_status_lbl)
+        self.gd_quota_lbl = QLabel("")
+        self.gd_quota_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.gd_quota_lbl.setVisible(False)
+        gd_text.addWidget(self.gd_quota_lbl)
         gd_layout.addLayout(gd_text, stretch=1)
 
         gd_btn_col = QVBoxLayout()
@@ -2763,6 +4418,15 @@ class AdminPanel(QDialog):
         self.gd_connect_btn.setObjectName("success")
         self.gd_connect_btn.clicked.connect(self._connect_gdrive)
         gd_btn_col.addWidget(self.gd_connect_btn)
+        self.gd_test_btn = QPushButton("Test Connection")
+        self.gd_test_btn.setObjectName("secondary")
+        self.gd_test_btn.setVisible(False)
+        self.gd_test_btn.setToolTip(
+            "Verify that the saved Google Drive token is still valid.\n"
+            "A silent token refresh is attempted automatically if it is about to expire."
+        )
+        self.gd_test_btn.clicked.connect(self._test_gdrive)
+        gd_btn_col.addWidget(self.gd_test_btn)
         self.gd_disconnect_btn = QPushButton("Disconnect")
         self.gd_disconnect_btn.setObjectName("danger")
         self.gd_disconnect_btn.setVisible(False)
@@ -2771,25 +4435,18 @@ class AdminPanel(QDialog):
         gd_layout.addLayout(gd_btn_col)
         cl.addWidget(gd_card)
 
-        # ── Assign cloud to watch ────────────────────────────────────────────
-        assign_group = QGroupBox("Assign Cloud to Watch")
+        # ── Assign cloud to watches (multi-select) ──────────────────────────────
+        assign_group = QGroupBox("Assign Cloud to Watches")
         agl = QFormLayout(assign_group)
 
-        self.cloud_watch_combo = QComboBox()
-        self.cloud_watch_combo.currentIndexChanged.connect(self._on_cloud_watch_changed)
-        agl.addRow("Watch:", self.cloud_watch_combo)
+        # Multi-watch checklist: check any number of watches; Save applies to all
+        self.cloud_watch_list = QListWidget()
+        self.cloud_watch_list.setFixedHeight(90)
+        self.cloud_watch_list.setToolTip("Check every watch that should upload to this GDrive folder.")
+        agl.addRow("Watches:", self.cloud_watch_list)
 
-        # Checkboxes for multi-cloud selection
-        self.chk_gdrive  = QCheckBox("Google Drive")
-        chk_row = QHBoxLayout()
-        chk_row.addWidget(self.chk_gdrive)
-        chk_row.addStretch()
-        chk_widget = QWidget()
-        chk_widget.setLayout(chk_row)
-        agl.addRow("Upload to:", chk_widget)
-
-        self.db_remote_path = QLineEdit()
-        self.db_remote_path.setPlaceholderText("/backups")
+        # Provider checkbox
+        # (Removed chk_gdrive checkbox and related row)
 
         self.gd_folder_id = QLineEdit()
         self.gd_folder_id.setPlaceholderText("Google Drive folder ID (leave blank for root)")
@@ -2808,7 +4465,7 @@ class AdminPanel(QDialog):
         gd_folder_widget.setLayout(gd_folder_row)
         agl.addRow("GDrive folder:", gd_folder_widget)
 
-        save_assign_btn = QPushButton("Save Assignment")
+        save_assign_btn = QPushButton("Save Assignment to All Checked Watches")
         save_assign_btn.setObjectName("success")
         save_assign_btn.clicked.connect(self._save_cloud)
         agl.addRow("", save_assign_btn)
@@ -2819,7 +4476,8 @@ class AdminPanel(QDialog):
         tabs.addTab(cloud_tab, "Cloud")
 
         # ── Tab 4: Notifications ────────────────────────────────────────────
-        notif_inner = QWidget()
+        self._notif_inner = QWidget()
+        notif_inner = self._notif_inner
         nl = QVBoxLayout(notif_inner)
         nl.setContentsMargins(20, 20, 20, 20)
         nl.setSpacing(16)
@@ -2856,7 +4514,7 @@ class AdminPanel(QDialog):
         egl.addRow("Username:", self.email_username)
 
         self.email_password = QLineEdit()
-        self.email_password.setEchoMode(QLineEdit.Password)
+        self.email_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.email_password.setPlaceholderText("App password or SMTP password")
         egl.addRow("Password:", self.email_password)
 
@@ -2895,7 +4553,9 @@ class AdminPanel(QDialog):
 
         webhook_note = QLabel(
             "Backup results are sent as JSON via HTTP POST.  Works with Slack, Discord,\n"
-            "Make/Zapier, or any custom API that accepts POST requests."
+            "Make/Zapier, or any custom API that accepts POST requests.\n"
+            "Each payload includes a machine_id field (this machine's hostname) "
+            "so you can distinguish events when multiple machines share the same webhook URL."
         )
         webhook_note.setStyleSheet("color:#94a3b8; font-size:11px;")
         webhook_note.setWordWrap(True)
@@ -2913,24 +4573,339 @@ class AdminPanel(QDialog):
         wgl.addRow("", webhook_btn_row)
 
         nl.addWidget(webhook_group)
+
+        # ── ntfy.sh Push Notifications section ──────────────────────────────
+        ntfy_group = QGroupBox("Push Notifications (ntfy.sh)")
+        ngl = QFormLayout(ntfy_group)
+        ngl.setSpacing(8)
+
+        self.ntfy_enabled_check = QCheckBox("Enable ntfy push notifications")
+        ngl.addRow("", self.ntfy_enabled_check)
+
+        self.ntfy_notify_success_check = QCheckBox("Send on successful backup")
+        ngl.addRow("", self.ntfy_notify_success_check)
+
+        self.ntfy_notify_failure_check = QCheckBox("Send on failed backup")
+        self.ntfy_notify_failure_check.setChecked(True)
+        ngl.addRow("", self.ntfy_notify_failure_check)
+
+        self.ntfy_server_input = QLineEdit()
+        self.ntfy_server_input.setPlaceholderText("https://ntfy.sh  (or your self-hosted URL)")
+        self.ntfy_server_input.setText("https://ntfy.sh")
+        ngl.addRow("Server URL:", self.ntfy_server_input)
+
+        self.ntfy_topic_input = QLineEdit()
+        self.ntfy_topic_input.setPlaceholderText("my-backupsys-alerts  (required)")
+        ngl.addRow("Topic:", self.ntfy_topic_input)
+
+        self.ntfy_token_input = QLineEdit()
+        self.ntfy_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ntfy_token_input.setPlaceholderText("Bearer token (optional — for protected topics)")
+        ngl.addRow("Auth Token:", self.ntfy_token_input)
+
+        self.ntfy_priority_combo = QComboBox()
+        for _p in ["min", "low", "default", "high", "urgent"]:
+            self.ntfy_priority_combo.addItem(_p)
+        self.ntfy_priority_combo.setCurrentText("default")
+        ngl.addRow("Priority:", self.ntfy_priority_combo)
+
+        ntfy_note = QLabel(
+            "Delivers instant push notifications to your phone via the free ntfy.sh service\n"
+            "or a self-hosted ntfy server.  Install the ntfy app (iOS / Android) and\n"
+            "subscribe to your topic to receive alerts.\n"
+            "Tip: use a hard-to-guess topic name as a lightweight secret."
+        )
+        ntfy_note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        ntfy_note.setWordWrap(True)
+        ngl.addRow("", ntfy_note)
+
+        ntfy_btn_row = QHBoxLayout()
+        save_ntfy_btn = QPushButton("Save Push Settings")
+        save_ntfy_btn.setObjectName("success")
+        save_ntfy_btn.clicked.connect(self._save_ntfy_settings)
+        test_ntfy_btn = QPushButton("Send Test Push")
+        test_ntfy_btn.setObjectName("secondary")
+        test_ntfy_btn.clicked.connect(self._test_ntfy)
+        ntfy_btn_row.addWidget(save_ntfy_btn)
+        ntfy_btn_row.addWidget(test_ntfy_btn)
+        ngl.addRow("", ntfy_btn_row)
+
+        nl.addWidget(ntfy_group)
+
+        # ── Telegram Bot Notifications section ──────────────────────────────
+        tg_group = QGroupBox("Telegram Bot Notifications")
+        tgl = QFormLayout(tg_group)
+        tgl.setSpacing(8)
+
+        self.tg_enabled_check = QCheckBox("Enable Telegram notifications")
+        tgl.addRow("", self.tg_enabled_check)
+
+        self.tg_notify_success_check = QCheckBox("Send on successful backup")
+        tgl.addRow("", self.tg_notify_success_check)
+
+        self.tg_notify_failure_check = QCheckBox("Send on failed backup")
+        self.tg_notify_failure_check.setChecked(True)
+        tgl.addRow("", self.tg_notify_failure_check)
+
+        self.tg_token_input = QLineEdit()
+        self.tg_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tg_token_input.setPlaceholderText("123456:ABC-DEFxxxxxxxxxxxxxxxxxxxxxxxx")
+        tgl.addRow("Bot Token:", self.tg_token_input)
+
+        self.tg_chat_id_input = QLineEdit()
+        self.tg_chat_id_input.setPlaceholderText("Your user ID or group/channel chat_id")
+        tgl.addRow("Chat ID:", self.tg_chat_id_input)
+
+        tg_note = QLabel(
+            "Get a bot token from @BotFather on Telegram (/newbot).\n"
+            "Find your chat_id by messaging @userinfobot on Telegram.\n"
+            "Works for private messages, groups, and channels."
+        )
+        tg_note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        tg_note.setWordWrap(True)
+        tgl.addRow("", tg_note)
+
+        tg_btn_row = QHBoxLayout()
+        save_tg_btn = QPushButton("Save Telegram Settings")
+        save_tg_btn.setObjectName("success")
+        save_tg_btn.clicked.connect(self._save_telegram_settings)
+        test_tg_btn = QPushButton("Send Test Message")
+        test_tg_btn.setObjectName("secondary")
+        test_tg_btn.clicked.connect(self._test_telegram)
+        tg_btn_row.addWidget(save_tg_btn)
+        tg_btn_row.addWidget(test_tg_btn)
+        tgl.addRow("", tg_btn_row)
+
+        nl.addWidget(tg_group)
+
+        # ── Pushover Notifications section ──────────────────────────────────
+        po_group = QGroupBox("Pushover Notifications")
+        pol = QFormLayout(po_group)
+        pol.setSpacing(8)
+
+        self.po_enabled_check = QCheckBox("Enable Pushover notifications")
+        pol.addRow("", self.po_enabled_check)
+
+        self.po_notify_success_check = QCheckBox("Send on successful backup")
+        pol.addRow("", self.po_notify_success_check)
+
+        self.po_notify_failure_check = QCheckBox("Send on failed backup")
+        self.po_notify_failure_check.setChecked(True)
+        pol.addRow("", self.po_notify_failure_check)
+
+        self.po_user_key_input = QLineEdit()
+        self.po_user_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.po_user_key_input.setPlaceholderText("Your Pushover user key")
+        pol.addRow("User Key:", self.po_user_key_input)
+
+        self.po_api_token_input = QLineEdit()
+        self.po_api_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.po_api_token_input.setPlaceholderText("Your application API token")
+        pol.addRow("API Token:", self.po_api_token_input)
+
+        self.po_device_input = QLineEdit()
+        self.po_device_input.setPlaceholderText("Device name (leave blank for all devices)")
+        pol.addRow("Device:", self.po_device_input)
+
+        self.po_priority_combo = QComboBox()
+        for _lbl, _val in [("Lowest (-2)", -2), ("Low / Quiet (-1)", -1),
+                            ("Normal (0)", 0), ("High (1)", 1)]:
+            self.po_priority_combo.addItem(_lbl, _val)
+        self.po_priority_combo.setCurrentIndex(2)   # Normal
+        pol.addRow("Failure Priority:", self.po_priority_combo)
+
+        po_note = QLabel(
+            "Register at pushover.net — free 30-day trial, then a one-time $5 per platform.\n"
+            "Create an application at pushover.net/apps/build to get an API token.\n"
+            "Priority 'High' will bypass Do Not Disturb on iOS/Android."
+        )
+        po_note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        po_note.setWordWrap(True)
+        pol.addRow("", po_note)
+
+        po_btn_row = QHBoxLayout()
+        save_po_btn = QPushButton("Save Pushover Settings")
+        save_po_btn.setObjectName("success")
+        save_po_btn.clicked.connect(self._save_pushover_settings)
+        test_po_btn = QPushButton("Send Test Push")
+        test_po_btn.setObjectName("secondary")
+        test_po_btn.clicked.connect(self._test_pushover)
+        po_btn_row.addWidget(save_po_btn)
+        po_btn_row.addWidget(test_po_btn)
+        pol.addRow("", po_btn_row)
+
+        nl.addWidget(po_group)
         nl.addStretch()
 
-        notif_scroll = QScrollArea()
+
+        self._notif_scroll = QScrollArea()
+        notif_scroll = self._notif_scroll
         notif_scroll.setWidgetResizable(True)
-        notif_scroll.setFrameShape(QScrollArea.NoFrame)
+        notif_scroll.setFrameShape(QFrame.Shape.NoFrame)
         notif_scroll.setWidget(notif_inner)
 
         tabs.addTab(notif_scroll, "Notifications")
 
+        # ── Tab 5: Logs ────────────────────────────────────────────────────────
+        logs_tab = QWidget()
+        ll = QVBoxLayout(logs_tab)
+        ll.setContentsMargins(12, 12, 12, 12)
+        ll.setSpacing(8)
+
+        # ── Toolbar ────────────────────────────────────────────────────────────
+        log_toolbar = QHBoxLayout()
+
+        self._log_filter_input = QLineEdit()
+        self._log_filter_input.setPlaceholderText("Filter logs…")
+        self._log_filter_input.setClearButtonEnabled(True)
+        self._log_filter_input.textChanged.connect(self._apply_log_filter)
+        log_toolbar.addWidget(self._log_filter_input, stretch=1)
+
+        self._log_tail_check = QCheckBox("Tail (follow)")
+        self._log_tail_check.setChecked(True)
+        log_toolbar.addWidget(self._log_tail_check)
+
+        log_refresh_btn = QPushButton("🔄 Refresh")
+        log_refresh_btn.setObjectName("secondary")
+        log_refresh_btn.clicked.connect(self._load_log_tab)
+        log_toolbar.addWidget(log_refresh_btn)
+
+        log_clear_btn = QPushButton("🗑 Clear Log")
+        log_clear_btn.setObjectName("secondary")
+        log_clear_btn.clicked.connect(self._clear_log_file)
+        log_toolbar.addWidget(log_clear_btn)
+
+        ll.addLayout(log_toolbar)
+
+        # ── Log viewer ─────────────────────────────────────────────────────────
+        self._log_viewer = QPlainTextEdit()
+        self._log_viewer.setReadOnly(True)
+        _log_font = QFont("Courier New" if sys.platform == "win32" else "Courier")
+        _log_font.setPointSize(9)
+        self._log_viewer.setFont(_log_font)
+        self._log_viewer.setStyleSheet("background:#0a0e18; color:#d1d5db; border:none; border-radius:6px;")
+        self._log_viewer.setMaximumBlockCount(5000)   # prevent memory blowup
+        ll.addWidget(self._log_viewer)
+
+        # ── Footer: file path + auto-refresh timer ─────────────────────────────
+        _log_data_dir = Path(os.environ.get("BACKUPSYS_DATA_DIR", Path(__file__).parent))
+        self._log_file_path = _log_data_dir / "logs" / "backupsys.log"
+        log_path_lbl = QLabel(str(self._log_file_path))
+        log_path_lbl.setStyleSheet("color:#6b7280; font-size:10px;")
+        ll.addWidget(log_path_lbl)
+
+        # Poll every 3 s so the tab stays fresh without blocking the UI
+        self._log_poll_timer = QTimer(self)
+        self._log_poll_timer.setInterval(3000)
+        self._log_poll_timer.timeout.connect(self._poll_log_file)
+        self._log_last_mtime = 0.0
+        self._log_raw_lines: list = []   # unfiltered lines cache
+
+        # Start polling when the Logs tab is visible; stop otherwise
+        self._tabs.currentChanged.connect(self._on_tab_changed_log_poll)
+
+        tabs.addTab(logs_tab, "Logs")
+
+        # ── Tab 6: SSH Keys ────────────────────────────────────────────────────
+        ssh_tab = QWidget()
+        ssh_l = QVBoxLayout(ssh_tab)
+        ssh_l.setContentsMargins(20, 20, 20, 20)
+        ssh_l.setSpacing(14)
+
+        # Key generation group
+        keygen_group = QGroupBox("SSH Key Pair")
+        keygen_layout = QVBoxLayout(keygen_group)
+        keygen_layout.setSpacing(8)
+
+        keygen_info = QLabel(
+            "BackupSys can generate an Ed25519 key pair for password-less SFTP authentication. "
+            "The private key is saved to <code>~/.backupsys_keys/id_ed25519</code> and used "
+            "automatically when no password is entered in the SFTP settings."
+        )
+        keygen_info.setTextFormat(Qt.TextFormat.RichText)
+        keygen_info.setWordWrap(True)
+        keygen_info.setStyleSheet("color:#94a3b8; font-size:11px;")
+        keygen_layout.addWidget(keygen_info)
+
+        keygen_btn_row = QHBoxLayout()
+        self._keygen_btn = QPushButton("⚡ Generate Ed25519 Key Pair")
+        self._keygen_btn.setObjectName("secondary")
+        self._keygen_btn.clicked.connect(self._generate_ssh_key)
+        keygen_btn_row.addWidget(self._keygen_btn)
+        keygen_btn_row.addStretch()
+        keygen_layout.addLayout(keygen_btn_row)
+
+        self._pubkey_edit = QPlainTextEdit()
+        self._pubkey_edit.setReadOnly(True)
+        self._pubkey_edit.setPlaceholderText("No key generated yet — click Generate above.")
+        self._pubkey_edit.setMaximumHeight(72)
+        self._pubkey_edit.setStyleSheet(
+            "background:#0f172a; color:#a3e635; font-family:monospace; font-size:11px; border-radius:4px;"
+        )
+        keygen_layout.addWidget(self._pubkey_edit)
+
+        copy_key_btn = QPushButton("📋 Copy Public Key")
+        copy_key_btn.setObjectName("secondary")
+        copy_key_btn.clicked.connect(self._copy_public_key)
+        keygen_layout.addWidget(copy_key_btn)
+
+        ssh_l.addWidget(keygen_group)
+
+        # Known-hosts management group
+        hosts_group = QGroupBox("Trusted Host Fingerprints  (~/.backupsys_known_hosts)")
+        hosts_layout = QVBoxLayout(hosts_group)
+        hosts_layout.setSpacing(6)
+
+        hosts_info = QLabel(
+            "On first SFTP connection BackupSys trusts the server automatically (TOFU). "
+            "Remove a host entry here to force re-verification on the next connection."
+        )
+        hosts_info.setWordWrap(True)
+        hosts_info.setStyleSheet("color:#94a3b8; font-size:11px;")
+        hosts_layout.addWidget(hosts_info)
+
+        self._known_hosts_table = QTableWidget(0, 3)
+        self._known_hosts_table.setHorizontalHeaderLabels(["Host", "Key Type", "Fingerprint (SHA-256)"])
+        self._known_hosts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self._known_hosts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._known_hosts_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._known_hosts_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._known_hosts_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._known_hosts_table.setMaximumHeight(200)
+        hosts_layout.addWidget(self._known_hosts_table)
+
+        hosts_btn_row = QHBoxLayout()
+        refresh_hosts_btn = QPushButton("↻ Refresh")
+        refresh_hosts_btn.setObjectName("secondary")
+        refresh_hosts_btn.clicked.connect(self._load_known_hosts)
+        remove_host_btn = QPushButton("🗑 Remove Selected")
+        remove_host_btn.setObjectName("danger")
+        remove_host_btn.clicked.connect(self._remove_selected_known_host)
+        hosts_btn_row.addWidget(refresh_hosts_btn)
+        hosts_btn_row.addWidget(remove_host_btn)
+        hosts_btn_row.addStretch()
+        hosts_layout.addLayout(hosts_btn_row)
+
+        ssh_l.addWidget(hosts_group)
+        ssh_l.addStretch()
+
+        tabs.addTab(ssh_tab, "SSH Keys")
+        # Populate known-hosts and existing key (if any) immediately
+        QTimer.singleShot(0, self._load_known_hosts)
+        QTimer.singleShot(0, self._refresh_pubkey_display)
+
         layout.addWidget(tabs)
 
-    def _on_dest_type_changed(self, idx):
+    def _on_dest_type_changed(self, idx: int) -> None:
+        """Show/hide destination sub-panels based on combo selection."""
         self.dest_local_widget.setVisible(idx == 0)
         self.dest_smb_widget.setVisible(idx == 1)
         self.dest_sftp_widget.setVisible(idx == 2)
         self.dest_ftp_widget.setVisible(idx == 3 or idx == 4)
         self.dest_https_widget.setVisible(idx == 5)
-        self.dest_webdav_widget.setVisible(idx == 6)
+        self.dest_rclone_widget.setVisible(idx == 6)
+        self.dest_webdav_widget.setVisible(idx == 7)
+        self.dest_gdrive_widget.setVisible(idx == 8)
 
     def _browse_dest(self):
         path = QFileDialog.getExistingDirectory(self, "Select Backup Destination")
@@ -2958,7 +4933,309 @@ class AdminPanel(QDialog):
                 f"Successfully connected to:\n{cfg['path']}")
         else:
             QMessageBox.critical(self, "SMB  ·  Failed",
-                f"Could not connect:\n\n{result.get('error', 'Unknown error')}")
+                f"Could not connect:\n\n{result.get('message', 'Unknown error')}")
+
+    def _test_rclone(self):
+        cfg = {
+            "remote": self.rclone_remote.text().strip(),
+            "path": self.rclone_path.text().strip(),
+        }
+        if not cfg["remote"]:
+            QMessageBox.warning(self, "Missing", "Please enter an rclone remote name first.")
+            return
+        try:
+            from transport_utils import test_rclone_connection
+            result = test_rclone_connection(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "rclone Test Failed", str(e))
+            return
+        if result.get("ok"):
+            QMessageBox.information(self, "rclone  ·  Connected ✓",
+                f"{result.get('message', 'rclone can access the remote')}")
+        else:
+            QMessageBox.critical(self, "rclone  ·  Failed",
+                f"Could not connect:\n\n{result.get('message', 'Unknown error')}")
+
+    # ── rclone wizard helpers ──────────────────────────────────────────────
+
+    def _detect_rclone_remotes(self):
+        """Run 'rclone listremotes' and populate the picker combo."""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["rclone", "listremotes"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except FileNotFoundError:
+            QMessageBox.critical(
+                self, "rclone not found",
+                "rclone is not installed or not on PATH.\n\n"
+                "Download it from https://rclone.org/downloads/ and re-try.",
+            )
+            return
+        except subprocess.TimeoutExpired:
+            QMessageBox.warning(self, "Timeout", "rclone listremotes timed out after 10 s.")
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
+            return
+
+        remotes = [r.rstrip(":").strip() for r in proc.stdout.splitlines() if r.strip()]
+        if not remotes:
+            QMessageBox.information(
+                self, "No remotes found",
+                "rclone reported no configured remotes.\n\n"
+                "Click '⚙ rclone config…' to add one.",
+            )
+            return
+
+        self.rclone_picker_combo.clear()
+        self.rclone_picker_combo.addItems(remotes)
+        # Pre-select the currently configured remote if it's in the list
+        current = self.rclone_remote.text().strip()
+        if current in remotes:
+            self.rclone_picker_combo.setCurrentText(current)
+
+    def _on_rclone_picker_changed(self, text: str):
+        """Fill the Remote name field when the user picks from the combo."""
+        if text:
+            self.rclone_remote.setText(text)
+
+    def _launch_rclone_config(self):
+        """Open a terminal running 'rclone config' so the user can add providers."""
+        import subprocess, sys
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(
+                    ["cmd.exe", "/k", "rclone config"],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            elif sys.platform == "darwin":
+                subprocess.Popen(
+                    ["open", "-a", "Terminal", "--args", "rclone", "config"]
+                )
+            else:
+                for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+                    try:
+                        subprocess.Popen([term, "-e", "rclone config"])
+                        break
+                    except FileNotFoundError:
+                        continue
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Could not open terminal",
+                f"Please open a terminal manually and run:\n    rclone config\n\nError: {exc}",
+            )
+
+    # ── SSH key management helpers ─────────────────────────────────────────
+
+    def _ssh_keys_dir(self):
+        return Path.home() / ".backupsys_keys"
+
+    def _ssh_privkey_path(self):
+        return self._ssh_keys_dir() / "id_ed25519"
+
+    def _ssh_pubkey_path(self):
+        return self._ssh_keys_dir() / "id_ed25519.pub"
+
+    def _refresh_pubkey_display(self):
+        pubkey_path = self._ssh_pubkey_path()
+        if pubkey_path.exists():
+            try:
+                self._pubkey_edit.setPlainText(pubkey_path.read_text(encoding="utf-8").strip())
+            except Exception:
+                pass
+
+    def _generate_ssh_key(self):
+        """Generate an Ed25519 SSH key pair into ~/.backupsys_keys/."""
+        keys_dir = self._ssh_keys_dir()
+        privkey  = self._ssh_privkey_path()
+        pubkey   = self._ssh_pubkey_path()
+
+        if privkey.exists():
+            ans = QMessageBox.question(
+                self, "Key already exists",
+                f"A key already exists at:\n{privkey}\n\nOverwrite it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            import paramiko
+        except ImportError:
+            QMessageBox.critical(
+                self, "paramiko not installed",
+                "Install paramiko to use SSH key generation:\n    pip install paramiko",
+            )
+            return
+
+        try:
+            keys_dir.mkdir(parents=True, exist_ok=True)
+            key = paramiko.Ed25519Key.generate()
+            key.write_private_key_file(str(privkey))
+            pub_line = f"ssh-ed25519 {key.get_base64()} backupsys@{socket.gethostname()}"
+            pubkey.write_text(pub_line + "\n", encoding="utf-8")
+            self._pubkey_edit.setPlainText(pub_line)
+            QMessageBox.information(
+                self, "Key generated ✓",
+                f"Ed25519 key pair created.\n\nPrivate key: {privkey}\nPublic key:  {pubkey}\n\n"
+                "Copy the public key and add it to ~/.ssh/authorized_keys on your SFTP server.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Key generation failed", str(exc))
+
+    def _copy_public_key(self):
+        text = self._pubkey_edit.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, "Nothing to copy", "Generate a key pair first.")
+            return
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Copied", "Public key copied to clipboard.")
+
+    def _load_known_hosts(self):
+        """Load ~/.backupsys_known_hosts into the table widget."""
+        import hashlib, base64
+        self._known_hosts_table.setRowCount(0)
+        kh_path = Path.home() / ".backupsys_known_hosts"
+        if not kh_path.exists():
+            return
+        try:
+            with open(kh_path, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        except Exception:
+            return
+
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            host_id, key_type, key_b64 = parts[0], parts[1], parts[2]
+            try:
+                raw = base64.b64decode(key_b64)
+                sha256 = base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+                fingerprint = f"SHA256:{sha256}"
+            except Exception:
+                fingerprint = "(invalid)"
+            row = self._known_hosts_table.rowCount()
+            self._known_hosts_table.insertRow(row)
+            self._known_hosts_table.setItem(row, 0, QTableWidgetItem(host_id))
+            self._known_hosts_table.setItem(row, 1, QTableWidgetItem(key_type))
+            self._known_hosts_table.setItem(row, 2, QTableWidgetItem(fingerprint))
+
+    def _remove_selected_known_host(self):
+        """Remove the selected host entry from ~/.backupsys_known_hosts."""
+        rows = self._known_hosts_table.selectedItems()
+        if not rows:
+            QMessageBox.information(self, "No selection", "Select a row to remove.")
+            return
+        row_idx = self._known_hosts_table.currentRow()
+        host_id = self._known_hosts_table.item(row_idx, 0).text()
+
+        ans = QMessageBox.question(
+            self, "Remove host?",
+            f"Remove trusted fingerprint for:\n  {host_id}\n\n"
+            "BackupSys will re-verify on the next SFTP connection.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        kh_path = Path.home() / ".backupsys_known_hosts"
+        try:
+            lines = kh_path.read_text(encoding="utf-8").splitlines(keepends=True)
+            kept  = [l for l in lines if not l.startswith(host_id + " ") and not l.startswith(host_id + ",")]
+            kh_path.write_text("".join(kept), encoding="utf-8")
+            self._known_hosts_table.removeRow(row_idx)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error removing host", str(exc))
+
+    def _browse_smb_network(self):
+        def parse_net_view_hosts(output: str) -> list:
+            hosts = []
+            for line in output.splitlines():
+                line = line.strip()
+                if line.startswith("\\\\"):
+                    token = line.split()[0]
+                    if token.startswith("\\\\"):
+                        host = token.lstrip("\\")
+                        if host and host not in hosts:
+                            hosts.append(host)
+            return hosts
+
+        def parse_net_view_shares(output: str, host: str) -> list:
+            shares = []
+            for line in output.splitlines():
+                line = line.strip()
+                if not line.startswith("\\\\"):
+                    continue
+                token = line.split()[0]
+                if token.startswith("\\\\"):
+                    path = token[len(f"\\\\{host}\\"):]
+                    if path and path not in shares:
+                        shares.append(path)
+            return shares
+
+        try:
+            proc = subprocess.run(["net", "view"], capture_output=True, text=True, timeout=10)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or "Failed to enumerate network computers")
+            hosts = parse_net_view_hosts(proc.stdout)
+            if not hosts:
+                raise RuntimeError("No hosts")
+        except Exception:
+            QMessageBox.warning(self, "Browse Network", "No network computers found. Enter the server and share name manually.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Browse Network")
+        dlg.setModal(True)
+        dlg.setMinimumSize(420, 320)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Select a network computer:"))
+        host_list = QListWidget()
+        host_list.addItems(hosts)
+        host_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        layout.addWidget(host_list)
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.button(QDialogButtonBox.StandardButton.Ok).setText("Next")
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        layout.addWidget(btn_box)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not host_list.selectedItems():
+            return
+
+        selected_host = host_list.selectedItems()[0].text()
+        try:
+            proc = subprocess.run(["net", "view", f"\\\\{selected_host}"], capture_output=True, text=True, timeout=10)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or "Failed to enumerate shares")
+            shares = parse_net_view_shares(proc.stdout, selected_host)
+            if not shares:
+                raise RuntimeError("No shares")
+        except Exception:
+            QMessageBox.warning(self, "Browse Network", "No network computers found. Enter the server and share name manually.")
+            return
+
+        dlg2 = QDialog(self)
+        dlg2.setWindowTitle("Select SMB Share")
+        dlg2.setModal(True)
+        dlg2.setMinimumSize(420, 320)
+        layout2 = QVBoxLayout(dlg2)
+        layout2.addWidget(QLabel(f"Select a share on \\\\{selected_host}:"))
+        share_list = QListWidget()
+        share_list.addItems(shares)
+        share_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        layout2.addWidget(share_list)
+        btn_box2 = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box2.accepted.connect(dlg2.accept)
+        btn_box2.rejected.connect(dlg2.reject)
+        layout2.addWidget(btn_box2)
+        if dlg2.exec() != QDialog.DialogCode.Accepted or not share_list.selectedItems():
+            return
+
+        selected_share = share_list.selectedItems()[0].text()
+        self.dest_smb_path.setText(f"\\\\{selected_host}\\{selected_share}")
 
     def _test_sftp(self):
         cfg = {
@@ -2984,7 +5261,7 @@ class AdminPanel(QDialog):
                 f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
         else:
             QMessageBox.critical(self, "SFTP  ·  Failed",
-                f"Could not connect:\n\n{result.get('error', 'Unknown error')}")
+                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
 
     def _test_ftp(self):
         cfg = {
@@ -3008,7 +5285,7 @@ class AdminPanel(QDialog):
                 f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
         else:
             QMessageBox.critical(self, "FTP  ·  Failed",
-                f"Could not connect:\n\n{result.get('error', 'Unknown error')}")
+                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
 
     def _test_https(self):
         cfg = {
@@ -3030,7 +5307,7 @@ class AdminPanel(QDialog):
                 f"Endpoint reachable:\n{cfg['url']}\n\nHTTP status: {result.get('status_code', 'n/a')}")
         else:
             QMessageBox.critical(self, "HTTPS  ·  Failed",
-                f"Could not reach endpoint:\n\n{result.get('error', 'Unknown error')}")
+                f'Could not reach endpoint:\n\n{result.get("error", "Unknown error")}')
 
     def _test_webdav(self):
         cfg = {
@@ -3055,11 +5332,23 @@ class AdminPanel(QDialog):
                 "PROPFIND succeeded — credentials and URL are correct.")
         else:
             QMessageBox.critical(self, "WebDAV  ·  Failed",
-                f"Could not connect:\n\n{result.get('error', 'Unknown error')}\n\n"
+                f'Could not connect:\n\n{result.get("error", "Unknown error")}\n\n'
                 "Tips:\n"
                 "• Nextcloud DAV root: /remote.php/dav/files/<USERNAME>/\n"
                 "• ownCloud DAV root: /remote.php/webdav/\n"
                 "• Plain WebDAV: leave DAV root empty")
+
+    def _trigger_integrity_check_now(self):
+        """Delegate integrity check to the MainWindow instance (parent)."""
+        main_win = self.parent()
+        if main_win is not None and hasattr(main_win, "_trigger_integrity_check_now"):
+            main_win._trigger_integrity_check_now()
+        else:
+            QMessageBox.information(
+                self, "Integrity Check",
+                "Could not reach the main window to trigger an integrity check.\n"
+                "Please use the tray menu or restart the application."
+            )
 
     def _on_interval_unit_changed(self, idx):
         # Keep interval limits reasonable for seconds mode
@@ -3068,10 +5357,23 @@ class AdminPanel(QDialog):
         else:
             self.interval_spin.setRange(1, 60)
         self.interval_spin.setSuffix("")
+        # Show a prominent warning when seconds (test-only) mode is active
+        self.seconds_warning_label.setVisible(idx == 1)
 
     def _load_values(self):
         dtype   = self.cfg.get("dest_type", "local")
-        idx_map = {"local": 0, "smb": 1, "sftp": 2, "ftps": 3, "ftp": 4, "https": 5}
+        idx_map = {
+            "local": 0,
+            "smb": 1,
+            "sftp": 2,
+            "ftps": 3,
+            "ftp": 4,
+            "https": 5,
+            "rclone": 6,
+            "webdav": 7,
+            "cloud":  8,
+            "gdrive": 8,
+        }
         idx     = idx_map.get(dtype, 0)
         self.dest_type_combo.setCurrentIndex(idx)
         self._on_dest_type_changed(idx)
@@ -3089,6 +5391,9 @@ class AdminPanel(QDialog):
         self.sftp_path.setText(sftp.get("path", ""))
         self.sftp_keyfile.setText(sftp.get("keyfile", ""))
         self.sftp_key_pass.setText(sftp.get("key_pass", ""))
+        rclone = self.cfg.get("dest_rclone", {})
+        self.rclone_remote.setText(rclone.get("remote", ""))
+        self.rclone_path.setText(rclone.get("path", "/backups"))
         ftp = self.cfg.get("dest_ftp", {})
         self.ftp_host.setText(ftp.get("host", ""))
         self.ftp_port.setValue(ftp.get("port", 21))
@@ -3106,31 +5411,43 @@ class AdminPanel(QDialog):
         self.webdav_path.setText(wdv.get("remote_path", "/backups"))
         self.webdav_root.setText(wdv.get("webdav_root", ""))
         self.webdav_ssl.setChecked(wdv.get("verify_ssl", True))
-        # Sync dest_type combo to 6 for webdav
+        # Sync dest_type combo for webdav and cloud/gdrive
         _dt = self.cfg.get("dest_type", "local")
         if _dt == "webdav":
-            self.dest_type_combo.setCurrentIndex(6)
+            self.dest_type_combo.setCurrentIndex(7)
+        elif _dt == "gdrive":
+            self.dest_type_combo.setCurrentIndex(8)
         self.auto_check.setChecked(self.cfg.get("auto_backup", False))
         unit = self.cfg.get("interval_unit", "minutes")
         self.interval_unit.setCurrentIndex(1 if unit == "seconds" else 0)
         self._on_interval_unit_changed(1 if unit == "seconds" else 0)
         self.interval_spin.setValue(self.cfg.get("interval_min", 30))
         self.retention_spin.setValue(self.cfg.get("retention_days", 0))
-        # Scheduled backup times  · display as comma-separated "HH:MM" string
+        # Scheduled backup times
         sched = self.cfg.get("backup_schedule_times", [])
-        self.schedule_times_input.setText(", ".join(sched) if sched else "")
+        self.schedule_times_widget.set_entries(sched)
+        self.backup_window_start_input.setText(self.cfg.get("backup_window_start", ""))
         self.backup_window_end_input.setText(self.cfg.get("backup_window_end", ""))
         try:
             bw_val = float(self.cfg.get("max_backup_mbps", 0.0))
             self.bw_spin.setValue(bw_val)
         except Exception:
             pass
+        # Load bandwidth schedule
+        self._populate_bandwidth_schedule(self.cfg.get("bandwidth_schedule", []))
         try:
             self.idle_spin.setValue(int(self.cfg.get("idle_threshold_cpu", 0)))
         except Exception:
             pass
+        self.metered_check.setChecked(self.cfg.get("pause_on_metered", False))
+        self.battery_check.setChecked(self.cfg.get("pause_on_battery", False))
+        self.verify_remote_cb.setChecked(self.cfg.get("verify_remote_uploads", False))
+        self.verify_after_cb.setChecked(self.cfg.get("verify_after", False))
         self.retry_check.setChecked(self.cfg.get("auto_retry", False))
         self.retry_delay_spin.setValue(int(self.cfg.get("retry_delay_min", 5)))
+        self.integrity_enabled_cb.setChecked(self.cfg.get("integrity_check_enabled", False))
+        self.integrity_interval_spin.setValue(int(self.cfg.get("integrity_check_interval_days", 7)))
+        self.force_full_global_spin.setValue(int(self.cfg.get("force_full_interval_days", 0)))
         self.startup_check.setChecked(self._is_startup_enabled())
         self._refresh_watch_table()
         self._refresh_cloud_combo()
@@ -3149,39 +5466,75 @@ class AdminPanel(QDialog):
         self.email_to.setText(ec.get("to_addr", ""))
         self.webhook_url_input.setText(self.cfg.get("webhook_url", ""))
         self.webhook_success_only.setChecked(self.cfg.get("webhook_on_success", False))
+        # Load ntfy settings
+        nc = self.cfg.get("ntfy_config", {})
+        self.ntfy_enabled_check.setChecked(nc.get("enabled", False))
+        self.ntfy_notify_success_check.setChecked(nc.get("notify_on_success", False))
+        self.ntfy_notify_failure_check.setChecked(nc.get("notify_on_failure", True))
+        self.ntfy_server_input.setText(nc.get("server", "https://ntfy.sh"))
+        self.ntfy_topic_input.setText(nc.get("topic", ""))
+        self.ntfy_token_input.setText(nc.get("token", ""))
+        _ntfy_pri = nc.get("priority", "default")
+        _ntfy_pri_idx = self.ntfy_priority_combo.findText(_ntfy_pri)
+        if _ntfy_pri_idx >= 0:
+            self.ntfy_priority_combo.setCurrentIndex(_ntfy_pri_idx)
+
+        # Load Telegram settings
+        tc = self.cfg.get("telegram_config", {})
+        self.tg_enabled_check.setChecked(tc.get("enabled", False))
+        self.tg_notify_success_check.setChecked(tc.get("notify_on_success", False))
+        self.tg_notify_failure_check.setChecked(tc.get("notify_on_failure", True))
+        self.tg_token_input.setText(tc.get("bot_token", ""))
+        self.tg_chat_id_input.setText(str(tc.get("chat_id", "")))
+
+        # Load Pushover settings
+        pc = self.cfg.get("pushover_config", {})
+        self.po_enabled_check.setChecked(pc.get("enabled", False))
+        self.po_notify_success_check.setChecked(pc.get("notify_on_success", False))
+        self.po_notify_failure_check.setChecked(pc.get("notify_on_failure", True))
+        self.po_user_key_input.setText(pc.get("user_key", ""))
+        self.po_api_token_input.setText(pc.get("api_token", ""))
+        self.po_device_input.setText(pc.get("device", ""))
+        _po_pri = int(pc.get("priority", 0))
+        for _i in range(self.po_priority_combo.count()):
+            if self.po_priority_combo.itemData(_i) == _po_pri:
+                self.po_priority_combo.setCurrentIndex(_i)
+                break
+
 
     def _refresh_cloud_combo(self):
-        self.cloud_watch_combo.blockSignals(True)
-        self.cloud_watch_combo.clear()
+        """Populate the multi-select watch checklist.
+        Pre-checks any watch that already has a GDrive cloud_config assigned,
+        and pre-fills the GDrive folder ID from the first assigned watch found.
+        """
+        self.cloud_watch_list.clear()
+        first_gdrive_folder = ""
         for w in self.cfg.get("watches", []):
-            self.cloud_watch_combo.addItem(w.get("name", w["id"]), w["id"])
-        self.cloud_watch_combo.blockSignals(False)
-        self._on_cloud_watch_changed()
+            item = QListWidgetItem(w.get("name", w["id"]))
+            item.setData(Qt.ItemDataRole.UserRole, w["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            # Pre-check if this watch already has GDrive assigned
+            configs = w.get("cloud_configs", [])
+            if not configs and w.get("cloud_config", {}).get("provider") == "gdrive":
+                configs = [w["cloud_config"]]
+            has_gdrive = any(c.get("provider") == "gdrive" and c.get("access_token") for c in configs)
+            item.setCheckState(Qt.CheckState.Checked if has_gdrive else Qt.CheckState.Unchecked)
+            if has_gdrive and not first_gdrive_folder:
+                for c in configs:
+                    if c.get("provider") == "gdrive":
+                        first_gdrive_folder = c.get("folder_id", "")
+                        break
+            self.cloud_watch_list.addItem(item)
+        # Pre-fill folder ID from the first watch that already has GDrive
+        if first_gdrive_folder and hasattr(self, "gd_folder_id"):
+            self.gd_folder_id.setText(first_gdrive_folder)
+
+        # (Removed chk_gdrive logic; all watches with GDrive are shown in checklist)
+
 
     def _on_cloud_watch_changed(self):
-        idx = self.cloud_watch_combo.currentIndex()
-        if idx < 0:
-            return
-        wid   = self.cloud_watch_combo.itemData(idx)
-        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
-        if not watch:
-            return
-
-        # Support both old single cloud_config and new cloud_configs list
-        configs   = watch.get("cloud_configs", [])
-        old_cfg   = watch.get("cloud_config", {})
-        if not configs and old_cfg:
-            configs = [old_cfg]
-
-        providers = {c.get("provider") for c in configs}
-        if hasattr(self, "chk_gdrive"):
-            self.chk_gdrive.setChecked("gdrive" in providers)
-
-        # Populate fields from existing configs
-        for c in configs:
-                self.db_remote_path.setText(c.get("remote_path", "/backups"))
-                if c.get("provider") == "gdrive" and hasattr(self, "gd_folder_id"):
-                        self.gd_folder_id.setText(c.get("folder_id", ""))
+        """No-op — replaced by multi-select checklist (_refresh_cloud_combo)."""
+        pass
 
     def _on_cloud_provider_ui_changed(self, provider: str):
         """Kept for backward compatibility  · no-op since we now use checkboxes."""
@@ -3235,19 +5588,18 @@ class AdminPanel(QDialog):
 
     @property
     def GDRIVE_CLIENT_ID(self):
-        return self._load_env_credentials()["GDRIVE_CLIENT_ID"]
+        return self._gdrive_client_id
 
     @property
     def GDRIVE_CLIENT_SECRET(self):
-        return self._load_env_credentials()["GDRIVE_CLIENT_SECRET"]
+        return self._gdrive_client_secret
 
     def _connect_gdrive(self):
         """Open browser for Google OAuth, catch callback on localhost."""
         import urllib.parse, threading, webbrowser
         from http.server import HTTPServer, BaseHTTPRequestHandler
 
-        REDIRECT_URI = "http://localhost:8765/oauth/gdrive"
-        SCOPES       = "https://www.googleapis.com/auth/drive.file"
+        SCOPES = "https://www.googleapis.com/auth/drive.file"
 
         client_id = self.GDRIVE_CLIENT_ID
         if not client_id:
@@ -3270,21 +5622,7 @@ class AdminPanel(QDialog):
             )
             return
 
-        params = {
-            "client_id":     client_id,
-            "redirect_uri":  REDIRECT_URI,
-            "response_type": "code",
-            "scope":         SCOPES,
-            "access_type":   "offline",
-            "prompt":        "consent",
-        }
-        url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
-
-        self.gd_connect_btn.setText("Waiting for login…")
-        self.gd_connect_btn.setEnabled(False)
-        webbrowser.open(url)
-
-        # Use a result queue so background thread can pass result safely
+        # Use a result dict so the background thread can pass the code back safely.
         self._gdrive_result = {}
 
         class _Handler(BaseHTTPRequestHandler):
@@ -3307,9 +5645,41 @@ class AdminPanel(QDialog):
                     self._gdrive_result["error"] = "No code returned"
             def log_message(self, *a): pass
 
+        # Bind to port 0 so the OS picks any free port — eliminates the
+        # "address already in use" failure that occurred with the old hardcoded
+        # port 8765.  Binding is synchronous, so the actual port is available
+        # immediately; only handle_request() blocks (done inside the thread).
+        try:
+            srv = HTTPServer(("localhost", 0), _Handler)
+        except Exception as e:
+            QMessageBox.critical(self, "Google Drive",
+                f"Could not start local OAuth server:\n{e}\n\n"
+                "Try again or check your firewall settings.")
+            return
+
+        actual_port = srv.server_address[1]
+        REDIRECT_URI = f"http://localhost:{actual_port}/oauth/gdrive"
+        # Stored on self so _poll_gdrive_result can pass the exact URI to the
+        # token exchange — Google rejects any mismatch between authorize and
+        # token calls.
+        self._gdrive_redirect_uri = REDIRECT_URI
+
+        params = {
+            "client_id":     client_id,
+            "redirect_uri":  REDIRECT_URI,
+            "response_type": "code",
+            "scope":         SCOPES,
+            "access_type":   "offline",
+            "prompt":        "consent",
+        }
+        url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+
+        self.gd_connect_btn.setText("Waiting for login…")
+        self.gd_connect_btn.setEnabled(False)
+        webbrowser.open(url)
+
         def _serve():
             try:
-                srv = HTTPServer(("localhost", 8765), _Handler)
                 srv.timeout = 180
                 srv.handle_request()
                 srv.server_close()
@@ -3336,7 +5706,7 @@ class AdminPanel(QDialog):
         elif "code" in self._gdrive_result:
             self._gdrive_poll_timer.stop()
             code = self._gdrive_result.pop("code")
-            self._exchange_gdrive_code(code, "http://localhost:8765/oauth/gdrive")
+            self._exchange_gdrive_code(code, self._gdrive_redirect_uri)
 
     def _exchange_gdrive_code(self, code: str, redirect_uri: str):
         """Exchange auth code for access + refresh tokens."""
@@ -3380,13 +5750,125 @@ class AdminPanel(QDialog):
                 config_manager.save(self.cfg)
             except Exception:
                 pass
-        self.gd_status_lbl.setText("▶  Connected")
+
+        # Show a placeholder label immediately so the UI updates without waiting
+        # for the userinfo network call.
+        self.gd_status_lbl.setText("✓ Connected")
         self.gd_status_lbl.setObjectName("status_ok")
         self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
         self.gd_status_lbl.style().polish(self.gd_status_lbl)
         self.gd_connect_btn.setVisible(False)
+        self.gd_test_btn.setVisible(True)
         self.gd_disconnect_btn.setVisible(True)
         QMessageBox.information(self, "Google Drive", "Google Drive connected successfully!")
+
+        # Fetch the connected account email in the background so the status
+        # label updates to "✓ Connected as you@gmail.com" without blocking the UI.
+        import threading, urllib.request as _ur, json as _json
+        def _fetch_email():
+            try:
+                req  = _ur.Request(
+                    f"https://www.googleapis.com/oauth2/v1/userinfo"
+                    f"?access_token={_access}"
+                )
+                info  = _json.loads(_ur.urlopen(req, timeout=10).read())
+                email = info.get("email", "").strip()
+                if email:
+                    _s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+                    _s.setValue("gdrive_email", email)
+                    QTimer.singleShot(0, lambda e=email: self._set_gdrive_status_label(e))
+            except Exception:
+                pass  # Non-fatal — label stays "✓ Connected"
+        threading.Thread(target=_fetch_email, daemon=True).start()
+
+        # Run a silent write+delete test ~1.5 s after the panel settles so the
+        # user sees a warning immediately if the Drive scope was not granted,
+        # rather than discovering it only when the first real backup fails.
+        QTimer.singleShot(1500, lambda: self._auto_test_gdrive_write(_access))
+
+    def _auto_test_gdrive_write(self, access_token: str):
+        """Create and immediately delete a tiny Drive file to verify write access.
+
+        Called automatically ~1.5 s after OAuth completes.  Silent on success
+        (the user already saw the "Connected" dialog and email label); shows a
+        warning on failure so the user learns about scope / permission problems
+        before the first real backup attempts and fails silently.
+
+        Uses raw urllib so no extra packages are required beyond what the rest
+        of the OAuth flow already uses.
+        """
+        import threading, urllib.request as _ur, json as _json
+
+        def _run():
+            try:
+                # ── Step 1: upload a tiny multipart file ─────────────────────
+                boundary = "bksys_write_test"
+                body = (
+                    f"--{boundary}\r\n"
+                    f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                    + _json.dumps({"name": "backupsys_connection_test.txt"})
+                    + f"\r\n--{boundary}\r\n"
+                    f"Content-Type: text/plain\r\n\r\n"
+                    f"backupsys_ok\r\n"
+                    f"--{boundary}--"
+                ).encode()
+                req = _ur.Request(
+                    "https://www.googleapis.com/upload/drive/v3/files"
+                    "?uploadType=multipart",
+                    data=body,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type":  f"multipart/related; boundary={boundary}",
+                    },
+                    method="POST",
+                )
+                resp     = _ur.urlopen(req, timeout=15)
+                file_info = _json.loads(resp.read())
+                file_id   = file_info.get("id", "")
+
+                if not file_id:
+                    raise ValueError(f"Upload returned no file ID — response: {file_info}")
+
+                # ── Step 2: delete the test file ─────────────────────────────
+                del_req = _ur.Request(
+                    f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                    method="DELETE",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                _ur.urlopen(del_req, timeout=10)
+
+                # Success — log only; no dialog (user already dismissed "Connected" dialog)
+                logger.info("✓ Google Drive write test passed — upload and delete OK")
+
+            except Exception as exc:
+                err_str = str(exc)
+                logger.warning(f"⚠ Google Drive write test failed: {err_str}")
+                QTimer.singleShot(0, lambda: QMessageBox.warning(
+                    self, "Google Drive — Write Test Failed",
+                    f"Connected but the upload test failed:\n\n{err_str}\n\n"
+                    "Possible causes:\n"
+                    "  • The drive.file scope was not granted\n"
+                    "  • The account lacks Drive storage space\n"
+                    "  • A network error occurred\n\n"
+                    "Backups may fail. Try disconnecting and reconnecting Google Drive."
+                ))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _set_gdrive_status_label(self, email: str = ""):
+        """Update the GDrive status label with the connected account email.
+
+        Called on the main thread after a successful userinfo fetch.
+        Also used by _check_cloud_connections() on panel open to restore the
+        saved email without making a network call.
+        """
+        if email:
+            self.gd_status_lbl.setText(f"✓ Connected as {email}")
+        else:
+            self.gd_status_lbl.setText("✓ Connected")
+        self.gd_status_lbl.setObjectName("status_ok")
+        self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
+        self.gd_status_lbl.style().polish(self.gd_status_lbl)
 
     def _gdrive_connect_failed(self, err=""):
         self.gd_connect_btn.setText("Connect Google Drive")
@@ -3397,26 +5879,138 @@ class AdminPanel(QDialog):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         s.remove("gdrive_access_token")
         s.remove("gdrive_refresh_token")
+        s.remove("gdrive_email")
         self.gd_status_lbl.setText("Not connected")
         self.gd_status_lbl.setObjectName("status_err")
         self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
         self.gd_status_lbl.style().polish(self.gd_status_lbl)
+        self.gd_quota_lbl.setVisible(False)
+        self.gd_quota_lbl.setText("")
         self.gd_connect_btn.setVisible(True)
         self.gd_connect_btn.setText("Connect Google Drive")
         self.gd_connect_btn.setEnabled(True)
+        self.gd_test_btn.setVisible(False)
         self.gd_disconnect_btn.setVisible(False)
 
+    def _test_gdrive(self):
+        """Test the saved Google Drive token and show a result dialog.
+
+        Runs the network call in a daemon thread so the UI stays responsive,
+        then pops a QMessageBox on the main thread with the outcome.
+        A successful test also silently updates the stored access token if a
+        refresh was needed (delegated to test_gdrive_connection).
+        """
+        import threading
+        from transport_utils import test_gdrive_connection
+
+        self.gd_test_btn.setEnabled(False)
+        self.gd_test_btn.setText("Testing…")
+
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        cloud_config = {
+            "access_token":  s.value("gdrive_access_token",  ""),
+            "refresh_token": s.value("gdrive_refresh_token", ""),
+            "client_id":     self.GDRIVE_CLIENT_ID,
+            "client_secret": self.GDRIVE_CLIENT_SECRET,
+        }
+
+        def _run():
+            result = test_gdrive_connection(cloud_config)
+            QTimer.singleShot(0, lambda: _done(result))
+
+        def _done(result):
+            self.gd_test_btn.setEnabled(True)
+            self.gd_test_btn.setText("Test Connection")
+            if result["ok"]:
+                QMessageBox.information(
+                    self, "Google Drive — Connection OK",
+                    f"✓ {result['detail']}"
+                )
+                saved_email = QSettings(SETTINGS_ORG, SETTINGS_APP).value("gdrive_email", "")
+                self._set_gdrive_status_label(saved_email)
+            else:
+                QMessageBox.warning(
+                    self, "Google Drive — Connection Failed",
+                    f"✗ {result['detail']}"
+                )
+                self.gd_status_lbl.setText("⚠ Token issue — test again or reconnect")
+                self.gd_status_lbl.setObjectName("status_err")
+                self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
+                self.gd_status_lbl.style().polish(self.gd_status_lbl)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _check_cloud_connections(self):
-        """Update connect/disconnect state and validate tokens."""
+        """Update connect/disconnect state, validate tokens, and fetch Drive quota."""
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         if s.value("gdrive_access_token", ""):
-            self.gd_status_lbl.setText("✓ Connected")
-            self.gd_status_lbl.setObjectName("status_ok")
+            # Restore the saved email so the label reads "✓ Connected as you@gmail.com"
+            # without making a network call every time the panel is opened.
+            saved_email = s.value("gdrive_email", "")
+            self._set_gdrive_status_label(saved_email)
             self.gd_connect_btn.setVisible(False)
+            self.gd_test_btn.setVisible(True)
             self.gd_disconnect_btn.setVisible(True)
+            # Fetch Drive quota in background so the panel opens instantly
+            self._fetch_gdrive_quota_async()
         # Validate tokens in background and warn if expired
         self._validate_cloud_tokens()
+
+    def _fetch_gdrive_quota_async(self):
+        """Fetch Google Drive storage quota in a background thread and update the UI label."""
+        import threading
+        try:
+            from transport_utils import get_gdrive_quota
+        except ImportError:
+            return
+
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        cloud_config = {
+            "access_token":  s.value("gdrive_access_token",  ""),
+            "refresh_token": s.value("gdrive_refresh_token", ""),
+            "client_id":     self.GDRIVE_CLIENT_ID,
+            "client_secret": self.GDRIVE_CLIENT_SECRET,
+        }
+
+        def _run():
+            quota = get_gdrive_quota(cloud_config)
+            QTimer.singleShot(0, lambda: _apply(quota))
+
+        def _apply(quota: dict):
+            if not quota.get("ok"):
+                return  # silently skip — don't surface quota errors in the panel
+            usage      = quota.get("usage", -1)
+            limit      = quota.get("limit", -1)
+            drive_used = quota.get("drive_used", -1)
+
+            def _fmt(n):
+                if n < 0:
+                    return "?"
+                for unit in ("B", "KB", "MB", "GB", "TB"):
+                    if n < 1024:
+                        return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+                    n /= 1024
+                return f"{n:.1f} PB"
+
+            if limit > 0:
+                pct  = min(int(usage / limit * 100), 100)
+                free = limit - usage
+                text = (
+                    f"Storage: {_fmt(usage)} used of {_fmt(limit)} ({pct}% full)"
+                    f" · {_fmt(free)} free"
+                )
+                if drive_used >= 0:
+                    text += f"  ·  Drive files: {_fmt(drive_used)}"
+            else:
+                # Unlimited plan (e.g. Workspace) — show usage only
+                text = f"Storage used: {_fmt(usage)}"
+                if drive_used >= 0:
+                    text += f"  ·  Drive files: {_fmt(drive_used)}"
+
+            self.gd_quota_lbl.setText(text)
+            self.gd_quota_lbl.setVisible(True)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _validate_cloud_tokens(self):
         """Check if saved tokens are still valid  · runs in a background thread."""
@@ -3450,7 +6044,7 @@ class AdminPanel(QDialog):
 
             if warnings:
                 # Use QTimer to update UI on main thread
-                from PyQt5.QtCore import QTimer
+                from PyQt6.QtCore import QTimer
                 QTimer.singleShot(0, lambda: self._on_token_warnings(warnings))
 
         t = threading.Thread(target=_check, daemon=True)
@@ -3483,7 +6077,7 @@ class AdminPanel(QDialog):
                         w["cloud_config"]["access_token"] = tokens["access_token"]
                 import config_manager as _cm
                 _cm.save(self.cfg)
-                from PyQt5.QtCore import QTimer
+                from PyQt6.QtCore import QTimer
                 QTimer.singleShot(0, lambda: self._append_log("🔄 Google Drive token refreshed silently"))
                 return True
         except Exception:
@@ -3503,13 +6097,14 @@ class AdminPanel(QDialog):
                 self.gd_status_lbl.style().polish(self.gd_status_lbl)
                 self.gd_connect_btn.setVisible(True)
                 self.gd_connect_btn.setText("🔄 Reconnect Google Drive")
+                self.gd_test_btn.setVisible(False)
             # 2. Tray notification
             if hasattr(self, "_tray"):
                 self._tray.showMessage(
                     f"⚠ {name}  · Reconnect Required",
                     f"Your {name} token has expired.\n"
                     f"Open Settings >Cloud tab >Reconnect to continue cloud backups.",
-                    QSystemTrayIcon.Warning, 8000
+                    QSystemTrayIcon.MessageIcon.Warning, 8000
                 )
             # 3. Log
             if hasattr(self, "log_text"):
@@ -3519,7 +6114,7 @@ class AdminPanel(QDialog):
 
     def _pick_gdrive_folder(self):
         """Fetch the user's Drive folders and let them pick one from a dialog."""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QListWidget, QListWidgetItem, QDialogButtonBox, QLabel
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QListWidgetItem, QDialogButtonBox, QLabel
 
         # Load current cloud config to get tokens
         cfg = config_manager.load()
@@ -3579,12 +6174,12 @@ class AdminPanel(QDialog):
         lst.setCurrentRow(0)
         vlay.addWidget(lst)
 
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         vlay.addWidget(btns)
 
-        if dlg.exec_() == QDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             sel = lst.currentItem()
             if sel:
                 fid   = sel.data(0x100)
@@ -3596,80 +6191,114 @@ class AdminPanel(QDialog):
                     + (f"\n(ID: {fid})" if fid else ""))
 
     def _save_cloud(self):
-        idx = self.cloud_watch_combo.currentIndex()
-        if idx < 0:
-            QMessageBox.warning(self, "No Watch", "Please add a watch first.")
+        """Save the current cloud assignment to ALL checked watches at once."""
+        # Collect checked watches from the checklist
+        checked_wids = []
+        for i in range(self.cloud_watch_list.count()):
+            item = self.cloud_watch_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                checked_wids.append(item.data(Qt.ItemDataRole.UserRole))
+
+        if not checked_wids:
+            QMessageBox.warning(self, "No Watch Selected",
+                "Please check at least one watch in the list above.")
             return
-        wid    = self.cloud_watch_combo.itemData(idx)
+
         s      = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        use_gd = hasattr(self, "chk_gdrive") and self.chk_gdrive.isChecked()
-
-        cloud_configs = []
-
-        if use_gd:
-            token = s.value("gdrive_access_token", "")
-            if not token:
-                QMessageBox.warning(self, "Not Connected", "Please connect Google Drive first.")
-                return
-            cloud_configs.append({
-                "provider":      "gdrive",
-                "access_token":  token,
-                "refresh_token": s.value("gdrive_refresh_token", ""),
-                "client_id":     self.GDRIVE_CLIENT_ID,
-                "client_secret": self.GDRIVE_CLIENT_SECRET,
-                "folder_id":     self.gd_folder_id.text().strip(),
-            })
-
-        # Write cloud_configs to the selected watch and persist
-        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
-        if not watch:
-            QMessageBox.warning(self, "Error", "Watch not found — please refresh and try again.")
+        # Always use GDrive for all checked watches
+        token = s.value("gdrive_access_token", "")
+        if not token:
+            QMessageBox.warning(self, "Not Connected", "Please connect Google Drive first.")
             return
+        cloud_config = {
+            "provider":      "gdrive",
+            "access_token":  token,
+            "refresh_token": s.value("gdrive_refresh_token", ""),
+            "client_id":     self.GDRIVE_CLIENT_ID,
+            "client_secret": self.GDRIVE_CLIENT_SECRET,
+            "folder_id":     self.gd_folder_id.text().strip(),
+        }
 
-        watch["cloud_configs"] = cloud_configs
-        # Keep legacy single cloud_config in sync for backward compatibility
-        watch["cloud_config"] = cloud_configs[0] if cloud_configs else {}
+        # Apply cloud_config to every checked watch
+        saved_names = []
+        for wid in checked_wids:
+            watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
+            if not watch:
+                continue
+            watch["cloud_config"] = cloud_config.copy()
+            watch["cloud_configs"] = [watch["cloud_config"]]  # backward compatibility
+            saved_names.append(watch.get("name", wid))
+
+        # Also clear cloud config from any UNCHECKED watches (user unticked them)
+        for i in range(self.cloud_watch_list.count()):
+            item = self.cloud_watch_list.item(i)
+            if item.checkState() == Qt.CheckState.Unchecked:
+                wid = item.data(Qt.ItemDataRole.UserRole)
+                watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
+                if watch:
+                    watch["cloud_configs"] = []
+                    watch["cloud_config"]  = {}
 
         try:
             config_manager.save(self.cfg)
             if cloud_configs:
                 providers = ", ".join(c["provider"].upper() for c in cloud_configs)
+                names_str = ", ".join(saved_names)
                 QMessageBox.information(self, "Saved",
-                    f"Cloud assignment saved.\n\n"
-                    f"Watch:     {watch.get('name', wid)}\n"
+                    f"Cloud assignment saved to {len(saved_names)} watch(es).\n\n"
+                    f"Watches:   {names_str}\n"
                     f"Providers: {providers}")
             else:
                 QMessageBox.information(self, "Saved",
-                    f"Cloud assignment cleared for:\n{watch.get('name', wid)}")
+                    "Cloud assignment cleared for all watches.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save: {e}")
 
     def _add_watch(self):
         dlg = AddWatchDialog(self, cfg=self.cfg)
-        if dlg.exec_() == QDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             try:
-                v = dlg.get_values()
+                v        = dlg.get_values()
+                src_type = v.get("source_type", "local")
                 config_manager.add_watch(
                     self.cfg,
                     v["name"],
                     v["path"],
-                    watch_type="smb" if v["is_smb"] else "local",
+                    watch_type=src_type,
                     interval_min=v["interval_min"],
                     smb_cfg={
                         "user":   v["smb_user"],
                         "pass":   v["smb_pass"],
                         "domain": v["smb_domain"],
-                    } if v["is_smb"] else {},
+                    } if v.get("is_smb") else {},
                 )
                 w = config_manager.get_watch_by_path(self.cfg, v["path"])
                 if w:
-                    config_manager.update_watch_meta(
-                        self.cfg, w["id"],
-                        compression=v.get("compression", False),
-                        sync_mode=True,
-                        destination=v.get("destination", "") or None,
-                    )
+                    extra_meta: dict = {
+                        "compression":      v.get("compression", False),
+                        "sync_mode":        True,
+                        "destination":      v.get("destination", "") or None,
+                        # Advanced fields set via "More Options…"
+                        "schedule_times":   v.get("schedule_times", []),
+                        "retention_days":   v.get("retention_days", 0),
+                        "max_backups":      v.get("max_backups", 0),
+                        "max_file_size_mb": v.get("max_file_size_mb", 0),
+                        "exclude_patterns": v.get("exclude_patterns", []),
+                        "encrypt_key":      v.get("encrypt_key", ""),
+                        "pre_backup_cmd":   v.get("pre_backup_cmd", ""),
+                        "post_backup_cmd":  v.get("post_backup_cmd", ""),
+                    }
+                    # Persist WebDAV source credentials on the watch dict so
+                    # BackupWorker can pass them to run_backup(source_webdav_cfg=…)
+                    if v.get("is_webdav"):
+                        extra_meta["webdav_cfg"] = {
+                            "url":      v["path"],
+                            "username": v.get("webdav_user", ""),
+                            "password": v.get("webdav_pass", ""),
+                        }
+                    config_manager.update_watch_meta(self.cfg, w["id"], **extra_meta)
                 self._refresh_watch_table()
+                self._refresh_cloud_combo()
                 self.watches_changed.emit()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -3682,11 +6311,12 @@ class AdminPanel(QDialog):
         reply = QMessageBox.question(
             self, "Delete Watch",
             f"Delete <b>{watch_name}</b> from the watch list?<br><br>Your backup files will <b>not</b> be deleted.",
-            QMessageBox.Yes | QMessageBox.Cancel
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             config_manager.remove_watch(self.cfg, wid)
             self._refresh_watch_table()
+            self._refresh_cloud_combo()
             self.watches_changed.emit()
 
     def _edit_watch(self):
@@ -3714,9 +6344,18 @@ class AdminPanel(QDialog):
             dlg.source_type.setCurrentIndex(0)
             dlg.path_input.setText(watch.get("path", ""))
         dlg.interval_spin.setValue(watch.get("interval_min", 0))
-        dlg.compress_check.setChecked(watch.get("compression", False))
+        # Set compression combo box based on existing value
+        current_compression = watch.get("compression", False)
+        if current_compression is True or current_compression == 6:
+            dlg.compress_combo.setCurrentIndex(2)  # Balanced
+        elif current_compression == 1:
+            dlg.compress_combo.setCurrentIndex(1)  # Fast
+        elif current_compression == 9:
+            dlg.compress_combo.setCurrentIndex(3)  # Best
+        else:
+            dlg.compress_combo.setCurrentIndex(0)  # Off
 
-        if dlg.exec_() == QDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             v = dlg.get_values()
             try:
                 config_manager.update_watch_meta(
@@ -3741,13 +6380,14 @@ class AdminPanel(QDialog):
                         break
                 config_manager.save(self.cfg)
                 self._refresh_watch_table()
+                self._refresh_cloud_combo()
                 self.watches_changed.emit()
                 # ── Success feedback ──────────────────────────────────────
                 msg = QMessageBox(self)
                 msg.setWindowTitle("Saved")
                 msg.setText(f"✅  <b>{v['name']}</b> settings saved successfully.")
-                msg.setIcon(QMessageBox.Information)
-                msg.exec_()
+                msg.setIcon(QMessageBox.Icon.Information)
+                msg.exec()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
@@ -3819,29 +6459,17 @@ class AdminPanel(QDialog):
             QMessageBox.warning(self, "Missing", "Please enter a To Address first.")
             return
         try:
-            # Prefer notification_utils.test_email() which returns a proper result dict
-            if _NOTIFICATION_UTILS_AVAILABLE:
-                from notification_utils import test_email as _nu_test_email
-                result = _nu_test_email(ec)
-            else:
-                # Inline fallback using send_email_notification directly
-                from notification_utils import send_email_notification as _nu_send_email
-                result = _nu_send_email(
-                    ec,
-                    "▶ Backup System  · Test Email",
-                    "This is a test email from your Backup System app.\n\nIf you received this, email notifications are working correctly.",
-                )
-
-            if result.get("ok"):
-                QMessageBox.information(
-                    self, "Test Email Sent",
-                    f"Test email sent to {to}.\nCheck your inbox (and spam folder)."
-                )
-            else:
-                QMessageBox.critical(
-                    self, "Test Failed",
-                    f"Could not send test email:\n\n{result.get('error', 'Unknown error')}"
-                )
+            # Use the local _send_email_notification function with test subject/body
+            test_cfg = {"email_config": ec}
+            _send_email_notification(
+                test_cfg,
+                "BackupSys — test email",
+                "This is a test email from BackupSys.\n\nEmail notifications are working correctly."
+            )
+            QMessageBox.information(
+                self, "Test Email Sent",
+                f"Test email sent to {to}.\nCheck your inbox (and spam folder)."
+            )
         except Exception as e:
             QMessageBox.critical(self, "Test Failed", str(e))
 
@@ -3879,30 +6507,230 @@ class AdminPanel(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Test Failed", str(e))
 
-    def _change_password(self):
+    def _save_ntfy_settings(self):
+        nc = self.cfg.setdefault("ntfy_config", {})
+        nc["enabled"]           = self.ntfy_enabled_check.isChecked()
+        nc["server"]            = self.ntfy_server_input.text().strip() or "https://ntfy.sh"
+        nc["topic"]             = self.ntfy_topic_input.text().strip()
+        nc["token"]             = self.ntfy_token_input.text().strip()
+        nc["priority"]          = self.ntfy_priority_combo.currentText()
+        nc["notify_on_success"] = self.ntfy_notify_success_check.isChecked()
+        nc["notify_on_failure"] = self.ntfy_notify_failure_check.isChecked()
+        try:
+            config_manager.save(self.cfg)
+            QMessageBox.information(self, "Saved", "ntfy push settings saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _test_ntfy(self):
+        """Send a test push via ntfy to verify topic/token."""
+        topic = self.ntfy_topic_input.text().strip()
+        if not topic:
+            QMessageBox.warning(self, "Missing", "Please enter an ntfy Topic first.")
+            return
+        nc = {
+            "enabled": True,
+            "server":  self.ntfy_server_input.text().strip() or "https://ntfy.sh",
+            "topic":   topic,
+            "token":   self.ntfy_token_input.text().strip(),
+        }
+        try:
+            from notification_utils import test_ntfy as _test_ntfy_fn
+            res = _test_ntfy_fn(nc)
+            if res["ok"]:
+                QMessageBox.information(
+                    self, "Test Push Sent",
+                    f"Test notification sent to topic '{topic}'.\n"
+                    "Check the ntfy app on your phone."
+                )
+            else:
+                QMessageBox.critical(self, "Test Failed", res.get("error", "Unknown error"))
+        except ImportError:
+            QMessageBox.warning(self, "Unavailable", "notification_utils.py not found.")
+        except Exception as e:
+            QMessageBox.critical(self, "Test Failed", str(e))
+
+    # ── Telegram settings ──────────────────────────────────────────────────────
+
+    def _save_telegram_settings(self):
+        tc = self.cfg.setdefault("telegram_config", {})
+        tc["enabled"]           = self.tg_enabled_check.isChecked()
+        tc["bot_token"]         = self.tg_token_input.text().strip()
+        tc["chat_id"]           = self.tg_chat_id_input.text().strip()
+        tc["notify_on_success"] = self.tg_notify_success_check.isChecked()
+        tc["notify_on_failure"] = self.tg_notify_failure_check.isChecked()
+        tc["parse_mode"]        = "HTML"
+        try:
+            config_manager.save(self.cfg)
+            QMessageBox.information(self, "Saved", "Telegram notification settings saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _test_telegram(self):
+        """Send a test message via Telegram to verify bot_token and chat_id."""
+        token   = self.tg_token_input.text().strip()
+        chat_id = self.tg_chat_id_input.text().strip()
+        if not token:
+            QMessageBox.warning(self, "Missing", "Please enter a Bot Token first.")
+            return
+        if not chat_id:
+            QMessageBox.warning(self, "Missing", "Please enter a Chat ID first.")
+            return
+        tc = {"bot_token": token, "chat_id": chat_id, "parse_mode": "HTML"}
+        try:
+            from notification_utils import test_telegram as _test_tg
+            res = _test_tg(tc)
+            if res["ok"]:
+                QMessageBox.information(
+                    self, "Message Sent",
+                    f"Test message sent to chat_id '{chat_id}'.\n"
+                    "Check your Telegram."
+                )
+            else:
+                QMessageBox.critical(self, "Test Failed", res.get("error", "Unknown error"))
+        except ImportError:
+            QMessageBox.warning(self, "Unavailable", "notification_utils.py not found.")
+        except Exception as e:
+            QMessageBox.critical(self, "Test Failed", str(e))
+
+    # ── Pushover settings ──────────────────────────────────────────────────────
+
+    def _save_pushover_settings(self):
+        pc = self.cfg.setdefault("pushover_config", {})
+        pc["enabled"]           = self.po_enabled_check.isChecked()
+        pc["user_key"]          = self.po_user_key_input.text().strip()
+        pc["api_token"]         = self.po_api_token_input.text().strip()
+        pc["device"]            = self.po_device_input.text().strip()
+        pc["priority"]          = self.po_priority_combo.currentData()
+        pc["notify_on_success"] = self.po_notify_success_check.isChecked()
+        pc["notify_on_failure"] = self.po_notify_failure_check.isChecked()
+        try:
+            config_manager.save(self.cfg)
+            QMessageBox.information(self, "Saved", "Pushover notification settings saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _test_pushover(self):
+        """Send a test push via Pushover to verify user_key and api_token."""
+        user_key  = self.po_user_key_input.text().strip()
+        api_token = self.po_api_token_input.text().strip()
+        if not user_key:
+            QMessageBox.warning(self, "Missing", "Please enter your Pushover User Key first.")
+            return
+        if not api_token:
+            QMessageBox.warning(self, "Missing", "Please enter your Pushover API Token first.")
+            return
+        pc = {"user_key": user_key, "api_token": api_token,
+              "device": self.po_device_input.text().strip()}
+        try:
+            from notification_utils import test_pushover as _test_po
+            res = _test_po(pc)
+            if res["ok"]:
+                QMessageBox.information(
+                    self, "Test Push Sent",
+                    "Test notification sent via Pushover.\n"
+                    "Check your device."
+                )
+            else:
+                QMessageBox.critical(self, "Test Failed", res.get("error", "Unknown error"))
+        except ImportError:
+            QMessageBox.warning(self, "Unavailable", "notification_utils.py not found.")
+        except Exception as e:
+            QMessageBox.critical(self, "Test Failed", str(e))
+
+    # ── Logs tab ───────────────────────────────────────────────────────────────
+
+    def _on_tab_changed_log_poll(self, index: int):
+        """Start/stop the log-poll timer based on whether the Logs tab is active."""
+        # The Logs tab is the last tab; find it by title to be robust
+        logs_tab_index = self._tabs.count() - 1
+        for i in range(self._tabs.count()):
+            if self._tabs.tabText(i) == "Logs":
+                logs_tab_index = i
+                break
+        if index == logs_tab_index:
+            self._load_log_tab()
+            self._log_poll_timer.start()
+        else:
+            self._log_poll_timer.stop()
+
+    def _load_log_tab(self):
+        """Load (or reload) the full log file into the viewer."""
+        try:
+            if not self._log_file_path.exists():
+                self._log_viewer.setPlainText(f"Log file not found:\n{self._log_file_path}")
+                self._log_raw_lines = []
+                self._log_last_mtime = 0.0
+                return
+            mtime = self._log_file_path.stat().st_mtime
+            self._log_last_mtime = mtime
+            content = self._log_file_path.read_text(encoding="utf-8", errors="replace")
+            self._log_raw_lines = content.splitlines()
+            self._apply_log_filter(self._log_filter_input.text())
+        except Exception as e:
+            self._log_viewer.setPlainText(f"Error reading log: {e}")
+
+    def _poll_log_file(self):
+        """Called every 3 s — only reload if the file has changed on disk."""
+        try:
+            if not self._log_file_path.exists():
+                return
+            mtime = self._log_file_path.stat().st_mtime
+            if mtime != self._log_last_mtime:
+                self._load_log_tab()
+        except Exception:
+            pass
+
+    def _apply_log_filter(self, text: str):
+        """Filter displayed lines by the text in the filter box (case-insensitive)."""
+        needle = text.strip().lower()
+        if needle:
+            visible = [ln for ln in self._log_raw_lines if needle in ln.lower()]
+        else:
+            visible = self._log_raw_lines
+
+        self._log_viewer.setPlainText("\n".join(visible))
+
+        if self._log_tail_check.isChecked():
+            cursor = self._log_viewer.textCursor()
+            cursor.movePosition(cursor.End)
+            self._log_viewer.setTextCursor(cursor)
+
+    def _clear_log_file(self):
+        """Prompt and then truncate the log file."""
+        reply = QMessageBox.question(
+            self, "Clear Log",
+            "This will permanently delete all log entries.\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._log_file_path.write_text("", encoding="utf-8")
+            self._log_raw_lines = []
+            self._log_viewer.clear()
+            QMessageBox.information(self, "Cleared", "Log file cleared.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not clear log file:\n{e}")
+
+
         dlg = PasswordDialog(self, mode="set")
-        dlg.exec_()
+        dlg.exec()
 
     def _apply_theme(self):
         """Apply the selected theme immediately and persist the choice."""
-        if self.theme_dark.isChecked():
-            choice = "dark"
-        elif self.theme_light.isChecked():
-            choice = "light"
-        else:
-            choice = ""   # auto — follow OS
+        choice = "light" if self.theme_light.isChecked() else "dark"
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         s.setValue("theme", choice)
-        _resolved = choice or _detect_os_theme()
-        sheet = LIGHT_STYLE if _resolved == "light" else DARK_STYLE
-        from PyQt5.QtWidgets import QApplication as _QApp
+        sheet = LIGHT_STYLE if choice == "light" else DARK_STYLE
+        from PyQt6.QtWidgets import QApplication as _QApp
         _QApp.instance().setStyleSheet(sheet)
-        _QApp.instance().setProperty("theme", _resolved)
+        _QApp.instance().setProperty("theme", choice)
 
     def _export_config(self):
         """Export a redacted copy of config.json that the user can save anywhere."""
         import copy, json as _json
-        from PyQt5.QtWidgets import QFileDialog
+        from PyQt6.QtWidgets import QFileDialog
 
         try:
             raw = copy.deepcopy(config_manager.load())
@@ -3952,6 +6780,56 @@ class AdminPanel(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", f"Could not write file: {e}")
 
+    def _import_config(self):
+        """Import a previously exported config file and merge it into the current config."""
+        import json as _json
+        from PyQt6.QtWidgets import QFileDialog
+
+        in_path, _ = QFileDialog.getOpenFileName(
+            self, "Import BackupSys Config",
+            "",
+            "JSON files (*.json)"
+        )
+        if not in_path:
+            return
+
+        try:
+            with open(in_path, "r", encoding="utf-8") as fh:
+                imported = _json.load(fh)
+        except _json.JSONDecodeError as e:
+            QMessageBox.critical(self, "Import Failed", f"Invalid JSON file: {e}")
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Could not read file: {e}")
+            return
+
+        # ── Validate required keys ──────────────────────────────────────────
+        if not isinstance(imported, dict):
+            QMessageBox.critical(
+                self, "Import Failed",
+                "Config file must be a JSON object (not an array or scalar)."
+            )
+            return
+
+        if "watches" not in imported:
+            QMessageBox.critical(
+                self, "Import Failed",
+                "Config file is missing required 'watches' key."
+            )
+            return
+
+        # ── Merge: Update self.cfg with imported values ──────────────────────
+        try:
+            # Merge all top-level keys from imported config into self.cfg
+            self.cfg.update(imported)
+            config_manager.save(self.cfg)
+            QMessageBox.information(
+                self, "Config Imported",
+                "Config imported. Restart may be required for all changes to take effect."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Could not merge config: {e}")
+
     def _save_general(self):
         self.cfg["dest_smb"] = {
             "path": self.dest_smb_path.text().strip(),
@@ -3987,6 +6865,10 @@ class AdminPanel(QDialog):
             "token": self.https_token.text().strip(),
             "verify_ssl": self.https_verify_ssl.isChecked(),
         }
+        self.cfg["dest_rclone"] = {
+            "remote": self.rclone_remote.text().strip(),
+            "path": self.rclone_path.text().strip() or "/backups",
+        }
         self.cfg["dest_webdav"] = {
             "url":         self.webdav_url.text().strip(),
             "username":    self.webdav_user.text().strip(),
@@ -3995,29 +6877,60 @@ class AdminPanel(QDialog):
             "webdav_root": self.webdav_root.text().strip(),
             "verify_ssl":  self.webdav_ssl.isChecked(),
         }
-        credential_store.set_webdav_password(self.cfg["dest_webdav"], self.webdav_pass.text())
+        # credential_store is imported inside the same try/except ImportError block
+        # that sets BACKEND_AVAILABLE. Guard against NameError when running without
+        # the full backend installed (e.g. UI-only stub / missing dependencies).
+        if BACKEND_AVAILABLE:
+            credential_store.set_sftp_password(self.cfg["dest_sftp"], self.sftp_pass.text())
+            credential_store.set_ftp_password(self.cfg["dest_ftp"], self.ftp_pass.text())
+            credential_store.set_smb_password(self.cfg["dest_smb"], self.dest_smb_pass.text())
+            credential_store.set_webdav_password(self.cfg["dest_webdav"], self.webdav_pass.text())
         idx = self.dest_type_combo.currentIndex()
-        dest_map = {0: "local", 1: "smb", 2: "sftp", 3: "ftps",
-                    4: "ftp", 5: "https", 6: "webdav"}
+        dest_map = {
+            0: "local",
+            1: "smb",
+            2: "sftp",
+            3: "ftps",
+            4: "ftp",
+            5: "https",
+            6: "rclone",
+            7: "webdav",
+            8: "gdrive",
+        }
         self.cfg["dest_type"] = dest_map.get(idx, "local")
         self.cfg["auto_backup"] = self.auto_check.isChecked()
         self.cfg["interval_unit"] = "seconds" if self.interval_unit.currentIndex() == 1 else "minutes"
         self.cfg["interval_min"] = self.interval_spin.value()
         self.cfg["retention_days"] = self.retention_spin.value()
-        self.cfg["backup_schedule_times"] = [t.strip() for t in self.schedule_times_input.text().split(",") if t.strip()]
+        self.cfg["low_disk_threshold_gb"] = self.disk_alert_spin.value()
+        self.cfg["backup_schedule_times"] = self.schedule_times_widget.get_entries()
+        self.cfg["backup_window_start"]   = self.backup_window_start_input.text().strip()
         self.cfg["backup_window_end"]     = self.backup_window_end_input.text().strip()
         self.cfg["max_backup_mbps"]    = self.bw_spin.value()
+        self.cfg["bandwidth_schedule"]  = self._get_bandwidth_schedule()
         self.cfg["idle_threshold_cpu"] = self.idle_spin.value()
+        self.cfg["pause_on_metered"]   = self.metered_check.isChecked()
+        self.cfg["pause_on_battery"]   = self.battery_check.isChecked()
+        self.cfg["verify_remote_uploads"] = self.verify_remote_cb.isChecked()
+        self.cfg["verify_after"]          = self.verify_after_cb.isChecked()
         self.cfg["auto_retry"]         = self.retry_check.isChecked()
         self.cfg["retry_delay_min"] = self.retry_delay_spin.value()
+        self.cfg["integrity_check_enabled"]       = self.integrity_enabled_cb.isChecked()
+        self.cfg["integrity_check_interval_days"] = self.integrity_interval_spin.value()
+        self.cfg["force_full_interval_days"]      = self.force_full_global_spin.value()
         try:
             config_manager.save(self.cfg)
             QMessageBox.information(self, "Saved", "Settings saved.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save settings: {e}")
 
+    def _change_password(self):
+        """Open the password-change dialog from within the Admin panel."""
+        dlg = PasswordDialog(self, mode="set")
+        dlg.exec()
+
     def _toggle_startup(self, state):
-        if state == Qt.Checked:
+        if state == Qt.CheckState.Checked:
             self._set_startup(True)
         else:
             self._set_startup(False)
@@ -4055,6 +6968,74 @@ class AdminPanel(QDialog):
                 return False
         except Exception:
             return False
+
+    def _populate_bandwidth_schedule(self, schedule: list):
+        """Load bandwidth schedule rules into the table."""
+        self.bw_table.setRowCount(0)
+        for rule in schedule:
+            self._add_bw_rule_with_data(
+                rule.get("start", "09:00"),
+                rule.get("end", "17:00"),
+                rule.get("max_mbps", 10.0)
+            )
+
+    def _add_bw_rule_with_data(self, start: str, end: str, max_mbps: float):
+        """Add a bandwidth schedule rule with specific data."""
+        row_count = self.bw_table.rowCount()
+        self.bw_table.insertRow(row_count)
+        
+        start_edit = QTimeEdit()
+        start_edit.setDisplayFormat("HH:mm")
+        try:
+            h, m = map(int, start.split(":"))
+            start_edit.setTime(QTime(h, m))
+        except:
+            start_edit.setTime(QTime(9, 0))
+        self.bw_table.setCellWidget(row_count, 0, start_edit)
+        
+        end_edit = QTimeEdit()
+        end_edit.setDisplayFormat("HH:mm")
+        try:
+            h, m = map(int, end.split(":"))
+            end_edit.setTime(QTime(h, m))
+        except:
+            end_edit.setTime(QTime(17, 0))
+        self.bw_table.setCellWidget(row_count, 1, end_edit)
+        
+        mbps_spin = QDoubleSpinBox()
+        mbps_spin.setRange(0.0, 1000.0)
+        mbps_spin.setDecimals(1)
+        mbps_spin.setValue(max_mbps)
+        self.bw_table.setCellWidget(row_count, 2, mbps_spin)
+
+    def _add_bw_rule(self):
+        """Add a new bandwidth schedule rule with defaults."""
+        self._add_bw_rule_with_data("09:00", "17:00", 10.0)
+
+    def _remove_bw_rule(self):
+        """Remove the selected bandwidth schedule rule."""
+        current_row = self.bw_table.currentRow()
+        if current_row >= 0:
+            self.bw_table.removeRow(current_row)
+
+    def _get_bandwidth_schedule(self) -> list:
+        """Extract bandwidth schedule from table."""
+        schedule = []
+        for row in range(self.bw_table.rowCount()):
+            start_widget = self.bw_table.cellWidget(row, 0)
+            end_widget = self.bw_table.cellWidget(row, 1)
+            mbps_widget = self.bw_table.cellWidget(row, 2)
+            
+            if start_widget and end_widget and mbps_widget:
+                start_time = start_widget.time().toString("HH:mm")
+                end_time = end_widget.time().toString("HH:mm")
+                max_mbps = mbps_widget.value()
+                schedule.append({
+                    "start": start_time,
+                    "end": end_time,
+                    "max_mbps": max_mbps
+                })
+        return schedule
 
 
 class StorageChartWidget(QWidget):
@@ -4099,11 +7080,11 @@ class StorageChartWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
         if not self._data:
             painter.setPen(QColor("#6b7280"))
-            painter.drawText(rect, Qt.AlignCenter, "No backup data")
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No backup data")
             return
         # Draw bars
         bar_color = QColor("#2563eb")
@@ -4136,15 +7117,21 @@ class WatchCard(QFrame):
     dry_run_requested         = pyqtSignal(dict)  # watch  · preview only
     validate_requested        = pyqtSignal(dict)
     restore_requested         = pyqtSignal(dict)
+    restore_to_original_requested = pyqtSignal(dict)
     pause_requested           = pyqtSignal(str, bool)   # watch_id, paused
+    pause_backup_requested    = pyqtSignal(str)         # watch_id  · pause running backup
+    resume_backup_requested   = pyqtSignal(str)         # watch_id  · resume paused backup
     cancel_requested          = pyqtSignal(str)         # watch_id
     open_backup_requested     = pyqtSignal(str)      # watch_id
+    watch_settings_requested  = pyqtSignal(dict)     # watch  · open advanced settings
 
-    def __init__(self, watch: dict, parent=None):
+    def __init__(self, watch: dict, dest_type: str = "local", parent=None):
         super().__init__(parent)
         self.watch        = watch
+        self.dest_type    = dest_type
         self._changes     = []   # list of recent change entries
         self._expanded    = False
+        self._backup_paused = False  # track if backup is currently paused
         self.setObjectName("card")
         self.setMinimumHeight(90)
         # Rolling speed window for ETA: list of (timestamp, bytes_done) pairs.
@@ -4268,10 +7255,35 @@ class WatchCard(QFrame):
 
         self.next_lbl = QLabel("")
         self.next_lbl.setStyleSheet("color: #374151; font-size: 10px;")
-        self.next_lbl.setVisible(False)
+        self.next_lbl.setVisible(True)
         info_layout.addWidget(self.next_lbl)
 
-        # ── Tag badges ────────────────────────────────────────────────────────
+        # ── rclone retention notice ───────────────────────────────────────────
+        # Shown only when this watch's effective destination is rclone AND a
+        # retention policy is configured.  rclone purge is best-effort; remind
+        # the user so they don't assume it silently just works in all cases.
+        _watch_retention = self.watch.get("retention_days", 0)
+        if self.dest_type == "rclone" and _watch_retention:
+            self._rclone_retention_warn = QLabel(
+                "⚠ rclone retention is best-effort — old folders are left in place "
+                "if rclone is unavailable at cleanup time."
+            )
+            self._rclone_retention_warn.setStyleSheet(
+                "color: #f59e0b; font-size: 10px; padding: 2px 0;"
+            )
+            self._rclone_retention_warn.setWordWrap(True)
+            self._rclone_retention_warn.setToolTip(
+                "BackupSys attempts to delete expired rclone backup folders using\n"
+                "'rclone purge' after each backup run.  If rclone is not installed,\n"
+                "not in PATH, or the remote is unreachable at that moment, old folders\n"
+                "are left in place — retention is NOT enforced by BackupSys policies\n"
+                "the way it is for local destinations.\n\n"
+                "Tip: configure server-side retention policies on your NAS or\n"
+                "Nextcloud instance as a safety net."
+            )
+            info_layout.addWidget(self._rclone_retention_warn)
+
+
         tags = self.watch.get("tags", [])
         if tags:
             tags_row = QHBoxLayout()
@@ -4299,7 +7311,7 @@ class WatchCard(QFrame):
 
         self.status_lbl = QLabel("▶ Watching")
         self.status_lbl.setObjectName("status_ok")
-        self.status_lbl.setAlignment(Qt.AlignRight)
+        self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         status_layout.addWidget(self.status_lbl)
 
         self.progress_bar = QProgressBar()
@@ -4334,37 +7346,91 @@ class WatchCard(QFrame):
         self.backup_btn.clicked.connect(lambda: self.backup_requested.emit(self.watch))
         status_layout.addWidget(self.backup_btn)
 
-        self.full_backup_btn = QPushButton("⟳ Force Full Backup")
-        self.full_backup_btn.setObjectName("secondary")
-        self.full_backup_btn.setFixedWidth(160)
-        self.full_backup_btn.clicked.connect(lambda: self.full_backup_requested.emit(self.watch))
-        status_layout.addWidget(self.full_backup_btn)
+        # ── "More ▾" dropdown for secondary actions ────────────────────────
+        self._more_btn = QToolButton()
+        self._more_btn.setText("More ▾")
+        self._more_btn.setFixedWidth(160)
+        self._more_btn.setObjectName("secondary")
+        self._more_btn.setPopupMode(QToolButton.InstantPopup)
+        self._more_btn.setStyleSheet(
+            "QToolButton { text-align:center; padding:4px 8px; }"
+            "QToolButton::menu-indicator { image: none; }"
+        )
 
-        self.dry_run_btn = QPushButton("🔍 Dry Run")
-        self.dry_run_btn.setObjectName("secondary")
-        self.dry_run_btn.setFixedWidth(160)
-        self.dry_run_btn.setToolTip("Preview what would be backed up without copying any files")
-        self.dry_run_btn.clicked.connect(lambda: self.dry_run_requested.emit(self.watch))
-        status_layout.addWidget(self.dry_run_btn)
+        more_menu = QMenu(self._more_btn)
 
         paused_now = self.watch.get("paused", False)
-        self.pause_btn = QPushButton("⏸ Pause" if not paused_now else "▶ Resume")
-        self.pause_btn.setObjectName("secondary")
-        self.pause_btn.setFixedWidth(160)
-        self.pause_btn.clicked.connect(self._toggle_pause)
-        status_layout.addWidget(self.pause_btn)
+        self._pause_action = more_menu.addAction("⏸ Pause" if not paused_now else "▶ Resume")
+        self._pause_action.triggered.connect(self._toggle_pause)
 
-        self.validate_btn = QPushButton("▶ Validate")
-        self.validate_btn.setObjectName("secondary")
-        self.validate_btn.setFixedWidth(160)
-        self.validate_btn.clicked.connect(lambda: self.validate_requested.emit(self.watch))
-        status_layout.addWidget(self.validate_btn)
+        more_menu.addSeparator()
 
-        self.restore_btn = QPushButton("↩ Restore")
-        self.restore_btn.setObjectName("secondary")
-        self.restore_btn.setFixedWidth(160)
-        self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.watch))
-        status_layout.addWidget(self.restore_btn)
+        act_full = more_menu.addAction("⟳ Force Full Backup")
+        act_full.triggered.connect(lambda: self.full_backup_requested.emit(self.watch))
+
+        act_dry = more_menu.addAction("🔍 Dry Run")
+        act_dry.setToolTip("Preview what would be backed up without copying any files")
+        act_dry.triggered.connect(lambda: self.dry_run_requested.emit(self.watch))
+
+        act_validate = more_menu.addAction("▶ Validate")
+        act_validate.triggered.connect(lambda: self.validate_requested.emit(self.watch))
+
+        more_menu.addSeparator()
+
+        act_restore = more_menu.addAction("↩ Restore")
+        act_restore.triggered.connect(lambda: self.restore_requested.emit(self.watch))
+
+        act_restore_orig = more_menu.addAction("🏠 Restore to Original")
+        act_restore_orig.setToolTip("Restore files to their original source location")
+        act_restore_orig.triggered.connect(lambda: self.restore_to_original_requested.emit(self.watch))
+
+        if self.dest_type == "local":
+            more_menu.addSeparator()
+            act_open = more_menu.addAction("📂 Open Folder")
+            act_open.triggered.connect(lambda: self.open_backup_requested.emit(self.watch["id"]))
+
+        more_menu.addSeparator()
+        act_settings = more_menu.addAction("⚙ Watch Settings…")
+        act_settings.setToolTip("Edit encryption, exclusions, retention, hooks and more for this watch")
+        act_settings.triggered.connect(lambda: self.watch_settings_requested.emit(self.watch))
+
+        # Store action references so external code can enable/disable them
+        self._act_full_backup   = act_full
+        self._act_dry_run       = act_dry
+        self._act_validate      = act_validate
+        self._act_restore       = act_restore
+        self._act_restore_orig  = act_restore_orig
+
+        self._more_btn.setMenu(more_menu)
+        status_layout.addWidget(self._more_btn)
+
+        # Stub QPushButtons kept for API compatibility — their setEnabled is
+        # overridden to also toggle the corresponding menu action.
+        class _StubBtn(QPushButton):
+            def __init__(self, action=None):
+                super().__init__()
+                self._action = action
+                self.setVisible(False)
+            def setEnabled(self, v):
+                super().setEnabled(v)
+                if self._action:
+                    self._action.setEnabled(v)
+
+        self.full_backup_btn      = _StubBtn(act_full)
+        self.dry_run_btn          = _StubBtn(act_dry)
+        self.pause_btn            = _StubBtn(None)
+        self.validate_btn         = _StubBtn(act_validate)
+        self.restore_btn          = _StubBtn(act_restore)
+        self.restore_original_btn = _StubBtn(act_restore_orig)
+        self.open_backup_btn      = _StubBtn(None)
+
+        # ── Pause/Resume and Cancel buttons (shown during backup) ─────
+        self.pause_backup_btn = QPushButton("⏸ Pause")
+        self.pause_backup_btn.setObjectName("secondary")
+        self.pause_backup_btn.setFixedWidth(160)
+        self.pause_backup_btn.setVisible(False)
+        self.pause_backup_btn.clicked.connect(self._on_pause_backup_clicked)
+        status_layout.addWidget(self.pause_backup_btn)
 
         self.cancel_btn = QPushButton("▶ Cancel")
         self.cancel_btn.setObjectName("danger")
@@ -4372,12 +7438,6 @@ class WatchCard(QFrame):
         self.cancel_btn.setVisible(False)
         self.cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self.watch["id"]))
         status_layout.addWidget(self.cancel_btn)
-
-        self.open_backup_btn = QPushButton("Open Backup")
-        self.open_backup_btn.setObjectName("secondary")
-        self.open_backup_btn.setFixedWidth(160)
-        self.open_backup_btn.clicked.connect(lambda: self.open_backup_requested.emit(self.watch["id"]))
-        status_layout.addWidget(self.open_backup_btn)
 
         layout.addWidget(self.status_widget)
         self._root_layout.addWidget(top)
@@ -4477,18 +7537,38 @@ class WatchCard(QFrame):
         count = len(self._changes)
         self.toggle_btn.setText(f"{'▴' if self._expanded else '▾'}  {count} change(s)")
 
+    def _on_pause_backup_clicked(self):
+        """Toggle pause/resume for a running backup."""
+        if self._backup_paused:
+            # Resume the backup
+            self._backup_paused = False
+            self.pause_backup_btn.setText("⏸ Pause")
+            self.resume_backup_requested.emit(self.watch["id"])
+        else:
+            # Pause the backup
+            self._backup_paused = True
+            self.pause_backup_btn.setText("▶ Resume")
+            self.pause_backup_requested.emit(self.watch["id"])
+
     def set_backing_up(self, active: bool):
         self.backup_btn.setEnabled(not active)
         self.backup_btn.setText("Backing up…" if active else "Backup Now")
-        self.full_backup_btn.setEnabled(not active)
-        self.validate_btn.setEnabled(not active)
-        self.restore_btn.setEnabled(not active)
+        # Disable/enable secondary actions in the More menu during backup
+        if hasattr(self, "_more_btn"):
+            self._more_btn.setEnabled(not active)
+        self.pause_backup_btn.setVisible(active)
         self.cancel_btn.setVisible(active)
         self.progress_bar.setVisible(active)
         self.file_lbl.setVisible(active)
         self.details_lbl.setVisible(active)
         if active:
             self._speed_window.clear()   # fresh window for each backup run
+            self._backup_paused = False   # track pause state during this backup run
+            self.pause_backup_btn.setText("⏸ Pause")  # reset to Pause
+            # FIX: always reset cancel button so a previous "Cancelling…" state
+            # doesn't leave it permanently disabled on the next backup run.
+            self.cancel_btn.setEnabled(True)
+            self.cancel_btn.setText("▶ Cancel")
             self.status_lbl.setText("▶ Backing up…")
             self.status_lbl.setObjectName("status_warn")
             # Start in indeterminate (scanning) mode
@@ -4643,16 +7723,69 @@ class WatchCard(QFrame):
         """Update the 'Next backup in …' countdown label.  Called every 30 s by MainWindow."""
         if not hasattr(self, "next_lbl"):
             return
-        # Hide when auto-backup is globally off, watch is paused, or watch opts out
-        if (not cfg.get("auto_backup", False)
-                or self.watch.get("paused", False)
-                or self.watch.get("skip_auto_backup", False)):
+
+        # If watch opts out of auto-backup, show "Manual only"
+        if self.watch.get("skip_auto_backup", False):
+            self.next_lbl.setText("Manual only")
+            self.next_lbl.setVisible(True)
+            return
+
+        # Resolve schedule: per-watch schedule_times takes priority over global
+        w_sched         = self.watch.get("schedule_times", [])
+        global_sched    = cfg.get("backup_schedule_times", [])
+        schedule_times  = w_sched if w_sched else global_sched
+
+        if schedule_times:
+            now = datetime.now()
+            now_secs_day = now.hour * 3600 + now.minute * 60 + now.second
+            today_bit = 1 << now.weekday()   # Mon=0 → bit 1, Sun=6 → bit 64
+            next_time = None
+            min_diff = float('inf')
+
+            for entry in schedule_times:
+                if isinstance(entry, str):
+                    sched_str = entry
+                    days_mask = 127
+                else:
+                    sched_str = entry.get("time", "")
+                    days_mask = int(entry.get("days", 127))
+                try:
+                    sh, sm = int(sched_str[:2]), int(sched_str[3:5])
+                    sched_sec = sh * 3600 + sm * 60
+                    # If today is not in the mask, fast-forward to next valid day
+                    if days_mask & today_bit:
+                        if sched_sec > now_secs_day:
+                            diff = sched_sec - now_secs_day
+                        else:
+                            diff = (24 * 3600) - now_secs_day + sched_sec
+                    else:
+                        # Count forward days until a valid weekday
+                        extra_days = next(
+                            (d for d in range(1, 8) if days_mask & (1 << ((now.weekday() + d) % 7))),
+                            1
+                        )
+                        diff = extra_days * 86400 - now_secs_day + sched_sec
+                    if diff < min_diff:
+                        min_diff = diff
+                        next_time = sched_str
+                except Exception:
+                    continue
+
+            if next_time:
+                label_prefix = "Next (watch):" if w_sched else "Next:"
+                self.next_lbl.setText(f"{label_prefix} {next_time}")
+                self.next_lbl.setVisible(True)
+                return
+
+        # Otherwise, show countdown based on interval (existing logic)
+        # Hide when auto-backup is globally off or watch is paused
+        if not cfg.get("auto_backup", False) or self.watch.get("paused", False):
             self.next_lbl.setVisible(False)
             return
 
         lb = self.watch.get("last_backup", "")
         if not lb:
-            self.next_lbl.setText("⏱ Auto-backup pending")
+            self.next_lbl.setText("Auto-backup pending")
             self.next_lbl.setVisible(True)
             return
 
@@ -4669,15 +7802,18 @@ class WatchCard(QFrame):
             last_dt   = datetime.fromisoformat(lb)
             remaining = (last_dt.timestamp() + interval_secs) - datetime.now().timestamp()
             if remaining <= 0:
-                text = "⏱ Backup due soon"
+                text = "Backup due soon"
             elif remaining < 60:
-                text = f"⏱ Next backup in {int(remaining)}s"
+                text = f"Next: in {int(remaining)}s"
             elif remaining < 3600:
-                text = f"⏱ Next backup in {int(remaining / 60)}m"
+                text = f"Next: in {int(remaining / 60)} min"
             else:
                 h = int(remaining / 3600)
                 m = int((remaining % 3600) / 60)
-                text = f"⏱ Next backup in {h}h {m:02d}m"
+                if h == 1:
+                    text = f"Next: in {h}h {m:02d}m"
+                else:
+                    text = f"Next: in {h}h {m:02d}m"
             self.next_lbl.setText(text)
             self.next_lbl.setVisible(True)
         except Exception:
@@ -4687,7 +7823,8 @@ class WatchCard(QFrame):
         """Toggle paused state and emit signal for the main window to persist."""
         paused = not self.watch.get("paused", False)
         self.watch["paused"] = paused
-        self.pause_btn.setText("▶ Resume" if paused else "⏸ Pause")
+        if hasattr(self, "_pause_action"):
+            self._pause_action.setText("▶ Resume" if paused else "⏸ Pause")
         self.pause_requested.emit(self.watch["id"], paused)
 
     def update_watch(self, watch: dict):
@@ -4728,8 +7865,8 @@ class WatchCard(QFrame):
 
         # Refresh pause button label
         paused = watch.get("paused", False)
-        if hasattr(self, "pause_btn"):
-            self.pause_btn.setText("▶ Resume" if paused else "⏸ Pause")
+        if hasattr(self, "_pause_action"):
+            self._pause_action.setText("▶ Resume" if paused else "⏸ Pause")
 
         # Rebuild the entire card UI if name/path/color changed significantly
         # (cheaply update the known labels instead of rebuilding)
@@ -4782,14 +7919,20 @@ class MainWindow(QMainWindow):
         self._pending_entries: dict  = {}   # watch_id >[entries]
         self._last_notif_time: dict  = {}   # watch_id >timestamp
         self._history_log: list      = []   # all change entries across all watches
+        self._backup_history: list   = []   # backup run history records
         self._history_save_counter   = 0    # throttle disk saves
         self._history_window         = None
         self._user_cancelled_watches: set = set()  # watches cancelled by user — suppress auto-restart
+        self._skipped_notified: dict = {}   # watch_id > {'window': bool, 'idle': bool}
 
         # Load persisted history from previous sessions
         if BACKEND_AVAILABLE:
             try:
                 self._history_log = config_manager.load_history()
+            except Exception:
+                pass
+            try:
+                self._backup_history = config_manager.load_backup_history()
             except Exception:
                 pass
 
@@ -4802,20 +7945,89 @@ class MainWindow(QMainWindow):
             self._integrity_scheduler = IntegrityScheduler(self)
             self._integrity_scheduler.watch_result.connect(self._on_integrity_result)
             self._integrity_scheduler.run_finished.connect(self._on_integrity_run_finished)
+            self._integrity_scheduler.disk_space_warning.connect(self._on_disk_space_warning)
             self._integrity_scheduler.start()
-        # Resume any backups that were queued but not completed in a previous session
         QTimer.singleShot(3000, self._process_startup_queue)
-        # Check cloud tokens 5 seconds after startup
         QTimer.singleShot(5000, self._validate_cloud_tokens)
-        # Non-blocking update check 10 seconds after startup
         QTimer.singleShot(10000, self._check_for_updates)
-        # Show one-time v1.0.x → v1.1.0 migration notice if needed
         QTimer.singleShot(4000, self._check_migration_notice)
-        # Warn if BACKUPSYS_API_KEY looks like a placeholder
-        if _api_key_is_weak():
-            QTimer.singleShot(2000, self._warn_weak_api_key)
+        self._drive_monitor = DriveTriggerMonitor(self)
+        self._drive_monitor.drive_connected.connect(self._on_drive_connected)
+        self._drive_monitor.start()
 
-    # ── Config ─────────────────────────────────────────────────────────────────
+
+
+    def _maybe_run_setup_wizard(self):
+        """
+        FIX #2 — Setup wizard integration.
+
+        Called once on first launch (via QTimer from main()).  If the user has
+        no watches configured yet, we run the non-interactive parts of
+        setup_wizard (create .env + starter config.json) and then offer a
+        startup-on-login dialog — replacing the old pattern where first-time
+        users had to discover and run ``python setup_wizard.py`` manually.
+
+        The wizard import is deferred so that desktop_app.py does not hard-depend
+        on setup_wizard.py being present (the app still works without it).
+        """
+        try:
+            watches = self.cfg.get("watches", [])
+            if watches:
+                # User already has watches — skip wizard entirely.
+                return
+
+            # Run the non-interactive setup steps (safe to call from GUI).
+            try:
+                import setup_wizard as _sw
+                _sw.run_for_app()
+            except Exception:
+                pass   # wizard not present or failed — non-fatal
+
+            # Welcome dialog: explain what to do next.
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Welcome to BackupSys!")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText(
+                "<b>Welcome — BackupSys is set up and ready to go.</b><br><br>"
+                "To get started:<br>"
+                "1. Click <b>Add Watch</b> to choose a folder to back up.<br>"
+                "2. Open <b>Settings</b> to set your backup destination.<br>"
+                "3. Enable <b>Auto-Backup</b> to run on a schedule.<br><br>"
+                "You can also run <code>python setup_wizard.py</code> in a terminal "
+                "for a guided CLI walkthrough."
+            )
+
+            # Offer startup-on-login (Windows / macOS / Linux).
+            startup_btn = msg.addButton(
+                "Add to Startup", QMessageBox.ButtonRole.ActionRole
+            )
+            msg.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+
+            if msg.clickedButton() == startup_btn:
+                try:
+                    import setup_wizard as _sw
+                    ok = _sw.offer_startup_gui()
+                    if ok:
+                        QMessageBox.information(
+                            self, "Startup entry added",
+                            "BackupSys will now launch automatically when you log in.\n"
+                            "You can remove this later from Settings → General → 'Start on login'."
+                        )
+                    else:
+                        QMessageBox.warning(
+                            self, "Startup entry failed",
+                            "Could not write the startup entry automatically.\n"
+                            "You can enable this later from Settings → General → 'Start on login'."
+                        )
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self, "Startup entry failed",
+                        f"Could not write the startup entry: {exc}"
+                    )
+
+        except Exception:
+            pass   # wizard errors must never crash the app
 
     def _check_for_updates(self):
         """Non-blocking background update check against GitHub releases API.
@@ -4828,7 +8040,7 @@ class MainWindow(QMainWindow):
         def _worker():
             try:
                 import urllib.request, urllib.error, json as _json
-                url = "https://api.github.com/repos/abegail6253/backupsystem/releases/latest"
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
                 req = urllib.request.Request(
                     url,
                     headers={"User-Agent": f"BackupSys/{APP_VERSION}",
@@ -4839,14 +8051,15 @@ class MainWindow(QMainWindow):
                 latest_tag = data.get("tag_name", "").lstrip("v")
                 if not latest_tag:
                     return
-                # Simple version comparison (handles "1.2.3" format)
+                # Version comparison: pad to equal length so (1,2) == (1,2,0)
                 def _ver(s):
                     try:
-                        return tuple(int(x) for x in s.split("."))
+                        parts = tuple(int(x) for x in s.split("."))
+                        return parts + (0,) * max(0, 3 - len(parts))
                     except Exception:
-                        return (0,)
+                        return (0, 0, 0)
                 if _ver(latest_tag) > _ver(APP_VERSION):
-                    html_url = data.get("html_url", "https://github.com/abegail6253/backupsystem/releases")
+                    html_url = data.get("html_url", GITHUB_RELEASES_URL)
                     _QTimer_call(lambda: self._notify_update(latest_tag, html_url))
             except Exception:
                 pass  # network error, rate-limit, wrong URL — all silently ignored
@@ -4866,7 +8079,7 @@ class MainWindow(QMainWindow):
                 tray.tray.showMessage(
                     f"BackupSys {latest_tag} available",
                     f"A new version is available. Visit:\n{html_url}",
-                    QSystemTrayIcon.Information, 8000,
+                    QSystemTrayIcon.MessageIcon.Information, 8000,
                 )
                 return
         except Exception:
@@ -4893,7 +8106,7 @@ class MainWindow(QMainWindow):
 
         msg = QMessageBox(self)
         msg.setWindowTitle("BackupSys v1.1.0 — What's New")
-        msg.setIcon(QMessageBox.Information)
+        msg.setIcon(QMessageBox.Icon.Information)
         msg.setText("<b>Welcome to BackupSys v1.1.0!</b>")
         msg.setInformativeText(
             "Here's what changed since v1.0.x:\n\n"
@@ -4911,31 +8124,55 @@ class MainWindow(QMainWindow):
             "✔  Per-watch last-backup status shown inline on each watch card\n\n"
             "No migration steps required — all existing watches and backups continue to work."
         )
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec_()
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
         _s.setValue(_seen_key, True)
 
-    def _warn_weak_api_key(self):
-        """Show a one-time startup warning if BACKUPSYS_API_KEY looks weak or unset."""
-        msg = QMessageBox(self)
-        msg.setWindowTitle("⚠ Weak API Key Detected")
-        msg.setIcon(QMessageBox.Warning)
-        msg.setText(
-            "<b>BACKUPSYS_API_KEY looks like a placeholder or is too short.</b>"
-        )
-        msg.setInformativeText(
-            "Your current key is either empty, a known example value, or fewer than "
-            "20 characters. This key protects your backup API from unauthorized access.\n\n"
-            "Generate a strong key by running:\n"
-            "  python -c \"import secrets; print(secrets.token_hex(32))\"\n\n"
-            "Then set it in your .env file:\n"
-            "  BACKUPSYS_API_KEY=<your-generated-key>"
-        )
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec_()
-        if hasattr(self, "log_text"):
+    # ── Drive trigger — USB / external drive auto-backup ───────────────────────
+
+
+    def _on_drive_connected(self, label: str, serial: str, mount_point: str):
+        """
+        Called when any new volume is mounted.  Checks every watch for a
+        matching drive_trigger_label or drive_trigger_serial and fires a backup
+        for each match.
+        """
+        if not BACKEND_AVAILABLE:
+            return
+        cfg = config_manager.load()
+        self.cfg = cfg
+        matched_any = False
+        for w in cfg.get("watches", []):
+            if not w.get("active", True) or w.get("paused", False):
+                continue
+            trigger_label  = (w.get("drive_trigger_label")  or "").strip()
+            trigger_serial = (w.get("drive_trigger_serial") or "").strip().upper()
+            if not trigger_label and not trigger_serial:
+                continue  # no trigger configured for this watch
+            label_match  = trigger_label  and label.lower()  == trigger_label.lower()
+            serial_match = trigger_serial and serial.upper() == trigger_serial.upper()
+            if not (label_match or serial_match):
+                continue
+            if w["id"] in self._workers:
+                logger.info(
+                    f"[drive-trigger] {w['name']!r}: drive matched but backup already running"
+                )
+                continue
+            logger.info(
+                f"[drive-trigger] Triggering backup for {w['name']!r} "
+                f"(label={label!r} serial={serial!r})"
+            )
             self._append_log(
-                "⚠ BACKUPSYS_API_KEY is weak/unset — generate a secure key and update .env"
+                f"🔌 Drive connected ({label or serial or mount_point}) — "
+                f"triggering backup: {w['name']}"
+            )
+            self._backup_single(w, triggered_by="drive_trigger")
+            matched_any = True
+
+        if not matched_any:
+            logger.debug(
+                f"[drive-trigger] Volume mounted (label={label!r} serial={serial!r} "
+                f"root={mount_point!r}) — no watch trigger matched"
             )
 
     def _load_config(self):
@@ -4979,10 +8216,31 @@ class MainWindow(QMainWindow):
 
         tl.addSpacing(8)
 
+        dashboard_btn = QPushButton("📈  Dashboard")
+        dashboard_btn.setObjectName("secondary")
+        dashboard_btn.clicked.connect(self._open_global_dashboard)
+        tl.addWidget(dashboard_btn)
+
+        tl.addSpacing(8)
+
+        logs_btn = QPushButton("📜  Logs")
+        logs_btn.setObjectName("secondary")
+        logs_btn.clicked.connect(self._open_logs)
+        tl.addWidget(logs_btn)
+
+        tl.addSpacing(8)
+
         admin_btn = QPushButton("🔧 Admin")
         admin_btn.setObjectName("secondary")
         admin_btn.clicked.connect(self._open_admin)
         tl.addWidget(admin_btn)
+
+        tl.addSpacing(8)
+
+        self.quit_btn = QPushButton("❌ Quit")
+        self.quit_btn.setObjectName("secondary")
+        self.quit_btn.clicked.connect(self._quit_app)
+        tl.addWidget(self.quit_btn)
 
         root.addWidget(topbar)
 
@@ -5021,6 +8279,16 @@ class MainWindow(QMainWindow):
         backup_all_btn.clicked.connect(self._backup_all)
         sl.addWidget(backup_all_btn)
 
+        self._pause_all_btn = QPushButton("⏸  Pause All Backups")
+        self._pause_all_btn.setObjectName("secondary")
+        self._pause_all_btn.setToolTip(
+            "Pause all watched folders at once.\n"
+            "Useful before presentations or on slow connections.\n"
+            "Click again to resume all watches."
+        )
+        self._pause_all_btn.clicked.connect(self._toggle_pause_all)
+        sl.addWidget(self._pause_all_btn)
+
         sl.addStretch()
 
         version_lbl = QLabel(f"v{APP_VERSION}")
@@ -5041,6 +8309,12 @@ class MainWindow(QMainWindow):
         watches_lbl.setObjectName("heading")
         header_row.addWidget(watches_lbl)
         header_row.addStretch()
+        self.watch_search_input = QLineEdit()
+        self.watch_search_input.setPlaceholderText("🔍  Filter watches…")
+        self.watch_search_input.setFixedWidth(200)
+        self.watch_search_input.setToolTip("Filter the watch list by name")
+        self.watch_search_input.textChanged.connect(self._filter_watch_cards)
+        header_row.addWidget(self.watch_search_input)
         cl.addLayout(header_row)
 
         # Auto backup status bar
@@ -5054,10 +8328,50 @@ class MainWindow(QMainWindow):
         abl.addStretch()
         cl.addWidget(self.auto_bar)
 
+        # ── Google Drive disconnected banner ──────────────────────────────
+        self.gdrive_banner = QFrame()
+        self.gdrive_banner.setObjectName("card")
+        self.gdrive_banner.setStyleSheet(
+            "QFrame { background: #7c2d12; border: 1px solid #ea580c; border-radius: 6px; }"
+        )
+        gdb_row = QHBoxLayout(self.gdrive_banner)
+        gdb_row.setContentsMargins(14, 8, 14, 8)
+        gdb_icon = QLabel("⚠")
+        gdb_icon.setStyleSheet("color:#fbbf24; font-size:16px; font-weight:bold;")
+        gdb_row.addWidget(gdb_icon)
+        self._gdrive_banner_lbl = QLabel(
+            "<b style='color:#fef3c7;'>Google Drive disconnected</b> "
+            "<span style='color:#fcd34d;'>— your token has expired or been revoked. "
+            "Backups to Google Drive will fail until you reconnect.</span>"
+        )
+        self._gdrive_banner_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._gdrive_banner_lbl.setWordWrap(True)
+        gdb_row.addWidget(self._gdrive_banner_lbl, stretch=1)
+        gdrive_reconnect_btn = QPushButton("Reconnect Drive →")
+        gdrive_reconnect_btn.setObjectName("secondary")
+        gdrive_reconnect_btn.setStyleSheet(
+            "QPushButton { background:#ea580c; color:#fff; border:none; border-radius:4px; padding:4px 12px; }"
+            "QPushButton:hover { background:#f97316; }"
+        )
+        gdrive_reconnect_btn.clicked.connect(self._open_gdrive_reconnect)
+        gdb_row.addWidget(gdrive_reconnect_btn)
+        gdrive_dismiss_btn = QPushButton("✕")
+        gdrive_dismiss_btn.setObjectName("secondary")
+        gdrive_dismiss_btn.setFixedWidth(28)
+        gdrive_dismiss_btn.setToolTip("Dismiss until next backup")
+        gdrive_dismiss_btn.setStyleSheet(
+            "QPushButton { background:transparent; color:#fcd34d; border:none; font-size:14px; }"
+            "QPushButton:hover { color:#fff; }"
+        )
+        gdrive_dismiss_btn.clicked.connect(lambda: self.gdrive_banner.hide())
+        gdb_row.addWidget(gdrive_dismiss_btn)
+        self.gdrive_banner.hide()   # hidden until a token failure is detected
+        cl.addWidget(self.gdrive_banner)
+
         # Watches scroll area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
         self.watches_container = QWidget()
         self.watches_layout = QVBoxLayout(self.watches_container)
@@ -5139,22 +8453,40 @@ class MainWindow(QMainWindow):
         self._cards.clear()
 
         watches = self.cfg.get("watches", [])
+        # Sync the Pause All button label to reflect persisted watch states
+        if hasattr(self, "_pause_all_btn"):
+            all_paused = bool(watches) and all(w.get("paused", False) for w in watches)
+            if all_paused:
+                self._pause_all_btn.setText("▶  Resume All Backups")
+                self._pause_all_btn.setToolTip("Resume all watched folders (backups were globally paused).")
+            else:
+                self._pause_all_btn.setText("⏸  Pause All Backups")
+                self._pause_all_btn.setToolTip(
+                    "Pause all watched folders at once.\n"
+                    "Useful before presentations or on slow connections.\n"
+                    "Click again to resume all watches."
+                )
         if not watches:
             placeholder = QLabel("No folders are being watched.\nClick Admin > Watches > Add Watch to get started.")
-            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             placeholder.setStyleSheet("color:#374151; font-size:13px; padding:40px;")
             self.watches_layout.insertWidget(0, placeholder)
         else:
             for w in watches:
-                card = WatchCard(w)
+                dest_type = self.cfg.get("dest_type", "local")
+                card = WatchCard(w, dest_type)
                 card.backup_requested.connect(self._backup_single)
                 card.full_backup_requested.connect(self._force_full_backup)
                 card.dry_run_requested.connect(self._dry_run_watch)
                 card.validate_requested.connect(self._validate_watch)
                 card.restore_requested.connect(self._restore_watch)
+                card.restore_to_original_requested.connect(self._restore_to_original)
                 card.pause_requested.connect(self._on_pause_requested)
+                card.pause_backup_requested.connect(self._on_pause_backup_requested)
+                card.resume_backup_requested.connect(self._on_resume_backup_requested)
                 card.cancel_requested.connect(self._on_cancel_requested)
                 card.open_backup_requested.connect(self._on_open_backup_folder)
+                card.watch_settings_requested.connect(self._on_watch_settings_requested)
                 self._cards[w["id"]] = card
                 self.watches_layout.insertWidget(self.watches_layout.count() - 1, card)
                 # Seed countdown label immediately so it shows on first load
@@ -5162,6 +8494,18 @@ class MainWindow(QMainWindow):
                     card.refresh_next_backup_lbl(self.cfg)
                 except Exception:
                     pass
+        # Re-apply any active filter after rebuild
+        if hasattr(self, "watch_search_input"):
+            self._filter_watch_cards(self.watch_search_input.text())
+
+    def _filter_watch_cards(self, text: str = ""):
+        """Show/hide watch cards based on search text."""
+        text = text.strip().lower()
+        for wid, card in self._cards.items():
+            watch_name = card.watch.get("name", "").lower()
+            watch_path = card.watch.get("path", "").lower()
+            visible = (not text) or (text in watch_name) or (text in watch_path)
+            card.setVisible(visible)
 
     def _update_stats(self):
         watches = self.cfg.get("watches", [])
@@ -5298,7 +8642,7 @@ class MainWindow(QMainWindow):
             self._tray.showMessage(
                 f"Change detected  · {name}",
                 f"{icon}  {etype.capitalize()}: {path}{who}",
-                QSystemTrayIcon.Information, 3000
+                QSystemTrayIcon.MessageIcon.Information, 3000
             )
 
     def _watch_name_for(self, watch_id: str) -> str:
@@ -5328,10 +8672,10 @@ class MainWindow(QMainWindow):
         self._auto_timer.timeout.connect(self._auto_backup_tick)
         self._auto_timer.start(5_000)  # check every 5s (supports seconds interval)
 
-        # Refresh "next backup in …" labels every 30 seconds
+        # Refresh "next backup in …" labels every 60 seconds
         self._countdown_timer = QTimer(self)
         self._countdown_timer.timeout.connect(self._refresh_countdown_labels)
-        self._countdown_timer.start(30_000)
+        self._countdown_timer.start(60_000)
 
     def _refresh_countdown_labels(self):
         """Refresh the 'Next backup in …' label on every watch card."""
@@ -5368,36 +8712,8 @@ class MainWindow(QMainWindow):
         if not cfg.get("auto_backup", False):
             return
 
-        # ── Backup window end check — don't START new backups after stop time ──
-        _window_end = cfg.get("backup_window_end", "").strip()
-        if _window_end:
-            try:
-                _we_h, _we_m = int(_window_end[:2]), int(_window_end[3:5])
-                _now = datetime.now()
-                _window_end_secs = _we_h * 3600 + _we_m * 60
-                _now_secs = _now.hour * 3600 + _now.minute * 60 + _now.second
-                if _now_secs >= _window_end_secs:
-                    logger.debug(
-                        f"[window] Auto-backup suppressed: current time "
-                        f"{_now.strftime('%H:%M')} is past backup window end {_window_end}"
-                    )
-                    return
-            except Exception:
-                pass  # malformed stop time — ignore silently
-        # idle_threshold_cpu: 0 = disabled; e.g. 50 = only backup when CPU < 50%
-        _idle_threshold = cfg.get("idle_threshold_cpu", 0)
-        if _idle_threshold and _idle_threshold > 0:
-            try:
-                import psutil
-                _cpu = psutil.cpu_percent(interval=0)   # non-blocking sample
-                if _cpu > _idle_threshold:
-                    logger.debug(
-                        f"[idle] CPU at {_cpu:.0f}% > threshold {_idle_threshold}% "
-                        "— deferring auto-backup until system is idle"
-                    )
-                    return
-            except ImportError:
-                pass   # psutil not installed — skip idle check silently
+        # ── Metered connection check (Windows only) ───────────────────────────
+        # Moved to per-watch below
 
         interval_val  = cfg.get("interval_min", 30)
         interval_unit = cfg.get("interval_unit", "minutes")
@@ -5405,48 +8721,183 @@ class MainWindow(QMainWindow):
         now = datetime.now()
 
         # ── Time-of-day schedule check ────────────────────────────────────────
-        # If backup_schedule_times is set, those times ARE the auto backup.
-        # The interval is completely ignored  · the backup only fires at the
-        # exact scheduled times (e.g. 17:50). This way the backup runs when
-        # the PC is idle and doesn't eat resources during working hours.
-        # If no scheduled times are configured, the interval runs as normal.
-        schedule_times = cfg.get("backup_schedule_times", [])
-        _schedule_due  = False
-        now_hhmm       = now.strftime("%H:%M")
-        now_secs_day   = now.hour * 3600 + now.minute * 60 + now.second
+        # Schedules are resolved per-watch: the watch's own schedule_times takes
+        # priority; if empty, the global backup_schedule_times is used; if that
+        # is also empty, the interval runs as normal.
+        global_schedule_times = cfg.get("backup_schedule_times", [])
+        now_hhmm              = now.strftime("%H:%M")
+        now_secs_day          = now.hour * 3600 + now.minute * 60 + now.second
 
-        if schedule_times:
-            # Scheduled mode  · check if it's time to fire
-            for sched_str in schedule_times:
+        if not hasattr(self, "_last_sched_fire"):
+            self._last_sched_fire = {}
+
+        def _sched_due_for(times: list) -> bool:
+            """Return True if any entry in times matches the current HH:MM (±5 s) and today's weekday."""
+            today_bit = 1 << now.weekday()   # Mon=0 → bit 1, Sun=6 → bit 64
+            for entry in times:
+                if isinstance(entry, str):
+                    sched_str = entry
+                    days_mask = 127
+                else:
+                    sched_str = entry.get("time", "")
+                    days_mask = int(entry.get("days", 127))
+                if not (days_mask & today_bit):
+                    continue   # not scheduled for today
                 try:
                     sh, sm    = int(sched_str[:2]), int(sched_str[3:5])
                     sched_sec = sh * 3600 + sm * 60
                     if abs(now_secs_day - sched_sec) <= 5:
-                        if not hasattr(self, "_last_sched_fire"):
-                            self._last_sched_fire = {}
-                        if self._last_sched_fire.get(sched_str) != now_hhmm:
-                            self._last_sched_fire[sched_str] = now_hhmm
-                            _schedule_due = True
+                        fire_key = sched_str + "@" + now_hhmm
+                        if self._last_sched_fire.get(fire_key) != now_hhmm:
+                            self._last_sched_fire[fire_key] = now_hhmm
                             logger.info(f"Scheduled backup triggered at {sched_str}")
-                            break
+                            return True
                 except Exception:
                     continue
+            return False
 
-            if not _schedule_due:
-                return  # Not the scheduled time yet  · skip interval entirely
+        # ── Global-only pre-check: if a global schedule is set and NO watch has
+        # its own schedule_times, bail out early when no global time is due.
+        # This preserves the original behaviour for deployments that don't use
+        # per-watch schedules (avoids iterating every watch on every tick).
+        watches_with_own_schedule = [
+            w for w in cfg.get("watches", []) if w.get("schedule_times")
+        ]
+        if global_schedule_times and not watches_with_own_schedule:
+            if not _sched_due_for(global_schedule_times):
+                return  # nothing to do yet
 
         for w in cfg.get("watches", []):
+            wid = w["id"]
             if not w.get("active", True) or w.get("paused", False):
                 continue
             if w.get("skip_auto_backup", False):
                 continue
-            if w["id"] in self._workers:
+            if wid in self._workers:
                 continue  # already running
-            if w["id"] in self._user_cancelled_watches:
+            if wid in self._user_cancelled_watches:
                 continue  # user explicitly cancelled — don't auto-restart
 
-            if _schedule_due:
-                self._backup_single(w, triggered_by="scheduled")
+            # ── Backup window check — only START new backups inside the allowed window ──
+            _window_start = cfg.get("backup_window_start", "").strip()
+            _window_end   = cfg.get("backup_window_end",   "").strip()
+            if _window_start or _window_end:
+                try:
+                    _now = datetime.now()
+                    _now_secs = _now.hour * 3600 + _now.minute * 60 + _now.second
+
+                    # Parse whichever bounds are set
+                    _ws_secs = None
+                    _we_secs = None
+                    if _window_start:
+                        _ws_h, _ws_m = int(_window_start[:2]), int(_window_start[3:5])
+                        _ws_secs = _ws_h * 3600 + _ws_m * 60
+                    if _window_end:
+                        _we_h, _we_m = int(_window_end[:2]), int(_window_end[3:5])
+                        _we_secs = _we_h * 3600 + _we_m * 60
+
+                    # Determine whether we are currently inside the allowed window.
+                    # Two cases:
+                    #   Normal window  (start < end):  e.g. 01:00–06:00 — inside iff start <= now < end
+                    #   Overnight wrap (start > end):  e.g. 22:00–06:00 — inside iff now >= start OR now < end
+                    _in_window = True  # assume allowed when only one bound is set
+                    if _ws_secs is not None and _we_secs is not None:
+                        if _ws_secs < _we_secs:
+                            # Same-day window
+                            _in_window = _ws_secs <= _now_secs < _we_secs
+                        else:
+                            # Overnight window (wraps midnight)
+                            _in_window = _now_secs >= _ws_secs or _now_secs < _we_secs
+                    elif _ws_secs is not None:
+                        # Only start bound set — allowed from start onwards (no end)
+                        _in_window = _now_secs >= _ws_secs
+                    elif _we_secs is not None:
+                        # Only end bound set (legacy: stop-only) — allowed until end
+                        _in_window = _now_secs < _we_secs
+
+                    if not _in_window:
+                        _bounds_str = (
+                            (f"{_window_start}–" if _window_start else "–") +
+                            (_window_end if _window_end else "")
+                        )
+                        logger.debug(
+                            f"[window] Auto-backup suppressed for {w['name']}: current time "
+                            f"{_now.strftime('%H:%M')} is outside backup window {_bounds_str}"
+                        )
+                        if not self._skipped_notified.get(wid, {}).get('window', False):
+                            self.tray_icon.showMessage(
+                                "BackupSys — Backup Skipped",
+                                f"Scheduled backup skipped — outside the allowed backup window ({_bounds_str}).",
+                                QSystemTrayIcon.MessageIcon.Information, 4000,
+                            )
+                            if wid not in self._skipped_notified:
+                                self._skipped_notified[wid] = {}
+                            self._skipped_notified[wid]['window'] = True
+                        continue
+                except Exception:
+                    pass  # malformed time — ignore silently
+
+            # idle_threshold_cpu: 0 = disabled; e.g. 50 = only backup when CPU < 50%
+            _idle_threshold = cfg.get("idle_threshold_cpu", 0)
+            if _idle_threshold and _idle_threshold > 0:
+                try:
+                    import psutil
+                    _cpu = psutil.cpu_percent(interval=0)   # non-blocking sample
+                    if _cpu > _idle_threshold:
+                        logger.debug(
+                            f"[idle] CPU at {_cpu:.0f}% > threshold {_idle_threshold}% "
+                            f"for {w['name']} — deferring auto-backup until system is idle"
+                        )
+                        if not self._skipped_notified.get(wid, {}).get('idle', False):
+                            self.tray_icon.showMessage("BackupSys — Backup Skipped", "Scheduled backup deferred — system is not idle (CPU above threshold).", QSystemTrayIcon.MessageIcon.Information, 4000)
+                            if wid not in self._skipped_notified:
+                                self._skipped_notified[wid] = {}
+                            self._skipped_notified[wid]['idle'] = True
+                        continue
+                except ImportError:
+                    pass   # psutil not installed — skip idle check silently
+
+            # ── Metered connection check (Windows only) ───────────────────────────
+            if cfg.get("pause_on_metered", False):
+                if is_metered_connection():
+                    logger.info(f"Auto-backup skipped for {w['name']} — metered network connection detected.")
+                    continue
+
+            # ── Battery check — skip backup when running on battery ────────────────────
+            if cfg.get("pause_on_battery", False):
+                try:
+                    import psutil
+                    _bat = psutil.sensors_battery()
+                    # sensors_battery() returns None on desktops (no battery).
+                    # Only suppress when a battery is present AND not plugged in.
+                    if _bat is not None and not _bat.power_plugged:
+                        logger.debug(
+                            f"[battery] Auto-backup deferred for {w['name']} — "
+                            f"running on battery ({_bat.percent:.0f}% remaining)"
+                        )
+                        if not self._skipped_notified.get(wid, {}).get('battery', False):
+                            self.tray_icon.showMessage(
+                                "BackupSys — Backup Skipped",
+                                "Scheduled backup deferred — laptop is running on battery.",
+                                QSystemTrayIcon.MessageIcon.Information, 4000,
+                            )
+                            if wid not in self._skipped_notified:
+                                self._skipped_notified[wid] = {}
+                            self._skipped_notified[wid]['battery'] = True
+                        continue
+                except ImportError:
+                    pass  # psutil not installed — skip battery check silently
+
+            # ── Per-watch schedule resolution ─────────────────────────────────
+            # Priority: per-watch schedule_times > global backup_schedule_times > interval
+            w_sched = w.get("schedule_times", [])
+            effective_schedule = w_sched if w_sched else global_schedule_times
+
+            if effective_schedule:
+                # Scheduled mode for this watch — only fire at the named times
+                if _sched_due_for(effective_schedule):
+                    self._backup_single(w, triggered_by="scheduled")
+                # else: not yet time for this watch — skip without falling through to interval
                 continue
 
             watch_interval_min = w.get("interval_min", 0)
@@ -5480,35 +8931,72 @@ class MainWindow(QMainWindow):
         # user-cancel so auto-backups resume normally after this run.
         self._user_cancelled_watches.discard(wid)
 
+        # Reset skip notification flags when backup actually runs
+        self._skipped_notified[wid] = {}
+
         # ── Per-watch storage quota check ─────────────────────────────────────
         # max_backup_bytes: if > 0, refuse to start a new backup once that
         # watch has already consumed more than N bytes of backup storage.
         _max_bytes = watch.get("max_backup_bytes", 0)
         if _max_bytes and _max_bytes > 0 and BACKEND_AVAILABLE:
-            try:
-                _used = backup_engine._backup_index.get_watch_disk_usage(
-                    self.cfg.get("destination", ""), wid
+            _dest_type_for_quota = self.cfg.get("dest_type", "local")
+            _non_local_dests = {"sftp", "ftp", "ftps", "smb", "webdav", "rclone", "cloud", "https", "gdrive"}
+            if _dest_type_for_quota in _non_local_dests:
+                # Storage quota cannot be enforced for remote destinations because
+                # get_watch_disk_usage scans the local backup_dir path which does
+                # not exist for remote-only targets.  Warn once and skip the check.
+                self._append_log(
+                    f"⚠ Storage quota for '{watch.get('name', wid)}' is set but cannot be "
+                    f"enforced for remote destination '{_dest_type_for_quota}'. "
+                    "The quota is only supported for local destinations. "
+                    "Proceeding with backup."
                 )
-                if _used >= _max_bytes:
-                    _used_h  = backup_engine._human_size(_used)
-                    _limit_h = backup_engine._human_size(_max_bytes)
-                    self._append_log(
-                        f"⚠ Skipped backup for '{watch.get('name', wid)}' — "
-                        f"storage quota exceeded ({_used_h} used of {_limit_h} limit). "
-                        "Delete old backups or raise the quota in Settings → Edit Watch."
+            else:
+                try:
+                    _used = backup_engine._backup_index.get_watch_disk_usage(
+                        self.cfg.get("destination", ""), wid
                     )
-                    if hasattr(self, "_tray"):
-                        self._tray.showMessage(
-                            APP_NAME,
-                            f"⚠ Quota exceeded for {watch.get('name',wid)}: "
-                            f"{_used_h} / {_limit_h}",
-                            QSystemTrayIcon.Warning, 6000,
-                        )
-                    return
-            except Exception:
-                pass  # quota check failure is non-fatal; proceed with backup
+                    # Add warning thresholds before hard refusal
+                    _usage_pct = (_used / _max_bytes) * 100
+                    if _usage_pct >= 90:
+                        # Add warning_90 to the result dict (will be checked in completion handler)
+                        watch["_quota_warning_90"] = True
+                    elif _usage_pct >= 80:
+                        # Add warning_80 to the result dict (will be checked in completion handler)
+                        watch["_quota_warning_80"] = True
 
-        worker = BackupWorker(watch, self.cfg, triggered_by=triggered_by)
+                    if _used >= _max_bytes:
+                        _used_h  = backup_engine._human_size(_used)
+                        _limit_h = backup_engine._human_size(_max_bytes)
+                        self._append_log(
+                            f"⚠ Skipped backup for '{watch.get('name', wid)}' — "
+                            f"storage quota exceeded ({_used_h} used of {_limit_h} limit). "
+                            "Delete old backups or raise the quota in Settings → Edit Watch."
+                        )
+                        if hasattr(self, "_tray"):
+                            self._tray.showMessage(
+                                APP_NAME,
+                                f"⚠ Quota exceeded for {watch.get('name',wid)}: "
+                                f"{_used_h} / {_limit_h}",
+                                QSystemTrayIcon.MessageIcon.Warning, 6000,
+                            )
+                        return
+                except Exception:
+                    pass  # quota check failure is non-fatal; proceed with backup
+
+        # Collect watcher-tracked changed paths for the fast-scan optimisation.
+        # Only use for incremental (non-manual-full) triggers; for "force full"
+        # changed_paths is left None so build_snapshot does a complete rglob.
+        _changed_paths = None
+        if self._watcher_mgr and triggered_by != "full":
+            try:
+                _pending = self._watcher_mgr.get_pending(wid)
+                if _pending:
+                    _changed_paths = [e.get("path", "") for e in _pending if e.get("path")]
+            except Exception:
+                pass
+
+        worker = BackupWorker(watch, self.cfg, triggered_by=triggered_by, changed_paths=_changed_paths)
         worker.progress.connect(lambda c, t, f, e, s, bd, tb, _wid=wid: self._on_progress(_wid, c, t, f, e, s, bd, tb))
         worker.finished.connect(lambda r, _wid=wid: self._on_backup_done(_wid, r))
         worker.log_message.connect(self._append_log)
@@ -5540,13 +9028,9 @@ class MainWindow(QMainWindow):
                         )
                     if est.get("skipped_files"):
                         parts.append(f"{est['skipped_files']} skipped")
-                    from PyQt5.QtCore import QMetaObject, Q_ARG
+                    from PyQt6.QtCore import QTimer
                     msg = "📊 Estimate:  " + "   |   ".join(parts)
-                    QMetaObject.invokeMethod(
-                        self, "_append_log",
-                        Qt.QueuedConnection,
-                        Q_ARG(str, msg),
-                    )
+                    QTimer.singleShot(0, lambda m=msg: self._append_log(m))
                 except Exception:
                     pass  # size estimate failure is always non-fatal
             import threading as _thr
@@ -5574,15 +9058,15 @@ class MainWindow(QMainWindow):
 
     def _force_full_backup(self, watch: dict):
         """Delete the snapshot so the next backup is a full backup, then run it."""
-        from PyQt5.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QMessageBox
         wid = watch["id"]
         reply = QMessageBox.question(
             self, "Force Full Backup",
             "This will re-upload ALL files regardless of changes.\n\nContinue?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
         if BACKEND_AVAILABLE:
             try:
@@ -5630,6 +9114,36 @@ class MainWindow(QMainWindow):
                 pass
 
         success = result.get("status") == "success"
+
+        # Record backup history for export
+        started_at = result.get("timestamp", datetime.now().isoformat())
+        finished_at = started_at
+        try:
+            started_dt = datetime.fromisoformat(started_at)
+            finished_at = (started_dt + timedelta(seconds=float(result.get("duration_s", 0) or 0))).isoformat()
+        except Exception:
+            finished_at = datetime.now().isoformat()
+
+        history_entry = {
+            "watch_name": self._watch_name_for(wid),
+            "watch_id": wid,
+            "backup_id": result.get("backup_id", result.get("id", "")),
+            "status": result.get("status", ""),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "file_count": int(result.get("files_copied", 0) or 0),
+            "size_bytes": int(result.get("total_size_bytes", 0) or 0),
+            "destination": result.get("destination", ""),
+            "error": result.get("error", "") or "",
+        }
+        self._backup_history.append(history_entry)
+        if len(self._backup_history) > 1000:
+            self._backup_history = self._backup_history[-1000:]
+        if BACKEND_AVAILABLE:
+            try:
+                config_manager.save_backup_history(self._backup_history)
+            except Exception:
+                pass
 
         if wid in self._cards:
             self._cards[wid].set_done(success, result.get("duration_s", 0.0))
@@ -5766,18 +9280,18 @@ class MainWindow(QMainWindow):
                                     names += f"\n  … and {count - 10} more"
                                 msg = QMessageBox(self)
                                 msg.setWindowTitle("Retention Cleanup Confirmation")
-                                msg.setIcon(QMessageBox.Warning)
+                                msg.setIcon(QMessageBox.Icon.Warning)
                                 msg.setText(
                                     f"<b>Retention cleanup will permanently delete {count} backup(s) "
                                     f"older than {retention} days for '{watch.get('name', wid)}'.</b><br><br>"
                                     f"This will free <b>{freed_str}</b> and <b>cannot be undone</b>."
                                 )
                                 msg.setDetailedText(f"Folders to be deleted:\n{names}")
-                                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                                msg.setDefaultButton(QMessageBox.No)
-                                msg.button(QMessageBox.Yes).setText("Delete permanently")
-                                msg.button(QMessageBox.No).setText("Skip cleanup")
-                                if msg.exec_() == QMessageBox.Yes:
+                                msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                                msg.setDefaultButton(QMessageBox.StandardButton.No)
+                                msg.button(QMessageBox.StandardButton.Yes).setText("Delete permanently")
+                                msg.button(QMessageBox.StandardButton.No).setText("Skip cleanup")
+                                if msg.exec() == QMessageBox.StandardButton.Yes:
                                     cleaned = backup_engine.cleanup_old_backups(dest, retention, wid)
                                     if cleaned.get("deleted", 0) > 0:
                                         self._append_log(
@@ -5824,19 +9338,41 @@ class MainWindow(QMainWindow):
 
         # Tray notification
         if hasattr(self, "_tray"):
+            # Check for quota warnings first
+            watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
+            if watch:
+                if watch.get("_quota_warning_90"):
+                    self._tray.showMessage(
+                        APP_NAME,
+                        f"Watch '{watch.get('name', wid)}' is at 90% of its storage quota — consider cleaning up old backups.",
+                        QSystemTrayIcon.MessageIcon.Warning, 8000
+                    )
+                elif watch.get("_quota_warning_80"):
+                    self._tray.showMessage(
+                        APP_NAME,
+                        f"Watch '{watch.get('name', wid)}' is at 80% of its storage quota — consider cleaning up old backups.",
+                        QSystemTrayIcon.MessageIcon.Warning, 6000
+                    )
+                # Clean up the temporary flags
+                watch.pop("_quota_warning_80", None)
+                watch.pop("_quota_warning_90", None)
+
             if success:
                 dur_str  = _fmt_duration(result.get("duration_s", 0.0))
                 dur_part = f"  ·  {dur_str}" if dur_str else ""
                 sz_part  = f"  ·  {result.get('total_size','')}" if result.get("total_size") else ""
                 msg = f"✅ Backup complete: {result.get('files_copied',0)} file(s){sz_part}{dur_part}"
-                _icon = QSystemTrayIcon.Information
+                _icon = QSystemTrayIcon.MessageIcon.Information
             elif result.get("status") == "cancelled":
                 msg   = f"⏹ Backup cancelled: {result.get('watch_name', self._watch_name_for(wid))}"
-                _icon = QSystemTrayIcon.Information
+                _icon = QSystemTrayIcon.MessageIcon.Information
             else:
                 err_detail = result.get("error", "unknown error")
                 msg   = f"❌ Backup FAILED: {self._watch_name_for(wid)} — {err_detail}"
-                _icon = QSystemTrayIcon.Warning
+                # Surface the Drive reconnect banner if the error is a token failure
+                if err_detail and "reconnect Google Drive" in err_detail and hasattr(self, "gdrive_banner"):
+                    self.gdrive_banner.show()
+                _icon = QSystemTrayIcon.MessageIcon.Warning
             self._tray.showMessage(APP_NAME, msg, _icon, 5000 if not success else 3000)
 
     def _append_log(self, text: str):
@@ -5856,23 +9392,59 @@ class MainWindow(QMainWindow):
     # ── Validate ───────────────────────────────────────────────────────────────
 
     def _dry_run_watch(self, watch: dict):
-        """Preview what would be backed up without copying any files."""
-        if not BACKEND_AVAILABLE:
-            return
-        wid  = watch["id"]
-        dest = watch.get("destination", "").strip() or self.cfg.get("destination", "")
-        dest_type = self.cfg.get("dest_type", "local")
+        """Run backup preview and display results in a dialog.
 
-        self._append_log(f"🔍 Dry run: scanning '{watch['name']}' …")
+        Strategy:
+          - Normal (script) mode : spawn backupsys_cli.py as a subprocess so the
+            output mirrors exactly what the user sees in the terminal.
+          - Frozen (.exe) mode   : call backup_engine.run_backup(dry_run=True)
+            directly, because backupsys_cli.py does not exist on disk in a
+            PyInstaller bundle.
+        Both paths run in a daemon thread so the Qt main thread never blocks.
+        """
+        watch_id   = watch["id"]
+        watch_name = watch.get("name", "Unknown")
 
-        def _run():
+        self._append_log(f"🔍 Running backup preview for \'{watch_name}\' …")
+
+        if watch_id in self._cards:
+            self._cards[watch_id].dry_run_btn.setEnabled(False)
+
+        def _run_cli():
+            """Subprocess path — used when running as a .py script."""
+            import subprocess
+            _app_dir = str(Path(__file__).parent)
+            _cli     = str(Path(__file__).parent / "backupsys_cli.py")
             try:
-                snapshot = config_manager.load_snapshot(wid, dest_type)
+                result = subprocess.run(
+                    [sys.executable, _cli, "dry-run", "--watch", watch_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=_app_dir,
+                )
+                return {
+                    "status": "ok" if result.returncode == 0 else "error",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
+            except subprocess.TimeoutExpired:
+                return {"status": "error", "stdout": "", "stderr": "Preview timed out after 120 seconds"}
+            except Exception as e:
+                return {"status": "error", "stdout": "", "stderr": str(e)}
+
+        def _run_inprocess():
+            """In-process path — used when running as a frozen PyInstaller .exe."""
+            try:
+                cfg      = config_manager.load()
+                dest     = watch.get("destination", "").strip() or cfg.get("destination", "")
+                dest_type = cfg.get("dest_type", "local")
+                snapshot = config_manager.load_snapshot(watch_id, dest_type)
                 result   = backup_engine.run_backup(
                     source            = watch["path"],
                     destination       = dest,
-                    watch_id          = wid,
-                    watch_name        = watch["name"],
+                    watch_id          = watch_id,
+                    watch_name        = watch_name,
                     storage_type      = dest_type,
                     previous_snapshot = snapshot or None,
                     incremental       = bool(snapshot),
@@ -5880,49 +9452,96 @@ class MainWindow(QMainWindow):
                     max_file_size_mb  = watch.get("max_file_size_mb", 0),
                     dry_run           = True,
                 )
-                return result
+                # Format the result the same way backupsys_cli does
+                changes  = result.get("changes", [])
+                added    = [c for c in changes if c["type"] == "added"]
+                modified = [c for c in changes if c["type"] == "modified"]
+                deleted  = [c for c in changes if c["type"] == "deleted"]
+                lines = [
+                    f"  Previewing: {watch_name}  ({watch.get('path', '')})",
+                    f"",
+                    f"  ✅  {watch_name}: {result.get('files_to_copy', 0)} file(s) would be copied"
+                    f"  ({result.get('total_size', '0 B')})",
+                ]
+                if added:
+                    lines.append(f"      + {len(added)} new file(s)")
+                if modified:
+                    lines.append(f"      ~ {len(modified)} modified file(s)")
+                if deleted:
+                    lines.append(f"      - {len(deleted)} deleted file(s) (marker only)")
+                if not changes:
+                    lines.append("      (nothing to back up — source is unchanged)")
+                lines.append("")
+                for c in sorted(changes, key=lambda x: x.get("path", "")):
+                    sym = {"added": "+", "modified": "~", "deleted": "-"}.get(c["type"], "?")
+                    sz  = backup_engine._human_size(c.get("size", 0))
+                    lines.append(f"    {sym} {c['path']:<60}  {sz}")
+                return {"status": "ok", "stdout": "\n".join(lines), "stderr": ""}
             except Exception as e:
-                return {"status": "failed", "error": str(e)}
-
+                return {"status": "error", "stdout": "", "stderr": str(e)}
+        
+        def _show_dialog(result):
+            """Display the preview output in a modal dialog."""
+            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout
+            from PyQt6.QtCore import Qt
+            
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Backup Preview — {watch_name}")
+            dlg.setGeometry(100, 100, 700, 500)
+            
+            layout = QVBoxLayout(dlg)
+            
+            # Read-only text edit for output
+            text_edit = QTextEdit()
+            text_edit.setReadOnly(True)
+            text_edit.setStyleSheet(
+                "background:#141720; color:#e5e7eb; font-family:'Courier New'; font-size:10px;"
+            )
+            
+            # Combine stdout and stderr for display
+            output = result.get("stdout", "")
+            if result.get("stderr"):
+                if output:
+                    output += "\n\n--- STDERR ---\n"
+                output += result.get("stderr", "")
+            
+            if result.get("status") == "error" and not output:
+                output = f"Error running preview: {result.get('stderr', 'Unknown error')}"
+            
+            text_edit.setPlainText(output if output else "(No output)")
+            text_edit.moveCursor(text_edit.textCursor().__class__.Start)
+            layout.addWidget(text_edit)
+            
+            # Close button
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dlg.accept)
+            btn_layout.addWidget(close_btn)
+            layout.addLayout(btn_layout)
+            
+            dlg.exec()
+            
+            # Re-enable the dry run button after dialog closes
+            if watch_id in self._cards:
+                self._cards[watch_id].dry_run_btn.setEnabled(True)
+            
+            # Log summary
+            if result.get("status") == "ok":
+                self._append_log(f"✔ Backup preview for '{watch_name}' completed")
+            else:
+                self._append_log(f"❌ Backup preview for '{watch_name}' failed")
+        
+        # Run in background thread.
+        # In frozen (.exe) mode backupsys_cli.py does not exist on disk, so
+        # we call backup_engine directly.  In script mode we spawn the CLI
+        # subprocess so the output is identical to the terminal command.
         import threading
+        _is_frozen = getattr(sys, "frozen", False)
         def _thread():
-            result = _run()
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(0, lambda: _show(result))
-
-        def _show(result):
-            if result.get("status") == "failed":
-                self._append_log(f"❌ Dry run failed: {result.get('error')}")
-                return
-            changes  = result.get("changes", [])
-            added    = [c for c in changes if c["type"] == "added"]
-            modified = [c for c in changes if c["type"] == "modified"]
-            deleted  = [c for c in changes if c["type"] == "deleted"]
-            n_copy   = result.get("files_to_copy", len(added) + len(modified))
-            sz       = result.get("total_size", "0 B")
-            self._append_log(
-                f"🔍 Dry run '{watch['name']}': {n_copy} file(s) would be copied ({sz})  "
-                f"[+{len(added)} new  ~{len(modified)} modified  -{len(deleted)} deleted]"
-            )
-            # Show a quick summary dialog
-            lines = []
-            for c in sorted(changes, key=lambda x: x.get("path",""))[:50]:
-                sym  = {"added": "+", "modified": "~", "deleted": "-"}.get(c["type"], "?")
-                from backup_engine import _human_size
-                sz_s = _human_size(c.get("size", 0))
-                lines.append(f"{sym}  {c['path']:<60}  {sz_s}")
-            if len(changes) > 50:
-                lines.append(f"… and {len(changes) - 50} more file(s)")
-            body = "\n".join(lines) if lines else "No changes detected — backup is already up to date."
-            dlg = QMessageBox(self)
-            dlg.setWindowTitle(f"Dry Run — {watch['name']}")
-            dlg.setIcon(QMessageBox.Information)
-            dlg.setText(
-                f"<b>{n_copy} file(s) would be copied ({sz})</b><br>"
-                f"+{len(added)} new &nbsp; ~{len(modified)} modified &nbsp; -{len(deleted)} deleted"
-            )
-            dlg.setDetailedText(body)
-            dlg.exec_()
+            result = _run_inprocess() if _is_frozen else _run_cli()
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: _show_dialog(result))
 
         threading.Thread(target=_thread, daemon=True).start()
 
@@ -6003,6 +9622,175 @@ class MainWindow(QMainWindow):
 
     # ── Restore ────────────────────────────────────────────────────────────────
 
+    def _pick_restore_destination(self, watch: dict) -> tuple:
+        """
+        Return (dest_path, dest_type, temp_dir_or_None) for a restore operation.
+
+        Priority:
+          1. If the global dest_type is non-local, use it (existing behaviour).
+          2. If the watch has per-watch destinations (watch["destinations"]),
+             let the user choose which remote to restore from.
+          3. Fall back to the local destination path.
+
+        Returns (dest_path, dest_type, temp_dir) where:
+          - dest_path  — local path to use for list_backups / restore_backup
+          - dest_type  — resolved type string (for display only after this call)
+          - temp_dir   — path to clean up after restore, or None if not a temp dir
+        Returns (None, None, None) if the user cancelled or download failed.
+        """
+        global_dest_type = self.cfg.get("dest_type", "local")
+
+        # ── Global non-local destination ──────────────────────────────────────
+        # "gdrive" is the canonical dest_type saved by the Settings dialog;
+        # "cloud" is kept as a legacy alias for configs saved by older versions.
+        _REMOTE_TYPES = {"sftp", "ftps", "ftp", "smb", "webdav", "https", "rclone", "cloud", "gdrive"}
+        if global_dest_type in _REMOTE_TYPES:
+            local_path = self._download_for_restore(
+                self._watch_dest(watch), global_dest_type, watch)
+            if local_path is None:
+                return None, None, None
+            return local_path["path"], global_dest_type, local_path["temp_dir"]
+
+        # ── Per-watch destinations (watch["destinations"] list) ───────────────
+        per_watch_dests = watch.get("destinations", [])
+        remote_dests = [
+            d for d in per_watch_dests
+            if d.get("dest_type", "local") in _REMOTE_TYPES
+        ]
+
+        if remote_dests:
+            # Build choice list: local first (if configured), then each remote
+            choices = []
+            local_path = self._watch_dest(watch)
+            local_accessible = bool(local_path) and Path(local_path).exists()
+            if local_accessible:
+                choices.append(f"Local  —  {local_path}")
+            for d in remote_dests:
+                dt = d.get("dest_type", "?").upper()
+                cfg_d = d.get("config", {})
+                host = cfg_d.get("host", "") or cfg_d.get("remote", "") or dt
+                choices.append(f"{dt}  —  {host}")
+
+            if len(choices) > 1:
+                from PyQt6.QtWidgets import QInputDialog
+                chosen_label, ok = QInputDialog.getItem(
+                    self, "Choose Restore Source",
+                    f"Watch \"{watch['name']}\" has multiple backup destinations.\n"
+                    "Choose which to restore from:",
+                    choices, 0, False,
+                )
+                if not ok:
+                    return None, None, None
+                chosen_idx = choices.index(chosen_label)
+                if local_accessible and chosen_idx == 0:
+                    return local_path, "local", None
+                # Adjust index if local was prepended
+                remote_idx = chosen_idx - (1 if local_accessible else 0)
+                chosen_dest = remote_dests[remote_idx]
+            elif remote_dests:
+                chosen_dest = remote_dests[0]
+            else:
+                return self._watch_dest(watch), "local", None
+
+            dt = chosen_dest.get("dest_type", "local")
+            rpath = chosen_dest.get("config", {}).get("path", self._watch_dest(watch))
+            result = self._download_for_restore(rpath, dt, watch,
+                                                 dest_cfg=chosen_dest.get("config", {}))
+            if result is None:
+                return None, None, None
+            return result["path"], dt, result["temp_dir"]
+
+        # ── Plain local destination ───────────────────────────────────────────
+        return self._watch_dest(watch), "local", None
+
+    def _download_for_restore(self, dest: str, dest_type: str, watch: dict,
+                               dest_cfg: dict = None) -> dict | None:
+        """
+        Download a remote backup store to a local temp directory.
+        Returns {"path": str, "temp_dir": str} on success, or None on failure/cancel.
+        Uses a modal progress dialog while downloading.
+        dest_cfg overrides the global cfg section when supplied (for per-watch dests).
+        """
+        import tempfile as _tmpmod
+        import shutil   as _sh
+        from PyQt6.QtWidgets import QProgressDialog
+        from PyQt6.QtCore    import Qt
+
+        label_map = {
+            "sftp": "SFTP", "ftps": "SFTP/TLS", "ftp": "FTP",
+            "smb": "SMB", "webdav": "WebDAV", "https": "HTTPS",
+            "rclone": "rclone", "cloud": "Google Drive", "gdrive": "Google Drive",
+        }
+        label = label_map.get(dest_type, dest_type.upper())
+
+        temp_dir = _tmpmod.mkdtemp(prefix="backupsys_restore_")
+
+        progress = QProgressDialog(f"Downloading backup from {label}…", "Cancel", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        def _prog(n, fname):
+            if progress.wasCanceled():
+                return
+            progress.setLabelText(f"Downloading from {label}… ({n} file(s))\n{fname}")
+            from PyQt6.QtWidgets import QApplication
+            QApplication.processEvents()
+
+        try:
+            from transport_utils import (
+                download_from_sftp, download_from_ftp, download_from_smb,
+                download_from_webdav, download_from_https, download_from_rclone,
+            )
+
+            def _cfg(key):
+                # Use dest_cfg when explicitly supplied (even if empty);
+                # only fall back to global config when dest_cfg is None.
+                return dest_cfg if dest_cfg is not None else self.cfg.get(key, {})
+
+            if dest_type in ("sftp", "ftps"):
+                result = download_from_sftp(dest, temp_dir, _cfg("dest_sftp"), progress_cb=_prog)
+            elif dest_type == "ftp":
+                result = download_from_ftp(dest, temp_dir, _cfg("dest_ftp"), progress_cb=_prog)
+            elif dest_type == "smb":
+                result = download_from_smb(dest, temp_dir, _cfg("dest_smb"), progress_cb=_prog)
+            elif dest_type == "webdav":
+                result = download_from_webdav(dest, temp_dir, _cfg("dest_webdav"), progress_cb=_prog)
+            elif dest_type == "https":
+                result = download_from_https(dest, temp_dir, _cfg("dest_https"), progress_cb=_prog)
+            elif dest_type == "rclone":
+                result = download_from_rclone(dest, temp_dir, _cfg("dest_rclone"), progress_cb=_prog)
+            elif dest_type in ("cloud", "gdrive"):
+                w_cloud = watch.get("cloud_config") or {}
+                result  = backup_engine.download_from_gdrive(w_cloud, temp_dir)
+                # gdrive uses "ok" key not "status"
+                if result.get("ok"):
+                    result["status"] = "ok"
+            else:
+                _sh.rmtree(temp_dir, ignore_errors=True)
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Download Failed",
+                    f"Unsupported destination type: {dest_type}")
+                return None
+
+            if result.get("status") != "ok":
+                _sh.rmtree(temp_dir, ignore_errors=True)
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Download Failed",
+                    f"Failed to download from {label}:\n{result.get('error', 'Unknown error')}")
+                return None
+
+            return {"path": temp_dir, "temp_dir": temp_dir}
+
+        except Exception as exc:
+            _sh.rmtree(temp_dir, ignore_errors=True)
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Download Failed",
+                f"Failed to download from {label}:\n{exc}")
+            return None
+        finally:
+            progress.close()
+
     def _restore_watch(self, watch: dict):
         if not BACKEND_AVAILABLE:
             return
@@ -6016,71 +9804,10 @@ class MainWindow(QMainWindow):
                 f"To recover a file, open that folder and copy it back manually.")
             return
 
-        dest = self._watch_dest(watch)
-
-        temp_dir = None
-        dest_type = self.cfg.get("dest_type", "local")
-        if dest_type == "sftp":
-            import tempfile
-            temp_dir = tempfile.mkdtemp(prefix="backupsys_restore_")
-            sftp_cfg = self.cfg.get("dest_sftp", {})
-            from PyQt5.QtWidgets import QProgressDialog
-            from PyQt5.QtCore import Qt
-            progress = QProgressDialog("Downloading backup from SFTP...", "Cancel", 0, 0, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            try:
-                import paramiko
-                import stat
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(sftp_cfg["host"], port=sftp_cfg.get("port", 22), username=sftp_cfg["user"], password=credential_store.get_sftp_password(sftp_cfg))
-                sftp = ssh.open_sftp()
-                def download_dir(remote_path, local_path):
-                    os.makedirs(local_path, exist_ok=True)
-                    for item in sftp.listdir_attr(remote_path):
-                        remote_item = remote_path + "/" + item.filename
-                        local_item = os.path.join(local_path, item.filename)
-                        if stat.S_ISDIR(item.st_mode):
-                            download_dir(remote_item, local_item)
-                        else:
-                            sftp.get(remote_item, local_item)
-                download_dir(dest, temp_dir)
-                dest = temp_dir
-            except Exception as e:
-                QMessageBox.critical(self, "Download Failed", f"Failed to download from SFTP: {e}")
-                if temp_dir:
-                    import shutil
-                    shutil.rmtree(temp_dir)
-                return
-            finally:
-                progress.close()
-        elif dest_type == "cloud":
-            import tempfile
-            temp_dir = tempfile.mkdtemp(prefix="backupsys_restore_")
-            # For cloud, the config is per-watch
-            w_cloud = watch.get("cloud_config") or {}
-            from PyQt5.QtWidgets import QProgressDialog
-            from PyQt5.QtCore import Qt
-            progress = QProgressDialog("Downloading backup from Google Drive...", "Cancel", 0, 0, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            try:
-                result = backup_engine.download_from_gdrive(w_cloud, temp_dir)
-                if not result.get("ok"):
-                    QMessageBox.critical(self, "Download Failed", f"Failed to download from Google Drive: {result['error']}")
-                    import shutil
-                    shutil.rmtree(temp_dir)
-                    return
-                dest = temp_dir
-            except Exception as e:
-                QMessageBox.critical(self, "Download Failed", f"Failed to download from Google Drive: {e}")
-                import shutil
-                shutil.rmtree(temp_dir)
-                return
-            finally:
-                progress.close()
-
+        # Resolve destination — handles global remote types AND per-watch destinations.
+        dest, _resolved_type, temp_dir = self._pick_restore_destination(watch)
+        if dest is None:
+            return   # user cancelled or download failed
         backups = backup_engine.list_backups(dest, watch["id"])
         if not backups:
             QMessageBox.warning(self, "Restore",
@@ -6088,7 +9815,7 @@ class MainWindow(QMainWindow):
             return
 
         # Let user pick which backup to restore
-        from PyQt5.QtWidgets import QInputDialog
+        from PyQt6.QtWidgets import QInputDialog
         items = []
         for b in backups[:100]:  # show latest 100
             ts = b.get("timestamp", "")
@@ -6128,11 +9855,11 @@ class MainWindow(QMainWindow):
                 "Only restores files changed in the selected backup (delta only).<br>"
                 "Use this only if you know what you're doing.<br><br>"
                 "Use Full Chain Restore?",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
             )
-            if mode_reply == QMessageBox.Cancel:
+            if mode_reply == QMessageBox.StandardButton.Cancel:
                 return
-            use_chain = (mode_reply == QMessageBox.Yes)
+            use_chain = (mode_reply == QMessageBox.StandardButton.Yes)
         else:
             use_chain = False
 
@@ -6140,16 +9867,16 @@ class MainWindow(QMainWindow):
         browse_reply = QMessageBox.question(
             self, "Preview Backup Contents",
             "Would you like to preview the files in this backup snapshot before restoring?",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if browse_reply == QMessageBox.Yes:
+        if browse_reply == QMessageBox.StandardButton.Yes:
             try:
                 contents = backup_engine.browse_backup_contents(backup_dir)
                 total    = contents.get("total", 0)
 
                 # ── Scrollable tree preview dialog ────────────────────────────
-                from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel, QDialogButtonBox
-                from PyQt5.QtCore import Qt
+                from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel, QDialogButtonBox
+                from PyQt6.QtCore import Qt
 
                 dlg = QDialog(self)
                 dlg.setWindowTitle(f"Backup Preview  ·  {chosen}")
@@ -6240,10 +9967,10 @@ class MainWindow(QMainWindow):
                 sfr_btn_row.addStretch()
                 vlay.addLayout(sfr_btn_row)
 
-                btns = QDialogButtonBox(QDialogButtonBox.Ok)
+                btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
                 btns.accepted.connect(dlg.accept)
                 vlay.addWidget(btns)
-                dlg.exec_()
+                dlg.exec()
 
             except Exception as e:
                 QMessageBox.warning(self, "Preview Error", str(e))
@@ -6256,16 +9983,54 @@ class MainWindow(QMainWindow):
         if not target:
             return
 
+        # Check for restore conflicts
+        overwrite = True
+        if os.path.exists(target) and os.listdir(target):
+            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QRadioButton, QLabel, QDialogButtonBox
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Restore Conflict")
+            dlg.setModal(True)
+            vlay = QVBoxLayout(dlg)
+            vlay.addWidget(QLabel("The target folder is not empty. Choose how to handle conflicts:"))
+            rb1 = QRadioButton("Overwrite existing files")
+            rb1.setChecked(True)
+            rb2 = QRadioButton("Skip files that already exist")
+            rb3 = QRadioButton("Restore to new folder (add '_restored' suffix)")
+            vlay.addWidget(rb1)
+            vlay.addWidget(rb2)
+            vlay.addWidget(rb3)
+            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            vlay.addWidget(btns)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                if rb1.isChecked():
+                    overwrite = True
+                elif rb2.isChecked():
+                    overwrite = False
+                elif rb3.isChecked():
+                    target = target.rstrip(os.sep) + "_restored"
+                    overwrite = True
+            else:
+                return
+
         # Confirm
         mode_label = "Full Chain Restore" if use_chain else "Single Snapshot Restore"
+        conflict_msg = ""
+        if overwrite:
+            conflict_msg = "Existing files with the same name will be overwritten."
+        elif not os.path.exists(target) or not os.listdir(target):
+            conflict_msg = "Existing files with the same name will be overwritten."
+        else:
+            conflict_msg = "Existing files will be skipped."
         reply = QMessageBox.question(
             self, "Confirm Restore",
             f"Mode:  {mode_label}\n"
             f"Restore to:  {target}\n\n"
-            f"Existing files with the same name will be overwritten.\nContinue?",
-            QMessageBox.Yes | QMessageBox.Cancel
+            f"{conflict_msg}\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         self._append_log(f"Restoring backup: {watch['name']} >{target} ({mode_label}) …")
@@ -6315,6 +10080,7 @@ class MainWindow(QMainWindow):
                 target_path=target,
                 up_to_backup_id=chosen_id,
                 encrypt_key=watch.get("encrypt_key") or None,
+                overwrite=overwrite,
             )
             worker = RestoreWorker("chain", kwargs, parent=self)
         else:
@@ -6322,6 +10088,171 @@ class MainWindow(QMainWindow):
                 backup_dir=backup_dir,
                 target_path=target,
                 encrypt_key=watch.get("encrypt_key") or None,
+                overwrite=overwrite,
+            )
+            worker = RestoreWorker("single", kwargs, parent=self)
+
+        worker.progress.connect(_on_restore_progress)
+        worker.finished.connect(_on_restore_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _restore_to_original(self, watch: dict):
+        if not BACKEND_AVAILABLE:
+            return
+
+        # Sync mode: the destination IS the live copy — no restore needed.
+        if watch.get("sync_mode", False):
+            folder = self._watch_dest(watch)
+            QMessageBox.information(self, "Restore  · Sync Mode",
+                f"This watch uses sync mode.\n\n"
+                f"Your files are stored directly at:\n{folder}\n\n"
+                f"To recover a file, open that folder and copy it back manually.")
+            return
+
+        # Resolve destination — handles global remote types AND per-watch destinations.
+        dest, _resolved_type, temp_dir = self._pick_restore_destination(watch)
+        if dest is None:
+            return   # user cancelled or download failed
+
+        backups = backup_engine.list_backups(dest, watch["id"])
+        if not backups:
+            QMessageBox.warning(self, "Restore",
+                f"No backups found for \"{watch['name']}\".\nRun a backup first.")
+            return
+
+        # Let user pick which backup to restore
+        from PyQt6.QtWidgets import QInputDialog
+        items = []
+        for b in backups[:100]:  # show latest 100
+            ts = b.get("timestamp", "")
+            try:
+                ts = datetime.fromisoformat(ts).strftime("%b %d, %Y %H:%M")
+            except Exception:
+                pass
+            files = b.get("files_copied", 0)
+            size  = b.get("total_size_bytes", 0)
+            size_h = f"{size // 1024} KB" if size < 1024*1024 else f"{size // (1024*1024)} MB"
+            incremental = "incremental" if b.get("incremental") else "full"
+            items.append(f"{ts}   ·  {files} file(s)  {size_h}  [{incremental}]")
+
+        chosen, ok = QInputDialog.getItem(
+            self, "Restore to Original Location",
+            f"Select a restore point for \"{watch['name']}\":\n"
+            "(Full Chain Restore replays ALL backups up to the chosen point  · recommended for incremental setups)",
+            items, 0, False
+        )
+        if not ok:
+            return
+
+        chosen_idx    = items.index(chosen)
+        chosen_backup = backups[chosen_idx]
+        backup_dir    = chosen_backup.get("backup_dir", "")
+        chosen_id     = chosen_backup.get("backup_id", "")
+
+        # Load manifest to get source_path
+        manifest_path = os.path.join(backup_dir, "MANIFEST.json")
+        try:
+            with open(manifest_path, 'r') as f:
+                manifest = json.load(f)
+            source_path = manifest.get("source")
+            if not source_path:
+                QMessageBox.warning(self, "Restore Failed",
+                    "Original location not recorded in this backup. Use the Restore… button to choose a target folder manually.")
+                return
+        except Exception as e:
+            QMessageBox.warning(self, "Restore Failed",
+                f"Could not read backup manifest: {e}")
+            return
+
+        # Confirm
+        reply = QMessageBox.question(
+            self, "Confirm Restore to Original Location",
+            f"This will restore files to their original location:\n{source_path}\n\n"
+            f"Existing files may be overwritten.\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Determine if any backup in the chain is incremental
+        is_incremental = any(b.get("incremental") for b in backups[:chosen_idx + 1])
+        if is_incremental:
+            mode_reply = QMessageBox.question(
+                self, "Restore Mode",
+                "<b>Full Chain Restore (Recommended)</b><br>"
+                "Replays every backup from the oldest up to your chosen point.<br>"
+                "Gives you the exact folder state at that point in time.<br><br>"
+                "<b>Single Snapshot Restore</b><br>"
+                "Only restores files changed in the selected backup (delta only).<br>"
+                "Use this only if you know what you're doing.<br><br>"
+                "Use Full Chain Restore?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+            )
+            if mode_reply == QMessageBox.StandardButton.Cancel:
+                return
+            use_chain = (mode_reply == QMessageBox.StandardButton.Yes)
+        else:
+            use_chain = False
+
+        self._append_log(f"Restoring to original location: {watch['name']} >{source_path} ({'Full Chain' if use_chain else 'Single Snapshot'}) …")
+
+        # Disable restore button while running to prevent double-trigger
+        if watch["id"] in self._cards:
+            self._cards[watch["id"]].restore_btn.setEnabled(False)
+            self._cards[watch["id"]].restore_original_btn.setEnabled(False)
+
+        def _on_restore_progress(step, total, label):
+            self._append_log(f"  ↳ Step {step}/{total}: {label}")
+
+        def _on_restore_done(result):
+            # Re-enable restore buttons
+            if watch["id"] in self._cards:
+                self._cards[watch["id"]].restore_btn.setEnabled(True)
+                self._cards[watch["id"]].restore_original_btn.setEnabled(True)
+            if result.get("ok"):
+                steps = result.get("steps_applied")
+                extra = f"\nChain steps applied:  {steps}" if steps is not None else ""
+                QMessageBox.information(self, "Restore Complete",
+                    f"▶  Restore complete\n\n"
+                    f"Files restored:  {result.get('files_restored', 0)}\n"
+                    f"Files skipped:   {result.get('skipped', 0)}\n"
+                    f"Destination:     {source_path}{extra}"
+                )
+                self._append_log(
+                    f"▶ Restore complete: {watch['name']}  · "
+                    f"{result.get('files_restored', 0)} file(s) >{source_path}"
+                )
+            else:
+                errors = result.get("errors", [])
+                err_preview = "\n".join(errors[:5]) if errors else result.get("error", "Unknown error")
+                QMessageBox.critical(self, "Restore Failed",
+                    f"⚠  Restore failed\n\n{err_preview}")
+                self._append_log(f"⚠ Restore failed: {watch['name']}")
+            # Clean up temp dir
+            if temp_dir:
+                import shutil
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception:
+                    pass
+
+        if use_chain:
+            kwargs = dict(
+                destination=dest,
+                watch_id=watch["id"],
+                target_path=source_path,
+                up_to_backup_id=chosen_id,
+                encrypt_key=watch.get("encrypt_key") or None,
+                overwrite=True,
+            )
+            worker = RestoreWorker("chain", kwargs, parent=self)
+        else:
+            kwargs = dict(
+                backup_dir=backup_dir,
+                target_path=source_path,
+                encrypt_key=watch.get("encrypt_key") or None,
+                overwrite=True,
             )
             worker = RestoreWorker("single", kwargs, parent=self)
 
@@ -6337,7 +10268,7 @@ class MainWindow(QMainWindow):
         import threading
         def _check():
             try:
-                from PyQt5.QtCore import QSettings, QTimer
+                from PyQt6.QtCore import QSettings, QTimer
                 s        = QSettings(SETTINGS_ORG, SETTINGS_APP)
                 warnings = []
                 # Check GDrive
@@ -6361,7 +10292,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=_check, daemon=True).start()
 
     def _on_cloud_token_warnings(self, warnings: list):
-        """Show tray and log warnings for expired tokens."""
+        """Show tray and log warnings for expired tokens, and surface the persistent banner."""
         for provider in warnings:
             name = "Google Drive"
             if hasattr(self, "_tray"):
@@ -6369,41 +10300,89 @@ class MainWindow(QMainWindow):
                     f"⚠ {name}  · Reconnect Required",
                     f"Your {name} token has expired.\n"
                     f"Open Settings >Cloud tab >Reconnect.",
-                    QSystemTrayIcon.Warning, 8000
+                    QSystemTrayIcon.MessageIcon.Warning, 8000
                 )
             self._append_log(
                 f"⚠ {name} token expired  · go to Settings >Cloud tab to reconnect"
             )
+            # Show the persistent in-window reconnect banner
+            if hasattr(self, "gdrive_banner"):
+                self.gdrive_banner.show()
+
+    def _open_gdrive_reconnect(self):
+        """Open the Settings (AdminPanel) dialog directly on the Cloud tab to reconnect Google Drive."""
+        try:
+            panel = AdminPanel(self.cfg, self)
+            panel.watches_changed.connect(self._on_watches_changed)
+            panel._tabs.setCurrentIndex(2)  # Cloud tab (0=General, 1=Watches, 2=Cloud)
+            panel.exec()
+            self._load_config()
+            self._update_auto_label()
+            self._update_stats()
+            # If we re-opened settings, assume the user reconnected — hide the banner.
+            # It will reappear on the next backup cycle if still disconnected.
+            self.gdrive_banner.hide()
+        except Exception as e:
+            QMessageBox.information(
+                self, "Reconnect Google Drive",
+                f"Open Settings → Cloud tab → click Reconnect next to Google Drive.\n\n({e})"
+            )
 
     def _open_admin(self):
         if not PasswordDialog.has_password():
-            if not BACKUPSYS_API_URL:
-                QMessageBox.warning(self, "Admin Access", 
-                    "OTP login requires the API to be deployed and configured in .env (BACKUPSYS_API_URL).")
-                return
             # First time  · prompt to set password
             reply = QMessageBox.question(self, "Set Admin Password",
                 "No admin password is set. Would you like to set one now?\n"
                 "(If you skip, any user can access admin settings)",
-                QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
                 dlg = PasswordDialog(self, mode="set")
-                if dlg.exec_() != QDialog.Accepted:
+                if dlg.exec() != QDialog.DialogCode.Accepted:
                     return
 
         dlg = PasswordDialog(self, mode="verify")
-        if dlg.exec_() != QDialog.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         panel = AdminPanel(self.cfg, self)
         panel.watches_changed.connect(self._on_watches_changed)
         # Validate cloud tokens when opening admin panel so user sees warning immediately
         self._validate_cloud_tokens()
-        panel.exec_()
+        panel.exec()
 
         self._load_config()
         self._update_auto_label()
         self._update_stats()
+
+    def _quit_app(self):
+        """Quit the application."""
+        reply = QMessageBox.question(self, "Quit Backup System",
+            "Are you sure you want to quit Backup System?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            if self._watcher_mgr:
+                self._watcher_mgr.stop_all()
+            # Persist history before exit
+            if BACKEND_AVAILABLE:
+                try:
+                    config_manager.save_history(self._history_log)
+                except Exception:
+                    pass
+            QApplication.quit()
+
+    def _on_pause_backup_requested(self, watch_id: str):
+        """Pause a running backup."""
+        worker = self._workers.get(watch_id)
+        if worker:
+            worker.pause()
+            self._append_log(f"⏸ Backup paused: {self._watch_name_for(watch_id)}")
+
+    def _on_resume_backup_requested(self, watch_id: str):
+        """Resume a paused backup."""
+        worker = self._workers.get(watch_id)
+        if worker:
+            worker.resume()
+            self._append_log(f"▶ Backup resumed: {self._watch_name_for(watch_id)}")
 
     def _on_cancel_requested(self, watch_id: str):
         """Cancel an in-progress backup for the given watch."""
@@ -6419,55 +10398,79 @@ class MainWindow(QMainWindow):
             self._cards[watch_id].cancel_btn.setText("Cancelling…")
 
     def _on_open_backup_folder(self, watch_id: str):
-        """Open the backup directory for a watch in the system file explorer.
-        For sync-mode watches, opens the destination folder directly (it IS the backup).
-        For versioned watches, opens the most recent timestamped backup subfolder.
+        """Open the backup destination folder in the system file explorer.
+        Only works for local destinations.
         """
-        if not BACKEND_AVAILABLE:
-            return
-
         watch = next((w for w in self.cfg.get("watches", []) if w["id"] == watch_id), None)
-
-        # Sync mode: destination folder IS the backup — open it directly.
-        if watch and watch.get("sync_mode", False):
-            folder = self._watch_dest(watch)
-            if not folder:
-                QMessageBox.information(self, "No Destination",
-                    "No destination path is configured for this watch.")
-                return
-            try:
-                import subprocess as _sp
-                if os.name == "nt":
-                    _sp.Popen(["explorer", folder])
-                elif sys.platform == "darwin":
-                    _sp.Popen(["open", folder])
-                else:
-                    _sp.Popen(["xdg-open", folder])
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Could not open folder:\\n{e}")
+        if not watch:
             return
 
-        # Versioned mode: find the latest timestamped backup subfolder.
-        dest = self._watch_dest(watch) if watch else self.cfg.get("destination", "")
-        backups = backup_engine.list_backups(dest, watch_id)
-        if not backups:
-            QMessageBox.information(self, "No Backups",
-                f"No backups found for \"{self._watch_name_for(watch_id)}\".\\nRun a backup first.")
+        # Get the destination path for this watch
+        dest_path = self._watch_dest(watch)
+        if not dest_path:
+            QMessageBox.warning(self, "No Destination",
+                "No destination path is configured for this watch.")
             return
-        folder = backups[0].get("backup_dir", "")
-        if not folder or not Path(folder).exists():
-            QMessageBox.warning(self, "Folder Missing", f"Backup folder not found:\\n{folder}")
+
+        # Check if the folder exists
+        if not os.path.exists(dest_path):
+            QMessageBox.warning(self, "Folder Not Found",
+                f"The destination folder does not exist yet:\n{dest_path}\n\nRun a backup first to create it.")
             return
+
+        # Open the folder using QDesktopServices
         try:
-            import subprocess as _sp
-            if os.name == "nt":
-                _sp.Popen(["explorer", folder])
-            elif sys.platform == "darwin":
-                _sp.Popen(["open", folder])
-            else:
-                _sp.Popen(["xdg-open", folder])
+            from PyQt6.QtCore import QUrl
+            from PyQt6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl.fromLocalFile(dest_path))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not open folder:\\n{e}")
+            QMessageBox.critical(self, "Error", f"Could not open folder:\n{e}")
+
+    def _on_watch_settings_requested(self, watch: dict):
+        """Open the EditWatchDialog for per-watch advanced settings (encryption, exclusions, retention, hooks)."""
+        wid = watch.get("id", "")
+        # Get a fresh copy from config in case it was modified since the card was built
+        live_watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), watch)
+
+        dlg = EditWatchDialog(live_watch, dest_type=self.cfg.get("dest_type", "local"), parent=self)
+        # Stash cfg reference so _rotate_key can resolve the destination
+        dlg._parent_cfg = self.cfg
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        v = dlg.get_values()
+        if BACKEND_AVAILABLE:
+            try:
+                config_manager.update_watch_meta(
+                    self.cfg, wid,
+                    name=v.get("name", live_watch.get("name", "")),
+                    interval_min=v.get("interval_min", 0),
+                    schedule_times=v.get("schedule_times", []),
+                    compression=v.get("compression", False),
+                    sync_mode=v.get("sync_mode", True),
+                    destination=v.get("destination", "") or None,
+                    retention_days=v.get("retention_days", 0),
+                    max_backups=v.get("max_backups", 0),
+                    max_file_size_mb=v.get("max_file_size_mb", 0),
+                    max_backup_bytes=v.get("max_backup_bytes", 0),
+                    skip_auto_backup=v.get("skip_auto_backup", False),
+                    color=v.get("color", ""),
+                    notes=v.get("notes", ""),
+                    tags=v.get("tags", []),
+                    exclude_patterns=v.get("exclude_patterns", []),
+                    encrypt_key=v.get("encrypt_key", ""),
+                    pre_backup_cmd=v.get("pre_backup_cmd", ""),
+                    post_backup_cmd=v.get("post_backup_cmd", ""),
+                )
+                config_manager.save(self.cfg)
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", f"Could not save watch settings:\n{e}")
+                return
+
+        self._load_config()
+        self._refresh_watches()
+        self._update_auto_label()
 
     def _on_pause_requested(self, watch_id: str, paused: bool):
         """Persist pause/resume state and restart or stop the watcher accordingly."""
@@ -6488,6 +10491,40 @@ class MainWindow(QMainWindow):
                     )
         self._append_log(f"{'⏸ Paused' if paused else '▶ Resumed'} watch: {self._watch_name_for(watch_id)}")
 
+    def _toggle_pause_all(self):
+        """Pause or resume every watch at once (global toggle)."""
+        watches = self.cfg.get("watches", [])
+        if not watches:
+            return
+
+        # Decide target state: if ANY watch is running → pause all; if all paused → resume all
+        any_running = any(not w.get("paused", False) for w in watches)
+        target_paused = any_running  # True = we're about to pause everything
+
+        for w in watches:
+            wid = w["id"]
+            if w.get("paused", False) != target_paused:
+                self._on_pause_requested(wid, target_paused)
+                # Also update card UI to reflect the new state
+                card = self._cards.get(wid)
+                if card:
+                    w["paused"] = target_paused
+                    card.update_watch(w)
+
+        # Update sidebar button label
+        if target_paused:
+            self._pause_all_btn.setText("▶  Resume All Backups")
+            self._pause_all_btn.setToolTip("Resume all watched folders (backups were globally paused).")
+            self._append_log("⏸ All watches paused globally")
+        else:
+            self._pause_all_btn.setText("⏸  Pause All Backups")
+            self._pause_all_btn.setToolTip(
+                "Pause all watched folders at once.\n"
+                "Useful before presentations or on slow connections.\n"
+                "Click again to resume all watches."
+            )
+            self._append_log("▶ All watches resumed globally")
+
     def _on_watches_changed(self):
         self._load_config()
         if self._watcher_mgr:
@@ -6500,13 +10537,54 @@ class MainWindow(QMainWindow):
     # ── History ───────────────────────────────────────────────────────────────
 
     def _open_history(self):
-        self._history_window = HistoryWindow(list(self._history_log), self)
+        queue = []
+        try:
+            if BACKEND_AVAILABLE:
+                queue = config_manager.load_backup_queue()
+        except Exception:
+            pass
+        self._history_window = HistoryWindow(
+            list(self._history_log),
+            list(self._backup_history),
+            backup_queue=queue,
+            cfg=self.cfg,
+            parent=self,
+        )
         self._history_window.show()
         self._history_window.raise_()
+
+    def _open_global_dashboard(self):
+        """Open the global backup trend dashboard."""
+        dlg = GlobalTrendDialog(list(self._backup_history), parent=self)
+        dlg.exec()
+
+    def _open_logs(self):
+        """Open the log viewer dialog."""
+        log_dialog = LogViewerDialog(self)
+        log_dialog.exec()
 
     # ── Window behavior ────────────────────────────────────────────────────────
 
     # ── Integrity Scheduler Handlers ───────────────────────────────────────────
+
+    def _trigger_integrity_check_now(self):
+        """Immediately trigger an integrity check for all watches, ignoring the schedule."""
+        sched = getattr(self, "_integrity_scheduler", None)
+        if sched is None:
+            QMessageBox.information(
+                self, "Integrity Check",
+                "The integrity scheduler is not running.\n"
+                "Enable scheduled integrity checks in Settings and restart the app."
+            )
+            return
+        sched.run_now()
+        self._append_log("🔍 Manual integrity check triggered — results will appear in the log.")
+        if hasattr(self, "_tray"):
+            self._tray.showMessage(
+                APP_NAME,
+                "Integrity check started. Results will appear in the Activity Log.",
+                QSystemTrayIcon.MessageIcon.Information, 3000
+            )
 
     def _on_integrity_result(self, watch_name: str, result: dict):
         """Called once per watch after its scheduled integrity check completes."""
@@ -6533,7 +10611,7 @@ class MainWindow(QMainWindow):
                 self._tray.showMessage(
                     APP_NAME,
                     f"⚠ Integrity check failed for {watch_name}. Check Activity Log.",
-                    QSystemTrayIcon.Warning, 5000
+                    QSystemTrayIcon.MessageIcon.Warning, 5000
                 )
 
     def _on_integrity_run_finished(self, summary: dict):
@@ -6547,35 +10625,335 @@ class MainWindow(QMainWindow):
                 + (f", {failed} failed" if failed else "")
             )
 
-    def closeEvent(self, event):
-        """Minimize to tray instead of closing."""
-        event.ignore()
-        self.hide()
+    def _on_disk_space_warning(self, free_gb: float):
+        """Called when backup destination has low disk space."""
+        self._append_log(f"⚠ Low disk space on backup destination: {free_gb:.1f} GB free")
         if hasattr(self, "_tray"):
             self._tray.showMessage(
                 APP_NAME,
-                "Running in background. Click the tray icon to reopen.",
-                QSystemTrayIcon.Information, 2500
+                f"⚠ Low disk space on backup destination: {free_gb:.1f} GB free",
+                QSystemTrayIcon.MessageIcon.Warning, 5000
             )
+
+    def closeEvent(self, event):
+        """Minimize to tray instead of closing, or minimize to taskbar in window mode."""
+        if hasattr(self, "_tray") and self._tray is not None:
+            # Tray mode: hide to tray
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(
+                APP_NAME,
+                "Running in background. Click the tray icon to reopen.",
+                QSystemTrayIcon.MessageIcon.Information, 2500
+            )
+        else:
+            # Window mode: minimize to taskbar instead of closing
+            event.ignore()
+            self.showMinimized()
 
     def set_tray(self, tray):
         self._tray = tray
+        if tray is None:
+            # Window mode: show quit button
+            self.quit_btn.show()
+        else:
+            # Tray mode: hide quit button
+            self.quit_btn.hide()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Global Backup Trend Dashboard ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _TrendChart(QWidget):
+    """Draws a dual-layer bar chart: total bytes per day (blue) overlaid with
+    success/failure counts, directly on top of a dark background."""
+
+    def __init__(self, daily_data: list, parent=None):
+        """daily_data: list of (date_str, bytes_mb, success, failure)"""
+        super().__init__(parent)
+        self.daily_data = daily_data
+        self.setMinimumHeight(160)
+
+    def paintEvent(self, event):          # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        w, h = rect.width(), rect.height()
+        padding_left, padding_right, padding_top, padding_bottom = 54, 12, 20, 30
+
+        # Background
+        painter.fillRect(rect, QColor("#0f172a"))
+
+        data = self.daily_data
+        if not data:
+            painter.setPen(QColor("#6b7280"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No backup data yet")
+            return
+
+        max_mb    = max((d[1] for d in data), default=1) or 1
+        bar_area_w = w - padding_left - padding_right
+        bar_area_h = h - padding_top - padding_bottom
+        bar_w = bar_area_w / len(data)
+
+        # Grid lines
+        painter.setPen(QColor("#1e293b"))
+        for i in range(1, 5):
+            y = padding_top + bar_area_h - int(bar_area_h * i / 4)
+            painter.drawLine(padding_left, y, w - padding_right, y)
+
+        # Y-axis labels
+        painter.setPen(QColor("#64748b"))
+        painter.setFont(QFont("Arial", 8))
+        for i in range(5):
+            y = padding_top + bar_area_h - int(bar_area_h * i / 4)
+            mb_label = f"{max_mb * i / 4:.0f}"
+            painter.drawText(2, y + 4, 46, 14, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, mb_label)
+
+        # Bars
+        for idx, (date_str, mb, ok, fail) in enumerate(data):
+            bx = padding_left + idx * bar_w
+            bh = int((mb / max_mb) * bar_area_h) if max_mb > 0 else 0
+            by = padding_top + bar_area_h - bh
+
+            # Size bar (blue gradient)
+            grad = QLinearGradient(0, by, 0, by + bh)
+            grad.setColorAt(0, QColor("#3b82f6"))
+            grad.setColorAt(1, QColor("#1d4ed8"))
+            painter.fillRect(int(bx + 1), by, int(bar_w - 3), bh, QBrush(grad))
+
+            # Thin success overlay (green top)
+            if ok and bh > 0:
+                painter.fillRect(int(bx + 1), by, int(bar_w - 3), 4, QColor("#22c55e"))
+
+            # Failure accent (red notch at bottom)
+            if fail:
+                painter.fillRect(int(bx + 1), padding_top + bar_area_h - 6,
+                                 int(bar_w - 3), 6, QColor("#ef4444"))
+
+            # X-axis date label
+            try:
+                lbl = datetime.fromisoformat(date_str).strftime("%m/%d")
+            except Exception:
+                lbl = date_str[-5:]
+            painter.setPen(QColor("#64748b"))
+            painter.setFont(QFont("Arial", 7))
+            painter.drawText(int(bx), h - padding_bottom + 4,
+                             int(bar_w), padding_bottom - 4,
+                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, lbl)
+
+        # Legend
+        lx = padding_left
+        painter.setFont(QFont("Arial", 8))
+        for color, label in [(QColor("#3b82f6"), "Size (MB)"), (QColor("#22c55e"), "Success"),
+                             (QColor("#ef4444"), "Failure")]:
+            painter.fillRect(lx, 4, 10, 10, color)
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(lx + 13, 13, label)
+            lx += 80
+
+
+class GlobalTrendDialog(QDialog):
+    """Global backup trend dashboard — aggregates across all watches."""
+
+    def __init__(self, backup_history: list, parent=None):
+        super().__init__(parent)
+        self.backup_history = backup_history
+        self.setWindowTitle("📈 Global Backup Dashboard")
+        self.setMinimumSize(760, 520)
+        self._build_ui()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_bytes(n: int) -> str:
+        if n <= 0:
+            return "0 B"
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    def _aggregate(self):
+        """Compute summary stats and per-day series from backup_history."""
+        total, success, failure = 0, 0, 0
+        total_bytes = 0
+        daily: dict[str, dict] = {}   # date -> {bytes, success, failure}
+
+        for entry in self.backup_history:
+            total += 1
+            st = (entry.get("status") or "").lower()
+            if st == "success":
+                success += 1
+            elif st == "failure":
+                failure += 1
+            bc = entry.get("bytes_copied") or 0
+            total_bytes += bc
+
+            ts = entry.get("timestamp") or entry.get("time") or ""
+            try:
+                day = datetime.fromisoformat(ts).strftime("%Y-%m-%d")
+            except Exception:
+                day = "unknown"
+            rec = daily.setdefault(day, {"bytes": 0, "success": 0, "failure": 0})
+            rec["bytes"] += bc
+            if st == "success":
+                rec["success"] += 1
+            elif st == "failure":
+                rec["failure"] += 1
+
+        # Build sorted daily list (last 60 days)
+        sorted_days = sorted(daily.keys())[-60:]
+        daily_series = [
+            (d, daily[d]["bytes"] / (1024 * 1024), daily[d]["success"], daily[d]["failure"])
+            for d in sorted_days
+        ]
+
+        # Watch breakdown
+        watch_stats: dict[str, dict] = {}
+        for entry in self.backup_history:
+            wn = entry.get("watch_name") or "(unnamed)"
+            rec = watch_stats.setdefault(wn, {"total": 0, "success": 0, "failure": 0, "bytes": 0})
+            rec["total"] += 1
+            st = (entry.get("status") or "").lower()
+            if st == "success":
+                rec["success"] += 1
+            elif st == "failure":
+                rec["failure"] += 1
+            rec["bytes"] += entry.get("bytes_copied") or 0
+
+        return total, success, failure, total_bytes, daily_series, watch_stats
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Header bar
+        header = QFrame()
+        header.setObjectName("topbar")
+        header.setFixedHeight(52)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(20, 0, 16, 0)
+        title = QLabel("Global Backup Trend Dashboard")
+        title.setStyleSheet("font-size:14px; font-weight:700; color:#f1f3f9;")
+        hl.addWidget(title)
+        hl.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("secondary")
+        close_btn.setFixedSize(32, 32)
+        close_btn.setStyleSheet("padding: 0px; font-size: 15px;")
+        close_btn.clicked.connect(self.close)
+        hl.addWidget(close_btn)
+        layout.addWidget(header)
+
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(20, 16, 20, 16)
+        bl.setSpacing(14)
+
+        total, success, failure, total_bytes, daily_series, watch_stats = self._aggregate()
+        rate = f"{100*success/total:.1f}%" if total else "—"
+        cancelled = total - success - failure
+
+        # ── KPI cards ────────────────────────────────────────────────────────
+        cards_row = QHBoxLayout()
+        for color, icon, label, value in [
+            ("#2563eb", "🗄", "Total Runs",    str(total)),
+            ("#22c55e", "✅", "Success Rate",  rate),
+            ("#ef4444", "❌", "Failures",      str(failure)),
+            ("#f59e0b", "⏹", "Cancelled",     str(cancelled)),
+            ("#8b5cf6", "💾", "Total Backed Up", self._fmt_bytes(total_bytes)),
+        ]:
+            card = QFrame()
+            card.setObjectName("card")
+            card.setFixedHeight(74)
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(14, 8, 14, 8)
+            cl.setSpacing(2)
+            top_row = QHBoxLayout()
+            ic = QLabel(icon)
+            ic.setStyleSheet("font-size:16px;")
+            top_row.addWidget(ic)
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color:#6b7280; font-size:10px;")
+            top_row.addWidget(lbl)
+            top_row.addStretch()
+            cl.addLayout(top_row)
+            val = QLabel(value)
+            val.setStyleSheet(f"color:{color}; font-size:20px; font-weight:800;")
+            cl.addWidget(val)
+            cards_row.addWidget(card)
+        bl.addLayout(cards_row)
+
+        # ── Trend chart ───────────────────────────────────────────────────────
+        chart_frame = QFrame()
+        chart_frame.setObjectName("card")
+        cfl = QVBoxLayout(chart_frame)
+        cfl.setContentsMargins(12, 10, 12, 10)
+        chart_title = QLabel("Backup size & outcome per day  (last 60 days)")
+        chart_title.setStyleSheet("color:#6b7280; font-size:11px; font-weight:700;")
+        cfl.addWidget(chart_title)
+        chart = _TrendChart(daily_series)
+        chart.setMinimumHeight(170)
+        cfl.addWidget(chart)
+        bl.addWidget(chart_frame)
+
+        # ── Per-watch breakdown table ─────────────────────────────────────────
+        watches_lbl = QLabel("Per-watch breakdown")
+        watches_lbl.setStyleSheet("color:#6b7280; font-size:11px; font-weight:700; text-transform:uppercase;")
+        bl.addWidget(watches_lbl)
+
+        tbl = QTableWidget(len(watch_stats), 5)
+        tbl.setHorizontalHeaderLabels(["Watch", "Total", "✅ OK", "❌ Fail", "Total Size"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.setAlternatingRowColors(True)
+        for r, (wname, wdata) in enumerate(sorted(watch_stats.items())):
+            tbl.setItem(r, 0, QTableWidgetItem(wname))
+            tbl.setItem(r, 1, QTableWidgetItem(str(wdata["total"])))
+            tbl.setItem(r, 2, QTableWidgetItem(str(wdata["success"])))
+            tbl.setItem(r, 3, QTableWidgetItem(str(wdata["failure"])))
+            tbl.setItem(r, 4, QTableWidgetItem(self._fmt_bytes(wdata["bytes"])))
+        bl.addWidget(tbl)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(body)
+        layout.addWidget(scroll)
+
+
 # ── History Window ─────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HistoryWindow(QDialog):
     """Full change history table  · all edits across all watches."""
 
-    def __init__(self, history: list, parent=None):
+    def __new__(cls, *args, **kwargs):
+        # Allow object.__new__(HistoryWindow) in unit tests (bypasses QDialog init).
+        return super().__new__(cls)
+
+    def __init__(self, history: list, backup_history: list, backup_queue: list = None, cfg: dict = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Change History")
+        self.setWindowTitle("History")
         self.setMinimumSize(900, 580)
-        self._all_history = history   # list of dicts
+        self.resize(1100, 680)
+        self._all_history = history          # change-history list of dicts
+        self._backup_history = backup_history
+        self._backup_queue = backup_queue or []
+        self._cfg = cfg or {}
         self._build_ui()
-        self._populate(history)
+        self._populate_changes(history)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -6588,25 +10966,12 @@ class HistoryWindow(QDialog):
         header.setFixedHeight(56)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 20, 0)
-        title = QLabel("📋  Change History")
+        title = QLabel("📋  History")
         title.setStyleSheet("font-size:15px; font-weight:700; color:#f1f3f9;")
         hl.addWidget(title)
         hl.addStretch()
 
-        # Filter bar
-        self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter by file, user, machine…")
-        self.filter_input.setFixedWidth(240)
-        self.filter_input.textChanged.connect(self._filter)
-        hl.addWidget(self.filter_input)
-
-        self.type_filter = QComboBox()
-        self.type_filter.addItems(["All Types", "modified", "added", "deleted", "renamed"])
-        self.type_filter.setFixedWidth(120)
-        self.type_filter.currentTextChanged.connect(self._filter)
-        hl.addWidget(self.type_filter)
-
-        export_btn = QPushButton("Export CSV")
+        export_btn = QPushButton("Export History…")
         export_btn.setObjectName("secondary")
         export_btn.clicked.connect(self._export_csv)
         hl.addWidget(export_btn)
@@ -6614,9 +10979,83 @@ class HistoryWindow(QDialog):
         close_btn = QPushButton("✕")
         close_btn.setObjectName("secondary")
         close_btn.setFixedSize(32, 32)
+        close_btn.setStyleSheet("padding: 0px; font-size: 15px;")
         close_btn.clicked.connect(self.close)
         hl.addWidget(close_btn)
         layout.addWidget(header)
+
+        # Tab container
+        self.tabs = QTabWidget()
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
+        layout.addWidget(self.tabs)
+
+        # Tab 1: Change History  (builds self.table)
+        self._build_change_history_tab()
+
+        # Tab 2: Backup History  (builds self.backup_table)
+        self._build_backup_history_tab()
+
+        # Tab 3: Backup Queue  (builds self.queue_table)
+        self._build_queue_tab()
+
+        # Tab 4: Cross-watch File Search
+        self._build_file_search_tab()
+
+    def _build_change_history_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Filter bar
+        filter_bar = QFrame()
+        filter_bar.setFixedHeight(50)
+        fl = QHBoxLayout(filter_bar)
+        fl.setContentsMargins(20, 0, 20, 0)
+        fl.setSpacing(12)
+
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter by file, user, machine…")
+        self.filter_input.setFixedWidth(240)
+        self.filter_input.textChanged.connect(self._filter_changes)
+        fl.addWidget(self.filter_input)
+
+        self.type_filter = QComboBox()
+        self.type_filter.addItems(["All Types", "modified", "added", "deleted", "renamed"])
+        self.type_filter.setFixedWidth(120)
+        self.type_filter.currentTextChanged.connect(self._filter_changes)
+        fl.addWidget(self.type_filter)
+
+        # Date range filters
+        from_label = QLabel("From:")
+        from_label.setStyleSheet("color:#9ca3af; font-size:11px;")
+        fl.addWidget(from_label)
+
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDate(QDate(1900, 1, 1))  # Special date to indicate no filter
+        self.date_from.dateChanged.connect(self._filter_changes)
+        fl.addWidget(self.date_from)
+
+        to_label = QLabel("To:")
+        to_label.setStyleSheet("color:#9ca3af; font-size:11px;")
+        fl.addWidget(to_label)
+
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDate(QDate(1900, 1, 1))  # Special date to indicate no filter
+        self.date_to.dateChanged.connect(self._filter_changes)
+        fl.addWidget(self.date_to)
+
+        clear_dates_btn = QPushButton("Clear dates")
+        clear_dates_btn.setObjectName("secondary")
+        clear_dates_btn.setMinimumWidth(100)
+        clear_dates_btn.clicked.connect(self._clear_dates)
+        fl.addWidget(clear_dates_btn)
+
+        fl.addStretch()
+        layout.addWidget(filter_bar)
 
         # ── Stats bar ────────────────────────────────────────────────────────
         stats_bar = QFrame()
@@ -6647,16 +11086,16 @@ class HistoryWindow(QDialog):
             "Time", "Watch", "Type", "File / Path", "👤 User", "💻 Machine", "🌐 IP"
         ])
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.Stretch)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet(
             self.table.styleSheet() +
@@ -6664,7 +11103,390 @@ class HistoryWindow(QDialog):
         )
         layout.addWidget(self.table)
 
-    def _populate(self, entries: list):
+        self.tabs.addTab(tab, "Change History")
+
+    def _build_backup_history_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Filter bar
+        filter_bar = QFrame()
+        filter_bar.setFixedHeight(50)
+        fl = QHBoxLayout(filter_bar)
+        fl.setContentsMargins(20, 0, 20, 0)
+        fl.setSpacing(12)
+
+        self.backup_filter_input = QLineEdit()
+        self.backup_filter_input.setPlaceholderText("Search by watch name or date…")
+        self.backup_filter_input.setFixedWidth(240)
+        self.backup_filter_input.textChanged.connect(self._filter_backups)
+        fl.addWidget(self.backup_filter_input)
+
+        self.status_filter = QComboBox()
+        self.status_filter.addItems(["All", "Success", "Failed", "Cancelled"])
+        self.status_filter.setFixedWidth(120)
+        self.status_filter.currentTextChanged.connect(self._filter_backups)
+        fl.addWidget(self.status_filter)
+
+        clear_filters_btn = QPushButton("Clear Filters")
+        clear_filters_btn.setObjectName("secondary")
+        clear_filters_btn.setFixedWidth(100)
+        clear_filters_btn.clicked.connect(self._clear_backup_filters)
+        fl.addWidget(clear_filters_btn)
+
+        fl.addStretch()
+        layout.addWidget(filter_bar)
+
+        # ── Table ────────────────────────────────────────────────────────────
+        self.backup_table = QTableWidget(0, 6)
+        self.backup_table.setHorizontalHeaderLabels([
+            "Started", "Watch", "Status", "Files", "Size", "Duration"
+        ])
+        hh = self.backup_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.backup_table.verticalHeader().setVisible(False)
+        self.backup_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.backup_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.backup_table.setAlternatingRowColors(True)
+        self.backup_table.setStyleSheet(
+            self.backup_table.styleSheet() +
+            "QTableWidget { alternate-background-color: #1e2128; }"
+        )
+        layout.addWidget(self.backup_table)
+
+        self._populate_backups(self._backup_history)
+        self.tabs.addTab(tab, "Backup History")
+
+    def _build_queue_tab(self):
+        """Build the Queue tab — shows items currently waiting to be backed up."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # ── Toolbar ──────────────────────────────────────────────────────────
+        toolbar = QFrame()
+        toolbar.setFixedHeight(50)
+        tl = QHBoxLayout(toolbar)
+        tl.setContentsMargins(20, 0, 20, 0)
+        tl.setSpacing(12)
+
+        queue_title_lbl = QLabel("⏳  Pending backup queue")
+        queue_title_lbl.setStyleSheet("font-size:13px; font-weight:600; color:#9ca3af;")
+        tl.addWidget(queue_title_lbl)
+        tl.addStretch()
+
+        self._queue_count_lbl = QLabel("")
+        self._queue_count_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
+        tl.addWidget(self._queue_count_lbl)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setObjectName("secondary")
+        refresh_btn.setFixedWidth(80)
+        refresh_btn.clicked.connect(self._refresh_queue_from_disk)
+        tl.addWidget(refresh_btn)
+        layout.addWidget(toolbar)
+
+        # ── Info bar ─────────────────────────────────────────────────────────
+        info_bar = QFrame()
+        info_bar.setStyleSheet("background:#141720; border-bottom:1px solid #2e3340;")
+        info_bar.setFixedHeight(34)
+        il = QHBoxLayout(info_bar)
+        il.setContentsMargins(20, 0, 20, 0)
+        note = QLabel(
+            "Items shown here will be retried automatically the next time BackupSys starts. "
+            "This queue is stored in backup_queue.json inside the data directory."
+        )
+        note.setStyleSheet("color:#6b7280; font-size:10px;")
+        il.addWidget(note)
+        layout.addWidget(info_bar)
+
+        # ── Table ────────────────────────────────────────────────────────────
+        self.queue_table = QTableWidget(0, 3)
+        self.queue_table.setHorizontalHeaderLabels(["Watch name / ID", "Triggered by", "Queued at"])
+        hh = self.queue_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.queue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.queue_table.setAlternatingRowColors(True)
+        self.queue_table.setStyleSheet(
+            self.queue_table.styleSheet() +
+            "QTableWidget { alternate-background-color: #1e2128; }"
+        )
+        layout.addWidget(self.queue_table)
+
+        self._populate_queue(self._backup_queue)
+        # Show item count in tab label
+        label = f"Queue  ({len(self._backup_queue)})" if self._backup_queue else "Queue  (empty)"
+        self.tabs.addTab(tab, label)
+
+    def _build_file_search_tab(self):
+        """Tab 4: Cross-watch file search — scans all snapshot manifests."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # ── Search bar ───────────────────────────────────────────────────────
+        search_bar = QFrame()
+        search_bar.setFixedHeight(54)
+        sl = QHBoxLayout(search_bar)
+        sl.setContentsMargins(20, 0, 20, 0)
+        sl.setSpacing(10)
+
+        self._fs_input = QLineEdit()
+        self._fs_input.setPlaceholderText("Search filename across all watches…  e.g. report.docx")
+        self._fs_input.setMinimumWidth(280)
+        self._fs_input.returnPressed.connect(self._run_file_search)
+        sl.addWidget(self._fs_input)
+
+        # Watch filter
+        self._fs_watch_combo = QComboBox()
+        self._fs_watch_combo.setFixedWidth(180)
+        self._fs_watch_combo.addItem("All watches", userData=None)
+        for w in self._cfg.get("watches", []):
+            self._fs_watch_combo.addItem(w.get("name", w["id"]), userData=w["id"])
+        sl.addWidget(self._fs_watch_combo)
+
+        search_btn = QPushButton("🔍  Search")
+        search_btn.setObjectName("primary")
+        search_btn.setFixedWidth(100)
+        search_btn.clicked.connect(self._run_file_search)
+        sl.addWidget(search_btn)
+
+        self._fs_status = QLabel("")
+        self._fs_status.setStyleSheet("color:#6b7280; font-size:11px;")
+        sl.addWidget(self._fs_status)
+        sl.addStretch()
+        layout.addWidget(search_bar)
+
+        # ── Results table ────────────────────────────────────────────────────
+        self._fs_table = QTableWidget(0, 5)
+        self._fs_table.setHorizontalHeaderLabels([
+            "Watch", "Backup Date", "File Path", "Size", "Backup Dir"
+        ])
+        hh = self._fs_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._fs_table.verticalHeader().setVisible(False)
+        self._fs_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._fs_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._fs_table.setAlternatingRowColors(True)
+        self._fs_table.setStyleSheet(
+            self._fs_table.styleSheet() +
+            "QTableWidget { alternate-background-color: #1e2128; }"
+        )
+        self._fs_table.setSortingEnabled(True)
+        layout.addWidget(self._fs_table)
+
+        self.tabs.addTab(tab, "🔍 File Search")
+
+    def _run_file_search(self):
+        """Scan every backup manifest for files matching the search query."""
+        query = self._fs_input.text().strip().lower()
+        if not query:
+            return
+
+        global_dest = self._cfg.get("destination", "")
+        filter_wid  = self._fs_watch_combo.currentData()
+
+        # Build a watch-id → name lookup and collect all distinct destinations
+        watch_names = {}
+        dest_set: set = set()
+        if global_dest:
+            dest_set.add(global_dest)
+        for w in self._cfg.get("watches", []):
+            watch_names[w["id"]] = w.get("name", w["id"])
+            wd = w.get("destination", "").strip()
+            if wd:
+                dest_set.add(wd)
+
+        if not dest_set:
+            self._fs_status.setText("No destination configured.")
+            return
+
+        self._fs_table.setSortingEnabled(False)
+        self._fs_table.setRowCount(0)
+        matches   = 0
+        scanned   = 0
+        errors    = 0
+
+        for dest in dest_set:
+            dest_path = Path(dest)
+            if not dest_path.exists():
+                continue
+            try:
+                for backup_dir in sorted(dest_path.iterdir(), reverse=True):
+                    if not backup_dir.is_dir():
+                        continue
+                    manifest_p = backup_dir / "MANIFEST.json"
+                    if not manifest_p.exists():
+                        continue
+                    scanned += 1
+                    try:
+                        with open(manifest_p, "r", encoding="utf-8") as f:
+                            manifest = json.load(f)
+                    except Exception:
+                        errors += 1
+                        continue
+
+                    wid = manifest.get("watch_id", "")
+                    if filter_wid and wid != filter_wid:
+                        continue
+
+                    watch_label = watch_names.get(wid, wid or backup_dir.name)
+                    ts_raw = manifest.get("timestamp", "")
+                    try:
+                        ts_display = datetime.fromisoformat(ts_raw).strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        ts_display = ts_raw
+
+                    for entry in manifest.get("changes", []):
+                        if entry.get("type") not in ("added", "modified"):
+                            continue
+                        rel_path = entry.get("path", "")
+                        filename = Path(rel_path).name.lower()
+                        if query not in filename and query not in rel_path.lower():
+                            continue
+
+                        size_bytes = entry.get("size", 0)
+                        if size_bytes >= 1024 * 1024:
+                            size_h = f"{size_bytes // (1024*1024)} MB"
+                        elif size_bytes >= 1024:
+                            size_h = f"{size_bytes // 1024} KB"
+                        else:
+                            size_h = f"{size_bytes} B"
+
+                        row = self._fs_table.rowCount()
+                        self._fs_table.insertRow(row)
+                        self._fs_table.setItem(row, 0, QTableWidgetItem(watch_label))
+                        self._fs_table.setItem(row, 1, QTableWidgetItem(ts_display))
+                        self._fs_table.setItem(row, 2, QTableWidgetItem(rel_path))
+                        self._fs_table.setItem(row, 3, QTableWidgetItem(size_h))
+                        self._fs_table.setItem(row, 4, QTableWidgetItem(str(backup_dir)))
+                        matches += 1
+
+            except Exception as e:
+                self._fs_status.setText(f"Error scanning {dest}: {e}")
+                errors += 1
+
+        self._fs_table.setSortingEnabled(True)
+        noun = "match" if matches == 1 else "matches"
+        detail = f"  ({scanned} snapshots scanned)" if scanned else "  (no snapshots found)"
+        if errors:
+            detail += f"  ⚠ {errors} unreadable"
+        self._fs_status.setText(f'{matches} {noun} for \u201c{query}\u201d{detail}')
+
+    def _populate_queue(self, queue: list):
+        """Fill the queue table from a list of queue-item dicts."""
+        self.queue_table.setRowCount(0)
+        for item in queue:
+            row = self.queue_table.rowCount()
+            self.queue_table.insertRow(row)
+
+            # Watch name — look it up from watch_id if no watch_name stored
+            watch_label = item.get("watch_name") or item.get("watch_id", "unknown")
+            triggered   = item.get("triggered_by", "")
+            queued_at   = item.get("queued_at", "")
+
+            def _cell(text, clr=None):
+                cell = QTableWidgetItem(str(text))
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if clr:
+                    cell.setForeground(QColor(clr))
+                return cell
+
+            self.queue_table.setItem(row, 0, _cell(watch_label))
+            self.queue_table.setItem(row, 1, _cell(triggered,  "#f59e0b"))
+            self.queue_table.setItem(row, 2, _cell(queued_at,  "#9ca3af"))
+
+        self.queue_table.resizeRowsToContents()
+        count = len(queue)
+        self._queue_count_lbl.setText(f"{count} item{'s' if count != 1 else ''} pending")
+
+        # Update tab label
+        idx = self.tabs.indexOf(self.queue_table.parent())
+        if idx >= 0:
+            label = f"Queue  ({count})" if count else "Queue  (empty)"
+            self.tabs.setTabText(idx, label)
+
+    def _refresh_queue_from_disk(self):
+        """Re-read backup_queue.json from disk and refresh the table."""
+        try:
+            if BACKEND_AVAILABLE:
+                import config_manager as _cm
+                self._backup_queue = _cm.load_backup_queue()
+            else:
+                self._backup_queue = []
+        except Exception:
+            self._backup_queue = []
+        self._populate_queue(self._backup_queue)
+
+    def refresh_queue(self, queue: list):
+        """Called by MainWindow to live-update the queue tab after a change."""
+        self._backup_queue = queue
+        self._populate_queue(queue)
+
+    def _populate_backups(self, entries: list):
+        self.backup_table.setRowCount(len(entries))
+        for i, e in enumerate(reversed(entries)):
+            started = e.get("started_at", "")
+            try:
+                started = datetime.fromisoformat(started).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+
+            watch = e.get("watch_name", "")
+            status = e.get("status", "")
+            files = e.get("file_count", 0)
+            size_bytes = e.get("size_bytes", 0)
+            size_h = f"{size_bytes // 1024} KB" if size_bytes < 1024*1024 else f"{size_bytes // (1024*1024)} MB"
+            duration = ""
+            if e.get("started_at") and e.get("finished_at"):
+                try:
+                    start = datetime.fromisoformat(e.get("started_at"))
+                    end = datetime.fromisoformat(e.get("finished_at"))
+                    dur = end - start
+                    duration = f"{dur.seconds // 60}m {dur.seconds % 60}s"
+                except Exception:
+                    pass
+
+            def _item(text, clr=None):
+                item = QTableWidgetItem(str(text))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if clr:
+                    item.setForeground(QColor(clr))
+                return item
+
+            status_color = {
+                "success": "#22c55e",
+                "failed": "#ef4444",
+                "cancelled": "#f59e0b"
+            }.get(status.lower(), "#9ca3af")
+
+            self.backup_table.setItem(i, 0, _item(started))
+            self.backup_table.setItem(i, 1, _item(watch))
+            self.backup_table.setItem(i, 2, _item(status, status_color))
+            self.backup_table.setItem(i, 3, _item(files))
+            self.backup_table.setItem(i, 4, _item(size_h))
+            self.backup_table.setItem(i, 5, _item(duration))
+
+        self.backup_table.resizeRowsToContents()
+
+    def _populate_changes(self, entries: list):
         icon_map  = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗"}
         color_map = {
             "modified": "#f59e0b",
@@ -6692,7 +11514,7 @@ class HistoryWindow(QDialog):
 
             def _item(text, clr=None):
                 item = QTableWidgetItem(str(text))
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if clr:
                     item.setForeground(QColor(clr))
                 return item
@@ -6700,7 +11522,7 @@ class HistoryWindow(QDialog):
             self.table.setItem(i, 0, _item(ts))
             self.table.setItem(i, 1, _item(watch, "#9ca3af"))
             type_item = _item(f"{icon}  {etype}", color)
-            type_item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+            type_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
             self.table.setItem(i, 2, type_item)
             self.table.setItem(i, 3, _item(path))
             self.table.setItem(i, 4, _item(user,    "#60a5fa"))
@@ -6721,9 +11543,11 @@ class HistoryWindow(QDialog):
         self.stat_added.setText(f"➕ Added: {added}")
         self.stat_deleted.setText(f"Deleted: {deleted}")
 
-    def _filter(self):
+    def _filter_changes(self):
         text      = self.filter_input.text().lower()
         type_sel  = self.type_filter.currentText()
+        date_from = self.date_from.date()
+        date_to   = self.date_to.date()
         filtered  = []
 
         for e in self._all_history:
@@ -6738,17 +11562,65 @@ class HistoryWindow(QDialog):
             ]).lower()
             if text and text not in searchable:
                 continue
+
+            # Date range filtering
+            if date_from.year() != 1900 or date_to.year() != 1900:  # If dates are set (not the special "no filter" date)
+                try:
+                    entry_date = datetime.fromisoformat(e.get("timestamp", "")).date()
+                    if date_from.year() != 1900 and entry_date < date_from.toPyDate():
+                        continue
+                    if date_to.year() != 1900 and entry_date > date_to.toPyDate():
+                        continue
+                except (ValueError, AttributeError):
+                    # If we can't parse the date, include the entry (don't filter it out)
+                    pass
+
             filtered.append(e)
 
-        self._populate(filtered)
-        if text or type_sel != "All Types":
+        self._populate_changes(filtered)
+        filter_active = text or type_sel != "All Types" or date_from.year() != 1900 or date_to.year() != 1900
+        if filter_active:
             self.result_lbl.setText(f"Showing {len(filtered)} of {len(self._all_history)}")
         else:
             self.result_lbl.setText("")
 
+    def _filter_backups(self):
+        text = self.backup_filter_input.text().lower()
+        status_sel = self.status_filter.currentText()
+        filtered = []
+
+        for e in self._backup_history:
+            if status_sel != "All" and e.get("status", "").lower() != status_sel.lower():
+                continue
+            searchable = " ".join([
+                e.get("watch_name", ""),
+                e.get("started_at", ""),
+                e.get("finished_at", ""),
+            ]).lower()
+            if text and text not in searchable:
+                continue
+            filtered.append(e)
+
+        self._populate_backups(filtered)
+
+    def _clear_backup_filters(self):
+        self.backup_filter_input.setText("")
+        self.status_filter.setCurrentText("All")
+        self._filter_backups()
+
+    def _clear_dates(self):
+        """Clear the date filters by setting them to null/empty."""
+        # Set dates to current date as default, but we'll treat invalid dates as "no filter"
+        self.date_from.setDate(QDate.currentDate().addDays(-30))
+        self.date_to.setDate(QDate.currentDate())
+        # Actually, let's use special dates to indicate "no filter"
+        self.date_from.setDate(QDate(1900, 1, 1))  # Special date to indicate no filter
+        self.date_to.setDate(QDate(1900, 1, 1))    # Special date to indicate no filter
+        self._filter_changes()
+
     def _export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export History", "change_history.csv", "CSV Files (*.csv)"
+            self, "Export History", "backupsys_history.csv", "CSV Files (*.csv)"
         )
         if not path:
             return
@@ -6756,21 +11628,30 @@ class HistoryWindow(QDialog):
             import csv
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Time", "Watch", "Type", "File/Path", "User", "Machine", "IP"])
-                for e in reversed(self._all_history):
-                    ts = e.get("timestamp", "")
-                    try:
-                        ts = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        pass
+                writer.writerow([
+                    "watch_name",
+                    "watch_id",
+                    "backup_id",
+                    "status",
+                    "started_at",
+                    "finished_at",
+                    "file_count",
+                    "size_bytes",
+                    "destination",
+                    "error",
+                ])
+                for entry in self._backup_history:
                     writer.writerow([
-                        ts,
-                        e.get("watch_name", ""),
-                        e.get("type", ""),
-                        e.get("path", ""),
-                        e.get("editor_user", ""),
-                        e.get("editor_machine", ""),
-                        e.get("editor_ip", ""),
+                        entry.get("watch_name", ""),
+                        entry.get("watch_id", ""),
+                        entry.get("backup_id", ""),
+                        entry.get("status", ""),
+                        entry.get("started_at", ""),
+                        entry.get("finished_at", ""),
+                        entry.get("file_count", 0),
+                        entry.get("size_bytes", 0),
+                        entry.get("destination", ""),
+                        entry.get("error", ""),
                     ])
             QMessageBox.information(self, "Exported", f"History exported to:\n{path}")
         except Exception as ex:
@@ -6821,7 +11702,7 @@ class HistoryWindow(QDialog):
 
         def _item(text, clr=None):
             item = QTableWidgetItem(str(text))
-            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             if clr:
                 item.setForeground(QColor(clr))
             return item
@@ -6830,7 +11711,7 @@ class HistoryWindow(QDialog):
         self.table.setItem(0, 0, _item(ts))
         self.table.setItem(0, 1, _item(entry.get("watch_name", ""), "#9ca3af"))
         type_item = _item(f"{icon}  {etype}", color)
-        type_item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        type_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.table.setItem(0, 2, type_item)
         self.table.setItem(0, 3, _item(entry.get("path", "")))
         self.table.setItem(0, 4, _item(entry.get("editor_user",    ""), "#60a5fa"))
@@ -6848,56 +11729,70 @@ class HistoryWindow(QDialog):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TrayApp:
-    def __init__(self, app: QApplication):
+    def __init__(self, app: QApplication, window_mode=False):
         self.app    = app
         self.window = MainWindow()
+        self.window_mode = window_mode
 
-        self.tray = QSystemTrayIcon()
-        self.tray.setIcon(make_tray_icon("ok"))
-        self.tray.setToolTip(APP_NAME)
+        if not window_mode:
+            self.tray = QSystemTrayIcon()
+            self.tray.setIcon(make_tray_icon("ok"))
+            self.tray.setToolTip(APP_NAME)
 
-        menu = QMenu()
+            menu = QMenu()
 
-        open_action = QAction("Open Dashboard", menu)
-        open_action.triggered.connect(self._show_window)
+            open_action = QAction("Open Dashboard", menu)
+            open_action.triggered.connect(self._show_window)
 
-        backup_action = QAction("⚡  Backup All Now", menu)
-        backup_action.triggered.connect(self.window._backup_all)
+            backup_action = QAction("⚡  Backup All Now", menu)
+            backup_action.triggered.connect(self.window._backup_all)
 
-        admin_action = QAction("🔧 Admin Settings", menu)
-        admin_action.triggered.connect(self.window._open_admin)
+            integrity_action = QAction("🔍  Run Integrity Check Now", menu)
+            integrity_action.triggered.connect(self.window._trigger_integrity_check_now)
 
-        history_action = QAction("📋  Change History", menu)
-        history_action.triggered.connect(self.window._open_history)
+            admin_action = QAction("🔧 Admin Settings", menu)
+            admin_action.triggered.connect(self.window._open_admin)
 
-        menu.addAction(open_action)
-        menu.addSeparator()
-        menu.addAction(backup_action)
-        menu.addAction(admin_action)
-        menu.addAction(history_action)
-        menu.addSeparator()
+            history_action = QAction("📋  Change History", menu)
+            history_action.triggered.connect(self.window._open_history)
 
-        quit_action = QAction("Quit", menu)
-        quit_action.triggered.connect(self._quit)
-        menu.addAction(quit_action)
+            menu.addAction(open_action)
+            menu.addSeparator()
+            menu.addAction(backup_action)
+            menu.addAction(integrity_action)
+            menu.addAction(admin_action)
+            menu.addAction(history_action)
+            menu.addSeparator()
 
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(self._on_tray_activated)
+            quit_action = QAction("Quit", menu)
+            quit_action.triggered.connect(self._quit)
+            menu.addAction(quit_action)
 
-        self.window.set_tray(self.tray)
-        self.tray.show()
+            self.tray.setContextMenu(menu)
+            self.tray.activated.connect(self._on_tray_activated)
+
+            self.window.set_tray(self.tray)
+            self.tray.show()
+        else:
+            # Window mode: modify title and set up for taskbar minimization
+            self.window.setWindowTitle(f"{APP_NAME} (no system tray — running in window mode)")
+            self.window.set_tray(None)  # No tray available
 
     def _show_window(self):
+        saved_ss = self.app.styleSheet()
+        self.app.setStyleSheet("")
         self.window.show()
+        self.app.setStyleSheet(saved_ss)
         self.window.raise_()
         self.window.activateWindow()
 
     def _on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.Trigger:  # single click
-            if self.window.isVisible():
-                self.window.hide()
-            else:
-                self._show_window()
+        if not self.window_mode:
+            if reason == QSystemTrayIcon.ActivationReason.Trigger:  # single click
+                if self.window.isVisible():
+                    self.window.hide()
+                else:
+                    self._show_window()
 
     def _quit(self):
         if self.window._watcher_mgr:
@@ -6908,7 +11803,8 @@ class TrayApp:
                 config_manager.save_history(self.window._history_log)
             except Exception:
                 pass
-        self.tray.hide()
+        if not self.window_mode:
+            self.tray.hide()
         self.app.quit()
 
 
@@ -6920,7 +11816,7 @@ def _acquire_single_instance_lock():
     """
     Prevent multiple instances of the app running simultaneously.
     Returns a file handle that must be kept open for the lifetime of the process.
-    Raises SystemExit if another instance is already running.
+    Returns None only if another instance is confirmed running.
     """
     import tempfile
     lock_path = Path(tempfile.gettempdir()) / "backupsys.lock"
@@ -6930,24 +11826,27 @@ def _acquire_single_instance_lock():
             fh = open(lock_path, "w")
             try:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return fh
             except OSError:
                 fh.close()
-                return None   # another instance is running
-            return fh
+                return None
         else:
             import fcntl
             fh = open(lock_path, "w")
             try:
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh
             except OSError:
                 fh.close()
                 return None
-            return fh
-    except Exception:
-        return None   # can't lock >allow app to start
+    except Exception as e:
+        logger.warning(f"[lock] exception acquiring lock (allowing start): {e}")
+        return "FALLBACK"
 
 
 def main():
+    import faulthandler
+    faulthandler.enable()
     # ── Global crash handler — catches unhandled exceptions in the Qt main thread ──
     # Without this, crashes in the .exe produce no output (stdout is hidden).
     def _excepthook(exc_type, exc_value, exc_tb):
@@ -6996,7 +11895,6 @@ def main():
     # Single-instance guard
     _lock_fh = _acquire_single_instance_lock()
     if _lock_fh is None:
-        # Another instance is already running  · show a quick error and exit
         _tmp_app = QApplication.instance() or QApplication(sys.argv)
         QMessageBox.warning(None, APP_NAME,
             "Backup System is already running.\n\nCheck your system tray.")
@@ -7008,36 +11906,105 @@ def main():
     app.setQuitOnLastWindowClosed(False)   # keep alive when window is closed
 
     # ── Theme selection ───────────────────────────────────────────────────────
-    # Honour an explicit user override saved in QSettings; otherwise follow OS.
     _s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-    _theme_override = _s.value("theme", "")          # "dark", "light", or "" (auto)
-    _active_theme   = _theme_override or _detect_os_theme()
+    _active_theme = _s.value("theme", "dark")   # "dark" or "light"
+    if _active_theme not in ("dark", "light"):
+        _active_theme = "dark"                  # sanitise stale ""/auto values
     app.setStyleSheet(LIGHT_STYLE if _active_theme == "light" else DARK_STYLE)
-    # Store the resolved theme so widgets can query it at runtime
     app.setProperty("theme", _active_theme)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
-        QMessageBox.critical(None, APP_NAME,
-            "System tray is not available on this system.")
-        sys.exit(1)
+        # QMessageBox.critical(None, APP_NAME,
+        #     "System tray is not available on this system.")
+        # sys.exit(1)
+        window_mode = True
+    else:
+        window_mode = False
 
-    tray_app = TrayApp(app)
+    tray_app = TrayApp(app, window_mode=window_mode)
 
-    # Show window on first launch if no password set yet
     s = QSettings(SETTINGS_ORG, SETTINGS_APP)
     first_launch = not s.value("launched_before", False)
     if first_launch:
         s.setValue("launched_before", True)
-        tray_app._show_window()
-    else:
-        # Start silently in tray
-        tray_app.tray.showMessage(
-            APP_NAME,
-            "Running in background. Click the tray icon to open.",
-            QSystemTrayIcon.Information, 2000
-        )
+        QTimer.singleShot(800, tray_app.window._maybe_run_setup_wizard)
 
-    sys.exit(app.exec_())
+    QTimer.singleShot(0, tray_app._show_window)
+    ret = app.exec()
+    sys.exit(ret)
+
+
+class LogViewerDialog(QDialog):
+    """Full log viewer dialog with refresh capability."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("View Logs")
+        self.setMinimumSize(700, 500)
+        self.resize(900, 600)
+        self._log_file = Path(os.environ.get("BACKUPSYS_DATA_DIR", Path(__file__).parent)) / "logs" / "backupsys.log"
+        self._build_ui()
+        self._load_logs()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # ── Header bar ───────────────────────────────────────────────────────
+        header = QFrame()
+        header.setObjectName("topbar")
+        header.setFixedHeight(48)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(16, 0, 16, 0)
+
+        title = QLabel("📜  Application Logs")
+        title.setStyleSheet("font-size:14px; font-weight:700; color:#f1f3f9;")
+        hl.addWidget(title)
+
+        log_path_lbl = QLabel(f"({self._log_file})")
+        log_path_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
+        hl.addWidget(log_path_lbl)
+        hl.addStretch()
+
+        refresh_btn = QPushButton("🔄 Refresh")
+        refresh_btn.setObjectName("secondary")
+        refresh_btn.clicked.connect(self._load_logs)
+        hl.addWidget(refresh_btn)
+
+        hl.addSpacing(8)
+
+        close_btn = QPushButton("✕ Close")
+        close_btn.setObjectName("secondary")
+        close_btn.clicked.connect(self.close)
+        hl.addWidget(close_btn)
+
+        layout.addWidget(header)
+
+        # ── Log viewer ───────────────────────────────────────────────────────
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        # Set monospace font
+        font = QFont("Courier New" if sys.platform == "win32" else "Courier")
+        font.setPointSize(9)
+        self.log_text.setFont(font)
+        self.log_text.setStyleSheet("background:#0a0e18; color:#d1d5db; border:none;")
+        layout.addWidget(self.log_text)
+
+    def _load_logs(self):
+        """Load and display log file content."""
+        try:
+            if self._log_file.exists():
+                content = self._log_file.read_text(encoding='utf-8', errors='replace')
+                self.log_text.setPlainText(content)
+                # Auto-scroll to bottom
+                cursor = self.log_text.textCursor()
+                cursor.movePosition(cursor.End)
+                self.log_text.setTextCursor(cursor)
+            else:
+                self.log_text.setPlainText(f"Log file not found: {self._log_file}")
+        except Exception as e:
+            self.log_text.setPlainText(f"Error reading log file: {e}")
 
 
 if __name__ == "__main__":
