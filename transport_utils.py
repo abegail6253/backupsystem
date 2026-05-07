@@ -2739,12 +2739,25 @@ def download_from_smb(remote_dir: str, local_dest: str, smb_config: dict,
     username  = (smb_config.get("username") or smb_config.get("user", "")).strip()
     password  = _cred_smb(smb_config) if _CRED_STORE else (smb_config.get("password") or smb_config.get("pass", ""))
     domain    = smb_config.get("domain", "")
-    remote_base = (smb_config.get("remote_path") or "/backups").lstrip("/")
+    remote_base = (smb_config.get("remote_path") or "").lstrip("/\\")
+
+    # Auto-parse server and share from UNC path (\\server\share\...) if not set in config
+    if (not server or not share) and remote_dir:
+        _unc = remote_dir.replace("/", "\\").lstrip("\\")
+        _parts = _unc.split("\\", 2)
+        if len(_parts) >= 2:
+            if not server:
+                server = _parts[0].strip()
+            if not share:
+                share = _parts[1].strip()
+            if len(_parts) == 3 and not remote_base:
+                remote_base = _parts[2].strip("\\")
 
     if not server or not share:
         return {"status": "error", "downloaded": 0, "error": "SMB server/share not configured"}
+    # Allow guest access for open/passwordless shares
     if not username:
-        return {"status": "error", "downloaded": 0, "error": "SMB username not configured"}
+        username = "guest"
 
     downloaded = 0
 
