@@ -147,6 +147,18 @@ if CONFIG_PATH.exists():
     except Exception:
         pass
 
+# ── Bundle .env credentials into the exe ─────────────────────────────────────
+# The .env is extracted to sys._MEIPASS at runtime — invisible to customers,
+# never committed to git (it's in .gitignore), and overridable by placing a
+# .env next to the .exe (useful for developers / power users).
+_ENV_PATH = SCRIPT_DIR / ".env"
+if _ENV_PATH.exists():
+    print(f"✅ Bundling .env credentials into exe (customers won't see this file)")
+else:
+    print(f"⚠  No .env found at {_ENV_PATH}")
+    print(f"   Customers will see the Google Drive setup dialog on first run.")
+    print(f"   Create a .env with GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET to fix this.\n")
+
 # Always write a clean blank config for PyInstaller to bundle.
 _bundle_config = SCRIPT_DIR / ".bundle_config.json"
 _bundle_config.write_text(_json.dumps(_BLANK_CONFIG, indent=2))
@@ -169,6 +181,11 @@ args = [
     # Use absolute paths so --add-data works from any cwd
     "--add-data",   f"{CONFIG_PATH}{os.pathsep}.",
     "--add-data",   f"{SNAP_DIR}{os.pathsep}snapshots",
+] + ([
+    # Bundle .env into the exe so customers never need to create one
+    "--add-data",   f"{_ENV_PATH}{os.pathsep}.",
+] if _ENV_PATH.exists() else []) + [
+
     "--add-data",   f"{SCRIPT_DIR / 'transport_utils.py'}{os.pathsep}.",
     "--add-data",   f"{SCRIPT_DIR / 'notification_utils.py'}{os.pathsep}.",
     # Watchdog needs --collect-all to bundle its platform observer correctly

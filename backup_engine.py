@@ -1743,17 +1743,132 @@ def run_backup(
         if incremental and previous_snapshot:
             changes       = diff_snapshots(previous_snapshot, new_snapshot)
             files_to_copy = [c for c in changes if c["type"] in ("added", "modified")]
+
+            # ── Sync-mode destination check ───────────────────────────────────
+            # diff_snapshots only compares source→source snapshots, so it cannot
+            # detect files that were deleted from the *destination* while the
+            # source remained unchanged.  In sync mode we want the destination to
+            # mirror the source exactly, so we do a single rglob pass over the
+            # destination to build a {rel: size} index (same pattern as the
+            # source scan — scan_cb fires per file so the UI stays responsive
+            # and cancel is supported), then find any source files absent from it.
+            if sync_mode:
+                _dest_index_inc: Dict[str, int] = {}
+                try:
+                    for _dp in dest_root.rglob("*"):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise InterruptedError("Backup cancelled by user")
+                        if not _dp.is_file() or _dp.is_symlink():
+                            continue
+                        try:
+                            _rel = str(_dp.relative_to(dest_root))
+                            _dest_index_inc[_rel] = _dp.stat().st_size
+                            if scan_cb:
+                                try:
+                                    scan_cb(_rel)
+                                except InterruptedError:
+                                    raise
+                                except Exception:
+                                    pass
+                        except (OSError, ValueError):
+                            pass
+                except InterruptedError:
+                    raise
+                except Exception as _de:
+                    logger.warning(
+                        f"[sync] '{watch_name}': destination scan failed ({_de}) "
+                        f"— skipping missing-file detection"
+                    )
+                    _dest_index_inc = None
+
+                if _dest_index_inc is not None:
+                    _already_queued = {c["path"] for c in files_to_copy}
+                    _dest_missing = [
+                        {
+                            "type":     "added",
+                            "path":     _rel,
+                            "new_hash": _meta["hash"],
+                            "size":     _meta["size"],
+                            "old_hash": None,
+                        }
+                        for _rel, _meta in new_snapshot.items()
+                        if _rel not in _already_queued
+                        and (
+                            _rel not in _dest_index_inc
+                            or _dest_index_inc[_rel] != _meta["size"]
+                        )
+                    ]
+                    if _dest_missing:
+                        logger.info(
+                            f"[sync] '{watch_name}': {len(_dest_missing)} file(s) missing "
+                            f"from destination — queuing for re-copy"
+                        )
+                        files_to_copy = files_to_copy + _dest_missing
+                        changes       = changes + _dest_missing
         else:
-            changes = [
-                {
-                    "type":     "added",
-                    "path":     k,
-                    "new_hash": v["hash"],
-                    "size":     v["size"],
-                    "old_hash": None,
-                }
-                for k, v in new_snapshot.items()
-            ]
+            # ── Sync-mode first-backup fast path ─────────────────────────────
+            # In sync mode the destination may already be pre-populated (e.g.
+            # user seeded the drive or re-added the watch after a reinstall).
+            # Instead of queuing all source files and then seed-skipping them
+            # one by one in the copy loop (O(n) individual stat calls over the
+            # network), we do a single rglob pass over the destination — the
+            # same way the source is scanned — to build a {rel: size} index,
+            # then diff that against new_snapshot.  This keeps the UI
+            # responsive (scan_cb fires per file), supports cancellation, and
+            # produces a minimal files_to_copy list up-front.
+            if sync_mode and not encrypt_key and compress_level == 0:
+                _dest_index: Dict[str, int] = {}   # rel_path → file size
+                try:
+                    for _dp in dest_root.rglob("*"):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise InterruptedError("Backup cancelled by user")
+                        if not _dp.is_file() or _dp.is_symlink():
+                            continue
+                        try:
+                            _rel = str(_dp.relative_to(dest_root))
+                            _dest_index[_rel] = _dp.stat().st_size
+                            if scan_cb:
+                                try:
+                                    scan_cb(_rel)
+                                except InterruptedError:
+                                    raise
+                                except Exception:
+                                    pass
+                        except (OSError, ValueError):
+                            pass
+                except InterruptedError:
+                    raise
+                except Exception as _de:
+                    logger.warning(f"[sync] '{watch_name}': destination pre-scan failed ({_de}) — falling back to full copy")
+                    _dest_index = {}   # safe fallback: treat dest as empty → copy everything
+
+                changes = []
+                for k, v in new_snapshot.items():
+                    if k not in _dest_index or _dest_index[k] != v["size"]:
+                        changes.append({
+                            "type":     "added",
+                            "path":     k,
+                            "new_hash": v["hash"],
+                            "size":     v["size"],
+                            "old_hash": None,
+                        })
+                if len(changes) < len(new_snapshot):
+                    logger.info(
+                        f"[sync] '{watch_name}': first backup — destination already has "
+                        f"{len(new_snapshot) - len(changes)} of {len(new_snapshot)} file(s); "
+                        f"only {len(changes)} file(s) need copying"
+                    )
+            else:
+                changes = [
+                    {
+                        "type":     "added",
+                        "path":     k,
+                        "new_hash": v["hash"],
+                        "size":     v["size"],
+                        "old_hash": None,
+                    }
+                    for k, v in new_snapshot.items()
+                ]
             files_to_copy = changes
 
         result["changes"] = changes
@@ -2144,17 +2259,25 @@ def run_backup(
         # files + .DELETED markers), and matches exactly what validate_backup
         # computes via rglob.  Using new_snapshot was wrong for incrementals:
         # it contains ALL source files, but backup_dir only holds changed ones.
-        _bh = hashlib.sha256()
-        _any_hash = False
-        for _rel in sorted(_files_written_hashes.keys()):
-            _fhash = _files_written_hashes.get(_rel, "")
-            if _fhash:
-                _bh.update(_rel.encode())
-                _bh.update(_fhash.encode())
-                _any_hash = True
-        # Fall back to full disk scan only when nothing was tracked at all
-        # (e.g. every file failed to copy — extremely rare edge case).
-        backup_hash    = _bh.hexdigest() if _any_hash else hash_directory(str(backup_dir))
+        #
+        # In sync mode the hash is never written to disk (BACKUP.sha256 is
+        # skipped to avoid polluting the live destination), so we skip the
+        # expensive hash_directory() fallback entirely — it would re-scan the
+        # whole destination over the network for no benefit.
+        if sync_mode:
+            backup_hash = ""
+        else:
+            _bh = hashlib.sha256()
+            _any_hash = False
+            for _rel in sorted(_files_written_hashes.keys()):
+                _fhash = _files_written_hashes.get(_rel, "")
+                if _fhash:
+                    _bh.update(_rel.encode())
+                    _bh.update(_fhash.encode())
+                    _any_hash = True
+            # Fall back to full disk scan only when nothing was tracked at all
+            # (e.g. every file failed to copy — extremely rare edge case).
+            backup_hash = _bh.hexdigest() if _any_hash else hash_directory(str(backup_dir))
 
         # In sync mode backup_dir IS the live destination — skip writing internal
         # metadata files (BACKUP.sha256, MANIFEST.json) there so they do not
@@ -3059,135 +3182,6 @@ def estimate_backup_size(
     return result
 
 
-# ─── Cleanup ──────────────────────────────────────────────────────────────────
-
-def preview_cleanup(destination: str, retention_days: int, watch_id: Optional[str] = None) -> dict:
-    """Preview which backup folders would be deleted by cleanup_old_backups — without deleting anything.
-    Returns { to_delete: [folder_names], freed_bytes, freed_human }
-    """
-    dest   = Path(destination)
-    result = {"to_delete": [], "freed_bytes": 0, "freed_human": "0 B"}
-
-    if not dest.exists() or retention_days <= 0:
-        return result
-
-    cutoff = datetime.now() - timedelta(days=retention_days)
-
-    for d in list(dest.iterdir()):
-        if not d.is_dir():
-            continue
-        manifest_p = d / "MANIFEST.json"
-        if not manifest_p.exists():
-            try:
-                age_hours = (datetime.now().timestamp() - d.stat().st_mtime) / 3600
-                if age_hours > 24:
-                    result["to_delete"].append(d.name)
-                    result["freed_bytes"] += _safe_size(str(d))
-            except Exception:
-                logger.debug("[suppressed] Exception ignored near: age_hours = (datetime.now().timestamp() - d.stat().st_mtime) / 3600 |           ", exc_info=True)
-                pass
-            continue
-        try:
-            with open(manifest_p) as f:
-                m = json.load(f)
-            if watch_id and m.get("watch_id") != watch_id:
-                continue
-            ts_str = m.get("timestamp", "")
-            if not ts_str:
-                continue
-            if datetime.fromisoformat(ts_str) < cutoff:
-                result["to_delete"].append(d.name)
-                result["freed_bytes"] += _safe_size(str(d))
-        except Exception:
-            logger.debug("[suppressed] Exception ignored near: continue |             if datetime.fromisoformat(ts_str) < cutoff: |            ", exc_info=True)
-            pass
-
-    result["freed_human"] = _human_size(result["freed_bytes"])
-    return result
-
-
-def cleanup_old_backups(destination: str, retention_days: int, watch_id: Optional[str] = None) -> dict:
-    """Delete backup folders older than retention_days and report cleanup results."""
-
-    dest = Path(destination)
-
-    result = {
-        "deleted": 0,
-        "freed_bytes": 0,
-        "freed_human": "0 B",
-        "errors": []
-    }
-
-    if not dest.exists() or retention_days <= 0:
-        return result
-
-    cutoff = datetime.now() - timedelta(days=retention_days)
-
-    for d in list(dest.iterdir()):
-
-        if not d.is_dir():
-            continue
-
-        manifest_p = d / "MANIFEST.json"
-
-        if not manifest_p.exists():
-            # Orphaned directory — left by a failed backup that was interrupted
-            # before its MANIFEST could be written.  Clean it up if it's old
-            # enough (>1 day grace period) so we don't remove in-progress dirs.
-            try:
-                age_hours = (datetime.now().timestamp() - d.stat().st_mtime) / 3600
-                if age_hours > 24:
-                    size = _safe_size(str(d))
-                    shutil.rmtree(str(d), ignore_errors=True)
-                    result["deleted"] += 1
-                    result["freed_bytes"] += size
-                    logger.info(f"🗑 Removed orphaned backup dir (no MANIFEST, {age_hours:.0f}h old): {d.name}")
-            except Exception as e:
-                result["errors"].append(f"orphan {d.name}: {e}")
-            continue
-
-        try:
-            with open(manifest_p) as f:
-                m = json.load(f)
-
-            # Skip if scoped to a specific watch and this backup doesn't match
-            if watch_id and m.get("watch_id") != watch_id:
-                continue
-
-            ts_str = m.get("timestamp", "")
-
-            if not ts_str:
-                continue
-
-            ts = datetime.fromisoformat(ts_str)
-
-            if ts < cutoff:
-
-                size = _safe_size(str(d))
-
-                shutil.rmtree(str(d), ignore_errors=True)
-
-                result["deleted"] += 1
-                result["freed_bytes"] += size
-
-        except Exception as e:
-            result["errors"].append(str(e))
-
-    # Convert bytes to human readable
-    result["freed_human"] = _human_size(result["freed_bytes"])
-
-    # Invalidate backup index and log cleanup notification
-    if result["deleted"] > 0:
-        _backup_index.invalidate(destination)
-
-        logger.info(
-            f"🗑 Deleted {result['deleted']} old backup(s) "
-            f"(older than {retention_days}d), freed {result['freed_human']}"
-        )
-
-    return result
-
-
 # ─── Restore Verification ─────────────────────────────────────────────────────
 
 def verify_restore_integrity(
@@ -3730,47 +3724,6 @@ def _short_id() -> str:
     """Full UUID4 hex for zero collision risk."""
     return uuid.uuid4().hex  # 32 chars, no truncation
 
-
-# ─── Max-Backups Pruning ──────────────────────────────────────────────────────
-
-def prune_excess_backups(destination: str, watch_id: str, max_backups: int) -> dict:
-    """
-    Delete the oldest backups for a watch when the count exceeds max_backups.
-    Called automatically after each successful backup if max_backups > 0.
-    """
-    result = {"pruned": 0, "freed_bytes": 0, "freed_human": "0 B", "errors": []}
-
-    if max_backups <= 0:
-        return result
-
-    backups = list_backups(destination, watch_id)  # newest-first
-    if len(backups) <= max_backups:
-        return result
-
-    to_delete = backups[max_backups:]  # everything beyond the keep limit
-
-    for b in to_delete:
-        bd = b.get("backup_dir", "")
-        if not bd or not Path(bd).exists():
-            continue
-        try:
-            size = _safe_size(bd)
-            shutil.rmtree(bd, ignore_errors=True)
-            result["pruned"]      += 1
-            result["freed_bytes"] += size
-        except Exception as e:
-            result["errors"].append(str(e))
-
-    result["freed_human"] = _human_size(result["freed_bytes"])
-
-    if result["pruned"]:
-        _backup_index.invalidate(destination)
-        logger.info(
-            f"✂  Pruned {result['pruned']} excess backup(s) for watch {watch_id} "
-            f"(max={max_backups}), freed {result['freed_human']}"
-        )
-
-    return result
 
 # ─── Encryption Key Rotation ──────────────────────────────────────────────────
 

@@ -55,7 +55,6 @@ DEFAULT_CONFIG = {
     "auto_backup":         False,
     "interval_min":        30,
     "interval_unit":       "minutes",
-    "retention_days":      0,
     "webhook_url":         "",
     "webhook_on_success":  False,
     "compression_enabled": False,
@@ -150,14 +149,12 @@ WATCH_TEMPLATE = {
     "backup_count":     0,
     "last_backup_size": 0,
     "compression":      False,
-    "max_backups":      0,        # 0 = unlimited; prunes oldest first after each backup
     "max_file_size_mb": 0,        # 0 = no limit; skip files larger than N MB
     "max_backup_bytes": 0,        # 0 = no limit; refuse new backup if stored bytes exceed this
     "skip_auto_backup": False,    # exclude from daemon without pausing manual backups
     "color":            "",       # optional color label (hex or empty)
     "interval_min":     0,
     "schedule_times":   [],       # per-watch time-of-day schedule e.g. ["01:00", "13:00"]; [] = use global
-    "retention_days":   0,        # 0 = use global interval; >0 = watch-specific interval
     "destinations":     [],       # list of {"dest_type": "sftp", "config": {...}}
     "cloud_config":     {},       # Google Drive OAuth credentials per-watch
     "smb_cfg":          {},       # SMB source credentials for UNC paths
@@ -366,8 +363,6 @@ def load() -> dict:
 
             # Guard against hand-edited bad values that would spin the daemon
             cfg["interval_min"]   = max(1, int(cfg.get("interval_min",   30)))
-            cfg["retention_days"] = max(0, int(cfg.get("retention_days", 0)))  # 0 = disabled (no auto-delete)
-
             # Normalize schedule entries → list of {"time": "HH:MM", "days": int}
             # Legacy plain strings are treated as all-days (bitmask 127).
             def _norm_sched_entry(e):
@@ -779,13 +774,11 @@ def update_watch_meta(
     tags:              Optional[list] = None,
     notes:             Optional[str]  = None,
     exclude_patterns:  Optional[list] = None,
-    max_backups:       Optional[int]  = None,
     skip_auto_backup:  Optional[bool] = None,
     reset_snapshot:    Optional[bool] = None,
     color:             Optional[str]  = None,
     interval_min:      Optional[int]  = None,
     active:            Optional[bool] = None,
-    retention_days:    Optional[int]  = None,   # ← added
     compression:       Optional[bool] = None,   # ← added
     encrypt_key:       Optional[str]  = None,   # ← added: Fernet key or "" to disable
     sync_mode:         Optional[bool] = None,   # ← added: mirror/sync mode
@@ -808,12 +801,10 @@ def update_watch_meta(
             if tags             is not None: w["tags"]             = list(tags)
             if notes            is not None: w["notes"]            = notes
             if exclude_patterns is not None: w["exclude_patterns"] = list(exclude_patterns)
-            if max_backups      is not None: w["max_backups"]      = max(0, int(max_backups))
             if skip_auto_backup is not None: w["skip_auto_backup"] = bool(skip_auto_backup)
             if color            is not None: w["color"]            = color[:7]  # max #rrggbb
             if interval_min     is not None: w["interval_min"]     = max(0, int(interval_min))
             if active           is not None: w["active"]           = bool(active)
-            if retention_days   is not None: w["retention_days"]   = max(0, int(retention_days))  # ← added
             if compression      is not None: w["compression"]      = compression            # ← updated to store int
             if smb_cfg          is not None: w["smb_cfg"]          = dict(smb_cfg)
             if encrypt_key      is not None: w["encrypt_key"]      = encrypt_key.strip()          # ← added
@@ -866,20 +857,16 @@ def clone_watch(cfg: dict, watch_id: str, new_name: str, new_path: str) -> Optio
     if new_watch:
         update_watch_meta(
             cfg, new_watch["id"],
-            max_backups=src.get("max_backups", 0),
             skip_auto_backup=src.get("skip_auto_backup", False),
             active=src.get("active", True),
             compression=src.get("compression", False),
-            retention_days=src.get("retention_days", 0),
             color=src.get("color", ""),
             encrypt_key=src.get("encrypt_key", ""),  # BUG FIX: persist in config too
             sync_mode=src.get("sync_mode", False),
             schedule_times=src.get("schedule_times", []),
         )
-        new_watch["max_backups"]      = src.get("max_backups", 0)
         new_watch["skip_auto_backup"] = src.get("skip_auto_backup", False)
         new_watch["compression"]      = src.get("compression", False)
-        new_watch["retention_days"]   = src.get("retention_days", 0)
         new_watch["color"]            = src.get("color", "")
         new_watch["encrypt_key"]      = src.get("encrypt_key", "")  # BUG FIX: return dict too
         new_watch["sync_mode"]        = src.get("sync_mode", False)

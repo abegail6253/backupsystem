@@ -63,6 +63,15 @@ def _load_dotenv():
     _env_candidates = [
         Path(__file__).parent / ".env",
         Path(__file__).parent / "_env",          # legacy fallback  · rename to .env
+        # When running as a compiled exe, __file__ is inside the _internal
+        # subfolder.  Also search the folder containing the .exe itself so
+        # users can place .env next to BackupSystem.exe without digging into
+        # _internal.
+        Path(sys.executable).parent / ".env",
+        Path(sys.executable).parent / "_env",
+        # When bundled with PyInstaller via --add-data, the .env is extracted
+        # to the _MEIPASS temp directory at runtime — invisible to customers.
+        Path(getattr(sys, "_MEIPASS", "")) / ".env" if getattr(sys, "_MEIPASS", None) else None,
         Path(os.environ.get("BACKUPSYS_DATA_DIR", "")) / ".env" if os.environ.get("BACKUPSYS_DATA_DIR") else None,
     ]
     for _env_path in _env_candidates:
@@ -124,7 +133,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QIcon, QFont, QColor, QPalette, QPixmap, QPainter, QBrush,
-    QLinearGradient, QFontDatabase
+    QLinearGradient, QFontDatabase, QTextCursor
 )
 
 # ── Local imports ──────────────────────────────────────────────────────────────
@@ -142,7 +151,9 @@ except ImportError as e:
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME        = "Backup System"
 APP_VERSION     = "1.1.8"
-ADMIN_PASS_KEY  = "admin_password_hash"
+ADMIN_PASS_KEY      = "admin_password_hash"
+ADMIN_ATTEMPTS_KEY  = "admin_failed_attempts"
+ADMIN_LOCKOUT_KEY   = "admin_lockout_until"   # epoch seconds (float)
 SETTINGS_ORG    = "BackupSystem"
 SETTINGS_APP    = "BackupSystem"
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -1562,6 +1573,80 @@ class RestoreWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ── Auto-Shutdown Countdown Dialog ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ShutdownCountdownDialog(QDialog):
+    """60-second countdown before auto-shutdown.  Cancel button aborts shutdown."""
+
+    def __init__(self, parent=None, countdown: int = 60):
+        super().__init__(parent)
+        self._remaining = countdown
+        self._cancelled = False
+        self.setWindowTitle("Auto-Shutdown")
+        self.setModal(True)
+        self.setFixedSize(400, 180)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+
+        icon_lbl = QLabel("🖥  All backups completed")
+        icon_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
+        layout.addWidget(icon_lbl)
+
+        self._msg_lbl = QLabel()
+        self._msg_lbl.setWordWrap(True)
+        self._msg_lbl.setStyleSheet("font-size: 12px; color: #d1d5db;")
+        layout.addWidget(self._msg_lbl)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel Shutdown")
+        cancel_btn.setObjectName("secondary")
+        cancel_btn.clicked.connect(self._cancel)
+        shutdown_now_btn = QPushButton("Shut Down Now")
+        shutdown_now_btn.setObjectName("danger")
+        shutdown_now_btn.clicked.connect(self._shutdown_now)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(shutdown_now_btn)
+        layout.addLayout(btn_row)
+
+        self._update_label()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def _update_label(self):
+        self._msg_lbl.setText(
+            f"The computer will shut down in <b>{self._remaining}</b> second(s).\n"
+            "Click <b>Cancel Shutdown</b> to abort."
+        )
+
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self._timer.stop()
+            self.accept()   # accepted → caller triggers shutdown
+        else:
+            self._update_label()
+
+    def _cancel(self):
+        self._timer.stop()
+        self._cancelled = True
+        self.reject()
+
+    def _shutdown_now(self):
+        self._timer.stop()
+        self.accept()
+
+    def was_cancelled(self) -> bool:
+        return self._cancelled
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ── Admin Password Dialog ──────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1572,9 +1657,34 @@ class PasswordDialog(QDialog):
         self.setWindowTitle("Admin Authentication")
         self.setMinimumWidth(360)
         self.setModal(True)
-        self._attempts  = 0       # wrong-password counter
-        self._locked    = False   # True while cooldown is active
+        self._pending_reset = False  # True when forgot-password flow is in progress
+
+        # ── Load persistent lockout state ─────────────────────────────────────
+        import time as _time
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._attempts = int(s.value(ADMIN_ATTEMPTS_KEY, 0))
+        lockout_until  = float(s.value(ADMIN_LOCKOUT_KEY, 0))
+        remaining_secs = lockout_until - _time.time()
+        if remaining_secs > 0:
+            self._locked = True
+        else:
+            self._locked = False
+            if self._attempts >= 5:
+                # Lockout expired — clear persisted counter
+                self._attempts = 0
+                s.setValue(ADMIN_ATTEMPTS_KEY, 0)
+                s.setValue(ADMIN_LOCKOUT_KEY, 0)
+
         self._build_ui()
+
+        # If already locked, start the UI countdown for the remaining time
+        if self._locked:
+            ms_left = max(1000, int(remaining_secs * 1000))
+            self.pw_input.setEnabled(False)
+            self.error_lbl.setText(
+                f"Too many attempts · locked for {int(remaining_secs)}s"
+            )
+            QTimer.singleShot(ms_left, self._unlock)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -1647,16 +1757,28 @@ class PasswordDialog(QDialog):
                 self.error_lbl.setText("Passwords do not match")
                 return
             self._save_password(pw)
+            # If this was triggered by "Forgot password?", the old key is now
+            # safely replaced — nothing extra to remove (save overwrites it).
+            self._pending_reset = False
             self.accept()
         else:
             if self._verify_password(pw):
+                # Successful login — clear the failed attempt counter
+                s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+                s.setValue(ADMIN_ATTEMPTS_KEY, 0)
+                s.setValue(ADMIN_LOCKOUT_KEY, 0)
                 self.accept()
             else:
+                import time as _time
                 self._attempts += 1
                 self.pw_input.clear()
+                s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+                s.setValue(ADMIN_ATTEMPTS_KEY, self._attempts)
                 # Lockout: 30-second cooldown after 5 consecutive failures
                 if self._attempts >= 5:
                     self._locked = True
+                    lockout_until = _time.time() + 30
+                    s.setValue(ADMIN_LOCKOUT_KEY, lockout_until)
                     self.error_lbl.setText("Too many attempts  · locked for 30 seconds")
                     self.pw_input.setEnabled(False)
                     QTimer.singleShot(30_000, self._unlock)
@@ -1676,8 +1798,9 @@ class PasswordDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        s.remove(ADMIN_PASS_KEY)
+        # Don't delete the old password yet — only wipe it once the user
+        # successfully saves a new one (handled in _submit via _pending_reset).
+        self._pending_reset = True
 
         self.mode = "set"
         self.title_lbl.setText("Set Admin Password")
@@ -1693,6 +1816,9 @@ class PasswordDialog(QDialog):
         """Called after the 30-second lockout expires."""
         self._attempts = 0
         self._locked   = False
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s.setValue(ADMIN_ATTEMPTS_KEY, 0)
+        s.setValue(ADMIN_LOCKOUT_KEY, 0)
         self.pw_input.setEnabled(True)
         self.error_lbl.setText("You may try again")
 
@@ -1779,6 +1905,9 @@ class AddWatchDialog(QDialog):
             "Local / Mapped Drive",
             "Network Share (SMB)",
             "WebDAV / Nextcloud",
+            "SFTP",
+            "FTPS",
+            "FTP (plain)",
         ])
         self.source_type.currentIndexChanged.connect(self._on_source_type_changed)
         form.addRow("Source Type:", self.source_type)
@@ -1854,6 +1983,50 @@ class AddWatchDialog(QDialog):
         self.webdav_widget.setVisible(False)
         form.addRow("WebDAV URL:", self.webdav_widget)
 
+        # ── SFTP / FTPS source ────────────────────────────────────────────────
+        self.src_sftp_widget = QWidget()
+        sftp_src_layout = QFormLayout(self.src_sftp_widget)
+        sftp_src_layout.setContentsMargins(0, 0, 0, 0)
+        sftp_src_layout.setSpacing(4)
+        self.src_sftp_host = QLineEdit(); self.src_sftp_host.setPlaceholderText("hostname or IP")
+        self.src_sftp_port = QSpinBox(); self.src_sftp_port.setRange(1, 65535); self.src_sftp_port.setValue(22)
+        self.src_sftp_user = QLineEdit(); self.src_sftp_user.setPlaceholderText("username")
+        self.src_sftp_pass = QLineEdit(); self.src_sftp_pass.setPlaceholderText("password")
+        self.src_sftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.src_sftp_path = QLineEdit(); self.src_sftp_path.setPlaceholderText("/remote/folder/to/watch")
+        self.src_sftp_key  = QLineEdit(); self.src_sftp_key.setPlaceholderText("path to private key (optional)")
+        sftp_src_layout.addRow("Host:", self.src_sftp_host)
+        sftp_src_layout.addRow("Port:", self.src_sftp_port)
+        sftp_src_layout.addRow("User:", self.src_sftp_user)
+        sftp_src_layout.addRow("Password:", self.src_sftp_pass)
+        sftp_src_layout.addRow("Remote Path:", self.src_sftp_path)
+        sftp_src_layout.addRow("Key File:", self.src_sftp_key)
+        self.src_sftp_widget.setVisible(False)
+        form.addRow("SFTP:", self.src_sftp_widget)
+
+        # ── FTP (plain) source ────────────────────────────────────────────────
+        self.src_ftp_widget = QWidget()
+        ftp_src_layout = QFormLayout(self.src_ftp_widget)
+        ftp_src_layout.setContentsMargins(0, 0, 0, 0)
+        ftp_src_layout.setSpacing(4)
+        self.src_ftp_host = QLineEdit(); self.src_ftp_host.setPlaceholderText("hostname or IP")
+        self.src_ftp_port = QSpinBox(); self.src_ftp_port.setRange(1, 65535); self.src_ftp_port.setValue(21)
+        self.src_ftp_user = QLineEdit(); self.src_ftp_user.setPlaceholderText("username")
+        self.src_ftp_pass = QLineEdit(); self.src_ftp_pass.setPlaceholderText("password")
+        self.src_ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.src_ftp_path = QLineEdit(); self.src_ftp_path.setPlaceholderText("/remote/folder/to/watch")
+        _ftp_src_warn = QLabel("⚠ FTP sends credentials in plaintext — prefer FTPS or SFTP.")
+        _ftp_src_warn.setWordWrap(True)
+        _ftp_src_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
+        ftp_src_layout.addRow("Host:", self.src_ftp_host)
+        ftp_src_layout.addRow("Port:", self.src_ftp_port)
+        ftp_src_layout.addRow("User:", self.src_ftp_user)
+        ftp_src_layout.addRow("Password:", self.src_ftp_pass)
+        ftp_src_layout.addRow("Remote Path:", self.src_ftp_path)
+        ftp_src_layout.addRow("", _ftp_src_warn)
+        self.src_ftp_widget.setVisible(False)
+        form.addRow("FTP:", self.src_ftp_widget)
+
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(0, 1440)
         self.interval_spin.setValue(0)
@@ -1909,18 +2082,8 @@ class AddWatchDialog(QDialog):
         more_form.addRow("Schedule times:", self.add_schedule_widget)
 
         # Retention
-        self.add_retention_spin = QSpinBox()
-        self.add_retention_spin.setRange(0, 365)
-        self.add_retention_spin.setValue(0)
-        self.add_retention_spin.setSuffix(" days  (0 = use global)")
-        more_form.addRow("Retention:", self.add_retention_spin)
 
         # Max backups
-        self.add_max_backups_spin = QSpinBox()
-        self.add_max_backups_spin.setRange(0, 9999)
-        self.add_max_backups_spin.setValue(0)
-        self.add_max_backups_spin.setSuffix("  (0 = unlimited)")
-        more_form.addRow("Max backups:", self.add_max_backups_spin)
 
         # Max file size
         self.add_max_file_size_spin = QSpinBox()
@@ -2010,6 +2173,13 @@ class AddWatchDialog(QDialog):
         self.local_widget.setVisible(idx == 0)
         self.smb_widget.setVisible(idx == 1)
         self.webdav_widget.setVisible(idx == 2)
+        is_sftp = idx in (3, 4)   # SFTP or FTPS
+        is_ftp  = idx == 5        # FTP plain
+        self.src_sftp_widget.setVisible(is_sftp)
+        self.src_ftp_widget.setVisible(is_ftp)
+        # For remote sources the path field is not used — hide the local path row
+        is_remote = idx in (3, 4, 5)
+        self.local_widget.setVisible(idx == 0 and not is_remote)
 
     def _browse_dest(self):
         """Browse for a per-watch destination folder."""
@@ -2021,9 +2191,9 @@ class AddWatchDialog(QDialog):
         msg = QMessageBox(self)
         msg.setWindowTitle("What to watch?")
         msg.setText("Do you want to watch a folder or a single file?")
-        folder_btn = msg.addButton("Folder", QMessageBox.AcceptRole)
-        file_btn   = msg.addButton("File",   QMessageBox.AcceptRole)
-        msg.addButton("Cancel", QMessageBox.RejectRole)
+        folder_btn = msg.addButton("Folder", QMessageBox.ButtonRole.AcceptRole)
+        file_btn   = msg.addButton("File",   QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         msg.exec()
         clicked = msg.clickedButton()
         if clicked == folder_btn:
@@ -2262,6 +2432,8 @@ class AddWatchDialog(QDialog):
         src_idx   = self.source_type.currentIndex()
         is_smb    = src_idx == 1
         is_webdav = src_idx == 2
+        is_sftp   = src_idx in (3, 4)
+        is_ftp    = src_idx == 5
 
         if is_smb:
             path_str = self.smb_path_input.text().strip().replace("/", "\\")
@@ -2282,6 +2454,28 @@ class AddWatchDialog(QDialog):
             if not self.webdav_user.text().strip():
                 self.error_lbl.setText("WebDAV username is required.")
                 return
+        elif is_sftp:
+            if not self.src_sftp_host.text().strip():
+                self.error_lbl.setText("SFTP host is required.")
+                return
+            if not self.src_sftp_user.text().strip():
+                self.error_lbl.setText("SFTP username is required.")
+                return
+            if not self.src_sftp_path.text().strip():
+                self.error_lbl.setText("SFTP remote path is required.")
+                return
+            path_str = self.src_sftp_path.text().strip()
+        elif is_ftp:
+            if not self.src_ftp_host.text().strip():
+                self.error_lbl.setText("FTP host is required.")
+                return
+            if not self.src_ftp_user.text().strip():
+                self.error_lbl.setText("FTP username is required.")
+                return
+            if not self.src_ftp_path.text().strip():
+                self.error_lbl.setText("FTP remote path is required.")
+                return
+            path_str = self.src_ftp_path.text().strip()
         else:
             path_str = self.path_input.text().strip()
 
@@ -2300,6 +2494,11 @@ class AddWatchDialog(QDialog):
                     self.error_lbl.setText(f"Cannot connect to SMB share: {err}")
                     return
 
+        # Remote sources (SFTP/FTPS/FTP/WebDAV) — skip local filesystem validation
+        if is_sftp or is_ftp or is_webdav:
+            self.accept()
+            return
+
         if self._validate_and_warn(path_str, name):
             self.accept()
 
@@ -2307,6 +2506,9 @@ class AddWatchDialog(QDialog):
         src_idx   = self.source_type.currentIndex()
         is_smb    = src_idx == 1
         is_webdav = src_idx == 2
+        is_sftp   = src_idx in (3, 4)
+        is_ftps   = src_idx == 4
+        is_ftp    = src_idx == 5
 
         if is_smb:
             path     = self.smb_path_input.text().strip()
@@ -2314,6 +2516,12 @@ class AddWatchDialog(QDialog):
         elif is_webdav:
             path     = self.webdav_url.text().strip()
             src_type = "webdav"
+        elif is_sftp:
+            path     = self.src_sftp_path.text().strip()
+            src_type = "ftps" if is_ftps else "sftp"
+        elif is_ftp:
+            path     = self.src_ftp_path.text().strip()
+            src_type = "ftp"
         else:
             path     = self.path_input.text().strip()
             src_type = "local"
@@ -2338,10 +2546,21 @@ class AddWatchDialog(QDialog):
             "is_webdav":        is_webdav,
             "webdav_user":      self.webdav_user.text().strip() if is_webdav else "",
             "webdav_pass":      self.webdav_pass.text() if is_webdav else "",
+            "is_sftp":          is_sftp,
+            "sftp_host":        self.src_sftp_host.text().strip() if is_sftp else "",
+            "sftp_port":        self.src_sftp_port.value() if is_sftp else 22,
+            "sftp_user":        self.src_sftp_user.text().strip() if is_sftp else "",
+            "sftp_pass":        self.src_sftp_pass.text() if is_sftp else "",
+            "sftp_path":        self.src_sftp_path.text().strip() if is_sftp else "",
+            "sftp_key":         self.src_sftp_key.text().strip() if is_sftp else "",
+            "is_ftp":           is_ftp,
+            "ftp_host":         self.src_ftp_host.text().strip() if is_ftp else "",
+            "ftp_port":         self.src_ftp_port.value() if is_ftp else 21,
+            "ftp_user":         self.src_ftp_user.text().strip() if is_ftp else "",
+            "ftp_pass":         self.src_ftp_pass.text() if is_ftp else "",
+            "ftp_path":         self.src_ftp_path.text().strip() if is_ftp else "",
             # Advanced fields (from "More Options…" expander)
             "schedule_times":   self.add_schedule_widget.get_entries(),
-            "retention_days":   self.add_retention_spin.value(),
-            "max_backups":      self.add_max_backups_spin.value(),
             "max_file_size_mb": self.add_max_file_size_spin.value(),
             "exclude_patterns": excl,
             "encrypt_key":      self.add_encrypt_input.text().strip(),
@@ -2938,7 +3157,7 @@ class _DestinationEntryDialog(QDialog):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EditWatchDialog(QDialog):
-    """Edit per-watch settings: name, interval, compression, retention, max_backups, exclusions."""
+    """Edit per-watch settings: name, interval, compression, exclusions."""
 
     def __init__(self, watch: dict, dest_type: str = "local", parent=None):
         super().__init__(parent)
@@ -2977,38 +3196,6 @@ class EditWatchDialog(QDialog):
         _w_sched = self.watch.get("schedule_times", [])
         self.watch_schedule_widget.set_entries(_w_sched)
         form.addRow("Schedule times:", self.watch_schedule_widget)
-
-        self.retention_spin = QSpinBox()
-        self.retention_spin.setRange(0, 365)
-        self.retention_spin.setValue(self.watch.get("retention_days", 0))
-        self.retention_spin.setSuffix(" days  (0 = use global)")
-        form.addRow("Retention:", self.retention_spin)
-
-        _watch_has_rclone = (
-            self.dest_type == "rclone" or
-            any(d.get("dest_type") == "rclone"
-                for d in self.watch.get("destinations", []))
-        )
-        if _watch_has_rclone:
-            _rclone_ret_note = QLabel(
-                "⚠ rclone destination detected — BackupSys retention policies apply "
-                "best-effort only. If rclone is unavailable at cleanup time, old backup "
-                "folders are left in place. Consider also enabling server-side retention "
-                "policies on your storage provider or NAS as a safety net."
-            )
-            _rclone_ret_note.setStyleSheet(
-                "color: #f59e0b; font-size: 11px; "
-                "background: #2d2200; border: 1px solid #78450a; "
-                "border-radius: 4px; padding: 4px 6px;"
-            )
-            _rclone_ret_note.setWordWrap(True)
-            form.addRow("", _rclone_ret_note)
-
-        self.max_backups_spin = QSpinBox()
-        self.max_backups_spin.setRange(0, 9999)
-        self.max_backups_spin.setValue(self.watch.get("max_backups", 0))
-        self.max_backups_spin.setSuffix("  (0 = unlimited)")
-        form.addRow("Max backups:", self.max_backups_spin)
 
         self.force_full_interval_spin = QSpinBox()
         self.force_full_interval_spin.setRange(0, 3650)
@@ -3069,7 +3256,7 @@ class EditWatchDialog(QDialog):
         self.max_backup_bytes_spin.setSuffix(" MB  (0 = no limit)")
         self.max_backup_bytes_spin.setToolTip(
             "Stop new backups for this watch once total backup storage exceeds this limit. "
-            "Old backups must be deleted (or max_backups reduced) to free space."
+            "Old backups must be deleted to free space."
         )
         form.addRow("Storage quota:", self.max_backup_bytes_spin)
 
@@ -3668,8 +3855,6 @@ class EditWatchDialog(QDialog):
             "name":               self.name_input.text().strip(),
             "interval_min":       self.interval_spin.value(),
             "schedule_times":     self.watch_schedule_widget.get_entries(),
-            "retention_days":     self.retention_spin.value(),
-            "max_backups":        self.max_backups_spin.value(),
             "max_file_size_mb":   int(self.max_file_size_spin.value()),
             "max_backup_bytes":   int(self.max_backup_bytes_spin.value()) * 1024 * 1024,
             "compression":        self.compress_combo.currentData(),
@@ -3937,15 +4122,6 @@ class AdminPanel(QDialog):
         rclone_note.setStyleSheet("color: #94a3b8; font-size: 11px;")
         rclone_note.setWordWrap(True)
         rcl.addRow("", rclone_note)
-        rclone_retention_warn = QLabel(
-            "\u2139 BackupSys applies retention policies to rclone destinations by running "
-            "rclone purge on expired backup folders. "
-            "If rclone is not available at cleanup time, old folders are left in place. "
-            "You can also configure server-side lifecycle rules as a secondary safety net."
-        )
-        rclone_retention_warn.setStyleSheet("color: #60a5fa; font-size: 11px;")
-        rclone_retention_warn.setWordWrap(True)
-        rcl.addRow("", rclone_retention_warn)
         rclone_test_btn = QPushButton("Test Connection")
         rclone_test_btn.setObjectName("secondary")
         rclone_test_btn.clicked.connect(self._test_rclone)
@@ -3972,17 +4148,6 @@ class AdminPanel(QDialog):
         wdvl.addRow("Remote path:", self.webdav_path)
         wdvl.addRow("DAV root:",    self.webdav_root)
         wdvl.addRow("",             self.webdav_ssl)
-        webdav_retention_warn = QLabel(
-            "⚠ BackupSys enforces retention on WebDAV destinations by sending "
-            "PROPFIND + DELETE requests against the remote backup folder. "
-            "This requires the server to support standard DAV collection DELETE. "
-            "Nextcloud and ownCloud both do. "
-            "If your server restricts DELETE, old backups will accumulate — "
-            "consider enabling server-side retention rules as a safety net."
-        )
-        webdav_retention_warn.setStyleSheet("color: #f59e0b; font-size: 11px;")
-        webdav_retention_warn.setWordWrap(True)
-        wdvl.addRow("",             webdav_retention_warn)
         wdvl.addRow("",             wdv_btn_row)
         self.dest_webdav_widget.setVisible(False)
         dg_main.addWidget(self.dest_webdav_widget)
@@ -4029,12 +4194,6 @@ class AdminPanel(QDialog):
         self.seconds_warning_label.setWordWrap(True)
         self.seconds_warning_label.setVisible(False)
         sg.addRow("", self.seconds_warning_label)
-        self.retention_spin = QSpinBox()
-        self.retention_spin.setRange(0, 36500)  # 0 = keep forever, no limit on max
-        self.retention_spin.setSuffix(" days  (0 = keep forever)")
-        self.retention_spin.setSpecialValueText("0 — Keep forever (no auto-delete)")
-        sg.addRow("Retention:", self.retention_spin)
-
         # Disk space alert threshold
         self.disk_alert_spin = QSpinBox()
         self.disk_alert_spin.setRange(0, 1000)
@@ -4239,6 +4398,25 @@ class AdminPanel(QDialog):
         _startup_note.setStyleSheet("color: #888; font-size: 11px;")
         stl.addWidget(_startup_note)
         gl.addWidget(startup_group)
+
+        # ── Auto-Shutdown ───────────────────────────────────────────────────
+        shutdown_group = QGroupBox("Auto-Shutdown")
+        sdl = QVBoxLayout(shutdown_group)
+        self.shutdown_check = QCheckBox("Shut down PC automatically when all backups complete")
+        self.shutdown_check.setToolTip(
+            "When enabled, BackupSys will shut down this computer once every\n"
+            "active backup finishes. A 60-second countdown dialog will appear\n"
+            "first so you can cancel if needed."
+        )
+        sdl.addWidget(self.shutdown_check)
+        _shutdown_note = QLabel(
+            "Only triggers when a backup was started manually or by the scheduler — "
+            "not on app launch.  A 60-second countdown lets you cancel."
+        )
+        _shutdown_note.setWordWrap(True)
+        _shutdown_note.setStyleSheet("color: #888; font-size: 11px;")
+        sdl.addWidget(_shutdown_note)
+        gl.addWidget(shutdown_group)
 
         # ── Portable mode indicator ─────────────────────────────────────────
         _portable_group = QGroupBox("Portable Mode")
@@ -5424,7 +5602,6 @@ class AdminPanel(QDialog):
         self.interval_unit.setCurrentIndex(1 if unit == "seconds" else 0)
         self._on_interval_unit_changed(1 if unit == "seconds" else 0)
         self.interval_spin.setValue(self.cfg.get("interval_min", 30))
-        self.retention_spin.setValue(self.cfg.get("retention_days", 0))
         # Scheduled backup times
         sched = self.cfg.get("backup_schedule_times", [])
         self.schedule_times_widget.set_entries(sched)
@@ -5451,6 +5628,7 @@ class AdminPanel(QDialog):
         self.integrity_interval_spin.setValue(int(self.cfg.get("integrity_check_interval_days", 7)))
         self.force_full_global_spin.setValue(int(self.cfg.get("force_full_interval_days", 0)))
         self.startup_check.setChecked(self._is_startup_enabled())
+        self.shutdown_check.setChecked(self.cfg.get("auto_shutdown_on_complete", False))
         self._refresh_watch_table()
         self._refresh_cloud_combo()
         self._check_cloud_connections()
@@ -5556,7 +5734,15 @@ class AdminPanel(QDialog):
         """Load OAuth credentials from .env file."""
         import os
         from pathlib import Path
-        env_path = Path(__file__).parent / ".env"
+        # Search same candidates as _load_dotenv: _internal folder first,
+        # then the exe's parent folder (where users usually place .env).
+        _env_candidates = [
+            Path(__file__).parent / ".env",
+            Path(sys.executable).parent / ".env",
+            Path(__file__).parent / "_env",
+            Path(sys.executable).parent / "_env",
+        ]
+        env_path = next((p for p in _env_candidates if p.exists()), Path(__file__).parent / ".env")
         creds = {
             "GDRIVE_CLIENT_ID":     "",
             "GDRIVE_CLIENT_SECRET": "",
@@ -5606,7 +5792,13 @@ class AdminPanel(QDialog):
         client_id = self.GDRIVE_CLIENT_ID
         if not client_id:
             from pathlib import Path
-            env_path = Path(__file__).parent / ".env"
+            _env_candidates = [
+                Path(__file__).parent / ".env",
+                Path(sys.executable).parent / ".env",
+                Path(__file__).parent / "_env",
+                Path(sys.executable).parent / "_env",
+            ]
+            env_path = next((p for p in _env_candidates if p.exists()), Path(sys.executable).parent / ".env")
             env_exists = env_path.exists()
             raw = ""
             if env_exists:
@@ -5614,14 +5806,64 @@ class AdminPanel(QDialog):
                     raw = env_path.read_text(encoding="utf-8")[:300]
                 except Exception as re:
                     raw = f"(read error: {re})"
-            QMessageBox.warning(self, "Not configured",
-                f"GDRIVE_CLIENT_ID not found.\n\n"
-                f".env path: {env_path}\n"
-                f".env exists: {env_exists}\n\n"
-                f"Contents preview:\n{raw if env_exists else '(file not found)'}\n\n"
-                f"Make sure your .env file has:\n"
-                f"GDRIVE_CLIENT_ID=your_client_id"
+            # Build a helpful dialog with a "Create .env template" button
+            # so the user can get started without manual file editing.
+            _dlg = QDialog(self)
+            _dlg.setWindowTitle("Google Drive — not configured")
+            _dlg.setMinimumWidth(480)
+            _vlay = QVBoxLayout(_dlg)
+            _vlay.setSpacing(10)
+
+            _msg = QLabel(
+                f"<b>GDRIVE_CLIENT_ID not found.</b><br><br>"
+                f"Create a <code>.env</code> file at:<br>"
+                f"<code>{env_path}</code><br><br>"
+                f"with your Google OAuth credentials:<br>"
+                f"<code>GDRIVE_CLIENT_ID=your_client_id<br>"
+                f"GDRIVE_CLIENT_SECRET=your_client_secret</code><br><br>"
+                f"Don't have credentials yet? "
+                f"Go to <b>console.cloud.google.com</b> → APIs &amp; Services → Credentials "
+                f"→ Create OAuth 2.0 Client ID (Desktop app)."
             )
+            _msg.setWordWrap(True)
+            _msg.setOpenExternalLinks(True)
+            _vlay.addWidget(_msg)
+
+            _btn_row = QHBoxLayout()
+            _create_btn = QPushButton("📄  Create .env template")
+            _open_btn   = QPushButton("📂  Open folder")
+            _close_btn  = QPushButton("Close")
+            _close_btn.setDefault(True)
+            _btn_row.addWidget(_create_btn)
+            _btn_row.addWidget(_open_btn)
+            _btn_row.addStretch()
+            _btn_row.addWidget(_close_btn)
+            _vlay.addLayout(_btn_row)
+
+            def _create_template():
+                try:
+                    if not env_path.exists():
+                        env_path.write_text(
+                            "# Google Drive OAuth credentials\n"
+                            "# Get these from console.cloud.google.com\n"
+                            "GDRIVE_CLIENT_ID=your_client_id\n"
+                            "GDRIVE_CLIENT_SECRET=your_client_secret\n",
+                            encoding="utf-8"
+                        )
+                    import subprocess, os
+                    subprocess.Popen(["notepad.exe", str(env_path)])
+                    _dlg.accept()
+                except Exception as _ce:
+                    QMessageBox.warning(_dlg, "Error", f"Could not create file:\n{_ce}")
+
+            def _open_folder():
+                import subprocess
+                subprocess.Popen(["explorer.exe", str(env_path.parent)])
+
+            _create_btn.clicked.connect(_create_template)
+            _open_btn.clicked.connect(_open_folder)
+            _close_btn.clicked.connect(_dlg.reject)
+            _dlg.exec()
             return
 
         # Use a result dict so the background thread can pass the code back safely.
@@ -6282,8 +6524,6 @@ class AdminPanel(QDialog):
                         "destination":      v.get("destination", "") or None,
                         # Advanced fields set via "More Options…"
                         "schedule_times":   v.get("schedule_times", []),
-                        "retention_days":   v.get("retention_days", 0),
-                        "max_backups":      v.get("max_backups", 0),
                         "max_file_size_mb": v.get("max_file_size_mb", 0),
                         "exclude_patterns": v.get("exclude_patterns", []),
                         "encrypt_key":      v.get("encrypt_key", ""),
@@ -6297,6 +6537,24 @@ class AdminPanel(QDialog):
                             "url":      v["path"],
                             "username": v.get("webdav_user", ""),
                             "password": v.get("webdav_pass", ""),
+                        }
+                    # Persist SFTP/FTPS source credentials
+                    if v.get("is_sftp"):
+                        extra_meta["sftp_cfg"] = {
+                            "host":       v.get("sftp_host", ""),
+                            "port":       v.get("sftp_port", 22),
+                            "username":   v.get("sftp_user", ""),
+                            "password":   v.get("sftp_pass", ""),
+                            "key_path":   v.get("sftp_key", ""),
+                        }
+                    # Persist FTP source credentials
+                    if v.get("is_ftp"):
+                        extra_meta["ftp_cfg"] = {
+                            "host":     v.get("ftp_host", ""),
+                            "port":     v.get("ftp_port", 21),
+                            "username": v.get("ftp_user", ""),
+                            "password": v.get("ftp_pass", ""),
+                            "use_tls":  False,
                         }
                     config_manager.update_watch_meta(self.cfg, w["id"], **extra_meta)
                 self._refresh_watch_table()
@@ -6705,7 +6963,13 @@ class AdminPanel(QDialog):
 
         if self._log_tail_check.isChecked():
             cursor = self._log_viewer.textCursor()
-            cursor.movePosition(cursor.End)
+            # PyQt5 < 5.15 uses QTextCursor.End; newer PyQt5/PyQt6 uses
+            # QTextCursor.MoveOperation.End — try both for compatibility.
+            try:
+                _end = QTextCursor.MoveOperation.End
+            except AttributeError:
+                _end = QTextCursor.End
+            cursor.movePosition(_end)
             self._log_viewer.setTextCursor(cursor)
 
     def _clear_log_file(self):
@@ -6913,7 +7177,6 @@ class AdminPanel(QDialog):
         self.cfg["auto_backup"] = self.auto_check.isChecked()
         self.cfg["interval_unit"] = "seconds" if self.interval_unit.currentIndex() == 1 else "minutes"
         self.cfg["interval_min"] = self.interval_spin.value()
-        self.cfg["retention_days"] = self.retention_spin.value()
         self.cfg["low_disk_threshold_gb"] = self.disk_alert_spin.value()
         self.cfg["backup_schedule_times"] = self.schedule_times_widget.get_entries()
         self.cfg["backup_window_start"]   = self.backup_window_start_input.text().strip()
@@ -6930,6 +7193,7 @@ class AdminPanel(QDialog):
         self.cfg["integrity_check_enabled"]       = self.integrity_enabled_cb.isChecked()
         self.cfg["integrity_check_interval_days"] = self.integrity_interval_spin.value()
         self.cfg["force_full_interval_days"]      = self.force_full_global_spin.value()
+        self.cfg["auto_shutdown_on_complete"]     = self.shutdown_check.isChecked()
         try:
             config_manager.save(self.cfg)
             QMessageBox.information(self, "Saved", "Settings saved.")
@@ -7270,31 +7534,6 @@ class WatchCard(QFrame):
         self.next_lbl.setVisible(True)
         info_layout.addWidget(self.next_lbl)
 
-        # ── rclone retention notice ───────────────────────────────────────────
-        # Shown only when this watch's effective destination is rclone AND a
-        # retention policy is configured.  rclone purge is best-effort; remind
-        # the user so they don't assume it silently just works in all cases.
-        _watch_retention = self.watch.get("retention_days", 0)
-        if self.dest_type == "rclone" and _watch_retention:
-            self._rclone_retention_warn = QLabel(
-                "⚠ rclone retention is best-effort — old folders are left in place "
-                "if rclone is unavailable at cleanup time."
-            )
-            self._rclone_retention_warn.setStyleSheet(
-                "color: #f59e0b; font-size: 10px; padding: 2px 0;"
-            )
-            self._rclone_retention_warn.setWordWrap(True)
-            self._rclone_retention_warn.setToolTip(
-                "BackupSys attempts to delete expired rclone backup folders using\n"
-                "'rclone purge' after each backup run.  If rclone is not installed,\n"
-                "not in PATH, or the remote is unreachable at that moment, old folders\n"
-                "are left in place — retention is NOT enforced by BackupSys policies\n"
-                "the way it is for local destinations.\n\n"
-                "Tip: configure server-side retention policies on your NAS or\n"
-                "Nextcloud instance as a safety net."
-            )
-            info_layout.addWidget(self._rclone_retention_warn)
-
 
         tags = self.watch.get("tags", [])
         if tags:
@@ -7407,7 +7646,7 @@ class WatchCard(QFrame):
 
         more_menu.addSeparator()
         act_settings = more_menu.addAction("⚙ Watch Settings…")
-        act_settings.setToolTip("Edit encryption, exclusions, retention, hooks and more for this watch")
+        act_settings.setToolTip("Edit encryption, exclusions, hooks and more for this watch")
         act_settings.triggered.connect(lambda: self.watch_settings_requested.emit(self.watch))
 
         # Store action references so external code can enable/disable them
@@ -8196,7 +8435,7 @@ class MainWindow(QMainWindow):
             self.cfg = config_manager.load()
         else:
             self.cfg = {"watches": [], "destination": "", "auto_backup": False,
-                        "interval_min": 30, "retention_days": 0}
+                        "interval_min": 30}
 
     # ── UI Build ───────────────────────────────────────────────────────────────
 
@@ -8580,8 +8819,27 @@ class MainWindow(QMainWindow):
             wid   = item.get("watch_id")
             watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
             if watch:
+                # Skip watches whose source is unreachable (e.g. SMB share not
+                # yet authenticated after reboot) — log a warning instead of crashing.
+                src_type = watch.get("type", "local")
+                src_path = watch.get("path", "")
+                if src_type in ("local", "smb"):
+                    try:
+                        accessible = Path(src_path).exists()
+                    except OSError:
+                        accessible = False
+                    if not accessible:
+                        self._append_log(
+                            f"⚠ Skipping queued backup '{watch.get('name', wid)}' "
+                            f"— source path not accessible at startup "
+                            f"(SMB share may need credentials). Will retry on next scheduled run."
+                        )
+                        continue
                 self._append_log(f"⏳ Resuming queued backup: {watch.get('name', wid)}")
-                self._backup_single(watch, triggered_by="queue")
+                try:
+                    self._backup_single(watch, triggered_by="queue")
+                except Exception as e:
+                    self._append_log(f"⚠ Could not resume queued backup '{watch.get('name', wid)}': {e}")
 
     # ── Watchers ───────────────────────────────────────────────────────────────
 
@@ -9017,6 +9275,8 @@ class MainWindow(QMainWindow):
         worker.finished.connect(lambda r, _wid=wid: self._on_backup_done(_wid, r))
         worker.log_message.connect(self._append_log)
         self._workers[wid] = worker
+        # Track how many backups have started this session (used by auto-shutdown)
+        self._backups_started_this_session = getattr(self, "_backups_started_this_session", 0) + 1
 
         # ── Background size estimate (non-blocking, manual triggers only) ───
         # Shows "Estimated: X files / Y MB" in the log before the backup starts.
@@ -9249,100 +9509,6 @@ class MainWindow(QMainWindow):
                 self._cards[wid].update_watch(w)
                 self._cards[wid].refresh_next_backup_lbl(self.cfg)
 
-        # Enforce per-watch max_backups limit
-        if success and BACKEND_AVAILABLE:
-            watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
-            if watch:
-                max_b = watch.get("max_backups", 0)
-                if max_b > 0:
-                    prune = backup_engine.prune_excess_backups(
-                        self.cfg.get("destination", ""), wid, max_b
-                    )
-                    if prune["pruned"] > 0:
-                        self._append_log(
-                            f"▶  Pruned {prune['pruned']} old backup(s) for {watch.get('name',wid)} "
-                            f"(max={max_b}), freed {prune['freed_human']}"
-                        )
-
-                # ── Auto retention cleanup (global + per-watch) ────────────
-                dest = self.cfg.get("destination", "")
-                if dest:
-                    # Per-watch retention overrides global if set
-                    retention = watch.get("retention_days", 0) or self.cfg.get("retention_days", 0)
-                    if retention > 0:
-                        # For auto/scheduled backups run cleanup silently — showing a
-                        # confirmation dialog during an unattended run blocks the UI forever.
-                        # Only prompt the user for manual backups.
-                        _triggered_by = result.get("triggered_by", "manual")
-                        _is_unattended = _triggered_by in ("auto", "scheduled", "queue")
-                        preview = backup_engine.preview_cleanup(dest, retention, wid)
-                        to_delete = preview.get("to_delete", [])
-                        if to_delete:
-                            count     = len(to_delete)
-                            freed_str = preview.get("freed_human", "0 B")
-                            if _is_unattended:
-                                # Silent cleanup — no dialog
-                                cleaned = backup_engine.cleanup_old_backups(dest, retention, wid)
-                                if cleaned.get("deleted", 0) > 0:
-                                    self._append_log(
-                                        f"🗑 Cleaned {cleaned['deleted']} backup(s) older than "
-                                        f"{retention}d for {watch.get('name', wid)}, "
-                                        f"freed {cleaned.get('freed_human', '0 B')}"
-                                    )
-                            else:
-                                # Manual backup — ask user before deleting
-                                names = "\n".join(f"  • {n}" for n in to_delete[:10])
-                                if count > 10:
-                                    names += f"\n  … and {count - 10} more"
-                                msg = QMessageBox(self)
-                                msg.setWindowTitle("Retention Cleanup Confirmation")
-                                msg.setIcon(QMessageBox.Icon.Warning)
-                                msg.setText(
-                                    f"<b>Retention cleanup will permanently delete {count} backup(s) "
-                                    f"older than {retention} days for '{watch.get('name', wid)}'.</b><br><br>"
-                                    f"This will free <b>{freed_str}</b> and <b>cannot be undone</b>."
-                                )
-                                msg.setDetailedText(f"Folders to be deleted:\n{names}")
-                                msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                                msg.setDefaultButton(QMessageBox.StandardButton.No)
-                                msg.button(QMessageBox.StandardButton.Yes).setText("Delete permanently")
-                                msg.button(QMessageBox.StandardButton.No).setText("Skip cleanup")
-                                if msg.exec() == QMessageBox.StandardButton.Yes:
-                                    cleaned = backup_engine.cleanup_old_backups(dest, retention, wid)
-                                    if cleaned.get("deleted", 0) > 0:
-                                        self._append_log(
-                                            f"🗑 Cleaned {cleaned['deleted']} backup(s) older than "
-                                            f"{retention}d for {watch.get('name', wid)}, "
-                                            f"freed {cleaned.get('freed_human', '0 B')}"
-                                        )
-                                else:
-                                    self._append_log(
-                                        f"⏭ Retention cleanup skipped for {watch.get('name', wid)} "
-                                        f"({count} backup(s) kept)"
-                                    )
-
-                # ── Remote retention cleanup (SFTP/FTP/SMB/FTPS) ──────────
-                dest_type = self.cfg.get("dest_type", "local")
-                if dest_type not in ("local",):
-                    retention = watch.get("retention_days", 0) or self.cfg.get("retention_days", 0)
-                    if retention > 0:
-                        try:
-                            from transport_utils import cleanup_remote_backups
-                            rc = cleanup_remote_backups(self.cfg, retention, wid)
-                            if rc.get("deleted", 0) > 0:
-                                freed_mb = rc.get("freed_bytes", 0) / (1024 * 1024)
-                                freed_str = f"{freed_mb:.1f} MB" if freed_mb >= 1 else f"{rc.get('freed_bytes', 0) // 1024} KB"
-                                self._append_log(
-                                    f"🗑 Remote: Cleaned {rc['deleted']} backup(s) older than "
-                                    f"{retention}d on {dest_type.upper()}, freed ~{freed_str}"
-                                )
-                            if rc.get("error") and rc.get("deleted", 0) == 0:
-                                self._append_log(f"⚠ Remote retention skipped: {rc['error']}")
-                        except ImportError:
-                            pass
-                        except Exception as e:
-                            self._append_log(f"⚠ Remote retention error: {e}")
-
         self._update_stats()
         self._update_auto_label()
 
@@ -9390,6 +9556,40 @@ class MainWindow(QMainWindow):
                     self.gdrive_banner.show()
                 _icon = QSystemTrayIcon.MessageIcon.Warning
             self._tray.showMessage(APP_NAME, msg, _icon, 5000 if not success else 3000)
+
+        # ── Auto-shutdown: trigger only when ALL backups are done ────────────
+        # _workers is empty → no backups running.  Check the config flag and
+        # that at least one backup ran in this session (avoid firing on launch).
+        if (
+            not self._workers
+            and self.cfg.get("auto_shutdown_on_complete", False)
+            and getattr(self, "_backups_started_this_session", 0) > 0
+        ):
+            self._trigger_auto_shutdown()
+
+    def _trigger_auto_shutdown(self):
+        """Show countdown dialog then shut down the OS."""
+        dlg = ShutdownCountdownDialog(self, countdown=60)
+        result = dlg.exec()
+        if dlg.was_cancelled():
+            self._append_log("⏹ Auto-shutdown cancelled by user.")
+            return
+        # Accepted (timer expired or 'Shut Down Now')
+        self._append_log("🖥  Auto-shutdown initiated — all backups complete.")
+        import platform, subprocess
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["shutdown", "/s", "/t", "0"], check=True)
+            elif platform.system() == "Darwin":
+                subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'], check=True)
+            else:  # Linux / BSD
+                subprocess.run(["systemctl", "poweroff"], check=True)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Shutdown Failed",
+                f"Could not shut down the computer:\n{exc}\n\n"
+                "You may need to run BackupSys as administrator."
+            )
 
     def _append_log(self, text: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -10443,7 +10643,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not open folder:\n{e}")
 
     def _on_watch_settings_requested(self, watch: dict):
-        """Open the EditWatchDialog for per-watch advanced settings (encryption, exclusions, retention, hooks)."""
+        """Open the EditWatchDialog for per-watch advanced settings (encryption, exclusions, hooks)."""
         wid = watch.get("id", "")
         # Get a fresh copy from config in case it was modified since the card was built
         live_watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), watch)
@@ -10466,8 +10666,6 @@ class MainWindow(QMainWindow):
                     compression=v.get("compression", False),
                     sync_mode=v.get("sync_mode", True),
                     destination=v.get("destination", "") or None,
-                    retention_days=v.get("retention_days", 0),
-                    max_backups=v.get("max_backups", 0),
                     max_file_size_mb=v.get("max_file_size_mb", 0),
                     max_backup_bytes=v.get("max_backup_bytes", 0),
                     skip_auto_backup=v.get("skip_auto_backup", False),
@@ -11877,6 +12075,32 @@ def main():
         tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         logger.critical(f"Unhandled exception:\n{tb_str}")
 
+        # ── SMB authentication errors are non-fatal — show a friendly warning
+        # instead of crashing the app. WinError 1326 = wrong username/password.
+        err_str = str(exc_value)
+        is_smb_auth = (
+            isinstance(exc_value, OSError) and
+            ("1326" in err_str or "1219" in err_str or
+             "ユーザー名またはパスワード" in err_str or
+             "wrong password" in err_str.lower() or
+             "logon failure" in err_str.lower())
+        )
+        if is_smb_auth:
+            logger.warning(f"[smb] Authentication error (non-fatal): {exc_value}")
+            try:
+                _tmp_app = QApplication.instance() or QApplication(sys.argv)
+                QMessageBox.warning(
+                    None,
+                    f"{APP_NAME} — Network Share Unavailable",
+                    f"A watched network share could not be accessed.\n\n"
+                    f"Path: {err_str}\n\n"
+                    f"The app will continue running. To fix this permanently, save your\n"
+                    f"NAS credentials in Windows Credential Manager so they survive reboots."
+                )
+            except Exception:
+                pass
+            return  # don't exit — app continues normally
+
         # ── Crash notification — attempt email + webhook ───────────────────
         try:
             _crash_cfg = config_manager.load()
@@ -12022,7 +12246,11 @@ class LogViewerDialog(QDialog):
                 self.log_text.setPlainText(content)
                 # Auto-scroll to bottom
                 cursor = self.log_text.textCursor()
-                cursor.movePosition(cursor.End)
+                try:
+                    _end = QTextCursor.MoveOperation.End
+                except AttributeError:
+                    _end = QTextCursor.End
+                cursor.movePosition(_end)
                 self.log_text.setTextCursor(cursor)
             else:
                 self.log_text.setPlainText(f"Log file not found: {self._log_file}")
