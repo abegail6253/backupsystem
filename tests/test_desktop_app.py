@@ -71,9 +71,7 @@ _QtWidgets.QSystemTrayIcon.Information = 1
 _QtWidgets.QSystemTrayIcon.Warning = 2
 
 # Stub out optional heavy deps before importing desktop_app
-for _dep in ["paramiko", "smbprotocol", "smbprotocol.connection",
-             "smbprotocol.session", "smbprotocol.tree", "smbprotocol.open",
-             "smbprotocol.query_info", "cryptography",
+for _dep in ["paramiko", "cryptography",
              "cryptography.hazmat", "cryptography.hazmat.primitives",
              "cryptography.hazmat.primitives.ciphers",
              "cryptography.hazmat.primitives.ciphers.aead",
@@ -629,7 +627,7 @@ class TestResolveRestoreDestination:
     """Test the branching in _resolve_restore_destination without real network calls."""
 
     # Replicate the routing logic as a pure function for isolated testing
-    _REMOTE_TYPES = {"sftp", "ftps", "ftp", "smb", "webdav", "https", "rclone", "cloud"}
+    _REMOTE_TYPES = {"sftp", "ftps", "ftp", "webdav", "https", "rclone", "cloud"}
 
     def _resolve(self, global_dest_type: str,
                  per_watch_dests: list,
@@ -728,24 +726,6 @@ class TestCheckRemoteFreeSpace:
         assert result["ok"] is False
         assert "insufficient" in result["error"].lower()
 
-    def test_smb_nt_enough_space(self):
-        import shutil
-        mock_usage = shutil.disk_usage.__class__  # just any namedtuple-like
-        # patch shutil.disk_usage inside transport_utils
-        free_bytes = 50 * 1024 ** 3  # 50 GB
-        fake_usage = Mock()
-        fake_usage.free = free_bytes
-        with patch("os.name", "nt"), \
-             patch("subprocess.run", return_value=Mock(returncode=0)), \
-             patch("shutil.disk_usage", return_value=fake_usage):
-            import transport_utils as tu
-            with patch.object(tu, "os") as mock_os:
-                mock_os.name = "nt"
-                # Can't easily test the full SMB path without mocking the full
-                # UNC handshake — verify the function at least returns a dict
-                result = self.fn("smb", {"dest_smb": {"server": "srv", "share": "bk"}}, 1024)
-        assert isinstance(result, dict)
-        assert "ok" in result
 
     def test_webdav_quota_not_supported_returns_skipped(self):
         """Server that doesn't return quota-available-bytes → ok=True, skipped."""
@@ -867,7 +847,10 @@ class TestFlaskAPIManagement:
             path,
             data=body,
             content_type="application/json",
-            headers={"X-BackupSys-Signature": self._sig(body)},
+            headers={
+                "X-BackupSys-Signature": self._sig(body),
+                "X-BackupSys-Timestamp": str(time.time()),
+            },
         )
 
     def _get(self, client, path: str, params: str = "") -> object:
@@ -875,7 +858,10 @@ class TestFlaskAPIManagement:
         empty = b""
         return client.get(
             url,
-            headers={"X-BackupSys-Signature": self._sig(empty)},
+            headers={
+                "X-BackupSys-Signature": self._sig(empty),
+                "X-BackupSys-Timestamp": str(time.time()),
+            },
         )
 
     def test_watches_register_and_list(self, client):
@@ -941,7 +927,10 @@ class TestFlaskAPIManagement:
             f"/commands/{cmd_id}/ack",
             data=body,
             content_type="application/json",
-            headers={"X-BackupSys-Signature": self._sig(body)},
+            headers={
+                "X-BackupSys-Signature": self._sig(body),
+                "X-BackupSys-Timestamp": str(time.time()),
+            },
         )
         assert resp.status_code == 200
         # Should no longer appear in pending
@@ -956,7 +945,10 @@ class TestFlaskAPIManagement:
         empty = b""
         resp = client.delete(
             f"/commands/{cmd_id}",
-            headers={"X-BackupSys-Signature": self._sig(empty)},
+            headers={
+                "X-BackupSys-Signature": self._sig(empty),
+                "X-BackupSys-Timestamp": str(time.time()),
+            },
         )
         assert resp.status_code == 200
 
@@ -967,13 +959,24 @@ class TestFlaskAPIManagement:
         cmd_id = json.loads(r.data)["command_id"]
         # First ack it
         body = json.dumps({"status": "done"}).encode()
-        client.post(f"/commands/{cmd_id}/ack", data=body,
-                    content_type="application/json",
-                    headers={"X-BackupSys-Signature": self._sig(body)})
+        client.post(
+            f"/commands/{cmd_id}/ack",
+            data=body,
+            content_type="application/json",
+            headers={
+                "X-BackupSys-Signature": self._sig(body),
+                "X-BackupSys-Timestamp": str(time.time()),
+            },
+        )
         # Now try to cancel
         empty = b""
-        resp = client.delete(f"/commands/{cmd_id}",
-                             headers={"X-BackupSys-Signature": self._sig(empty)})
+        resp = client.delete(
+            f"/commands/{cmd_id}",
+            headers={
+                "X-BackupSys-Signature": self._sig(empty),
+                "X-BackupSys-Timestamp": str(time.time()),
+            },
+        )
         assert resp.status_code == 409
 
     def test_config_update_queued(self, client):

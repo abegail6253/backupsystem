@@ -87,7 +87,7 @@ except ImportError:
 
 # ── Optional Flask import with a friendly error ───────────────────────────────
 try:
-    from flask import Flask, request, jsonify, g, send_file, session, redirect, url_for, make_response, render_template
+    from flask import Flask, request, jsonify, g, send_file, session, redirect, url_for, make_response, render_template, current_app
     from werkzeug.exceptions import RequestEntityTooLarge
 except ImportError:
     raise SystemExit(
@@ -423,7 +423,7 @@ def require_auth(f):
         if not API_KEY:
             logger.critical("BACKUPSYS_API_KEY is not set — all requests are rejected.")
             return jsonify({"error": "Server misconfiguration: API key not set."}), 500
-        # ── Replay protection: timestamp must be within ±60 s ────────────────
+        # ── Replay protection: timestamp must be within ±60 s
         ts_ok, ts_err = _check_timestamp()
         if not ts_ok:
             _log_request(401)
