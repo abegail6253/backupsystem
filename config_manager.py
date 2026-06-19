@@ -43,12 +43,10 @@ SNAPSHOTS_DIR = _DATA_DIR / "snapshots"
 _save_lock    = threading.Lock()
 
 DEFAULT_CONFIG = {
-    "destination":         "./backups",
     "storage_type":        "local",
     "dest_type":           "local",
     "dest_webdav":         {},
     "dest_sftp":           {},
-    "dest_smb":            {},
     "dest_ftp":            {},
     "dest_https":          {},
     "dest_rclone":         {"remote": "", "path": "/backups"},
@@ -157,7 +155,6 @@ WATCH_TEMPLATE = {
     "schedule_times":   [],       # per-watch time-of-day schedule e.g. ["01:00", "13:00"]; [] = use global
     "destinations":     [],       # list of {"dest_type": "sftp", "config": {...}}
     "cloud_config":     {},       # Google Drive OAuth credentials per-watch
-    "smb_cfg":          {},       # SMB source credentials for UNC paths
     "encrypt_key":      "",       # Fernet key (44 chars, URL-safe base64); empty = no encryption
     "last_integrity_check":    None, # ISO timestamp of last scheduled integrity check, or None
     # Scheduled force-full backup (per-watch override) ─────────────────────
@@ -185,6 +182,10 @@ WATCH_TEMPLATE = {
     "source_type":     "local",  # "local" | "sftp" | "ftp"
     "source_sftp_cfg": {},        # {host, port, username, password|key_path, key_passphrase}
     "source_ftp_cfg":  {},        # {host, port, username, password, use_tls}
+    # ── Same-host UNC robocopy override ──────────────────────────────────────
+    # When source and destination are on the same Windows host, BackupSys normally
+    # uses robocopy /MT:8 /J — much faster than the Python read→write loop.
+    "force_robocopy":  False,     # True = always use robocopy, even for same-host UNC copies
 }
 
 
@@ -356,10 +357,21 @@ def load() -> dict:
                     if k not in _sub_cfg:
                         _sub_cfg[k] = v
 
-            # Resolve relative destination paths to absolute (relative to config.json location)
-            _dest = cfg.get("destination", "./backups")
-            if _dest and not os.path.isabs(_dest):
-                cfg["destination"] = str((CONFIG_PATH.parent / _dest).resolve())
+            # Migration: copy global destination into any watch that has a blank per-watch destination.
+            # This ensures existing configs are not broken after removing the global destination fallback.
+            _global_dest = cfg.get("destination", "")
+            if _global_dest and not os.path.isabs(_global_dest):
+                _global_dest = str((CONFIG_PATH.parent / _global_dest).resolve())
+            _migrated = False
+            for _w in cfg.get("watches", []):
+                if not _w.get("destination", "").strip():
+                    _w["destination"] = _global_dest
+                    _migrated = True
+            if _migrated:
+                try:
+                    save(cfg)
+                except Exception:
+                    pass
 
             # Guard against hand-edited bad values that would spin the daemon
             cfg["interval_min"]   = max(1, int(cfg.get("interval_min",   30)))
@@ -446,8 +458,37 @@ def load() -> dict:
             return cfg
 
         except (json.JSONDecodeError, IOError) as e:
-            print(f"[config_manager] WARNING: config.json is corrupt ({e}), resetting.", file=sys.stderr)
+            print(f"[config_manager] WARNING: config.json is corrupt ({e}), attempting recovery from auto-backups.", file=sys.stderr)
             _backup_corrupt_config()
+
+            # ── Auto-backup recovery ──────────────────────────────────────
+            # Before wiping everything, try each rotating backup (newest first)
+            # until we find one that is valid JSON.  This preserves all watch
+            # settings even when the live config.json gets corrupted or truncated
+            # by a crash, disk-full event, or bad manual edit.
+            _parent = CONFIG_PATH.parent
+            for _n in range(1, CONFIG_BACKUP_KEEP + 1):
+                _bak = _parent / f"config.backup.{_n}.json"
+                if not _bak.exists():
+                    continue
+                try:
+                    with open(_bak, encoding="utf-8") as _f:
+                        json.load(_f)   # validate only — full merge happens on re-entry
+                    import shutil as _sh
+                    _sh.copy2(str(_bak), str(CONFIG_PATH))
+                    with _cache_lock:
+                        _config_cache["cfg"]   = None
+                        _config_cache["mtime"] = 0.0
+                    print(
+                        f"[config_manager] Recovered config from auto-backup #{_n} "
+                        f"({_bak.name}) — your watches and settings have been restored.",
+                        file=sys.stderr,
+                    )
+                    return load()   # re-run with restored file so all merge/migration runs normally
+                except Exception:
+                    continue   # backup itself corrupt — try next one
+
+            print("[config_manager] No recoverable backup found — resetting to defaults.", file=sys.stderr)
 
     cfg = dict(DEFAULT_CONFIG)
     save(cfg)
@@ -588,9 +629,9 @@ def add_watch(cfg: dict, name: str, path: str, watch_type: str = "local",
               exclude_patterns: Optional[list] = None,
               skip_path_check: bool = False,
               cloud_config: Optional[dict] = None,
-              smb_cfg: Optional[dict] = None,
               interval_min: int = 0,
-              encrypt_key: Optional[str] = None) -> dict:
+              encrypt_key: Optional[str] = None,
+              destination: Optional[str] = None) -> dict:
     """Add a new watch target with validation."""
 
     norm_path = _norm_path(path)
@@ -676,10 +717,13 @@ def add_watch(cfg: dict, name: str, path: str, watch_type: str = "local",
 
     # ─── DUPLICATE CHECK ────────────────────────────────────────────────────
 
+    new_dest_norm = _norm_path(destination) if destination else ""
     for w in cfg["watches"]:
         w_norm = _norm_path(w["path"])
         if w_norm == norm_path:
-            raise ValueError(f"Path already watched: {path}")
+            w_dest_norm = _norm_path(w.get("destination", "")) if w.get("destination") else ""
+            if w_dest_norm == new_dest_norm:
+                raise ValueError(f"Path already watched: {path}")
 
         # Warn about overlapping watches
         if (norm_path.lower().startswith(w_norm.lower() + os.sep) if os.name == "nt"
@@ -706,9 +750,9 @@ def add_watch(cfg: dict, name: str, path: str, watch_type: str = "local",
         "notes":            notes or "",
         "exclude_patterns": list(exclude_patterns) if exclude_patterns else cfg.get("default_exclude_patterns", []),
         "cloud_config":     cloud_config or {},
-        "smb_cfg":          dict(smb_cfg) if smb_cfg else {},
         "interval_min":     max(0, int(interval_min)),
         "encrypt_key":      encrypt_key.strip() if encrypt_key else "",
+        "destination":      destination.strip() if destination else "",
     })
 
     cfg["watches"].append(watch)
@@ -782,7 +826,6 @@ def update_watch_meta(
     compression:       Optional[bool] = None,   # ← added
     encrypt_key:       Optional[str]  = None,   # ← added: Fernet key or "" to disable
     sync_mode:         Optional[bool] = None,   # ← added: mirror/sync mode
-    smb_cfg:           Optional[dict] = None,   # ← fix: was referenced in body but missing from signature
     destination:       Optional[str]  = None,   # ← per-watch destination override
     schedule_times:    Optional[list] = None,   # ← per-watch time-of-day schedule e.g. ["01:00"]
     source_type:       Optional[str]  = None,   # ← "local" | "sftp" | "ftp"
@@ -805,9 +848,7 @@ def update_watch_meta(
             if color            is not None: w["color"]            = color[:7]  # max #rrggbb
             if interval_min     is not None: w["interval_min"]     = max(0, int(interval_min))
             if active           is not None: w["active"]           = bool(active)
-            if compression      is not None: w["compression"]      = compression            # ← updated to store int
-            if smb_cfg          is not None: w["smb_cfg"]          = dict(smb_cfg)
-            if encrypt_key      is not None: w["encrypt_key"]      = encrypt_key.strip()          # ← added
+            if compression      is not None: w["compression"]      = compression            # ← updated to store int            if encrypt_key      is not None: w["encrypt_key"]      = encrypt_key.strip()          # ← added
             if sync_mode        is not None: w["sync_mode"]        = bool(sync_mode)              # ← added
             if destination      is not None: w["destination"]      = destination.strip()           # ← per-watch destination
             if schedule_times   is not None:                                                       # ← per-watch schedule

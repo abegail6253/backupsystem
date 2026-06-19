@@ -1,0 +1,20 @@
+0 verbose cli /usr/bin/node /usr/bin/npm
+1 info using npm@10.9.7
+2 info using node@v22.22.2
+3 silly config load:file:/usr/lib/node_modules/npm/npmrc
+4 silly config load:file:/home/claude/.npmrc
+5 error config prefix cannot be changed from project config: /home/claude/.npmrc.
+6 silly config load:file:/root/.npmrc
+7 silly config load:file:/home/claude/.npm-global/etc/npmrc
+8 verbose title npm cache clean
+9 verbose argv "cache" "clean" "--force"
+10 verbose logfile logs-max:10 dir:/home/claude/.npm/_logs/2026-04-18T18_12_56_182Z-
+11 verbose logfile /home/claude/.npm/_logs/2026-04-18T18_12_56_182Z-debug-0.log
+12 warn using --force Recommended protections disabled.
+13 silly logfile done cleaning log files
+14 verbose cwd /home/claude
+15 verbose os Linux 6.12.55-74.119.amzn2023.x86_64
+16 verbose node v22.22.2
+17 verbose npm  v10.9.7
+18 verbose exit 0
+19 info ok

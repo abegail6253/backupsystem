@@ -466,9 +466,9 @@ class TestIntegritySchedulerDiskSpace:
     @patch("integrity_scheduler.config_manager.load")
     def test_check_disk_space_skips_non_local_destinations(self, mock_load):
         """Test that check_disk_space() only checks local destinations."""
-        # Mock config with SMB destination
+        # Mock config with local destination
         mock_load.return_value = {
-            "dest_type": "smb",
+            "dest_type": "sftp",
             "destination": "\\\\server\\share",
             "low_disk_threshold_gb": 5.0
         }

@@ -6,7 +6,7 @@ Place this file in the same folder as backup_engine.py, config_manager.py, watch
 
 import sys
 import os
-import shutil
+import subprocess
 import threading
 import hashlib
 import json
@@ -16,6 +16,9 @@ import logging
 import time as _time_mod
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Suppress console/PowerShell pop-up windows on Windows
+_WIN_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def _fmt_eta(seconds: float) -> str:
@@ -116,7 +119,7 @@ def _warn_missing_gdrive_env() -> None:
 
 _warn_missing_gdrive_env()
 
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QShortcut
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSystemTrayIcon, QMenu,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea,
@@ -133,14 +136,14 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QIcon, QFont, QColor, QPalette, QPixmap, QPainter, QBrush,
-    QLinearGradient, QFontDatabase, QTextCursor
+    QLinearGradient, QFontDatabase, QTextCursor, QKeySequence
 )
 
 # ── Local imports ──────────────────────────────────────────────────────────────
 try:
     import config_manager
     import backup_engine
-    from watcher import WatcherManager
+    from watcher import WatcherManager, register_history_persist_suppressor, _get_net_session_enum_fn, set_defer_history_to_app, register_watcher_manager
     from integrity_scheduler import IntegrityScheduler
     import credential_store
     BACKEND_AVAILABLE = True
@@ -150,7 +153,7 @@ except ImportError as e:
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME        = "Backup System"
-APP_VERSION     = "1.1.8"
+APP_VERSION     = "1.1.10"
 ADMIN_PASS_KEY      = "admin_password_hash"
 ADMIN_ATTEMPTS_KEY  = "admin_failed_attempts"
 ADMIN_LOCKOUT_KEY   = "admin_lockout_until"   # epoch seconds (float)
@@ -303,16 +306,22 @@ QLabel#status_err { color: #ef4444; font-weight: 600; }
 QLabel#status_warn{ color: #f59e0b; font-weight: 600; }
 QProgressBar {
     background-color: #2e3340;
-    border-radius: 4px;
-    height: 6px;
+    border-radius: 6px;
+    height: 18px;
+    min-height: 18px;
     border: none;
     text-align: center;
-    color: transparent;
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 600;
 }
 QProgressBar::chunk {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 #2563eb, stop:1 #7c3aed);
-    border-radius: 4px;
+    /* border-radius removed: setting it on ::chunk disables Qt's indeterminate
+       (marquee) animation. The QProgressBar container already clips the fill
+       with its own border-radius, so this property here is both redundant
+       and breaks the scanning-phase progress animation. */
 }
 QTabWidget::pane {
     border: 1px solid #2e3340;
@@ -491,6 +500,22 @@ QMenu {
 QMenu::item { padding: 6px 20px; border-radius: 4px; color: #111827; }
 QMenu::item:selected { background-color: #eff6ff; color: #1e40af; }
 QMenu::separator { background-color: #e5e7eb; height: 1px; margin: 4px 8px; }
+QProgressBar {
+    background-color: #e5e7eb;
+    border-radius: 6px;
+    height: 18px;
+    min-height: 18px;
+    border: none;
+    text-align: center;
+    color: #374151;
+    font-size: 11px;
+    font-weight: 600;
+}
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #2563eb, stop:1 #7c3aed);
+    /* border-radius removed: see dark-theme comment above — same fix applies. */
+}
 """
 
 
@@ -538,11 +563,45 @@ def is_metered_connection() -> bool:
             ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps_script],
             capture_output=True,
             timeout=6,
+            creationflags=_WIN_NO_WINDOW,
         )
         return result.returncode == 1
     except Exception:
         pass
     return False
+
+
+def _resolve_smb_host_name(host: str) -> str:
+    """Resolve an SMB host IP/address to its Windows machine name."""
+    try:
+        import socket as _sock
+        _resolved_name = _sock.gethostbyaddr(host)[0]
+        if _resolved_name and _resolved_name.lower() != host.lower():
+            return _resolved_name
+    except Exception:
+        pass
+
+    try:
+        import subprocess as _subp
+        _nbt = _subp.run(
+            ["nbtstat", "-A", host],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=_WIN_NO_WINDOW,
+        )
+        if _nbt.returncode == 0 and _nbt.stdout:
+            for _line in _nbt.stdout.splitlines():
+                _line = _line.strip()
+                if not _line or _line.lower().startswith("name") or _line.lower().startswith("node"):
+                    continue
+                _parts = [p for p in _line.split() if p]
+                if len(_parts) >= 4 and _parts[1] == "<00>" and _parts[2].upper() == "UNIQUE":
+                    return _parts[0]
+    except Exception:
+        pass
+
+    return ""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Tray Icon Generator ────────────────────────────────────────────────────────
@@ -566,21 +625,6425 @@ def make_tray_icon(status: str = "ok") -> QIcon:
     return QIcon(pix)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Who edited helper ─────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 
-def _get_editor_info(filepath: str) -> dict:
+
+
+
+def _apply_sacl_local(path: str) -> tuple[bool, str]:
     """
-    Try to get the Windows user + machine that last modified a file.
-    Falls back gracefully if not available.
+    Automatically configure Windows object-auditing (SACL) on a *local* folder
+    so that Event 4663 is written on every deletion/write — identical to the
+    manual PowerShell script the admin would otherwise run by hand.
+
+    Called automatically when the app is already installed on the PC that owns
+    the watched folder (i.e. source_type == "local" and path is a plain drive
+    letter path, not a UNC share).
+
+    Strategy
+    --------
+    1. Build a self-contained PowerShell script that:
+       - applies the FileSystemAuditRule to both the watched folder (and its
+         parent, so renames/moves out of the folder are also captured)
+       - enables "File System" object auditing via auditpol
+    2. Try to run it in the *current* process first (works when the app was
+       launched as Administrator or the user already elevated it).
+    3. If that fails with an access-denied / privilege error, re-launch the
+       same script via ``Start-Process powershell -Verb RunAs`` which triggers
+       a UAC prompt — completely automatic, no manual steps for the user.
+
+    Returns (True, message) on success, (False, message) on failure.
     """
-    import os, socket
-    info = {
-        "user":    "",
-        "machine": "",
-        "ip":      "",
-    }
+    import subprocess, sys, os, logging as _log
+    _la = _log.getLogger(__name__)
+
+    if sys.platform != "win32":
+        return False, "Local SACL setup is only supported on Windows."
+
+    path = path.strip().rstrip("\\")
+    if not path:
+        return False, "Empty path — skipping local SACL setup."
+
+    # ── BUG-FIX: idempotency marker ─────────────────────────────────────────
+    # Without this, _apply_sacl_local() re-ran its FULL script (Get-Acl/Set-Acl
+    # + auditpol + wevtutil) — including the elevated "Attempt 2" UAC prompt —
+    # on EVERY app startup and every manual Retry, even after it had already
+    # succeeded once. Attempt 1 (non-elevated) always fails with
+    # "SeSecurityPrivilege is required" (reading/writing a SACL needs that
+    # privilege regardless of whether the rule is already present), so every
+    # single run fell straight through to Attempt 2 and asked Windows for UAC
+    # consent again. That's the "popups keep showing" symptom. Fix: remember
+    # successful configurations in a small marker file and skip straight to
+    # "already done" without touching PowerShell or UAC at all.
+    import json as _sacl_json
+    _marker_path = config_manager._DATA_DIR / "sacl_state.json"
+    _path_key = path.strip().lower()
+    try:
+        _marker_data = _sacl_json.loads(_marker_path.read_text(encoding="utf-8")) if _marker_path.exists() else {}
+    except Exception as _mk_read_err:
+        _la.debug(f"[_apply_sacl_local] marker read failed ({_mk_read_err!r}) — treating as not configured")
+        _marker_data = {}
+
+    if _marker_data.get(_path_key, {}).get("configured"):
+        _la.info(
+            f"[_apply_sacl_local] SKIPPING — {path!r} was already successfully "
+            f"configured at {_marker_data[_path_key].get('timestamp', '?')!r} "
+            f"(marker={_marker_path!s}). No PowerShell/UAC prompt needed. "
+            f"Delete this entry from sacl_state.json (or the file) to force "
+            f"re-configuration, e.g. after recreating the folder."
+        )
+        return True, f"Local SACL already configured for '{path}' (cached)."
+
+    def _mark_configured(p: str) -> None:
+        import datetime as _mk_dt
+        try:
+            _marker_data[p.strip().lower()] = {
+                "configured": True,
+                "timestamp": _mk_dt.datetime.utcnow().isoformat() + "Z",
+            }
+            _marker_path.parent.mkdir(parents=True, exist_ok=True)
+            _marker_path.write_text(_sacl_json.dumps(_marker_data, indent=2), encoding="utf-8")
+            _la.info(f"[_apply_sacl_local] marker SAVED for {p!r} → {_marker_path!s}")
+        except Exception as _mk_write_err:
+            _la.warning(
+                f"[_apply_sacl_local] marker SAVE FAILED for {p!r}: {_mk_write_err!r} "
+                f"— SACL setup will be re-attempted (and may re-prompt UAC) on next run."
+            )
+
+    _la.info(
+        f"[_apply_sacl_local] ENTER path={path!r} — not yet in marker cache "
+        f"({_marker_path!s}); will attempt configuration"
+    )
+
+    # Also audit the immediate parent so moves/renames *out of* the folder
+    # are captured (same behaviour as the manual script).
+    parent = os.path.dirname(path)
+
+    def _ps_sacl_block(p: str) -> str:
+        """Return PowerShell lines that apply the audit rule to path *p*."""
+        escaped = p.replace("'", "''")
+        return (
+            f"$acl = Get-Acl -Audit '{escaped}'; "
+            f"$rule = New-Object System.Security.AccessControl.FileSystemAuditRule("
+            f"'Everyone',"
+            f"'Delete,DeleteSubdirectoriesAndFiles,WriteData,AppendData,"
+            f"WriteAttributes,WriteExtendedAttributes',"
+            f"'ContainerInherit,ObjectInherit','None','Success'); "
+            f"$acl.AddAuditRule($rule); Set-Acl '{escaped}' $acl;"
+        )
+
+    # Full script: apply SACL to the watched folder + its parent, then enable
+    # File System auditing globally.
+    script_lines = [
+        _ps_sacl_block(path),
+    ]
+    if parent and parent.lower() != path.lower():
+        script_lines.append(_ps_sacl_block(parent))
+    script_lines.append(
+        "auditpol /set /subcategory:'File System' /success:enable /failure:enable"
+    )
+    # Ensure the Security event log is large enough so that 4624 Network Logon
+    # events are not rotated out before a deletion can be correlated back to them.
+    # 512 MB is the recommended minimum for environments with multiple SMB clients.
+    # wevtutil sl only changes the size if the current max is smaller — it is a
+    # no-op when the log is already big enough, so always safe to run.
+    # /rt:false keeps the existing retention policy (overwrite as needed).
+    script_lines.append(
+        "wevtutil sl Security /ms:524288000 /rt:false"
+    )
+    script = " ".join(script_lines)
+
+    # ── Attempt 1: run in the current process ────────────────────────────────
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=30,
+            creationflags=_WIN_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            _la.info(f"[_apply_sacl_local] SACL configured locally for {path!r}")
+            _mark_configured(path)
+            return True, f"Local SACL configured for '{path}'."
+        _la.info(
+            f"[_apply_sacl_local] Attempt 1 failed (rc={r.returncode}): "
+            f"{(r.stderr or r.stdout)[:300]!r}"
+        )
+    except Exception as _e1:
+        _la.info(f"[_apply_sacl_local] Attempt 1 exception: {_e1!r}")
+
+    # ── Attempt 2: re-launch elevated via UAC (Start-Process -Verb RunAs) ────
+    # Write the script to a temp .ps1 file so the elevated child process can
+    # find it without shell-quoting nightmares.
+    # NOTE: timeout was bumped from 60s → 150s. The 60s window was too tight
+    # if the UAC consent dialog doesn't grab focus immediately (it can render
+    # behind the main window or on a secure desktop the user doesn't notice
+    # right away) — every observed failure in the logs was a clean
+    # TimeoutExpired at exactly 60s, consistent with the user simply not
+    # having clicked "Yes" yet, not a real failure.
+    import tempfile
+    _elevate_timeout = 150
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+        ) as _tf:
+            _tf.write(script)
+            _tf_path = _tf.name
+
+        elevate_cmd = (
+            f"Start-Process powershell "
+            f"-ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass "
+            f"-WindowStyle Hidden "
+            f"-File \"{_tf_path}\"' "
+            f"-Verb RunAs -Wait -WindowStyle Hidden"
+        )
+        _la.info(
+            f"[_apply_sacl_local] Attempt 2: requesting UAC elevation for {path!r} "
+            f"(timeout={_elevate_timeout}s) — a Windows 'User Account Control' "
+            f"consent prompt should appear now; click Yes to allow it."
+        )
+        r2 = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", elevate_cmd],
+            capture_output=True, text=True, timeout=_elevate_timeout,
+            creationflags=_WIN_NO_WINDOW,
+        )
+        try:
+            os.unlink(_tf_path)
+        except Exception:
+            pass
+
+        if r2.returncode == 0:
+            _la.info(
+                f"[_apply_sacl_local] SACL configured locally (elevated UAC) "
+                f"for {path!r}"
+            )
+            _mark_configured(path)
+            return True, f"Local SACL configured for '{path}' (elevated)."
+
+        _la.warning(
+            f"[_apply_sacl_local] Attempt 2 (elevated) failed "
+            f"(rc={r2.returncode}): {(r2.stderr or r2.stdout)[:300]!r}"
+        )
+        return False, (
+            f"Local SACL setup failed for '{path}'. "
+            f"Please run the SACL PowerShell script manually as Administrator."
+        )
+    except subprocess.TimeoutExpired:
+        _la.warning(
+            f"[_apply_sacl_local] Attempt 2 TIMED OUT after {_elevate_timeout}s "
+            f"for {path!r} — most likely the Windows UAC consent dialog appeared "
+            f"but was not clicked in time (it can open behind the main window, "
+            f"or minimized in the taskbar, without flashing). Check the taskbar "
+            f"for a 'User Account Control' prompt next time before pressing Retry."
+        )
+        return False, (
+            f"Local SACL setup timed out waiting for UAC approval for '{path}'. "
+            f"Look for a 'User Account Control' window (it may be behind this "
+            f"one, or minimized) and click Yes, or click Retry to try again."
+        )
+    except Exception as _e2:
+        _la.warning(f"[_apply_sacl_local] Attempt 2 exception: {_e2!r}")
+        return False, f"Local SACL setup error for '{path}': {_e2}"
+
+
+def _apply_sacl_remote(host: str, unc_path: str, smb_audit_cfg: dict) -> tuple[bool, str]:
+    """
+    Automatically configure Windows object-auditing (SACL) on the shared folder
+    of a remote Windows PC so that Event 4663 is written on every deletion,
+    write, and file-creation — enabling actor attribution for "added",
+    "modified", and "deleted" events alike.
+
+    Strategy:
+      1. Try Invoke-Command (WinRM) directly.
+      2. If WinRM is off, bootstrap it remotely via WMI (Win32_Process) — no
+         manual step needed on the coworker's PC.
+      3. Retry Invoke-Command after WinRM bootstrap.
+
+    Returns (success: bool, message: str).  Never raises.
+    """
+    import logging as _sa_log, subprocess as _sa_sp, re as _sa_re, time as _sa_time
+    _sa = _sa_log.getLogger(__name__)
+
+    _sa_user = (smb_audit_cfg or {}).get("username", "")
+    _sa_pass = (smb_audit_cfg or {}).get("password", "")
+
+    if not host or not unc_path:
+        return False, "No host or UNC path provided."
+    if not _sa_user or not _sa_pass:
+        return False, "No SMB credentials — cannot configure SACL automatically."
+
+    # ── Parse UNC path → share name + sub-path ────────────────────────────
+    # Normalise all slashes to backslash, then parse \\host\share[\sub]
+    _unc_norm = unc_path.replace("/", "\\")
+    _unc_m = _sa_re.match(r"^[\\]{2}([^\\]+)[\\]([^\\]+)(.*)?$", _unc_norm)
+    if not _unc_m:
+        return False, f"Cannot parse UNC path: {unc_path!r}"
+    _share_name = _unc_m.group(2)
+    _sub_path   = (_unc_m.group(3) or "").strip("\\")
+
+    _CNW = 0x08000000  # CREATE_NO_WINDOW
+
+    # ── PowerShell script that runs ON the remote PC ──────────────────────
+    # Resolves share → local path, applies SACL audit rule.
+    _REMOTE_SCRIPT = (
+        "param($ShareName,$SubPath);"
+        "try {"
+        "  $s=Get-WmiObject Win32_Share -Filter \"Name='$ShareName'\" -EA Stop;"
+        "  if(-not $s){throw \"Share not found\"};"
+        "  $root=$s.Path.TrimEnd('\\');"
+        "  $lp=if($SubPath){$root+'\\'+$SubPath.TrimStart('\\')}else{$root};"
+        "  if(-not(Test-Path $lp)){throw \"Path not found: $lp\"};"
+        "  $acl=Get-Acl -Audit $lp;"
+        "  $rule=New-Object System.Security.AccessControl.FileSystemAuditRule("
+        "    'Everyone','Delete,DeleteSubdirectoriesAndFiles,WriteData,AppendData,WriteAttributes,WriteExtendedAttributes',"
+        "    'ContainerInherit,ObjectInherit','None','Success');"
+        "  $acl.AddAuditRule($rule);Set-Acl $lp $acl;"
+        "  auditpol /set /subcategory:'File System' /success:enable /failure:enable | Out-Null;"
+        "  wevtutil sl Security /ms:524288000 /rt:false | Out-Null;"
+        "  Write-Output \"OK:$lp\""
+        "} catch { Write-Output \"ERR:$($_.Exception.Message)\" }"
+    )
+
+    def _run_invoke_command():
+        """Try WinRM Invoke-Command. Returns (stdout, stderr, returncode)."""
+        _cmd = (
+            f"$pw=ConvertTo-SecureString {_sa_pass!r} -AsPlainText -Force;"
+            f"$cr=New-Object System.Management.Automation.PSCredential({_sa_user!r},$pw);"
+            f"Invoke-Command -ComputerName {host!r} -Credential $cr "
+            f"-ScriptBlock {{param($a,$b) {_REMOTE_SCRIPT}}} "
+            f"-ArgumentList {_share_name!r},{_sub_path!r}"
+        )
+        r = _sa_sp.run(
+            ["powershell", "-NonInteractive", "-NoProfile", "-Command", _cmd],
+            capture_output=True, text=True, timeout=40, creationflags=_CNW,
+        )
+        return (r.stdout or "").strip(), (r.stderr or "").strip(), r.returncode
+
+    def _winrm_error(stderr):
+        """Return True if the error looks like WinRM is simply not running."""
+        _s = stderr.lower()
+        return any(k in _s for k in (
+            "winrm", "wsman", "cannot connect", "connection refused",
+            "access is denied", "the client cannot connect",
+            "no connection could be made", "network path was not found",
+            "0x80090322", "0x80131501",
+        ))
+
+    def _enable_winrm_via_wmi():
+        """
+        Use WMI Win32_Process.Create to run:
+            cmd /c winrm quickconfig -quiet & sc config WinRM start=auto & net start WinRM
+        on the remote PC — works over SMB/DCOM even when WinRM is off.
+        Returns (success, message).
+        """
+        _sa.info(f"[_apply_sacl_remote] WinRM not responding on {host!r} — "
+                 f"attempting auto-enable via WMI Win32_Process")
+        try:
+            import win32com.client as _w32, pywintypes as _pwt
+            _wmi_cmd = (
+                "cmd /c \"winrm quickconfig -quiet 2>nul & "
+                "sc config WinRM start=auto & "
+                "net start WinRM 2>nul & "
+                "powershell -Command Set-NetFirewallRule "
+                "-Name WINRM-HTTP-In-TCP -Enabled True 2>nul\""
+            )
+            _loc = _w32.Dispatch("WbemScripting.SWbemLocator")
+            _svc = _loc.ConnectServer(
+                host, "root\\cimv2", _sa_user, _sa_pass,
+                "", "", 0x80,   # wbemConnectFlagUseMaxWait
+            )
+            _proc = _svc.Get("Win32_Process")
+            _ret, _pid = _proc.SpawnInstance_().Create(_wmi_cmd, None, None)
+            _sa.info(f"[_apply_sacl_remote] WMI Win32_Process.Create ret={_ret} pid={_pid}")
+            if _ret == 0:
+                _sa_time.sleep(5)   # give WinRM time to start
+                return True, "WinRM enabled via WMI."
+            else:
+                return False, f"WMI Win32_Process.Create returned {_ret}."
+        except ImportError:
+            # win32com not available — fall back to wmic.exe subprocess
+            _sa.info("[_apply_sacl_remote] win32com unavailable — trying wmic.exe fallback")
+            try:
+                _wmic_cmd = [
+                    "wmic", f"/node:{host}",
+                    f"/user:{_sa_user}", f"/password:{_sa_pass}",
+                    "process", "call", "create",
+                    (
+                        "cmd /c \"winrm quickconfig -quiet 2>nul & "
+                        "sc config WinRM start=auto & net start WinRM 2>nul\""
+                    ),
+                ]
+                _r = _sa_sp.run(
+                    _wmic_cmd, capture_output=True, text=True,
+                    timeout=30, creationflags=_CNW,
+                )
+                _sa.info(f"[_apply_sacl_remote] wmic fallback rc={_r.returncode} "
+                         f"out={_r.stdout[:200]!r}")
+                if _r.returncode == 0 and "ReturnValue = 0" in _r.stdout:
+                    _sa_time.sleep(5)
+                    return True, "WinRM enabled via wmic."
+                return False, f"wmic fallback failed: {_r.stderr[:200]}"
+            except Exception as _we:
+                return False, f"WMI/wmic unavailable: {_we!r}"
+        except Exception as _ex:
+            return False, f"WMI error: {_ex!r}"
+
+    # ── Attempt 1: try Invoke-Command directly ────────────────────────────
+    _sa.info(f"[_apply_sacl_remote] Attempt 1 (Invoke-Command) → {host!r} "
+             f"share={_share_name!r} sub={_sub_path!r}")
+    try:
+        _out, _err, _rc = _run_invoke_command()
+        _sa.info(f"[_apply_sacl_remote] Attempt 1 result: rc={_rc} "
+                 f"out={_out!r} err={_err[:150]!r}")
+
+        if _out.startswith("OK:"):
+            return True, f"SACL configured on {_out[3:]!r} ({host})."
+        elif _out.startswith("ERR:"):
+            return False, f"Remote error on {host}: {_out[4:]}"
+
+        # WinRM is off — try to enable it automatically
+        if _rc != 0 and _winrm_error(_err):
+            _sa.info(f"[_apply_sacl_remote] WinRM appears off on {host!r} — "
+                     f"attempting auto-enable")
+            _ok_wmi, _wmi_msg = _enable_winrm_via_wmi()
+            if not _ok_wmi:
+                return False, (
+                    f"WinRM is disabled on {host} and auto-enable failed: {_wmi_msg}. "
+                    f"Ask the PC owner to run once as Admin: "
+                    f"Enable-PSRemoting -Force"
+                )
+
+            # ── Attempt 2: retry Invoke-Command after WinRM bootstrap ────
+            _sa.info(f"[_apply_sacl_remote] Attempt 2 (post-WinRM-enable) → {host!r}")
+            _out2, _err2, _rc2 = _run_invoke_command()
+            _sa.info(f"[_apply_sacl_remote] Attempt 2 result: rc={_rc2} "
+                     f"out={_out2!r} err={_err2[:150]!r}")
+            if _out2.startswith("OK:"):
+                return True, f"SACL configured on {_out2[3:]!r} ({host}) after WinRM auto-enable."
+            elif _out2.startswith("ERR:"):
+                return False, f"Remote error on {host} (attempt 2): {_out2[4:]}"
+            else:
+                return False, (
+                    f"SACL setup failed on {host} after WinRM enable "
+                    f"(rc={_rc2}): {_err2[:300]}"
+                )
+
+        # Some other non-WinRM error
+        return False, (
+            f"Invoke-Command failed on {host} (rc={_rc}): {_err[:300]}"
+        )
+
+    except _sa_sp.TimeoutExpired:
+        return False, f"Timed out connecting to {host} — host may be unreachable."
+    except Exception as _ex:
+        _sa.warning(f"[_apply_sacl_remote] unexpected error: {_ex!r}")
+        return False, str(_ex)
+
+
+
+
+def _verify_sacl_propagation(host: str, unc_path: str, smb_audit_cfg: dict) -> None:
+    """
+    Check whether the SACL on the remote shared folder has proper
+    InheritanceFlags (ContainerInherit + ObjectInherit).  If the rule exists
+    but has InheritanceFlags=None it will NOT cover subfolders/files, meaning
+    Event 4663 will never be written for deletions inside subfolders.
+
+    Logs a WARNING if the SACL is missing or has InheritanceFlags=None.
+    Called at watch-start so the admin is warned BEFORE a deletion happens.
+    """
+    import logging as _sv_log, subprocess as _sv_sp
+    _sv = _sv_log.getLogger(__name__)
+    if not host or not unc_path:
+        return
+    _win_user = (smb_audit_cfg or {}).get("username", "")
+    _win_pass = (smb_audit_cfg or {}).get("password", "")
+    if not (_win_user and _win_pass):
+        _sv.debug(
+            f"[_verify_sacl_propagation] no credentials for {host!r} — skipping SACL check"
+        )
+        return
+    try:
+        _CNW = 0x08000000
+        # Resolve UNC path to local drive path on the remote PC via net share query
+        # e.g. \\192.168.254.109\test\test4  ->  share=test, subpath=test4
+        _norm = unc_path.replace("\\\\", "//").replace("\\", "/").lstrip("/")
+        _parts = _norm.split("/")
+        if len(_parts) < 2:
+            return
+        _share = _parts[1]  # e.g. "test"
+        _subpath = "\\".join(_parts[2:]) if len(_parts) > 2 else ""
+
+        # Query the share path on the remote machine
+        _sh_res = _sv_sp.run(
+            ["net", "share", _share, f"//{host}"],
+            capture_output=True, text=True, timeout=8, creationflags=_CNW
+        )
+        _local_path = ""
+        for _line in _sh_res.stdout.splitlines():
+            if _line.strip().lower().startswith("path"):
+                _local_path = _line.split(None, 1)[1].strip() if len(_line.split(None, 1)) > 1 else ""
+                break
+        if not _local_path:
+            _sv.debug(
+                f"[_verify_sacl_propagation] could not resolve share {_share!r} "
+                f"on {host!r} to local path — skipping SACL check"
+            )
+            return
+
+        _full_local = (_local_path + "\\" + _subpath).rstrip("\\") if _subpath else _local_path
+
+        # Use wevtutil/PowerShell to read the SACL remotely
+        _ps_script = (
+            f"$acl = Get-Acl -Audit '{_full_local}'; "
+            f"$acl.Audit | Select-Object FileSystemRights,AuditFlags,InheritanceFlags,IsInherited | "
+            f"ConvertTo-Json -Compress"
+        )
+        _ps_cmd = [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            f"Invoke-Command -ComputerName {host} "
+            f"-Credential (New-Object PSCredential('{_win_user}',"
+            f"(ConvertTo-SecureString '{_win_pass}' -AsPlainText -Force))) "
+            f"-ScriptBlock {{ {_ps_script} }}"
+        ]
+        _ps_res = _sv_sp.run(_ps_cmd, capture_output=True, text=True, timeout=15, creationflags=_CNW)
+        if _ps_res.returncode != 0 or not _ps_res.stdout.strip():
+            _sv.debug(
+                f"[_verify_sacl_propagation] remote PowerShell failed for {host!r} "
+                f"rc={_ps_res.returncode} err={_ps_res.stderr.strip()!r} — "
+                f"cannot verify SACL remotely (WinRM may not be enabled)"
+            )
+            return
+
+        import json as _sv_json
+        try:
+            _sacl_entries = _sv_json.loads(_ps_res.stdout.strip())
+        except Exception:
+            _sv.debug(f"[_verify_sacl_propagation] JSON parse error: {_ps_res.stdout[:200]!r}")
+            return
+
+        if not isinstance(_sacl_entries, list):
+            _sacl_entries = [_sacl_entries]
+
+        _has_propagating_delete = False
+        for _entry in _sacl_entries:
+            _iflags = str(_entry.get("InheritanceFlags", "")).lower()
+            _rights = str(_entry.get("FileSystemRights", "")).lower()
+            _aflags = str(_entry.get("AuditFlags", "")).lower()
+            _inherited = _entry.get("IsInherited", False)
+            _has_delete = "delete" in _rights
+            _has_inherit = "containerinherit" in _iflags or "objectinherit" in _iflags
+            if _has_delete and _has_inherit and "success" in _aflags:
+                _has_propagating_delete = True
+                _sv.info(
+                    f"[_verify_sacl_propagation] {unc_path!r}: SACL OK — "
+                    f"Delete+Success rule with InheritanceFlags={_entry.get('InheritanceFlags')!r} "
+                    f"found (IsInherited={_inherited})"
+                )
+                break
+            elif _has_delete and not _has_inherit and "success" in _aflags:
+                _sv.warning(
+                    f"[_verify_sacl_propagation] {unc_path!r}: SACL WARNING — "
+                    f"Delete+Success rule found but InheritanceFlags=None. "
+                    f"This rule will NOT propagate to subfolders or files. "
+                    f"Deletions inside subfolders will NOT generate Event 4663 → attribution will be Unknown. "
+                    f"FIX on {host!r}: Set-Acl with InheritanceFlags='ContainerInherit,ObjectInherit'. "
+                    f"Run: $acl=Get-Acl -Audit '{_full_local}'; "
+                    f"$rule=New-Object System.Security.AccessControl.FileSystemAuditRule("
+                    f"'Everyone','Delete,DeleteSubdirectoriesAndFiles',"
+                    f"'ContainerInherit,ObjectInherit','None','Success'); "
+                    f"$acl.AddAuditRule($rule); Set-Acl '{_full_local}' $acl"
+                )
+
+        if not _has_propagating_delete:
+            _sv.warning(
+                f"[_verify_sacl_propagation] {unc_path!r}: SACL WARNING — "
+                f"no Delete+Success+ContainerInherit/ObjectInherit rule found on {_full_local!r}. "
+                f"File deletions will NOT generate Event 4663 → attribution will be Unknown. "
+                f"FIX on {host!r}: "
+                f"$acl=Get-Acl -Audit '{_full_local}'; "
+                f"$rule=New-Object System.Security.AccessControl.FileSystemAuditRule("
+                f"'Everyone','Delete,DeleteSubdirectoriesAndFiles',"
+                f"'ContainerInherit,ObjectInherit','None','Success'); "
+                f"$acl.AddAuditRule($rule); Set-Acl '{_full_local}' $acl"
+            )
+    except Exception as _sv_err:
+        _sv.debug(f"[_verify_sacl_propagation] unexpected error: {_sv_err!r}")
+
+
+# ── Friendly translation of `net use` failures ───────────────────────────────
+# `net use` only reports a Windows system error code/text — it never says
+# *why* in plain English. Customers see "wrong username or password" even
+# when the real cause is something else entirely (most commonly: error 1219,
+# an existing connection to that PC under different credentials). This maps
+# the known codes to a message that tells the person what to actually do,
+# instead of sending them on a wild goose chase re-typing a correct password.
+_NET_USE_ERROR_MESSAGES = {
+    "1219": ("❌  Another connection to this PC already exists with different "
+             "credentials. Close any open File Explorer windows or mapped "
+             "network drives to this PC (or restart your computer), then try again."),
+    "1326": "❌  Auth failed — wrong username or password.",
+    "1909": "❌  This account is locked out on that PC. Unlock it there, then try again.",
+    "1907": "❌  This account's password has expired and must be changed on that PC first.",
+    "53":   "❌  Could not find that PC on the network. Check the path and that it's turned on.",
+    "67":   "❌  That network share name could not be found. Check the share name in the path.",
+    "5":    "❌  Access denied. Make sure this account is an administrator on that PC.",
+}
+
+
+def _format_net_use_error(out_txt: str) -> str:
+    """Translate a raw `net use` failure (stderr/stdout text) into a clear,
+    actionable message. Falls back to showing the raw Windows error text
+    rather than guessing, so we never claim "wrong password" when we don't
+    actually know that's true."""
+    import re as _fnue_re
+    txt = out_txt or ""
+    m = _fnue_re.search(r"error\s+(\d+)", txt, _fnue_re.IGNORECASE)
+    code = m.group(1) if m else None
+    if code and code in _NET_USE_ERROR_MESSAGES:
+        return _NET_USE_ERROR_MESSAGES[code]
+    if txt:
+        return f"❌  Connection failed: {txt[:160]}"
+    return "❌  Auth failed — wrong username or password."
+
+
+import threading as _burst_threading
+_BURST_CACHE_TTL   = 30.0   # seconds — reuse confirmed attribution within this window
+                             # (increased from 10s: bulk-delete bursts can span ~20s when
+                             # the 24h rescue query runs for each file concurrently)
+_BURST_INTER_BURST_GAP = 10.0  # seconds — if the existing entry is older than this,
+                                # treat it as a prior burst even if same event_type and
+                                # within TTL.  Prevents a LogonId-confirmed .106 'added'
+                                # entry from blocking .105's local 'added' attribution
+                                # when two distinct actors copy files to the same share
+                                # within the same 30s TTL window but >10s apart.
+_burst_cache: dict = {}     # (host, server_local_user_lower) → (machine, ip, user, mono_ts, local_actor, event_type, logon_id_confirmed)
+
+# ── Last-modified-actor cache ─────────────────────────────────────────────
+# Tracks the most recent confirmed remote actor for 'modified' events per
+# (host, server_local_user) key.  Survives beyond the 30s burst cache TTL
+# so that when .105 edits a file 43s after .106 did, the code can detect
+# that a prior different actor exists and correctly apply the inter-burst
+# stale check to reject .106's old 4624 in favour of server-local .105.
+_LAST_MOD_ACTOR_TTL = 300.0  # 5 minutes — long enough to cover typical edit sessions
+_last_mod_actor: dict = {}   # (host_lower, sluser_lower) → (machine_lower, ip, user, mono_ts)
+_last_mod_actor_lock = _burst_threading.Lock()
+
+
+def _last_mod_actor_put(host: str, server_local_user: str,
+                        machine: str, ip: str, user: str) -> None:
+    """Record the most recent confirmed remote actor for a modified event."""
+    key = (host.lower(), server_local_user.lower())
+    with _last_mod_actor_lock:
+        _last_mod_actor[key] = (machine.lower(), ip, user, _time_mod.monotonic())
+
+
+def _last_mod_actor_get(host: str, server_local_user: str) -> "str | None":
+    """Return the last confirmed remote actor machine (lowercase) for this key,
+    or None if unknown or expired."""
+    key = (host.lower(), server_local_user.lower())
+    with _last_mod_actor_lock:
+        entry = _last_mod_actor.get(key)
+        if entry is None:
+            return None
+        machine_lower, ip, user, ts = entry
+        if (_time_mod.monotonic() - ts) > _LAST_MOD_ACTOR_TTL:
+            del _last_mod_actor[key]
+            return None
+        return machine_lower
+
+_burst_cache_lock  = _burst_threading.Lock()
+
+import logging as _burst_log
+_bcl = _burst_log.getLogger(__name__)
+
+
+def _burst_cache_put(host: str, server_local_user: str, machine: str, ip: str, user: str,
+                     local_actor: bool = False, event_type: str = "",
+                     logon_id_confirmed: bool = False) -> None:
+    """Store a confirmed attribution in the burst cache.
+
+    local_actor=True marks entries that were resolved via the server-local
+    identity (e.g. DESKTOP-KGG55PU\\User acting locally on the share server).
+    These entries must NOT be reused to override attributions for sibling files
+    that may have been written by a *different* remote machine (e.g. .103) whose
+    SMB session is older than the ±120s narrow window.
+
+    event_type (e.g. "added", "deleted", "modified") is stored so that burst-
+    patch lookups can enforce type consistency — a 'deleted' burst must never
+    inherit attribution from an 'added' burst and vice versa.  Different event
+    types in the same burst window indicate different actors (e.g. .106 added
+    files earlier while .105 deleted them now).
+    """
+    key = (host.lower(), server_local_user.lower())
+    _bcl.debug(
+        f"[burst_cache_put] host={host!r} sluser={server_local_user!r} "
+        f"machine={machine!r} ip={ip!r} user={user!r} "
+        f"local_actor={local_actor} event_type={event_type!r} logon_id_confirmed={logon_id_confirmed}"
+    )
+    with _burst_cache_lock:
+        # If an existing entry is confirmed via LogonId, do not overwrite it
+        # with a less-certain (non-logon_id_confirmed) result.  This prevents
+        # a reliable attribution (e.g. a LogonId-exact wevtutil match) from
+        # being replaced by a later, weaker 24h-rescue guess for the same host
+        # and server-local user within the TTL window.
+        #
+        # EXCEPTIONS — always allow overwrite when:
+        # 1. The existing entry has EXPIRED (past TTL). Expiry is normally checked
+        #    on read, but an expired entry must also never block a fresh write —
+        #    it belongs to a prior burst that is no longer active.
+        # 2. The incoming event_type differs from the stored event_type. Different
+        #    event types mean different actor bursts (e.g. .106 added files, then
+        #    .105 added different files 33s later — same key but different actors).
+        #    Without this, a LogonId-confirmed .106 'added' entry from burst #1
+        #    would block .105's LOCAL 'added' attribution for burst #2, causing
+        #    the second batch to be wrongly attributed to .106.
+        _existing = _burst_cache.get(key)
+        if _existing is not None:
+            _ex_logon_confirmed = bool(_existing[6])
+            _ex_ts              = _existing[3]
+            _ex_event_type      = _existing[5] or ""
+            _now                = _time_mod.monotonic()
+            _ex_age             = _now - _ex_ts
+            _ex_expired         = _ex_age > _BURST_CACHE_TTL
+            # A prior burst from a DIFFERENT actor can arrive within the same TTL
+            # window but with a meaningful time gap (e.g. .106 copied files at T=0,
+            # then .105 copied different files at T=12s — same event_type, same key,
+            # but clearly two separate actors/bursts).  If the existing entry is older
+            # than _BURST_INTER_BURST_GAP seconds, treat it as a prior burst and allow
+            # overwrite regardless of logon_id_confirmed, so the new actor's attribution
+            # is not silently suppressed.
+            _ex_inter_burst_gap = _ex_age > _BURST_INTER_BURST_GAP
+            # Different event_type, expired, or inter-burst gap → different/stale burst,
+            # always allow overwrite
+            _same_active_burst  = (
+                not _ex_expired
+                and not _ex_inter_burst_gap
+                and (not _ex_event_type or not event_type or _ex_event_type == event_type)
+            )
+            if _ex_logon_confirmed and not logon_id_confirmed and _same_active_burst:
+                # Do not overwrite an entry that was confirmed via LogonId
+                # with a less-certain later result (including server-local
+                # local_actor guesses). This prevents retroactive attribution
+                # flips WITHIN the same active burst TTL window.
+                _bcl.info(
+                    f"[burst_cache_put] SKIP overwrite host={host!r} sluser={server_local_user!r} "
+                    f"reason=existing_logon_id_confirmed existing_machine={_existing[0]!r} existing_user={_existing[2]!r}"
+                )
+                return
+            if _ex_logon_confirmed and not logon_id_confirmed and not _same_active_burst:
+                _reason = (
+                    "expired" if _ex_expired
+                    else "inter_burst_gap" if _ex_inter_burst_gap
+                    else "different_event_type"
+                )
+                _bcl.info(
+                    f"[burst_cache_put] ALLOW overwrite host={host!r} sluser={server_local_user!r} "
+                    f"reason={_reason} "
+                    f"(existing={_ex_event_type!r} age={_ex_age:.1f}s TTL={_BURST_CACHE_TTL:.0f}s "
+                    f"gap_threshold={_BURST_INTER_BURST_GAP:.0f}s incoming={event_type!r}) — "
+                    f"stale/different-burst entry; prior logon_id_confirmed does not protect. "
+                    f"existing_machine={_existing[0]!r} → new_machine={machine!r}"
+                )
+        _burst_cache[key] = (machine, ip, user, _time_mod.monotonic(), local_actor, event_type, logon_id_confirmed)
+
+
+def _burst_cache_get(host: str, server_local_user: str,
+                     require_remote: bool = False,
+                     event_type: str = "",
+                     max_age_secs: float = 0.0) -> "tuple[str,str,str] | None":
+    """
+    Return (machine, ip, user) if a confirmed attribution exists within TTL,
+    otherwise None.  Expired entries are evicted on access.
+
+    require_remote=True skips local-actor entries (those stored via the
+    server-local identity path).  Use this when the caller needs a confirmed
+    *remote* machine attribution and must not inherit a local-actor guess.
+
+    event_type: when non-empty, only return a hit whose stored event_type
+    matches (or whose stored event_type is empty/unknown).  This prevents
+    attributions from 'added' events being reused for 'deleted' events and
+    vice versa — the actors can differ even within the same burst window.
+
+    max_age_secs: when >0, reject entries older than this many seconds even
+    if they are within the TTL.  Used to prevent stale burst entries from a
+    prior save (e.g. by .106) from overriding a fresh server-local result
+    (e.g. .105 editing the same file shortly after).
+    """
+    key = (host.lower(), server_local_user.lower())
+    with _burst_cache_lock:
+        entry = _burst_cache.get(key)
+        if entry is None:
+            return None
+        machine, ip, user, ts, local_actor, cached_etype, cached_logon_id_confirmed = entry
+        _age = _time_mod.monotonic() - ts
+        if _age > _BURST_CACHE_TTL:
+            del _burst_cache[key]
+            return None
+        if max_age_secs > 0 and _age > max_age_secs:
+            _bcl.info(
+                f"[burst_cache_get] SKIP host={host!r} sluser={server_local_user!r} "
+                f"reason=max_age_exceeded age={_age:.1f}s max_age={max_age_secs:.0f}s "
+                f"machine={machine!r} — entry is from a prior burst"
+            )
+            return None
+        if require_remote and local_actor:
+            _bcl.debug(
+                f"[burst_cache_get] SKIP host={host!r} sluser={server_local_user!r} "
+                f"reason=local_actor machine={machine!r}"
+            )
+            return None
+        if event_type and cached_etype and event_type != cached_etype:
+            # Allow a small, safe exception: a 'renamed' event may be the
+            # finalisation of an Office temp write (temp -> final).  In that
+            # case an earlier 'added' or 'modified' attribution from the same
+            # burst window is appropriate to reuse.  Otherwise enforce strict
+            # type matching to avoid cross-type attribution mistakes.
+            if not (event_type == "renamed" and cached_etype in ("added", "modified")):
+                _bcl.info(
+                    f"[burst_cache_get] SKIP host={host!r} sluser={server_local_user!r} "
+                    f"reason=event_type_mismatch cached={cached_etype!r} requested={event_type!r} "
+                    f"machine={machine!r} — prevents cross-type burst attribution "
+                    f"(e.g. 'added' by .106 must not be reused for 'deleted' by .105)"
+                )
+                return None
+        return (machine, ip, user)
+
+
+def _burst_cache_any_for_host(host: str,
+                               require_remote: bool = False,
+                               event_type: str = "") -> "tuple[str, str, str] | None":
+    """
+    Return (machine, ip, user) for ANY non-expired entry whose host matches,
+    regardless of server_local_user key.  Used for retroactive Unknown patching
+    when the server-local user key is no longer available (e.g. the Unknown
+    entry was stored before the sibling resolved).
+    Best match is the most recently stored entry for the host.
+
+    require_remote=True skips local-actor entries (see _burst_cache_put).
+
+    event_type: when non-empty, only consider entries whose stored event_type
+    matches (or is empty).  Critical: prevents 'added' burst cache entries
+    (e.g. from .106) being used to patch 'deleted' entries from a different
+    actor (.105).
+    """
+    host_lower = host.lower()
+    now = _time_mod.monotonic()
+    best_remote: "tuple[str, str, str] | None" = None
+    best_remote_ts = -1.0
+    best_local: "tuple[str, str, str] | None" = None
+    best_local_ts = -1.0
+    with _burst_cache_lock:
+        stale_keys = []
+        for (h, _sluser), (machine, ip, user, ts, local_actor, cached_etype, cached_logon_id_confirmed) in list(_burst_cache.items()):
+            if (now - ts) > _BURST_CACHE_TTL:
+                stale_keys.append((h, _sluser))
+                continue
+            if h == host_lower:
+                if event_type and cached_etype and event_type != cached_etype:
+                    # Same safe exception as _burst_cache_get: allow a 'renamed'
+                    # lookup to match a cached 'added' or 'modified' attribution
+                    # because Office save sequences often perform a rename from
+                    # a temp file to the final filename.  For all other type
+                    # mismatches we skip the cached entry to avoid incorrect
+                    # cross-type attribution.
+                    if not (event_type == "renamed" and cached_etype in ("added", "modified")):
+                        _bcl.info(
+                            f"[burst_cache_any_for_host] SKIP host={host!r} sluser={_sluser!r} "
+                            f"reason=event_type_mismatch cached={cached_etype!r} requested={event_type!r} "
+                            f"machine={machine!r} — prevents cross-type burst attribution "
+                            f"(e.g. 'added' by .106 must not be reused for 'deleted' by .105)"
+                        )
+                        continue
+                # Track best local-actor and best remote candidates separately.
+                if local_actor:
+                    if ts > best_local_ts:
+                        best_local = (machine, ip, user)
+                        best_local_ts = ts
+                else:
+                    if ts > best_remote_ts:
+                        best_remote = (machine, ip, user)
+                        best_remote_ts = ts
+        for k in stale_keys:
+            _burst_cache.pop(k, None)
+    # Prefer the most recent candidate, but respect the caller's
+    # `require_remote` hint. When `require_remote` is True we must skip
+    # local-actor entries entirely. Otherwise choose the most-recent
+    # of the local and remote candidates (tie -> prefer local).
+    chosen = None
+    if require_remote:
+        chosen = best_remote
+    else:
+        if best_local and best_remote:
+            # choose whichever has the later timestamp
+            chosen = best_local if best_local_ts >= best_remote_ts else best_remote
+        elif best_local:
+            chosen = best_local
+        else:
+            chosen = best_remote
+    if chosen:
+        _bcl.debug(
+            f"[burst_cache_any_for_host] HIT host={host!r} event_type={event_type!r} "
+            f"-> machine={chosen[0]!r} ip={chosen[1]!r} user={chosen[2]!r}"
+        )
+    else:
+        _bcl.debug(
+            f"[burst_cache_any_for_host] MISS host={host!r} event_type={event_type!r} "
+            f"require_remote={require_remote}"
+        )
+    return chosen
+
+
+def _burst_cache_lookup(host: str, server_local_user: str,
+                        event_type: str = "",
+                        max_age_secs: float = 0.0) -> "tuple[str,str,str] | None":
+    """
+    Robust burst-cache lookup with sensible fallbacks.
+
+    Order of attempts:
+      1. exact key with require_remote=True
+      2. exact key with require_remote=False
+      3. any-for-host with require_remote=True
+      4. any-for-host with require_remote=False
+
+    event_type is forwarded to all sub-calls to enforce type consistency —
+    'deleted' events must not reuse attributions stored by 'added' events.
+
+    max_age_secs: when >0, forwarded to _burst_cache_get to reject entries
+    older than this threshold.  Used by the local-actor rescue for 'modified'
+    events to prevent a prior save by .106 (within TTL but stale) from
+    overriding a fresh server-local result for .105's subsequent save.
+
+    This helps avoid missed cache hits due to minor username formatting
+    differences or when a remote attribution was stored under a slightly
+    different server_local_user string.
+    """
+    if not server_local_user:
+        # No server-local user key available (e.g. Unknown stored earlier).
+        # Best-effort: try host-wide burst-cache entries — this helps the
+        # forward-burst-patch when the exact server_local_user string is
+        # missing but a recent confirmed sibling attribution exists for the
+        # same host.  We still forward the event_type to enforce type rules.
+        hit = _burst_cache_any_for_host(host, require_remote=True, event_type=event_type)
+        if hit:
+            return hit
+        return _burst_cache_any_for_host(host, require_remote=False, event_type=event_type)
+    # Prefer remote-confirmed entries first (safer to reuse a confirmed remote attribution)
+    hit = _burst_cache_get(host, server_local_user, require_remote=True, event_type=event_type, max_age_secs=max_age_secs)
+    if hit:
+        return hit
+    hit = _burst_cache_get(host, server_local_user, require_remote=False, event_type=event_type, max_age_secs=max_age_secs)
+    if hit:
+        return hit
+    hit = _burst_cache_any_for_host(host, require_remote=True, event_type=event_type)
+    if hit:
+        return hit
+    return _burst_cache_any_for_host(host, require_remote=False, event_type=event_type)
+
+
+
+def _burst_cache_get_logon_confirmed(host: str, server_local_user: str,
+                                     event_type: str = "") -> "tuple[str,str,str] | None":
+    """
+    Like _burst_cache_get but ONLY returns entries where logon_id_confirmed=True.
+
+    This is used by the source-watch-deletion burst-cache fast-path to ensure
+    only LogonId-exact-confirmed attributions skip the per-file 24h rescue.
+
+    Background: when the first deletion in a burst is resolved via
+    time-window-closest (ambiguous — no LogonId match), that result is stored
+    in the burst cache but must NOT be reused for sibling files without their
+    own 24h verification.  In the scenario where .105 deleted files locally,
+    the first file may be incorrectly resolved to .103 (sole time-window
+    candidate 55s away), then all siblings inherit that wrong attribution.
+
+    By requiring logon_id_confirmed=True, we ensure that only high-confidence
+    LogonId-exact matches propagate across sibling deletions.  Ambiguous
+    time-window results go through the 24h rescue per-file, which will
+    independently find the correct actor (or detect the loopback LogonId that
+    proves local actor).
+    """
+    key = (host.lower(), server_local_user.lower())
+    with _burst_cache_lock:
+        entry = _burst_cache.get(key)
+        if entry is None:
+            return None
+        machine, ip, user, ts, local_actor, cached_etype, cached_logon_id_confirmed = entry
+        if (_time_mod.monotonic() - ts) > _BURST_CACHE_TTL:
+            del _burst_cache[key]
+            return None
+        if event_type and cached_etype and event_type != cached_etype:
+            _bcl.info(
+                f"[burst_cache_get_logon_confirmed] SKIP host={host!r} sluser={server_local_user!r} "
+                f"reason=event_type_mismatch cached={cached_etype!r} requested={event_type!r} "
+                f"machine={machine!r}"
+            )
+            return None
+        if not cached_logon_id_confirmed:
+            _bcl.info(
+                f"[burst_cache_get_logon_confirmed] SKIP host={host!r} sluser={server_local_user!r} "
+                f"reason=not_logon_id_confirmed (was time-window-closest or local-actor) "
+                f"machine={machine!r} cached_etype={cached_etype!r} — "
+                f"ambiguous burst-cache entry must not skip per-file 24h rescue for deletions; "
+                f"each sibling deletion needs independent verification to avoid propagating "
+                f"a wrong time-window guess (e.g. .103 at -55s when .105 deleted locally)"
+            )
+            return None
+        _bcl.debug(
+            f"[burst_cache_get_logon_confirmed] HIT host={host!r} sluser={server_local_user!r} "
+            f"-> machine={machine!r} ip={ip!r} user={user!r} (logon_id_confirmed=True)"
+        )
+        return (machine, ip, user)
+
+
+def _query_smb_audit(host: str, filepath: str, event_type: str,
+                     timestamp_iso: str,
+                     smb_audit_cfg: dict | None = None,
+                     is_dest_watch: bool = False) -> dict:
+    """
+    Identify who performed a file operation on a Windows/Mac SMB share.
+
+    Tries two strategies in order:
+      1. Windows Security Event Log (Event ID 4663/4660) — works when the
+         remote PC has object auditing (SACL) enabled on the shared folder.
+      2. NetSessionEnum (win32net) — enumerates currently-open SMB sessions;
+         catches most add/modify events where the session is still active.
+      3. NetFileEnum (win32net) — enumerates open file handles; useful for
+         in-progress writes detected before the session closes.
+      4. Direct session enumeration using all available calling conventions.
+
+    Returns dict with keys: user, machine, ip  (all strings, may be empty).
+    Never raises — all errors are swallowed and result in empty strings.
+    """
+    import datetime as _dt, time as _time
+
+    import logging as _qna_log
+    _qna = _qna_log.getLogger(__name__)
+    _qna.info(
+        f"[_query_smb_audit] ENTER host={host!r} event_type={event_type!r} "
+        f"is_dest_watch={is_dest_watch} "
+        f"filepath={filepath!r} "
+        f"has_creds={bool((smb_audit_cfg or {}).get('username'))}"
+    )
+
+    result = {"user": "", "machine": "", "ip": ""}
+
+    # Parse timestamp for log window query (±30 s around the event)
+    try:
+        event_dt = _dt.datetime.fromisoformat(timestamp_iso)
+    except Exception:
+        event_dt = _dt.datetime.now()
+    window_start = event_dt - _dt.timedelta(seconds=30)
+    window_end   = event_dt + _dt.timedelta(seconds=30)
+
+    # UTC-equivalent of event_dt for comparing against wevtutil XML (which uses UTC).
+    # datetime.now().isoformat() stores LOCAL time with no tzinfo, so we convert
+    # via the local UTC offset so the ±300s window lands on the correct UTC range.
+    try:
+        _local_utc_offset = _dt.datetime.now(_dt.timezone.utc).astimezone().utcoffset()
+        event_dt_utc = (event_dt - _local_utc_offset).replace(tzinfo=None)
+    except Exception:
+        event_dt_utc = event_dt  # fallback: hope clocks match
+
+    # ── Strategy 1: Windows Security Event Log (Event ID 4663/4660) ─────────
+    # This is the MOST reliable method for Windows/Mac PC targets.
+    # It works even when the actor deleted the file LOCALLY (not via SMB),
+    # as long as SACL object auditing is enabled on the shared folder and
+    # the "Remote Event Log Management" firewall rule is open on the target PC.
+    #
+    # Prerequisites on the target Windows PC:
+    #   (A) Object auditing enabled: right-click shared folder → Properties →
+    #       Security → Advanced → Auditing → Add → Everyone / All / Delete
+    #   (B) "Remote Event Log Management" firewall rule enabled:
+    #       Control Panel → Windows Defender Firewall → Allow an app → tick Private
+    #   (C) SMB credentials in watch settings must have admin rights on the PC
+    #
+    # ── CREDENTIAL APPROACH ──────────────────────────────────────────────────
+    # win32net.NetUseAdd has the same session-cache problem as the Test Connection
+    # button: if the PC already has an active connection to this host (Explorer,
+    # mapped drives, the watcher itself), Windows reuses the cached token and
+    # NetUseAdd "succeeds" without actually re-authenticating.
+    # OpenEventLog then inherits that cached (potentially wrong/different) token
+    # → "Access is denied".
+    #
+    # Fix: use win32wnet.WNetAddConnection2 which forces explicit credential
+    # registration for this UNC prefix.  Falls back to subprocess net use
+    # (same approach as the Test Connection button) if win32wnet is unavailable.
+    _creds_win      = smb_audit_cfg or {}
+    _win_user       = _creds_win.get("username", "")
+    _win_pass       = _creds_win.get("password", "")
+    _net_use_ok     = False
+    _s1_auth_method = "none"
+    if _win_user and _win_pass and host:
+        _ipc_path = f"\\\\{host}\\IPC$"
+        # ── Attempt A: WNetAddConnection2 (explicit cred registration) ───────
+        try:
+            import win32wnet as _w32wnet, win32netcon as _w32nc1
+            _CONNECT_REDIRECT = getattr(_w32nc1, "CONNECT_REDIRECT", 0x0080)
+            _RESOURCETYPE_ANY = getattr(_w32nc1, "RESOURCETYPE_ANY", 0)
+            _nr = _w32wnet.NETRESOURCE()
+            _nr.lpRemoteName = _ipc_path
+            _nr.dwType       = _RESOURCETYPE_ANY
+            try:
+                _w32wnet.WNetAddConnection2(_nr, _win_pass, _win_user, _CONNECT_REDIRECT)
+                _net_use_ok     = True
+                _s1_auth_method = "WNetAddConnection2"
+                _qna.info(f"[_query_smb_audit] Strategy1: WNetAddConnection2 OK for {host!r} user={_win_user!r}")
+            except Exception as _wnet_err:
+                _wnet_code = getattr(_wnet_err, "winerror", None)
+                if _wnet_code in (1219, 487):
+                    # 1219 = ERROR_SESSION_CREDENTIAL_CONFLICT — different creds cached
+                    # 487  = ERROR_INVALID_ADDRESS — CONNECT_REDIRECT rejected because
+                    #        an existing SMB session to this host (e.g. from the watcher/
+                    #        backup engine) is already registered; cancel it and retry.
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1: WNetAddConnection2 error {_wnet_code} on {host!r} "
+                        f"(existing SMB session conflict) — cancelling IPC$ connection and retrying "
+                        f"with user={_win_user!r}"
+                    )
+                    try:
+                        _w32wnet.WNetCancelConnection2(_ipc_path, 0, True)
+                    except Exception as _disc_err:
+                        _qna.info(f"[_query_smb_audit] Strategy1: WNetCancelConnection2 failed: {_disc_err!r}")
+                    try:
+                        _w32wnet.WNetAddConnection2(_nr, _win_pass, _win_user, _CONNECT_REDIRECT)
+                        _net_use_ok     = True
+                        _s1_auth_method = "WNetAddConnection2-retry"
+                        _qna.info(f"[_query_smb_audit] Strategy1: WNetAddConnection2 retry OK for {host!r}")
+                    except Exception as _wnet2:
+                        _wnet2_code = getattr(_wnet2, "winerror", None)
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1: WNetAddConnection2 retry FAILED: {_wnet2!r} "
+                            f"(winerror={_wnet2_code}) — falling back to subprocess"
+                        )
+                        # winerror 487 on retry means an active data share (e.g. backup drive)
+                        # is blocking IPC$ re-registration entirely.  OpenEventLog may still
+                        # work because the watcher's existing session already authenticated
+                        # with the correct account — mark partial-ok so we still attempt it.
+                        if _wnet2_code == 487:
+                            _net_use_ok     = True   # allow OpenEventLog attempt
+                            _s1_auth_method = "existing-session-fallback"
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1: winerror 487 on retry — "
+                                f"active SMB session to {host!r} may already carry correct credentials; "
+                                f"proceeding to OpenEventLog with existing session token"
+                            )
+                else:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1: WNetAddConnection2 FAILED: {_wnet_err!r} "
+                        f"(winerror={_wnet_code}) — falling back to subprocess"
+                    )
+        except ImportError:
+            _qna.info("[_query_smb_audit] Strategy1: win32wnet unavailable — falling back to subprocess net use")
+
+        # ── Attempt B: subprocess net use (always bypasses session cache) ────
+        if not _net_use_ok:
+            try:
+                import subprocess as _s1_sp
+                _CNW = 0x08000000
+                _r = _s1_sp.run(
+                    ["net", "use", _ipc_path, _win_pass, f"/user:{_win_user}", "/persistent:no"],
+                    capture_output=True, text=True, timeout=10, creationflags=_CNW,
+                )
+                if _r.returncode == 0:
+                    _net_use_ok     = True
+                    _s1_auth_method = "subprocess-net-use"
+                    _qna.info(f"[_query_smb_audit] Strategy1: subprocess net use OK for {host!r} user={_win_user!r}")
+                else:
+                    _err_txt = (_r.stderr or _r.stdout or "").strip().replace("\n", " ")
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1: subprocess net use FAILED for {host!r} "
+                        f"rc={_r.returncode} msg={_err_txt!r}. "
+                        f"DIAGNOSE: wrong password? account not admin on {host!r}?"
+                    )
+            except Exception as _s1_sub_err:
+                _qna.info(f"[_query_smb_audit] Strategy1: subprocess net use exception: {_s1_sub_err!r}")
+            # ── Attempt C: even if net use failed, the watcher's active SMB   ──
+            # connection to this host may already carry the right credentials.
+            # Mark partial-ok so OpenEventLog is still attempted — it will either
+            # succeed (existing session is sufficient) or fail with Access Denied
+            # (in which case nothing is lost vs. the previous behaviour).
+            if not _net_use_ok and _win_user and _win_pass:
+                _net_use_ok     = True
+                _s1_auth_method = "existing-session-fallback"
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1: net use failed but attempting OpenEventLog anyway "
+                    f"— the watcher's active SMB session to {host!r} may already carry valid credentials"
+                )
+
+        if _net_use_ok:
+            _qna.info(
+                f"[_query_smb_audit] Strategy1: IPC$ auth OK via {_s1_auth_method} "
+                f"for {host!r} user={_win_user!r} — OpenEventLog will use these creds"
+            )
+        else:
+            _qna.info(
+                f"[_query_smb_audit] Strategy1: ALL auth methods failed for {host!r}. "
+                f"OpenEventLog will likely get 'Access is denied'. "
+                f"DIAGNOSE: (1) correct username/password? (2) account has admin rights on {host!r}? "
+                f"(3) 'File and Printer Sharing' enabled on {host!r}?"
+            )
+    else:
+        _qna.info(
+            f"[_query_smb_audit] Strategy1: skipping IPC$ auth — no SMB credentials configured. "
+            f"FIX: add Windows PC credentials in watch settings → Edit Watch → WHO-DID-IT TRACKING."
+        )
+
+    # ── Strategy 1b: Read Security Event Log via win32evtlog ─────────────────
+    # Query Event ID 4663 (object access) and 4660 (object deleted) from the
+    # remote PC's Security log.  Matches by file path and timestamp window.
+    # Falls through gracefully if SACL is not configured or firewall blocks access.
+    if host and not result.get("user"):
+        try:
+            import win32evtlog, win32evtlogutil, win32con, pywintypes as _pwt
+            import re as _re
+
+            _s1b_server = host
+            _s1b_logtype = "Security"
+            _s1b_flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
+
+            # Normalise filepath to a bare filename + parent for matching
+            # (the event log stores the full local path on the PC, not the UNC path)
+            import os as _s1b_os
+            _s1b_fname  = _s1b_os.path.basename(filepath).lower()
+            _s1b_parent = _s1b_os.path.basename(_s1b_os.path.dirname(filepath)).lower()
+
+            # ── Strategy 1b auth: try wevtutil subprocess first (bypasses SMB  ──
+            # session cache), then fall back to in-process OpenEventLog.
+            #
+            # win32evtlog.OpenEventLog(host, ...) inherits the process token and
+            # goes through the Windows SMB session cache.  When the watcher has
+            # an active data connection to this host the OS reuses that cached
+            # token, which may lack EventLog Reader rights → Access Denied.
+            #
+            # wevtutil.exe /r:host /u:user /p:pass runs in the same process but
+            # presents credentials directly to the remote RPC endpoint, bypassing
+            # the SMB credential cache entirely.
+            _s1b_handle      = None
+            _s1b_wevtutil_ok = False   # True when wevtutil path found matching event
+            if _win_user and _win_pass:
+                try:
+                    import subprocess as _s1b_sp, json as _s1b_json
+                    _CNW = 0x08000000  # CREATE_NO_WINDOW
+                    # Query Security log on remote host with explicit credentials.
+                    # /rd:true = reverse chronological (newest first, faster for recent events)
+                    # /c:200   = cap at 200 events (enough for a ±60s window)
+                    # /f:xml   = structured output for reliable parsing
+                    _wev_cmd = [
+                        "wevtutil", "qe", "Security",
+                        f"/r:{host}",
+                        f"/u:{_win_user}",
+                        f"/p:{_win_pass}",
+                        "/rd:true",
+                        "/c:1000",
+                        "/f:xml",
+                        # Include 4624 (Network Logon) alongside the file-audit events so that
+                        # Strategy1b-post can correlate SubjectLogonId→TargetLogonId in ONE call
+                        # using the same already-working auth path.  A separate wevtutil /r:
+                        # call for 4624 fails with Access Denied on some Windows configs even
+                        # though 4656/4663 succeed (different RPC endpoint privilege check).
+                        "/q:*[System[(EventID=4663 or EventID=4660 or EventID=4656 or EventID=4624)]]",
+                    ]
+                    _wev_result = _s1b_sp.run(
+                        _wev_cmd,
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=_CNW,
+                    )
+                    if _wev_result.returncode == 0 and _wev_result.stdout.strip():
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b: wevtutil query succeeded on {host!r} "
+                            f"({len(_wev_result.stdout)} chars) — parsing XML for filename={_s1b_fname!r}"
+                        )
+                        # Parse XML — events are concatenated (not a single root element)
+                        import re as _s1b_re, xml.etree.ElementTree as _ET
+                        _wev_xml = "<root>" + _wev_result.stdout + "</root>"
+                        try:
+                            _wev_root = _ET.fromstring(_wev_xml)
+                        except Exception as _xe:
+                            _qna.info(f"[_query_smb_audit] Strategy1b: wevtutil XML parse error: {_xe!r}")
+                            _wev_root = None
+                        if _wev_root is not None:
+                            _ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                            # Collect 4624 Network Logon events seen in this same query for
+                            # use by Strategy1b-post.  Keyed by TargetLogonId for O(1) lookup.
+                            # list of (diff_seconds, WorkstationName, IpAddress, TargetLogonId)
+                            _s1b_4624_events: list = []
+                            # SubjectLogonIds from 4656/4663 handle-open events for THIS file
+                            # within ±30s — used to prefer 4624 candidates whose TargetLogonId
+                            # matches an actual handle-open session (handles the case where
+                            # multiple machines all have active SMB sessions simultaneously).
+                            _s1b_handle_logon_ids: list = []
+                            for _wev_ev in _wev_root:
+                                try:
+                                    _sys   = _wev_ev.find("e:System", _ns)
+                                    _evid  = int(_sys.find("e:EventID", _ns).text)
+                                    _evdt_str = _sys.find("e:TimeCreated", _ns).attrib.get("SystemTime", "")
+                                    import datetime as _wev_dt_mod
+                                    _evdt = _wev_dt_mod.datetime.fromisoformat(_evdt_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                                    _diff = (_evdt - event_dt_utc).total_seconds()
+                                    # Collect ALL 4624 events within a generous ±900s window.
+                                    # The inner ±120s entries go into _s1b_4624_events (used by
+                                    # the fast-path LogonId/closest-in-time logic).
+                                    # Entries between 120–900s go into _s1b_4624_wide (used ONLY
+                                    # when the matched event is 4656 and no non-own candidate
+                                    # was found in the narrow window — e.g. a coworker who
+                                    # opened the share minutes before deleting).
+                                    if _evid == 4624:
+                                        if _diff < -86400:
+                                            break  # events are reverse-chronological; stop after 24h
+                                        if abs(_diff) <= 120:
+                                            _ev4624_edata = _wev_ev.find("e:EventData", _ns)
+                                            _ev4624_map = {}
+                                            if _ev4624_edata is not None:
+                                                for _d4 in _ev4624_edata:
+                                                    _n4 = _d4.get("Name", "")
+                                                    if _n4:
+                                                        _ev4624_map[_n4] = _d4.text or ""
+                                            _ev4624_logon_type = _ev4624_map.get("LogonType", "")
+                                            if _ev4624_logon_type == "3":  # Network logon only
+                                                _ev4624_ws  = _ev4624_map.get("WorkstationName", "").strip("-").strip()
+                                                _ev4624_ip  = _ev4624_map.get("IpAddress", "").strip()
+                                                _ev4624_lid = _ev4624_map.get("TargetLogonId", "").strip()
+                                                _s1b_4624_events.append((_diff, _ev4624_ws, _ev4624_ip, _ev4624_lid))
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b: collected 4624 (narrow ±120s) "
+                                                    f"WorkstationName={_ev4624_ws!r} IpAddress={_ev4624_ip!r} "
+                                                    f"TargetLogonId={_ev4624_lid!r} time_diff={_diff:+.1f}s"
+                                                )
+                                        elif abs(_diff) <= 86400:
+                                            # Wide window (120s–24h): used when the narrow window
+                                            # has no third-party candidate. Covers coworkers who
+                                            # opened the share hours (or even a full workday)
+                                            # before deleting — their 4624 can be far in the past.
+                                            _ev4624w_edata = _wev_ev.find("e:EventData", _ns)
+                                            _ev4624w_map = {}
+                                            if _ev4624w_edata is not None:
+                                                for _d4w in _ev4624w_edata:
+                                                    _n4w = _d4w.get("Name", "")
+                                                    if _n4w:
+                                                        _ev4624w_map[_n4w] = _d4w.text or ""
+                                            if _ev4624w_map.get("LogonType", "") == "3":
+                                                _ev4624w_ws  = _ev4624w_map.get("WorkstationName", "").strip("-").strip()
+                                                _ev4624w_ip  = _ev4624w_map.get("IpAddress", "").strip()
+                                                _ev4624w_lid = _ev4624w_map.get("TargetLogonId", "").strip()
+                                                if "_s1b_4624_wide" not in result:
+                                                    result["_s1b_4624_wide"] = []
+                                                result["_s1b_4624_wide"].append((_diff, _ev4624w_ws, _ev4624w_ip, _ev4624w_lid))
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b: collected 4624 (wide 120s-24h) "
+                                                    f"WorkstationName={_ev4624w_ws!r} IpAddress={_ev4624w_ip!r} "
+                                                    f"TargetLogonId={_ev4624w_lid!r} time_diff={_diff:+.1f}s"
+                                                )
+                                        continue  # 4624 handled; don't fall through to file-audit parsing
+                                    if abs(_diff) > 60:
+                                        if _diff < -180:
+                                            break  # passed 3-min window
+                                        continue
+                                    # Extract EventData by Name attribute (reliable across OS versions)
+                                    _edata = _wev_ev.find("e:EventData", _ns)
+                                    _edata_map = {}
+                                    _edata_list = []
+                                    if _edata is not None:
+                                        for _d in _edata:
+                                            _dname = _d.get("Name", "")
+                                            _dval  = _d.text or ""
+                                            if _dname:
+                                                _edata_map[_dname] = _dval
+                                            _edata_list.append(_dval)
+                                    # Named lookup (preferred) — matches actual 4663 XML schema
+                                    _subj = _edata_map.get("SubjectUserName") or (_edata_list[1] if len(_edata_list) > 1 else "")
+                                    _dom  = _edata_map.get("SubjectDomainName") or (_edata_list[2] if len(_edata_list) > 2 else "")
+                                    _obj  = _edata_map.get("ObjectName", "")
+                                    _accesses = _edata_map.get("Accesses", "")
+                                    _access_mask = _edata_map.get("AccessMask", "0x0")
+                                    # Build _all_str early so it's available in all _is_delete checks below
+                                    _obj_lower = _obj.lower()
+                                    _all_str   = " ".join(_edata_list).lower()
+                                    # Determine what kind of event we're matching.
+                                    # For "deleted" → only accept delete-related access bits.
+                                    # For "added" / "modified" → accept write/create access bits too
+                                    # (WriteData=0x2, AppendData=0x4, WriteAttributes=0x100,
+                                    #  WriteExtendedAttributes=0x200, AddFile=0x2, AddSubdirectory=0x4).
+                                    _is_write_event = event_type in ("added", "modified", "changed")
+                                    _is_delete = False
+                                    _is_write  = False
+                                    try:
+                                        _mask_int = int(_access_mask, 16) if _access_mask.startswith("0x") else int(_access_mask)
+                                        # 0x10000=DELETE, 0x40=DeleteSubdirectoriesAndFiles only.
+                                        # Do NOT include read masks (0x1, 0x80, 0x20000, 0xc0000) —
+                                        # those are ReadData/ReadAttributes/READ_CONTROL/SYNCHRONIZE.
+                                        _is_delete = bool(_mask_int & 0x10000) or bool(_mask_int & 0x40)
+                                        # WriteData(0x2), AppendData(0x4), WriteAttributes(0x100),
+                                        # WriteExtendedAttributes(0x200), or any combination
+                                        _is_write  = bool(_mask_int & 0x2) or bool(_mask_int & 0x4) or bool(_mask_int & 0x100) or bool(_mask_int & 0x200)
+                                    except Exception:
+                                        pass
+                                    if not _is_delete:
+                                        _is_delete = any(kw in _accesses.lower() for kw in ("delete", "%%4098", "%%4114"))
+                                    if not _is_write:
+                                        _is_write = any(kw in _accesses.lower() for kw in ("writedata", "appenddata", "write data", "%%4417", "%%4418", "%%4420", "%%4421"))
+                                    # Accept the event only if it matches the right operation type.
+                                    # No fallback — accepting reads as deletes causes wrong attribution.
+                                    _event_matches = _is_delete or (_is_write_event and _is_write)
+                                    if not _event_matches:
+                                        continue  # skip unrelated events (ReadAttributes etc.)
+                                    # Skip system/machine accounts
+                                    if not _subj or _subj.endswith("$") or _subj.upper() in ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", ""):
+                                        continue
+                                    # Match filename or parent folder (audit ObjectName is often parent dir, not the file)
+                                    _s1b_parent_match = _s1b_parent and _s1b_parent in _obj_lower
+                                    # True when matched via folder name only — a *different* file in
+                                    # the same directory triggered this event.  Tracked so
+                                    # Strategy1b-post does not treat such a match as a reliable 4663
+                                    # (which would wrongly set _lc_logon_confirmed_local and fire the
+                                    # staleness guard, attributing an 'added' event to own-machine).
+                                    _s1b_this_is_parent_only = bool(
+                                        _s1b_fname
+                                        and _s1b_fname not in _obj_lower
+                                        and _s1b_fname not in _all_str
+                                        and _s1b_parent_match
+                                    )
+                                    if _s1b_fname and _s1b_fname not in _obj_lower and _s1b_fname not in _all_str:
+                                        if not _s1b_parent_match:
+                                            continue
+                                    _s1b_user_full = f"{_dom}\\{_subj}" if _dom and _dom not in ("-", "") else _subj
+                                    # Use domain prefix as machine name when it looks like a hostname
+                                    # (e.g. DESKTOP-KGG55PU from "DESKTOP-KGG55PU\User")
+                                    _s1b_machine = _dom if (_dom and _dom not in ("-", "") and "." not in _dom) else host
+                                    # CLOSEST-MATCH GUARD: the scan is reverse-chronological (newest
+                                    # first), so the first valid match is always the closest in time
+                                    # to the actual file event.  Never overwrite a closer 4656 match
+                                    # with a staler 4656 found later in the scan.  Only upgrade when
+                                    # we find a 4663 (authoritative) to replace an earlier 4656.
+                                    #
+                                    # Why this matters: when .107 adds IMG_0020.pdf at T-42s, Windows
+                                    # logs a 4656 with mask=0x17019f (write+delete bits) at T-42s.
+                                    # Later at T-8s, robocopy on .104 opens a DELETE handle → another
+                                    # 4656 at T-8s with mask=0x10080.  Without this guard the staler
+                                    # T-42s event (with .107's SubjectLogonId) overwrites the T-8s
+                                    # event (with .104's SubjectLogonId), causing wrong attribution.
+                                    if _s1b_wevtutil_ok and _evid == 4656:
+                                        # Already have a match (closer one); only continue collecting
+                                        # SubjectLogonIds and 4624 events — don't overwrite the result.
+                                        _s1b_logon_id_extra = _edata_map.get("SubjectLogonId", "")
+                                        if _s1b_logon_id_extra and abs(_diff) <= 30:
+                                            if _s1b_logon_id_extra not in _s1b_handle_logon_ids:
+                                                _s1b_handle_logon_ids.append(_s1b_logon_id_extra)
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b (wevtutil): SKIP-STALE "
+                                            f"EventID={_evid} user={_s1b_user_full!r} "
+                                            f"object={_obj!r} mask={_access_mask} time_diff={_diff:+.1f}s "
+                                            f"(closer match already recorded — keeping first/closest 4656)"
+                                        )
+                                        continue  # keep scanning for a potential 4663 upgrade
+                                    result["user"]    = _s1b_user_full
+                                    result["machine"] = _s1b_machine
+                                    result["ip"]      = host  # temporary; upgraded by Strategy1b-post via Event 4624
+                                    result["_s1b_server_local"] = True  # signal for Strategy1b-post
+                                    result["_s1b_event_id"] = _evid   # 4656 or 4663 — affects LogonId trust
+                                    # Flag parent-only matches: matched via folder name because the
+                                    # exact filename had no audit event (e.g. a different file in the
+                                    # same dir was audited).  Strategy1b-post must NOT treat such
+                                    # matches as reliable 4663 events (no _lc_logon_confirmed_local).
+                                    if _s1b_this_is_parent_only:
+                                        result["_s1b_parent_only_match"] = True
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b (wevtutil): "
+                                            f"PARENT-ONLY match — EventID={_evid} matched "
+                                            f"object={_obj!r} via folder name {_s1b_parent!r}, "
+                                            f"not filename {_s1b_fname!r}. "
+                                            f"LogonId reliability downgraded (will not set "
+                                            f"_lc_logon_confirmed_local in Strategy1b-post)."
+                                        )
+                                    else:
+                                        result.pop("_s1b_parent_only_match", None)
+                                    # Extract SubjectLogonId — used by Strategy1b-post to find
+                                    # the original 4624 by Logon ID (session may predate deletion).
+                                    # PARENT-ONLY GUARD: if this is a parent-only match, the
+                                    # SubjectLogonId belongs to a DIFFERENT file in the same
+                                    # folder (e.g. Screenshot.png's 4656 being reused for
+                                    # IMG_0019.pdf).  Using it for 4624 correlation would
+                                    # attribute the wrong machine (e.g. .104's robocopy session
+                                    # instead of .107's real actor session).  Discard it.
+                                    _s1b_logon_id = _edata_map.get("SubjectLogonId", "")
+                                    if _s1b_logon_id and not _s1b_this_is_parent_only:
+                                        result["_s1b_logon_id"] = _s1b_logon_id
+                                    elif _s1b_this_is_parent_only:
+                                        result.pop("_s1b_logon_id", None)
+                                        _s1b_logon_id = ""  # prevent adding to handle_logon_ids
+                                    # Track all SubjectLogonIds for handle-open events on this
+                                    # file within ±30s — allows exact session→machine matching
+                                    # when multiple backup-app machines have concurrent sessions.
+                                    if _s1b_logon_id and abs(_diff) <= 30:
+                                        _s1b_handle_logon_ids.append(_s1b_logon_id)
+                                    # Pass collected 4624 events to Strategy1b-post so it can
+                                    # do LogonId correlation without a second wevtutil query
+                                    # (the separate /r: query for 4624 fails with Access Denied
+                                    # on some Windows configs even though 4656/4663 succeed).
+                                    if _s1b_4624_events:
+                                        result["_s1b_4624_events"] = _s1b_4624_events
+                                    if _s1b_handle_logon_ids:
+                                        result["_s1b_handle_logon_ids"] = _s1b_handle_logon_ids
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b: passing "
+                                            f"{len(_s1b_4624_events)} collected 4624 event(s) "
+                                            f"to Strategy1b-post for LogonId correlation"
+                                        )
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b (wevtutil): MATCH "
+                                        f"EventID={_evid} user={_s1b_user_full!r} "
+                                        f"object={_obj!r} accesses={_accesses!r} "
+                                        f"mask={_access_mask} time_diff={_diff:+.1f}s"
+                                    )
+                                    _s1b_wevtutil_ok = True
+                                    # Don't break immediately — keep scanning to see if a
+                                    # 4663 exists for the same file.  4663 has a reliable
+                                    # SubjectLogonId that allows exact 4624 correlation;
+                                    # for 4656, the SubjectLogonId is the SMB network session
+                                    # LogonId (reliable for remote operations — see fix above).
+                                    # If we already have a 4663, stop — it's the best we
+                                    # can get.  If we only have a 4656 so far, keep going to
+                                    # find a potential 4663, but the closest-match guard above
+                                    # ensures we never overwrite a closer 4656 with a staler one.
+                                    if _evid == 4663:
+                                        break  # 4663 is authoritative — stop scanning
+                                except Exception as _wev_ev_err:
+                                    continue
+                        # Post-loop: flush any handle_logon_ids collected via the skip-stale
+                        # guard (those were appended to the list but result[] wasn't refreshed
+                        # because we did `continue` instead of falling through to the write block).
+                        if _s1b_wevtutil_ok and _s1b_handle_logon_ids:
+                            result["_s1b_handle_logon_ids"] = _s1b_handle_logon_ids
+                        # Even when no 4656/4663 match found, save the collected 4624 narrow
+                        # events so the no-SACL 4624 fallback (Strategy1c-wide) can use them.
+                        if not _s1b_wevtutil_ok and _s1b_4624_events:
+                            result["_s1b_4624_events"] = _s1b_4624_events
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b: no 4656/4663 match but saving "
+                                f"{len(_s1b_4624_events)} narrow 4624 event(s) for no-SACL fallback"
+                            )
+                        if not _s1b_wevtutil_ok:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b: wevtutil returned data but no matching "
+                                f"event for filename={_s1b_fname!r} within ±300s. "
+                                f"ROOT CAUSE: Either (A) SACL object auditing is not configured on the "
+                                f"shared folder at all, or (B) the SACL rule exists on the parent folder "
+                                f"but has InheritanceFlags=None — meaning it does NOT propagate to "
+                                f"subfolders or files, so Windows never writes Event 4663 for deletions "
+                                f"inside subfolders. "
+                                f"FIX (must be done BEFORE the next deletion, run on {host!r}): "
+                                f"  $acl = Get-Acl -Audit 'D:\\your\\shared\\folder'; "
+                                f"  $rule = New-Object System.Security.AccessControl.FileSystemAuditRule("
+                                f"'Everyone','Delete,DeleteSubdirectoriesAndFiles',"
+                                f"'ContainerInherit,ObjectInherit','None','Success'); "
+                                f"  $acl.AddAuditRule($rule); Set-Acl 'D:\\your\\shared\\folder' $acl. "
+                                f"Key: InheritanceFlags must be ContainerInherit,ObjectInherit (not None). "
+                                f"After applying, BackupSys will read Event 4663 and show the real username."
+                            )
+                    else:
+                        _wev_err = (_wev_result.stderr or "").strip().replace("\n", " ")
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b: wevtutil FAILED on {host!r} "
+                            f"rc={_wev_result.returncode} err={_wev_err!r}. "
+                            f"Falling back to in-process OpenEventLog. "
+                            f"FIX: on {host!r} enable 'Remote Event Log Management' firewall rule "
+                            f"and ensure {_win_user!r} is in 'Event Log Readers' group."
+                        )
+                except Exception as _wev_err2:
+                    _qna.info(f"[_query_smb_audit] Strategy1b: wevtutil exception: {_wev_err2!r} — falling back to OpenEventLog")
+
+            # Fall back to in-process OpenEventLog only if wevtutil didn't find a match
+            if not _s1b_wevtutil_ok:
+                try:
+                    _s1b_handle = win32evtlog.OpenEventLog(_s1b_server, _s1b_logtype)
+                    _qna.info(f"[_query_smb_audit] Strategy1b: OpenEventLog OK for {_s1b_server!r}")
+                except Exception as _s1b_open_err:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1b: OpenEventLog FAILED for {_s1b_server!r}: {_s1b_open_err!r}. "
+                        f"FIX: on {host!r} open Windows Defender Firewall → Allow an app → "
+                        f"'Remote Event Log Management' → tick Private/Domain. "
+                        f"Also ensure SMB credentials have admin rights."
+                    )
+
+            if _s1b_handle and not _s1b_wevtutil_ok:
+                _s1b_found       = False
+                _s1b_read_count  = 0
+                _s1b_in_window   = 0    # events with matching EventID inside time window
+                _s1b_skip_system = 0    # skipped: SYSTEM / machine$ accounts
+                _s1b_skip_fname  = 0    # skipped: filename did not match
+                _s1b_max_events  = 2000   # cap — Security log can be huge
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b: reading Security log on {_s1b_server!r} "
+                    f"looking for EventID 4663/4660/4656 within ±60s of {event_dt.strftime('%H:%M:%S')} "
+                    f"matching filename={_s1b_fname!r}"
+                )
+                try:
+                    while _s1b_read_count < _s1b_max_events:
+                        _s1b_events = win32evtlog.ReadEventLog(
+                            _s1b_handle, _s1b_flags, 0
+                        )
+                        if not _s1b_events:
+                            break
+                        for _ev in _s1b_events:
+                            _s1b_read_count += 1
+                            # Event IDs: 4663=object access attempt, 4660=object deleted
+                            if _ev.EventID not in (4663, 4660, 4656):
+                                continue
+                            # Time-window check: within 60 s of the detected event
+                            try:
+                                _ev_dt = _ev.TimeGenerated.replace(tzinfo=None)
+                                _diff  = (_ev_dt - event_dt.replace(tzinfo=None)).total_seconds()
+                                _adiff = abs(_diff)
+                                if _adiff > 60:
+                                    # Events are backwards (newest first); if we've gone
+                                    # more than 5 min past the window, stop reading
+                                    if _diff < -300:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b: passed 5-min window — "
+                                            f"stopping after {_s1b_read_count} events "
+                                            f"(in_window={_s1b_in_window} skip_system={_s1b_skip_system} "
+                                            f"skip_fname={_s1b_skip_fname})"
+                                        )
+                                        break
+                                    continue
+                            except Exception:
+                                continue
+                            _s1b_in_window += 1
+                            # Extract strings — layout varies by EventID but
+                            # SubjectUserName is always index 1, ObjectName is ~index 6
+                            _strs        = list(_ev.StringInserts or [])
+                            _s1b_subject = _strs[1] if len(_strs) > 1 else ""
+                            _s1b_domain  = _strs[2] if len(_strs) > 2 else ""
+                            _s1b_objname = ""
+                            for _si, _sv in enumerate(_strs):
+                                if _sv and ("\\" in _sv or ":" in _sv) and _s1b_fname in _sv.lower():
+                                    _s1b_objname = _sv
+                                    break
+                            # Log every in-window event at debug level for visibility
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b: in-window event "
+                                f"EventID={_ev.EventID} time={_ev_dt.strftime('%H:%M:%S')} "
+                                f"diff={_diff:+.1f}s subject={_s1b_subject!r} domain={_s1b_domain!r} "
+                                f"objname={_s1b_objname!r} all_strs={_strs!r}"
+                            )
+                            # Skip machine accounts (end with $) and SYSTEM
+                            if not _s1b_subject or _s1b_subject.endswith("$") or _s1b_subject.upper() in ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", ""):
+                                _s1b_skip_system += 1
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b: SKIP (system/machine account) "
+                                    f"subject={_s1b_subject!r}"
+                                )
+                                continue
+                            # Match filename, or if the audit event is on the parent folder,
+                            # still allow it if the parent folder matches the watched location.
+                            _s1b_objname_lower = _s1b_objname.lower()
+                            _s1b_all_str = " ".join(str(s) for s in _strs).lower()
+                            _s1b_parent = _s1b_parent if _s1b_parent else ""
+                            _s1b_parent_match = _s1b_parent and _s1b_parent in _s1b_objname_lower
+                            if _s1b_fname and _s1b_fname not in _s1b_objname_lower:
+                                if _s1b_fname not in _s1b_all_str and not _s1b_parent_match:
+                                    _s1b_skip_fname += 1
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b: SKIP (filename mismatch) "
+                                        f"looking_for={_s1b_fname!r} objname={_s1b_objname!r}"
+                                    )
+                                    continue
+                                if _s1b_parent_match:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b: ACCEPT (parent-folder match) "
+                                        f"parent={_s1b_parent!r} objname={_s1b_objname!r}"
+                                    )
+                            _s1b_user_full = f"{_s1b_domain}\\{_s1b_subject}" if _s1b_domain and _s1b_domain not in ("-", "") else _s1b_subject
+                            _s1b_machine = _s1b_domain if (_s1b_domain and _s1b_domain not in ("-", "") and "." not in _s1b_domain) else host
+                            result["user"]    = _s1b_user_full
+                            result["machine"] = _s1b_machine
+                            result["ip"]      = host  # temporary; upgraded by Strategy1b-post via Event 4624
+                            result["_s1b_server_local"] = True  # signal for Strategy1b-post
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b (Security Event Log): MATCH "
+                                f"EventID={_ev.EventID} user={_s1b_user_full!r} "
+                                f"object={_s1b_objname!r} time_diff={_adiff:.1f}s "
+                                f"read_count={_s1b_read_count}"
+                            )
+                            _s1b_found = True
+                            break
+                        if _s1b_found:
+                            break
+                except Exception as _s1b_read_err:
+                    _qna.info(f"[_query_smb_audit] Strategy1b: ReadEventLog error: {_s1b_read_err!r}")
+                finally:
+                    try:
+                        win32evtlog.CloseEventLog(_s1b_handle)
+                    except Exception:
+                        pass
+
+                if not _s1b_found:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1b: no match found "
+                        f"(read {_s1b_read_count} total events, {_s1b_in_window} in time-window, "
+                        f"{_s1b_skip_system} skipped=system, {_s1b_skip_fname} skipped=fname-mismatch). "
+                        f"DIAGNOSE: if in_window=0 and read_count>0 → SACL auditing not configured on "
+                        f"the shared folder (Event ID 4663 never generated). "
+                        f"FIX: on {host!r} right-click the shared folder → Properties → Security → "
+                        f"Advanced → Auditing → Add → Principal=Everyone, Type=Success+Failure, "
+                        f"Access=Delete / Write / Delete subfolders and files. "
+                        f"If read_count=0 → Security log may be empty or OpenEventLog used wrong creds."
+                    )
+        except ImportError:
+            _qna.info(
+                "[_query_smb_audit] Strategy1b: win32evtlog not available — "
+                "install pywin32 to enable Security Event Log attribution."
+            )
+        except Exception as _s1b_err:
+            _qna.info(f"[_query_smb_audit] Strategy1b: unexpected error: {_s1b_err!r}")
+
+    # ── Strategy 1c: Event 4624 (Network Logon) — remote IP fallback ─────────
+    # When SACL is not configured on the destination folder, Event 4663 with
+    # DELETE access is never generated, so Strategy1b finds nothing.  However,
+    # every time a remote machine connects over SMB, Windows logs Event 4624
+    # (Logon) with LogonType=3 (Network) that includes the WorkstationName and
+    # IpAddress of the connecting machine.  Querying 4624 events near the
+    # deletion time gives us the remote machine's IP even without SACL.
+    # This is particularly useful for __dest watch deletions where the coworker
+    # accesses the backup folder from a different PC (e.g. 192.168.254.104).
+    if not result.get("user") and _win_user and _win_pass and event_type == "deleted":
+        try:
+            import subprocess as _s1c_sp
+            _CNW_1C = 0x08000000
+            _s1c_cmd = [
+                "wevtutil", "qe", "Security",
+                f"/r:{host}",
+                f"/u:{_win_user}",
+                f"/p:{_win_pass}",
+                "/rd:true",
+                "/c:200",
+                "/f:xml",
+                "/q:*[System[EventID=4624] and EventData[Data[@Name='LogonType']='3']]",
+            ]
+            _s1c_result = _s1c_sp.run(
+                _s1c_cmd,
+                capture_output=True, text=True, timeout=15,
+                creationflags=_CNW_1C,
+            )
+            if _s1c_result.returncode == 0 and _s1c_result.stdout.strip():
+                import xml.etree.ElementTree as _ET1c
+                import datetime as _dt1c
+                _s1c_xml = "<root>" + _s1c_result.stdout + "</root>"
+                try:
+                    _s1c_root = _ET1c.fromstring(_s1c_xml)
+                except Exception:
+                    _s1c_root = None
+                if _s1c_root is not None:
+                    _ns1c = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                    for _s1c_ev in _s1c_root:
+                        try:
+                            _s1c_sys  = _s1c_ev.find("e:System", _ns1c)
+                            _s1c_dt_s = _s1c_sys.find("e:TimeCreated", _ns1c).attrib.get("SystemTime", "")
+                            _s1c_evdt = _dt1c.datetime.fromisoformat(_s1c_dt_s.replace("Z", "+00:00")).replace(tzinfo=None)
+                            _s1c_diff = (_s1c_evdt - event_dt_utc).total_seconds()
+                            if _s1c_diff < -300:
+                                break  # too old
+                            if abs(_s1c_diff) > 120:
+                                continue
+                            _s1c_edata = _s1c_ev.find("e:EventData", _ns1c)
+                            _s1c_map = {}
+                            if _s1c_edata is not None:
+                                for _d in _s1c_edata:
+                                    _n = _d.get("Name", "")
+                                    if _n:
+                                        _s1c_map[_n] = _d.text or ""
+                            _s1c_user = _s1c_map.get("TargetUserName", "")
+                            _s1c_dom  = _s1c_map.get("TargetDomainName", "")
+                            _s1c_ws   = _s1c_map.get("WorkstationName", "").strip("-").strip()
+                            _s1c_ip   = _s1c_map.get("IpAddress", "").strip()
+                            # Skip system/machine accounts and own machine
+                            if not _s1c_user or _s1c_user.endswith("$") or _s1c_user.upper() in ("SYSTEM", "-", ""):
+                                continue
+                            # Skip own machine's logon
+                            import socket as _s1c_sock
+                            _own_h_1c = _s1c_sock.gethostname().lower()
+                            if _s1c_ws.lower() == _own_h_1c or _s1c_ip in ("127.0.0.1", "::1"):
+                                continue
+                            _s1c_user_full = f"{_s1c_dom}\\{_s1c_user}" if _s1c_dom and _s1c_dom not in ("-", "") else _s1c_user
+                            result["user"]    = _s1c_user_full
+                            result["machine"] = _s1c_ws or _s1c_ip or host
+                            result["ip"]      = _s1c_ip or host
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1c (Event 4624 Network Logon): MATCH "
+                                f"user={_s1c_user_full!r} machine={_s1c_ws!r} ip={_s1c_ip!r} "
+                                f"time_diff={_s1c_diff:+.1f}s — "
+                                f"NOTE: this is the last network logon near the deletion; "
+                                f"enable SACL auditing on the destination folder for definitive attribution."
+                            )
+                            break
+                        except Exception:
+                            continue
+            if not result.get("user"):
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1c: no matching 4624 Network Logon found "
+                    f"near deletion time on {host!r}. "
+                    f"FIX: ensure SACL is set on the destination folder — right-click "
+                    f"'{filepath}' parent folder on {host!r} → Properties → Security → "
+                    f"Advanced → Auditing → Add → Principal=Everyone, Type=Success, Access=Delete."
+                )
+        except Exception as _s1c_err:
+            _qna.info(f"[_query_smb_audit] Strategy1c: unexpected error: {_s1c_err!r}")
+
+    
+    if not result.get("user") and not locals().get("_s1b_wevtutil_ok", True) and event_type == "deleted":
+        try:
+            import socket as _s1cw_sock
+            _s1cw_own_host = _s1cw_sock.gethostname().lower()
+            _s1cw_own_ip   = host  # the SMB server IP — not the actor
+            # Merge narrow (±120s) and wide (120–900s) candidates, closest first
+            _s1cw_narrow = result.get("_s1b_4624_events", [])
+            _s1cw_wide   = result.get("_s1b_4624_wide", [])
+            _s1cw_all    = sorted(
+                [e for e in (_s1cw_narrow + _s1cw_wide) if abs(e[0]) <= 900],
+                key=lambda e: abs(e[0])
+            )
+            _s1cw_best = None
+            for (_s1cw_diff, _s1cw_ws, _s1cw_ip, _s1cw_lid) in _s1cw_all:
+                if not _s1cw_ws and not _s1cw_ip:
+                    continue
+                # Skip own machine (the backup app host)
+                if _s1cw_ws.lower() == _s1cw_own_host:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1c-wide: SKIP own-machine 4624 "
+                        f"WorkstationName={_s1cw_ws!r} time_diff={_s1cw_diff:+.1f}s"
+                    )
+                    continue
+                # Skip loopback
+                if _s1cw_ip in ("127.0.0.1", "::1"):
+                    continue
+                # Skip the SMB server's own IP (local-service sessions)
+                if _s1cw_ip == host:
+                    continue
+                _s1cw_best = (_s1cw_diff, _s1cw_ws, _s1cw_ip, _s1cw_lid)
+                break
+            if _s1cw_best:
+                _s1cw_diff, _s1cw_ws, _s1cw_ip, _s1cw_lid = _s1cw_best
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1c-wide: no-SACL 4624 fallback — "
+                    f"WorkstationName={_s1cw_ws!r} IpAddress={_s1cw_ip!r} "
+                    f"time_diff={_s1cw_diff:+.1f}s staleness={abs(_s1cw_diff):.0f}s "
+                    f"(threshold=900s). Attribution is best-effort without SACL audit events."
+                )
+                # Build user string from WorkstationName (we don't have TargetUserName here,
+                # but the pattern is consistent: the machine's local 'user' account).
+                _s1cw_machine = _s1cw_ws or _s1cw_ip
+                result["user"]    = f"{_s1cw_machine}\\User"
+                result["machine"] = _s1cw_machine
+                result["ip"]      = _s1cw_ip or host
+                result["_s1cw_no_sacl_fallback"] = True  # flag: lower confidence
+            else:
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1c-wide: no non-own 4624 candidate "
+                    f"within 900s — actor was likely LOCAL on {host!r} (no remote session found)"
+                )
+                # Actor is the local machine — report as the SMB server's local identity
+                _s1cw_resolved = _resolve_smb_host_name(host)
+                if _s1cw_resolved:
+                    result["user"]    = f"{_s1cw_resolved}\\User"
+                    result["machine"] = _s1cw_resolved
+                    result["ip"]      = host
+                    result["_s1cw_local_actor"] = True
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1c-wide: actor is LOCAL on {host!r} "
+                        f"({_s1cw_resolved}) — no remote 4624 session found within 900s"
+                    )
+        except Exception as _s1cw_err:
+            _qna.info(f"[_query_smb_audit] Strategy1c-wide: unexpected error: {_s1cw_err!r}")
+
+    # ── Strategy 1b-post: upgrade machine/IP after a 4663 match ─────────────
+    # Event 4663 (SACL) only records the *local* subject on the file server
+    # (e.g. DESKTOP-KGG55PU\User at 192.168.254.109). The actual remote
+    # client that triggered the deletion over SMB is recorded in Event 4624
+    # (Network Logon, LogonType=3) which carries WorkstationName and IpAddress.
+    # When Strategy1b set result["ip"] == host it means we only have the
+    # server-local subject — query 4624 to find the true remote caller.
+    if result.get("user") and result.get("_s1b_server_local") and _win_user and _win_pass:
+        class _S1BPostDone(Exception):
+            """Sentinel: pre-fetched path resolved — skip separate query."""
+        # Strategy1b-post: upgrade server-local 4663 attribution to the real remote
+        # caller via Event 4624 (Network Logon, LogonType=3).
+        #
+        # Windows SACL (4663) always records the *server-side* local account whether
+        # the action was done locally or over SMB. So the user in 4663 is ALWAYS the
+        # file-server's local account (e.g. DESKTOP-KGG55PU\User), making it useless
+        # for distinguishing local vs remote actors.
+        #
+        # Three scenarios this handles:
+        #   Scenario 1 - YOU remote (192.168.254.108):
+        #     4663 shows DESKTOP-KGG55PU\User (server token, wrong)
+        #     4624 shows WorkstationName=DESKTOP-0EDUBAP IpAddress=192.168.254.108
+        #     result: DESKTOP-0EDUBAP\user / 192.168.254.108  (correct)
+        #
+        #   Scenario 2 - Coworker remote (192.168.254.105):
+        #     4663 shows DESKTOP-KGG55PU\User (server token, wrong)
+        #     4624 shows WorkstationName=DESKTOP-FAGSHTO IpAddress=192.168.254.105
+        #     result: DESKTOP-FAGSHTO\user / 192.168.254.105  (correct)
+        #
+        #   Scenario 3 - Folder owner local (192.168.254.109):
+        #     4663 shows DESKTOP-KGG55PU\User (this IS the actor, correct)
+        #     No 4624 generated for local actions
+        #     result: DESKTOP-KGG55PU\User / 192.168.254.109  (kept as-is, correct)
+        try:
+            import subprocess as _s1bp_sp
+            import xml.etree.ElementTree as _ET1bp
+            import datetime as _dt1bp
+            _CNW_1BP   = 0x08000000
+            # Username portion from 4663 (e.g. "User" from "DESKTOP-KGG55PU\User").
+            _s1bp_4663_user_raw = result.get("user", "")
+            _s1bp_4663_uname = (
+                _s1bp_4663_user_raw.split("\\")[-1]
+                if "\\" in _s1bp_4663_user_raw
+                else _s1bp_4663_user_raw
+            )
+            _s1bp_logon_id  = result.get("_s1b_logon_id", "").strip()
+            _s1bp_event_id  = result.get("_s1b_event_id", 0)
+            
+            _s1bp_parent_only = result.get("_s1b_parent_only_match", False)
+            _s1bp_logon_id_is_reliable = (
+                (_s1bp_event_id == 4663)
+                and (
+                    not _s1bp_parent_only                       # exact filename match: always reliable
+                    or (
+                        event_type == "deleted"                 # deletion + PARENT-ONLY: SubjectLogonId
+                        and bool(_s1bp_logon_id)                # ONLY reliable when LogonId is non-empty;
+                                                                # an empty LogonId means Windows did not
+                                                                # record the session ID in this audit entry
+                                                                # — we cannot use "no 4624 match" as proof
+                                                                # of a local session.  Without a LogonId,
+                                                                # fall through to the 24h rescue so stale
+                                                                # third-party sessions (e.g. .103 that
+                                                                # browsed hours ago) are not picked up,
+                                                                # and own-machine (.106) is not assumed.
+                                                                # The 24h rescue will report UNKNOWN if no
+                                                                # third-party is found, which is correct:
+                                                                # the share-server owner (.105) deleted
+                                                                # locally and left no traceable session.
+                    )
+                )
+            )
+            if _s1bp_parent_only and event_type == "deleted" and not _s1bp_logon_id:
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b-post: PARENT-ONLY deletion with EMPTY LogonId "
+                    f"— logon_id_is_reliable forced to False. "
+                    f"Reason: an empty SubjectLogonId cannot be used to confirm a local session "
+                    f"(no 4624 match is only meaningful when we have a LogonId to look up). "
+                    f"The file server owner (.105) may have deleted locally without generating "
+                    f"a usable audit LogonId. Falling through to 24h rescue / UNKNOWN."
+                )
+            _s1bp_matched   = False
+            if _s1bp_parent_only:
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b-post: PARENT-ONLY 4663 match — "
+                    f"logon_id={_s1bp_logon_id!r} event_type={event_type!r} "
+                    f"logon_id_is_reliable={_s1bp_logon_id_is_reliable} "
+                    f"(reliable=True for deletions: SubjectLogonId still proves local session; "
+                    f"reliable=False for adds/modifies: SubjectLogonId belongs to different file op)"
+                )
+
+            # ── Resolve own machine identity ONCE — used by BOTH fast and slow paths ──
+            # MUST be defined before the fast-path block; previously it was only defined
+            # in the slow path, causing UnboundLocalError when pre-fetched 4624 events
+            # were available (fast path runs first and references these variables).
+            try:
+                import socket as _s1bp_pre_sock
+                _s1bp_own_host_resolved = _s1bp_pre_sock.gethostname().lower()
+                _s1bp_own_ip_resolved   = _s1bp_pre_sock.gethostbyname(_s1bp_own_host_resolved)
+            except Exception as _s1bp_pre_err:
+                _s1bp_own_host_resolved = ""
+                _s1bp_own_ip_resolved   = ""
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b-post: WARNING — could not resolve own "
+                    f"machine IP via gethostbyname: {_s1bp_pre_err!r}. "
+                    f"Own-machine skip will use hostname comparison only."
+                )
+            _qna.info(
+                f"[_query_smb_audit] Strategy1b-post: own machine resolved as "
+                f"host={_s1bp_own_host_resolved!r} ip={_s1bp_own_ip_resolved!r} "
+                f"(used to exclude backup-app SMB sessions from 4624 candidate list)"
+            )
+
+            # ── Fast path: use 4624 events already fetched in Strategy1b ────────
+            # The separate wevtutil /r: query for EventID=4624 fails with
+            # "Access Denied" on some Windows configs (different RPC privilege
+            # check) even though the 4656/4663 query in Strategy1b succeeded.
+            # We now include EventID=4624 in the Strategy1b query itself, so the
+            # events are already available here.  Try LogonId exact match first,
+            # then fall back to closest-in-time if no LogonId is available.
+            _s1bp_prefetched = result.get("_s1b_4624_events", [])
+            if _s1bp_prefetched:
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b-post: using {len(_s1bp_prefetched)} "
+                    f"pre-fetched 4624 event(s) — skipping separate wevtutil query"
+                )
+                # Try LogonId exact match first
+                _s1bp_exact = None
+                if _s1bp_logon_id:
+                    for (_pf_diff, _pf_ws, _pf_ip, _pf_lid) in _s1bp_prefetched:
+                        if _pf_lid.lower() == _s1bp_logon_id.lower():
+                            _s1bp_exact = (_pf_diff, _pf_ws, _pf_ip, _pf_lid)
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: pre-fetched LogonId "
+                                f"EXACT MATCH TargetLogonId={_pf_lid!r} "
+                                f"WorkstationName={_pf_ws!r} IpAddress={_pf_ip!r} "
+                                f"time_diff={_pf_diff:+.1f}s"
+                            )
+                            break
+                if _s1bp_exact is None:
+                    # Decide whether to fall back to closest-in-time remote candidate.
+                    #
+                    # KEY RULE: if we have a real SubjectLogonId from the 4663 event
+                    # but NONE of the pre-fetched 4624 (Network Logon) events carries
+                    # that LogonId, the session is a LOCAL (interactive/console) logon —
+                    # Windows never emits Event 4624 LogonType=3 for local actions.
+                    # In that case this IS Scenario 3 (folder owner acting locally) and
+                    # we must NOT pick a stale remote 4624 from an earlier backup session
+                    # that happens to fall within the time window.
+                    #
+                    # Only use time-window closest when we have NO LogonId at all
+                    # (older Windows where SubjectLogonId is absent from 4663 XML).
+                    if _s1bp_logon_id and _s1bp_logon_id_is_reliable:
+                        # Event 4663: SubjectLogonId is the primary session ID.
+                        # No matching 4624 Network Logon means the session is LOCAL
+                        # (interactive/console) — treat as LOCAL actor (Scenario 3).
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post: SubjectLogonId={_s1bp_logon_id!r} "
+                            f"from EventID={_s1bp_event_id} had NO matching 4624 Network Logon in "
+                            f"pre-fetched events ({len(_s1bp_prefetched)} event(s) checked) — "
+                            f"session is a LOCAL (interactive/console) logon, NOT a remote SMB "
+                            f"session. Skipping time-window fallback to avoid picking stale remote "
+                            f"sessions from earlier backup jobs. Actor is LOCAL: user={result.get('user')!r}"
+                        )
+                        # Leave _s1bp_exact = None → falls through to local-actor handling below
+                    else:
+                        # Either: no LogonId at all (older Windows/SACL configs), OR
+                        # the matched event was 4656 whose SubjectLogonId is an impersonation
+                        # token that never appears in 4624 — so "no exact match" does NOT
+                        # mean local actor. Fall back to closest-in-time remote candidate.
+                        _pf_all_excluded = []
+                        _pf_remote = []
+                        _pf_own_fresh = []  # own-machine candidates kept as fallback
+                        for (_pf_d, _pf_ws_f, _pf_ip_f, _pf_lid_f) in _s1bp_prefetched:
+                            if (_pf_ip_f in ("127.0.0.1", "::1", "", host)
+                                    or _pf_ws_f.lower() == host.lower()):
+                                _pf_all_excluded.append((_pf_d, _pf_ws_f, _pf_ip_f, "loopback-or-server"))
+                                continue
+                            _pf_is_own = (
+                                (bool(_s1bp_own_ip_resolved) and _pf_ip_f == _s1bp_own_ip_resolved)
+                                or (bool(_s1bp_own_host_resolved) and _pf_ws_f.lower() == _s1bp_own_host_resolved)
+                            )
+                            if _pf_is_own:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                    f"DEFER own-machine 4624 WorkstationName={_pf_ws_f!r} "
+                                    f"IpAddress={_pf_ip_f!r} time_diff={_pf_d:+.1f}s "
+                                    f"(will use only if no other remote candidate exists; "
+                                    f"own={_s1bp_own_host_resolved!r}/{_s1bp_own_ip_resolved!r})"
+                                )
+                                _pf_own_fresh.append((_pf_d, _pf_ws_f, _pf_ip_f, _pf_lid_f))
+                                continue
+                            _pf_remote.append((_pf_d, _pf_ws_f, _pf_ip_f, _pf_lid_f))
+
+                        
+                        _pf_wide_remote = []
+                        _pf_wide_own = []
+                        #
+                        if not _pf_remote and not _s1bp_logon_id_is_reliable and event_type == "deleted":
+                            _s1b_4624_wide = result.get("_s1b_4624_wide", [])
+                            if _s1b_4624_wide:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                    f"narrow ±120s found no non-own candidate — trying wide "
+                                    f"window (120–900s): {len(_s1b_4624_wide)} event(s)"
+                                )
+                                for (_pfw_d, _pfw_ws, _pfw_ip, _pfw_lid) in _s1b_4624_wide:
+                                    if (_pfw_ip in ("127.0.0.1", "::1", "", host)
+                                            or _pfw_ws.lower() == host.lower()):
+                                        continue
+                                    _pfw_is_own = (
+                                        (bool(_s1bp_own_ip_resolved) and _pfw_ip == _s1bp_own_ip_resolved)
+                                        or (bool(_s1bp_own_host_resolved) and _pfw_ws.lower() == _s1bp_own_host_resolved)
+                                    )
+                                    if _pfw_is_own:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (wide): "
+                                            f"DEFER own-machine 4624 WorkstationName={_pfw_ws!r} "
+                                            f"IpAddress={_pfw_ip!r} time_diff={_pfw_d:+.1f}s"
+                                        )
+                                        _pf_wide_own.append((_pfw_d, _pfw_ws, _pfw_ip, _pfw_lid))
+                                        continue
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (wide): "
+                                        f"non-own candidate WorkstationName={_pfw_ws!r} "
+                                        f"IpAddress={_pfw_ip!r} time_diff={_pfw_d:+.1f}s"
+                                    )
+                                    _pf_wide_remote.append((_pfw_d, _pfw_ws, _pfw_ip, _pfw_lid))
+                                if _pf_wide_remote:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (wide): "
+                                        f"found {len(_pf_wide_remote)} non-own wide-window candidate(s) — "
+                                        f"using instead of narrow window"
+                                    )
+                                    _pf_remote = _pf_wide_remote
+                                elif _pf_wide_own:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (wide): "
+                                        f"only own-machine entries in wide window too — "
+                                        f"event is 4656 so CANNOT confirm self-deletion. "
+                                        f"Reporting UNKNOWN to avoid false attribution."
+                                    )
+                                    # Do NOT add to _pf_remote — fall through to UNKNOWN below
+                            else:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                    f"no wide-window 4624 events available (all sessions opened "
+                                    f"within ±120s or >900s ago)"
+                                )
+
+                        # If no third-party remote candidates found in either window:
+                        # for 4663 events (reliable LogonId) → own-machine IS the actor.
+                        # for 4656 events (impersonation token) → SubjectLogonId is an
+                        #   impersonation token that never matches a 4624 TargetLogonId,
+                        #   so "no 4624 match" does NOT prove the actor was local.
+                        #   However, the backup app (robocopy) only ever COPIES (adds/modifies)
+                        #   files — it NEVER deletes destination files.  Therefore:
+                        #     • event_type == "deleted": own-machine DID the delete; use it.
+                        #     • event_type != "deleted": could be robocopy write; report UNKNOWN.
+                        if not _pf_remote:
+                            if _pf_own_fresh and _s1bp_logon_id_is_reliable:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                    f"no third-party remote 4624 found (4663 match, reliable logon) "
+                                    f"— using own-machine candidate(s) as actor (backup-app user deleted). "
+                                    f"{len(_pf_own_fresh)} own-machine candidate(s): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh]}"
+                                )
+                                _pf_remote = _pf_own_fresh
+                            elif _pf_own_fresh and not _s1bp_logon_id_is_reliable:
+                                if event_type == "deleted" and not is_dest_watch:
+                                    # Source-watch deletion: robocopy never deletes source files,
+                                    # BUT any other machine on the LAN (e.g. a coworker who has
+                                    # no backup app installed) can also delete from the source
+                                    # share directly — producing no remote 4624 within ±900s when
+                                    # their SMB session was opened long ago.
+                                    # Treat this identically to dest-watch deletions: leave
+                                    # _pf_remote empty (UNKNOWN) so the 24h rescue block below
+                                    # runs and can find the real third-party actor.  If the rescue
+                                    # finds no third party, the rescue block will fall back to
+                                    # own-machine automatically (same logic as dest-watch).
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                        f"4656 match + event_type='deleted' + is_dest_watch=False "
+                                        f"— could be own-machine or another LAN PC with stale SMB "
+                                        f"session.  Reporting UNKNOWN; 24h rescue will determine "
+                                        f"real actor. own-machine candidates (suppressed for now): "
+                                        f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh]}"
+                                    )
+                                    # Leave _pf_remote empty → falls through to 24h rescue at
+                                    # _s1bp_exact is None branch below, same as dest-watch path.
+                                elif event_type == "deleted" and is_dest_watch:
+                                    # Dest-watch: both the backup-app operator (own-machine) AND
+                                    # the server owner / another LAN PC could have deleted this file
+                                    # locally on the server.  We cannot distinguish without a matching
+                                    # remote 4624.  Report UNKNOWN to avoid a false accusation.
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                        f"4656 match + event_type='deleted' + is_dest_watch=True "
+                                        f"— dest deletion could be server-local actor (no remote 4624). "
+                                        f"Reporting UNKNOWN. own-machine candidates (suppressed): "
+                                        f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh]}"
+                                    )
+                                    # Leave _pf_remote empty → UNKNOWN
+                                else:
+                                    
+                                    if not is_dest_watch and not _s1bp_parent_only:
+                                        
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                            f"4656 match + event_type={event_type!r} + is_dest_watch=False "
+                                            f"+ exact_file=True — deferring to 24h rescue scan. "
+                                            f"Robocopy never writes to source, but other LAN PCs can "
+                                            f"(e.g. a coworker PC with no backup app whose SMB session "
+                                            f"is hours old and outside the ±120s window). "
+                                            f"Own-machine candidates will be used as fallback if rescue "
+                                            f"finds no third-party actor. "
+                                            f"own-machine candidates (deferred): "
+                                            f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh]}"
+                                        )
+                                        # Leave _pf_remote empty → 24h rescue block runs below
+                                        # Store own-machine candidates so the rescue fallback can use them
+                                        _pf_src_exact_add_own = _pf_own_fresh
+                                    elif not is_dest_watch and _s1bp_parent_only:
+                                        
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                            f"4656 match + event_type={event_type!r} + is_dest_watch=False "
+                                            f"+ parent_only=True — 4656 belongs to a different file; "
+                                            f"own-machine sessions cannot be attributed to this file. "
+                                            f"Reporting UNKNOWN. own-machine candidates (suppressed): "
+                                            f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh]}"
+                                        )
+                                        # Leave _pf_remote empty → UNKNOWN / falls through to local-actor
+                                    else:
+                                        # Destination watch add/modify: could be robocopy write; report UNKNOWN
+                                        # to avoid falsely attributing backup-app writes to the operator.
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                            f"4656 match + event_type={event_type!r} + is_dest_watch=True "
+                                            f"— cannot confirm own-machine (impersonation token; may be "
+                                            f"robocopy write). No non-own candidate in ±900s window. "
+                                            f"Reporting UNKNOWN. own-machine candidates (suppressed): "
+                                            f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh]}"
+                                        )
+                                        # Leave _pf_remote empty → UNKNOWN
+                            else:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                    f"WARNING — no usable 4624 candidates after filtering "
+                                    f"loopback/server entries. Attribution will be UNKNOWN."
+                                )
+                        if _pf_remote:
+                            # Priority 1: prefer a 4624 whose TargetLogonId matches a
+                            # SubjectLogonId from a 4656/4663 handle-open event on this
+                            # exact file within ±30s.  This pinpoints the actor precisely
+                            # even when multiple backup-app machines have concurrent sessions.
+                            #
+                            # IMPORTANT: only apply this for EventID=4663 (reliable LogonId).
+                            # For EventID=4656 the SubjectLogonId is a short-lived impersonation
+                            # token that does NOT correspond to a 4624 TargetLogonId.  When all
+                            # machines have had the folder open for a long time (e.g. >20 min),
+                            # stale SubjectLogonIds from earlier file-open events on OTHER machines
+                            # can accidentally match unrelated 4624 TargetLogonId values, causing
+                            # false attribution (e.g. attributing a .104 deletion to .107 because
+                            # .107's earlier session ID matched the impersonation token).
+                            _pf_handle_lids = result.get("_s1b_handle_logon_ids", []) if _s1bp_logon_id_is_reliable else []
+                            _pf_logon_match = None
+                            if _pf_handle_lids:
+                                _pf_handle_lid_set = set(l.lower() for l in _pf_handle_lids)
+                                _pf_lid_matches = [
+                                    (d, ws, ip, lid) for (d, ws, ip, lid) in _pf_remote
+                                    if lid.lower() in _pf_handle_lid_set
+                                ]
+                                if _pf_lid_matches:
+                                    _pf_lid_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _pf_lid_matches if d <= 0]
+                                    _pf_logon_match = (
+                                        min(_pf_lid_neg,     key=lambda x: abs(x[0])) if _pf_lid_neg
+                                        else min(_pf_lid_matches, key=lambda x: abs(x[0]))
+                                    )
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post: handle-LogonId match "
+                                        f"found {len(_pf_lid_matches)} 4624 candidate(s) whose "
+                                        f"TargetLogonId matches a file handle-open SubjectLogonId "
+                                        f"{_pf_handle_lids!r}. Using: "
+                                        f"WorkstationName={_pf_logon_match[1]!r} "
+                                        f"IpAddress={_pf_logon_match[2]!r} "
+                                        f"TargetLogonId={_pf_logon_match[3]!r} "
+                                        f"time_diff={_pf_logon_match[0]:+.1f}s"
+                                    )
+                            # -- Own-machine freshness guard (4656 + dest-watch + deleted) --
+                            # For EventID=4656 (unreliable SubjectLogonId / impersonation
+                            # token), own-machine sessions were deferred to _pf_own_fresh
+                            # instead of _pf_remote.  If own-machine has a very fresh session
+                            # (<=30s) AND is significantly fresher than the best third-party
+                            # candidate (>=5x fresher), promote own-machine as the actor.
+                            #
+                            # Justification: robocopy NEVER deletes destination files (it only
+                            # copies/adds/updates them).  So if a dest-watch deletion event
+                            # fires AND own-machine has a much fresher SMB session than any
+                            # third-party machine, the deletion almost certainly came from the
+                            # backup-app operator on own-machine -- NOT from the stale third-
+                            # party session.  Without this guard the closest-in-time third-party
+                            # is wrongly preferred even when own-machine is dramatically fresher.
+                            #
+                            # Safety: the guard only fires for 4656 events (not 4663, which has
+                            # a reliable SubjectLogonId already handled above), only for
+                            # event_type="deleted", only for dest-watch, and only when the
+                            # own-machine freshness advantage is substantial (>=5x ratio).
+                            _pf_own_freshness_override = False
+                            if (
+                                not _pf_logon_match
+                                and not _s1bp_logon_id_is_reliable
+                                and event_type == "deleted"
+                                and is_dest_watch
+                                and _pf_own_fresh
+                                and _pf_remote
+                            ):
+                                _pf_own_best_abs = min(abs(d) for (d, _, _, _) in _pf_own_fresh)
+                                _pf_third_best_abs = min(abs(d) for (d, _, _, _) in _pf_remote)
+                                _PF_OWN_TIGHT_THRESHOLD = 30.0   # own-machine must be within 30s
+                                _PF_FRESHNESS_RATIO     = 3.0    # own-machine must be >=3x fresher
+                                if (
+                                    _pf_own_best_abs <= _PF_OWN_TIGHT_THRESHOLD
+                                    and _pf_third_best_abs > 0
+                                    and (_pf_third_best_abs / max(_pf_own_best_abs, 0.1)) >= _PF_FRESHNESS_RATIO
+                                ):
+                                    _pf_own_best_cand = min(_pf_own_fresh, key=lambda x: abs(x[0]))
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (pre-fetched own-freshness-guard): "
+                                        f"4656 dest-watch deletion -- own-machine has session "
+                                        f"{_pf_own_best_abs:.1f}s old vs best third-party "
+                                        f"{_pf_third_best_abs:.1f}s old "
+                                        f"(ratio={_pf_third_best_abs/max(_pf_own_best_abs,0.1):.1f}x >= {_PF_FRESHNESS_RATIO:.0f}x). "
+                                        f"Robocopy never deletes dest files -- own-machine IS the actor. "
+                                        f"Promoting: WorkstationName={_pf_own_best_cand[1]!r} "
+                                        f"IpAddress={_pf_own_best_cand[2]!r} time_diff={_pf_own_best_cand[0]:+.1f}s. "
+                                        f"Rejected third-party candidates: "
+                                        f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_remote]}"
+                                    )
+                                    _pf_logon_match = _pf_own_best_cand
+                                    _pf_own_freshness_override = True
+                                else:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (pre-fetched own-freshness-guard): "
+                                        f"4656 dest-watch deletion -- freshness guard NOT triggered. "
+                                        f"own_best={_pf_own_best_abs:.1f}s "
+                                        f"(need <={_PF_OWN_TIGHT_THRESHOLD:.0f}s), "
+                                        f"third_best={_pf_third_best_abs:.1f}s "
+                                        f"(ratio={_pf_third_best_abs/max(_pf_own_best_abs,0.1):.1f}x, need >={_PF_FRESHNESS_RATIO:.0f}x). "
+                                        f"Proceeding with standard priority selection."
+                                    )
+
+                            # Priority 2: tight-window candidates (±60s) — machine just
+                            # connected to perform the delete.  Robocopy sessions from the
+                            # backup app on own-machine are already filtered; remaining
+                            # tight-window candidates are genuine delete-time connections.
+                            _pf_tight = [(d, ws, ip, lid) for (d, ws, ip, lid) in _pf_remote if abs(d) <= 60]
+                            # Priority 3: among wide-window candidates, if only ONE unique
+                            # non-own machine exists it must be the actor (all app machines
+                            # keep persistent sessions from start of day — if only one
+                            # third-party machine has a session at all, that's who deleted).
+                            _pf_unique_hosts = set((ws.lower() or ip) for (_, ws, ip, _) in _pf_remote)
+                            _pf_own_hosts = set()
+                            if _s1bp_own_host_resolved:
+                                _pf_own_hosts.add(_s1bp_own_host_resolved)
+                            if _s1bp_own_ip_resolved:
+                                _pf_own_hosts.add(_s1bp_own_ip_resolved)
+                            _pf_third_party_hosts = _pf_unique_hosts - _pf_own_hosts
+                            _pf_solo_remote = None
+                            if len(_pf_third_party_hosts) == 1:
+                                _solo_key = next(iter(_pf_third_party_hosts))
+                                _pf_solo_cands = [
+                                    (d, ws, ip, lid) for (d, ws, ip, lid) in _pf_remote
+                                    if (ws.lower() or ip) == _solo_key
+                                ]
+                                if _pf_solo_cands:
+                                    _solo_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _pf_solo_cands if d <= 0]
+                                    _pf_solo_remote = (
+                                        min(_solo_neg,       key=lambda x: abs(x[0])) if _solo_neg
+                                        else min(_pf_solo_cands, key=lambda x: abs(x[0]))
+                                    )
+                            # Priority 4: absolute closest-in-time (last resort)
+                            _pf_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _pf_remote if d <= 0]
+                            _pf_closest = (
+                                min(_pf_neg,    key=lambda x: abs(x[0])) if _pf_neg
+                                else min(_pf_remote, key=lambda x: abs(x[0]))
+                            )
+                            if _pf_logon_match:
+                                _s1bp_exact = _pf_logon_match
+                                _sel_method = "own-freshness-guard" if _pf_own_freshness_override else "handle-LogonId-match"
+                            elif _pf_tight:
+                                # Among tight-window candidates pick closest
+                                _pf_tight_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _pf_tight if d <= 0]
+                                _s1bp_exact = (
+                                    min(_pf_tight_neg, key=lambda x: abs(x[0])) if _pf_tight_neg
+                                    else min(_pf_tight, key=lambda x: abs(x[0]))
+                                )
+                                _sel_method = f"tight-window-closest(±60s, {len(_pf_tight)} cand)"
+                            elif _pf_solo_remote:
+                                _s1bp_exact = _pf_solo_remote
+                                _sel_method = f"sole-third-party-host({_solo_key!r})"
+                            else:
+                                _s1bp_exact = _pf_closest
+                                _sel_method = f"time-window-closest(ambiguous,{len(_pf_third_party_hosts)}-hosts)"
+                            
+                            _pf_sel_is_ambiguous = (
+                                _s1bp_exact is not None
+                                and not _pf_logon_match
+                                and not _pf_own_freshness_override
+                            )
+                            if _pf_sel_is_ambiguous:
+                                _pf_bc_server_user = result.get("user", "")
+                                
+                                _pf_bc_hit = _burst_cache_get(host, _pf_bc_server_user, require_remote=True, event_type=event_type)
+                                if not _pf_bc_hit:
+                                    
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (pre-fetched burst-cache override): "
+                                        f"SKIP — no exact-key burst cache hit for "
+                                        f"host={host!r} server_local_user={_pf_bc_server_user!r}. "
+                                        f"(Cross-user any-for-host hits are intentionally ignored here to "
+                                        f"prevent a prior burst's attribution from overriding a different actor.) "
+                                        f"Proceeding with time-window selection [{_sel_method}]."
+                                    )
+                                if _pf_bc_hit:
+                                    _pf_bc_machine, _pf_bc_ip, _pf_bc_user = _pf_bc_hit
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (pre-fetched burst-cache override): "
+                                        f"ambiguous time-window selection [{_sel_method}] overridden by burst cache. "
+                                        f"Burst cache confirmed remote attribution: "
+                                        f"machine={_pf_bc_machine!r} ip={_pf_bc_ip!r} user={_pf_bc_user!r} "
+                                        f"(was: WorkstationName={_s1bp_exact[1]!r} IpAddress={_s1bp_exact[2]!r} "
+                                        f"time_diff={_s1bp_exact[0]:+.1f}s). "
+                                        f"Sibling file in same burst was already attributed to this machine."
+                                    )
+                                    result["machine"] = _pf_bc_machine
+                                    result["ip"]      = _pf_bc_ip
+                                    result["user"]    = _pf_bc_user
+                                    _s1bp_matched = True
+                                    _s1bp_exact = None  # skip normal assignment below
+                                    _sel_method = f"burst-cache-override({_sel_method})"
+                            if _s1bp_exact is not None:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: no SubjectLogonId in 4663 "
+                                    f"— using pre-fetched [{_sel_method}] candidate "
+                                    f"WorkstationName={_s1bp_exact[1]!r} "
+                                    f"IpAddress={_s1bp_exact[2]!r} time_diff={_s1bp_exact[0]:+.1f}s "
+                                    f"(from {len(_pf_remote)} candidate(s), "
+                                    f"{len(_pf_third_party_hosts)} unique third-party host(s): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_remote]})"
+                                )
+                        else:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: no SubjectLogonId in 4663 "
+                                f"— time-window had no candidates after filtering loopback "
+                                f"and file-server {host!r}. "
+                                f"Actor treated as LOCAL. Keeping 4663: user={result.get('user')!r}"
+                            )
+                if _s1bp_exact is not None:
+                    _pf_diff, _pf_ws, _pf_ip, _pf_lid = _s1bp_exact
+                    _old_machine = result.get("machine", "")
+                    _old_ip      = result.get("ip", "")
+                    _old_user    = result.get("user", "")
+                    _s1bp_remote_machine = _pf_ws if _pf_ws else _pf_ip
+                    _s1bp_user_full = (
+                        f"{_s1bp_remote_machine}\\{_s1bp_4663_uname}"
+                        if _s1bp_remote_machine and _s1bp_4663_uname
+                        else _old_user
+                    )
+                    result["machine"] = _s1bp_remote_machine
+                    result["ip"]      = _pf_ip if _pf_ip else _old_ip
+                    result["user"]    = _s1bp_user_full
+                    _s1bp_matched = True
+                    _match_method = "PreFetched-LogonId" if (_s1bp_logon_id and _pf_lid.lower() == _s1bp_logon_id.lower()) else "PreFetched-Closest"
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1b-post ({_match_method}): "
+                        f"server-local {_old_user!r}/{_old_machine!r}/{_old_ip!r} "
+                        f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r} "
+                        f"(WorkstationName={_pf_ws!r} IpAddress={_pf_ip!r} "
+                        f"LogonId={_pf_lid!r} time_diff={_pf_diff:+.1f}s)"
+                    )
+                    # ── Burst cache: store successful attribution so concurrent files
+                    # in the same add/modify burst (e.g. IMG_0019.pdf alongside IMG_0020.pdf)
+                    # can reuse this result without needing their own LogonId-exact match.
+                    # Without this, a PARENT-ONLY 4656 on a concurrent file has no LogonId
+                    # to correlate and returns UNKNOWN even though the actor is already known.
+                    if _old_user and result.get("machine"):
+                        # A LogonId-exact match is always authoritative — Windows SMB
+                        # network sessions use the session LogonId in 4656/4663, so a
+                        # TargetLogonId match to a remote 4624 is a cryptographic proof
+                        # of identity regardless of how old the 4624 session is.
+                        # Persistent SMB sessions (e.g. a user who opened the share at
+                        # 8am and deletes at 7pm) produce a 4624 that is hours old —
+                        # the old ±120s restriction incorrectly stored logon_id_confirmed=False
+                        # for these, causing sibling deletions in the same burst to fall
+                        # through to the expensive 24h rescue instead of reusing the
+                        # already-confirmed attribution from the first deletion.
+                        # Fix: LogonId-exact match → always confirmed; time-window guesses
+                        # (no LogonId) → never confirmed (they remain ambiguous heuristics).
+                        _logon_confirmed_flag = ("LogonId" in _match_method)
+                        _burst_cache_put(
+                            host, _old_user,
+                            result["machine"],
+                            result["ip"] or host,
+                            result["user"],
+                            event_type=event_type,
+                            logon_id_confirmed=_logon_confirmed_flag,
+                        )
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post ({_match_method} burst-cache): "
+                            f"stored confirmed attribution for host={host!r} "
+                            f"server_local_user={_old_user!r} event_type={event_type!r} "
+                            f"logon_id_confirmed={_logon_confirmed_flag} -> "
+                            f"machine={result['machine']!r} ip={result['ip']!r} "
+                            f"(TTL={_BURST_CACHE_TTL:.0f}s)"
+                        )
+                else:
+                    
+                    _pf_own_fresh_safe = _pf_own_fresh if '_pf_own_fresh' in dir() else []
+                    if _pf_own_fresh_safe:
+                        
+                        _pf_src_parent_add = (
+                            not is_dest_watch
+                            and event_type in ("added", "modified")
+                            and _s1bp_parent_only
+                        )
+                        
+                        _pf_src_exact_add = (
+                            not is_dest_watch
+                            and event_type in ("added", "modified")
+                            and not _s1bp_parent_only
+                            and "_pf_src_exact_add_own" in dir()
+                            and bool(_pf_src_exact_add_own)
+                        )
+                        if (_pf_src_parent_add or _pf_src_exact_add or is_dest_watch or (not is_dest_watch and event_type == "deleted")) and result.get("user") and result.get("machine"):
+                            # ── Burst cache fast-path (source-watch deletions) ───────────
+                            # For source-watch deletions (is_dest_watch=False), check the
+                            # burst cache FIRST before running the expensive 24h query.
+                            # If another file in the same bulk-delete burst was ALREADY correctly
+                            # attributed to a third-party machine (e.g. DESKTOP-FAGSHTO/.107
+                            # was identified via LogonId-exact match on a previous file), reuse
+                            # that attribution here immediately.
+                            #
+                            # This handles the common scenario: .107 deletes 5 files rapidly.
+                            # One file carries a SubjectLogonId that matches .107's stale 4624 →
+                            # attributed correctly → burst cache populated.  The other 4 files
+                            # have no SubjectLogonId (PARENT-ONLY 4656 match) → without this
+                            # fast-path they fall through to the 24h rescue which may return
+                            # nothing or be slowed by the XPath query.
+                            if not is_dest_watch and (event_type == "deleted" or _pf_src_parent_add or _pf_src_exact_add):
+                                _src_del_local_user = result.get("user", "")
+                                # GUARD: if we have a reliable 4663 SubjectLogonId that found
+                                # NO matching 4624 Network Logon, the actor is DEFINITIVELY LOCAL
+                                # on the file server (Scenario 3 — folder owner acting locally).
+                                # Do NOT let a stale burst-cache entry from a PREVIOUS burst
+                                # (different actor) override this confirmed-local determination.
+                                # The burst cache is only valid within the same actor's burst.
+                                _src_del_confirmed_local = bool(_s1bp_logon_id and _s1bp_logon_id_is_reliable)
+                                
+                                _src_del_burst_hit = None
+                                if not _src_del_confirmed_local:
+                                    
+                                    _skip_burst_for_add = bool(_pf_src_parent_add or _pf_src_exact_add)
+                                    if not _skip_burst_for_add:
+                                        # Use LogonId-confirmed-only lookup for deletion fast-path
+                                        _src_del_burst_hit = _burst_cache_get_logon_confirmed(
+                                            host, _src_del_local_user, event_type=event_type
+                                        )
+                                    if _src_del_burst_hit is None and not _skip_burst_for_add:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (source-watch-deletion burst-cache): "
+                                            f"NO logon-id-confirmed burst cache hit for host={host!r} "
+                                            f"server_local_user={_src_del_local_user!r} event_type={event_type!r} — "
+                                            f"falling through to 24h rescue for per-file independent verification. "
+                                            f"(Time-window-closest ambiguous entries are intentionally excluded here to "
+                                            f"prevent propagating a wrong guess — e.g. .103 at -55s — to sibling "
+                                            f"deletions that may have been done locally by .105.)"
+                                        )
+                                    if _skip_burst_for_add:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (source-watch-deletion burst-cache): "
+                                            f"SKIPPING burst-cache fast-path for event_type={event_type!r} "
+                                            f"(pf_src_parent_add={_pf_src_parent_add} pf_src_exact_add={_pf_src_exact_add}). "
+                                            f"ADD bursts require per-file verification because two different actors "
+                                            f"may add files within the same TTL window (e.g. .106 adds files, then "
+                                            f".105 adds different files 11s later). Falling through to 24h rescue."
+                                        )
+                                if _src_del_confirmed_local:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (source-watch-deletion burst-cache): "
+                                        f"SKIPPING burst-cache lookup — confirmed local actor via reliable 4663 "
+                                        f"SubjectLogonId={_s1bp_logon_id!r} with no matching 4624 Network Logon. "
+                                        f"Actor is local on file server {host!r}; cached remote attribution "
+                                        f"from a previous burst must not override this."
+                                    )
+                                if _src_del_burst_hit:
+                                    _src_del_bc_machine, _src_del_bc_ip, _src_del_bc_user = _src_del_burst_hit
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (source-watch-deletion burst-cache): "
+                                        f"LogonId-confirmed burst cache HIT for host={host!r} "
+                                        f"server_local_user={_src_del_local_user!r} "
+                                        f"→ machine={_src_del_bc_machine!r} ip={_src_del_bc_ip!r} user={_src_del_bc_user!r}. "
+                                        f"Skipping 24h rescue — attribution confirmed by LogonId-exact match on earlier "
+                                        f"sibling file in same burst (high-confidence, safe to reuse)."
+                                    )
+                                    result["machine"] = _src_del_bc_machine
+                                    result["ip"]      = _src_del_bc_ip
+                                    result["user"]    = _src_del_bc_user
+                                    _s1bp_matched = True
+                            # ── Dest-watch rescue: decide whether to run 24h query ────────
+                            # The 24h query finds third-party machines that connected >900s ago.
+                            # This is correct for "deleted" events (robocopy never deletes), but
+                            # for "added"/"modified" events it can misattribute robocopy writes
+                            # to a stale third-party session from hours ago.
+                            #
+                            # SKIP the 24h rescue when ALL of:
+                            #   * event_type is "added" or "modified" (backup app writes), AND
+                            #   * own-machine (.108) has fresh narrow-window 4624 candidates
+                            #     within +-120s of the event, AND
+                            #   * at least one of those own-machine TargetLogonIds matches the
+                            #     SubjectLogonId from the 4656 event for THIS specific file.
+                            #
+                            # The third condition is critical: without it, a robocopy session
+                            # for file A (testfile_10gb.dat) would suppress the 24h rescue for
+                            # file B (IMG_0019.pdf) written by .105, because robocopy 4624 sessions
+                            # fall within +-120s of .105's write with a DIFFERENT LogonId.
+                            # If no LogonId match -> own-machine sessions belong to a different
+                            # operation; run the 24h rescue to find the real actor.
+                            _dwr_own_logon_ids = {lid.lower() for (_, _, _, lid) in _pf_own_fresh_safe if lid}
+                            _dwr_subj_logon_id = (_s1bp_logon_id or "").strip().lower()
+                            # LogonId match: own-machine 4624 TargetLogonId == 4656 SubjectLogonId
+                            _dwr_logon_id_match = (
+                                bool(_dwr_subj_logon_id)
+                                and bool(_dwr_own_logon_ids)
+                                and _dwr_subj_logon_id in _dwr_own_logon_ids
+                            )
+                            _dwr_skip_for_robocopy = (
+                                event_type in ("added", "modified")
+                                and bool(_pf_own_fresh_safe)
+                                and _dwr_logon_id_match
+                            )
+                            
+                            _dwr_skip_confirmed_local = (
+                                not is_dest_watch
+                                and event_type == "deleted"
+                                and bool(_s1bp_logon_id)
+                                and bool(_s1bp_logon_id_is_reliable)
+                            )
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (deletion-path debug): "
+                                f"event_type={event_type!r} is_dest_watch={is_dest_watch} "
+                                f"s1bp_logon_id={_s1bp_logon_id!r} "
+                                f"s1bp_logon_id_is_reliable={_s1bp_logon_id_is_reliable} "
+                                f"s1bp_parent_only={_s1bp_parent_only} "
+                                f"s1bp_event_id={_s1bp_event_id} "
+                                f"dwr_skip_confirmed_local={_dwr_skip_confirmed_local} "
+                                f"s1bp_server_local_user={_s1bp_server_local_user!r} "
+                                f"src_del_confirmed_local={_src_del_confirmed_local if 'deleted' in event_type else 'N/A'}"
+                            )
+                            _qna.info(
+                                "[_query_smb_audit] Strategy1b-post (dest-watch rescue robocopy-check): "
+                                "event_type=%r subj_logon_id=%r own_logon_ids=%s "
+                                "logon_id_match=%s own_fresh_narrow=%d skip_for_robocopy=%s skip_confirmed_local=%s"
+                                % (
+                                    event_type, _dwr_subj_logon_id,
+                                    sorted(_dwr_own_logon_ids) if _dwr_own_logon_ids else "[]",
+                                    _dwr_logon_id_match, len(_pf_own_fresh_safe), _dwr_skip_for_robocopy,
+                                    _dwr_skip_confirmed_local,
+                                )
+                            )
+                            if _s1bp_matched:
+                                # Burst cache (or confirmed-local guard) already resolved attribution
+                                # before we reached the rescue decision block. Skip the entire
+                                # rescue chain — the 24h query and "no-third-party" path at the
+                                # bottom of the rescue must NOT overwrite result["ip"] with `host`.
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (dest-watch rescue): "
+                                    f"SKIPPING rescue — _s1bp_matched already True (burst-cache or "
+                                    f"confirmed-local resolved before this point). "
+                                    f"Current result: user={result.get('user')!r} "
+                                    f"machine={result.get('machine')!r} ip={result.get('ip')!r}"
+                                )
+                            elif _dwr_skip_confirmed_local:
+                                
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched dest-watch rescue): "
+                                    f"SKIPPING 24h rescue — confirmed local actor via reliable 4663 "
+                                    f"SubjectLogonId={_dwr_subj_logon_id!r} with no matching 4624 Network Logon. "
+                                    f"Actor is the file-server machine itself ({result.get('machine')!r} / "
+                                    f"{result.get('ip')!r}). Stale third-party sessions from earlier "
+                                    f"bursts must not override this."
+                                )
+                                _s1bp_matched = True
+                            elif _dwr_skip_for_robocopy:
+                                # Own-machine has fresh 4624 sessions in the narrow window.
+                                # These are the robocopy SMB sessions. Use the closest one.
+                                _dwr_neg_own = [(d, ws, ip, lid) for (d, ws, ip, lid) in _pf_own_fresh_safe if d <= 0]
+                                _dwr_best_own = (
+                                    min(_dwr_neg_own,      key=lambda x: abs(x[0])) if _dwr_neg_own
+                                    else min(_pf_own_fresh_safe, key=lambda x: abs(x[0]))
+                                )
+                                _qna.info(
+                                    "[_query_smb_audit] Strategy1b-post (pre-fetched dest-watch rescue): "
+                                    "event_type=%r + own-machine has fresh narrow-window 4624 candidates "
+                                    "AND SubjectLogonId=%r matches own-machine TargetLogonId "
+                                    "— confirmed robocopy session for THIS file. "
+                                    "SKIPPING 24h rescue. Attributing to own-machine: "
+                                    "WorkstationName=%r IpAddress=%r time_diff=%+.1fs"
+                                    % (event_type, _dwr_subj_logon_id, _dwr_best_own[1], _dwr_best_own[2], _dwr_best_own[0])
+                                )
+                                # Update result to reflect own-machine (robocopy writer)
+                                result["machine"] = _dwr_best_own[1]
+                                result["ip"]      = _dwr_best_own[2]
+                                result["user"]    = (
+                                    f"{_dwr_best_own[1]}\\{_s1bp_4663_uname}"
+                                    if _dwr_best_own[1] and _s1bp_4663_uname
+                                    else result.get("user", "")
+                                )
+                                _s1bp_matched = True
+                            else:
+                                # Dest-watch rescue: own-machine 4624 candidates were suppressed
+                                # (no remote network logon for the actor), but the server-local
+                                # 4656/4663 gives us a valid server-side identity.
+                                # BEFORE keeping the server-local identity, run a 24h 4624 query
+                                # to check whether a third-party machine (e.g. a coworker on the LAN
+                                # whose session was opened >900s ago) performed the action remotely.
+                                # This covers the case where someone deletes a file, then immediately
+                                # adds/modifies a different file — their 4624 session may be hours old
+                                # and outside the narrow ±120s / wide 120-900s pre-fetched windows.
+                                _dwr_rescue_reason = (
+                                    "src-exact-add-deferred" if (_pf_src_exact_add if "_pf_src_exact_add" in dir() else False)
+                                    else "src-parent-add" if _pf_src_parent_add
+                                    else "dest-watch" if is_dest_watch
+                                    else "src-deletion"
+                                )
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched dest-watch rescue [{_dwr_rescue_reason}]): "
+                                    f"own-machine candidates deferred/suppressed; running 24h 4624 query to detect "
+                                    f"third-party remote machines (e.g. a LAN PC with no backup app whose SMB "
+                                    f"session was opened hours ago). "
+                                    f"subj_logon_id={_dwr_subj_logon_id!r} (will use for LogonId-exact match in 24h results). "
+                                    f"own-machine candidates (deferred): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh_safe]}"
+                                )
+                                _dwr_resolved = False
+                                if _win_user and _win_pass:
+                                    try:
+                                        import datetime as _dwr_dt
+                                        import xml.etree.ElementTree as _dwr_et
+                                        _dwr_end   = (event_dt_utc + _dwr_dt.timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S")
+                                        _dwr_start = (event_dt_utc - _dwr_dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+                                        # Exclude own-machine IP in XPath to prevent backup-app
+                                        # SMB sessions (constant polling) from filling the result
+                                        # cap and crowding out stale third-party sessions (e.g.
+                                        # a coworker whose session is 5+ hours old).
+                                        # Own-machine sessions are already filtered in Python, but
+                                        # excluding them at query time means the /c: cap is spent
+                                        # only on actual candidates, not backup-app noise.
+                                        # NOTE: Do NOT add an IpAddress != own-machine XPath filter here.
+                                        # On some Windows versions the != operator in XPath on Security
+                                        # log EventData fields causes wevtutil to return 0 results
+                                        # (the query silently fails), which means third-party machines
+                                        # like DESKTOP-FAGSHTO (.107) are never found.
+                                        # Own-machine filtering is already done correctly in Python below
+                                        # (via _dwr_is_own check), so the XPath exclusion is redundant
+                                        # and harmful.  Remove it and let Python filter.
+                                        _dwr_query = (
+                                            f"*[System[EventID=4624 and "
+                                            f"TimeCreated[@SystemTime>='{_dwr_start}' and @SystemTime<='{_dwr_end}']] "
+                                            f"and EventData[Data[@Name='LogonType']='3']]"
+                                        )
+                                        _dwr_cmd = [
+                                            "wevtutil", "qe", "Security",
+                                            f"/r:{host}",
+                                            f"/u:{_win_user}",
+                                            f"/p:{_win_pass}",
+                                            "/rd:true",
+                                            "/c:2000",
+                                            "/f:xml",
+                                            f"/q:{_dwr_query}",
+                                        ]
+                                        _dwr_result = _s1bp_sp.run(
+                                            _dwr_cmd, capture_output=True, text=True, timeout=20,
+                                            creationflags=_CNW_1BP,
+                                        )
+                                        _dwr_remote = []
+                                        _dwr_own    = []
+                                        if _dwr_result.returncode == 0 and _dwr_result.stdout.strip():
+                                            _dwr_xml  = "<root>" + _dwr_result.stdout + "</root>"
+                                            _dwr_root = _dwr_et.fromstring(_dwr_xml)
+                                            _dwr_ns   = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                                            for _dwr_ev in _dwr_root:
+                                                try:
+                                                    _dwr_sys  = _dwr_ev.find("e:System", _dwr_ns)
+                                                    if _dwr_sys is None:
+                                                        continue
+                                                    _dwr_tc = _dwr_sys.find("e:TimeCreated", _dwr_ns)
+                                                    if _dwr_tc is None:
+                                                        continue
+                                                    _dwr_dts  = _dwr_tc.attrib.get("SystemTime", "")
+                                                    _dwr_evdt = _dwr_dt.datetime.fromisoformat(
+                                                        _dwr_dts.replace("Z", "+00:00")
+                                                    ).replace(tzinfo=None)
+                                                    _dwr_d = (_dwr_evdt - event_dt_utc).total_seconds()
+                                                    if _dwr_d > 30 or _dwr_d < -86400:
+                                                        continue
+                                                    _dwr_edata = _dwr_ev.find("e:EventData", _dwr_ns)
+                                                    if _dwr_edata is None:
+                                                        continue
+                                                    _dwr_map = {d.get("Name", ""): (d.text or "") for d in _dwr_edata if d.get("Name")}
+                                                    if _dwr_map.get("LogonType", "") != "3":
+                                                        continue
+                                                    _dwr_ws  = _dwr_map.get("WorkstationName", "").strip("-").strip()
+                                                    _dwr_ip  = _dwr_map.get("IpAddress", "").strip()
+                                                    _dwr_lid = _dwr_map.get("TargetLogonId", "").strip().lower()
+                                                    if _dwr_ip in ("127.0.0.1", "::1", "", host) or _dwr_ws.lower() == host.lower():
+                                                        continue
+                                                    _dwr_is_own = (
+                                                        (bool(_s1bp_own_ip_resolved) and _dwr_ip == _s1bp_own_ip_resolved)
+                                                        or (bool(_s1bp_own_host_resolved) and _dwr_ws.lower() == _s1bp_own_host_resolved)
+                                                    )
+                                                    if _dwr_is_own:
+                                                        _dwr_own.append((_dwr_d, _dwr_ws, _dwr_ip, _dwr_lid))
+                                                        _qna.info(
+                                                            f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                            f"DEFER own-machine 4624 WorkstationName={_dwr_ws!r} "
+                                                            f"IpAddress={_dwr_ip!r} time_diff={_dwr_d:+.1f}s"
+                                                        )
+                                                    else:
+                                                        _dwr_remote.append((_dwr_d, _dwr_ws, _dwr_ip, _dwr_lid))
+                                                        _qna.info(
+                                                            f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                            f"third-party 4624 WorkstationName={_dwr_ws!r} "
+                                                            f"IpAddress={_dwr_ip!r} TargetLogonId={_dwr_lid!r} "
+                                                            f"time_diff={_dwr_d:+.1f}s"
+                                                        )
+                                                except Exception:
+                                                    continue
+                                        if _dwr_remote:
+                                            _dwr_neg  = [(d, ws, ip, lid) for (d, ws, ip, lid) in _dwr_remote if d <= 0]
+                                            _dwr_best = (
+                                                min(_dwr_neg,    key=lambda x: abs(x[0])) if _dwr_neg
+                                                else min(_dwr_remote, key=lambda x: abs(x[0]))
+                                            )
+                                            
+                                            _dwr_logon_id_exact_match = None
+                                            if _dwr_subj_logon_id:
+                                                for _dwr_cand in _dwr_remote:
+                                                    if _dwr_cand[3] and _dwr_subj_logon_id == _dwr_cand[3]:
+                                                        _dwr_logon_id_exact_match = _dwr_cand
+                                                        break  # first match is sufficient; all point to same machine
+                                                if _dwr_logon_id_exact_match is None:
+                                                    _qna.info(
+                                                        f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                        f"no LogonId-exact match found in {len(_dwr_remote)} remote candidate(s) "
+                                                        f"for subj_logon_id={_dwr_subj_logon_id!r}. "
+                                                        f"Remote TargetLogonIds: "
+                                                        f"{[_c[3] for _c in _dwr_remote]}. "
+                                                        f"Staleness guard may fire if time-based best is stale."
+                                                    )
+                                            if _dwr_logon_id_exact_match is not None:
+                                                # Promote the exact-match entry to _dwr_best
+                                                _dwr_best = _dwr_logon_id_exact_match
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                    f"LogonId-EXACT match found in full remote list — "
+                                                    f"PROMOTING WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                    f"TargetLogonId={_dwr_best[3]!r} (was not time-closest; promoted over "
+                                                    f"previous _dwr_best). SubjectLogonId={_dwr_subj_logon_id!r} matches."
+                                                )
+                                            _dwr_best_logon_id_exact = (
+                                                bool(_dwr_subj_logon_id)
+                                                and bool(_dwr_best[3])
+                                                and _dwr_subj_logon_id == _dwr_best[3]
+                                            )
+                                            if _dwr_best_logon_id_exact:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                    f"LogonId-EXACT match confirmed for best third-party — "
+                                                    f"WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                    f"TargetLogonId={_dwr_best[3]!r} matches SubjectLogonId={_dwr_subj_logon_id!r} "
+                                                    f"from 4656/4663 event. Staleness guard will be BYPASSED — "
+                                                    f"persistent session is stale by design, not by inactivity."
+                                                )
+                                            
+                                            _DWR_STALE_THRESHOLD    = 3600.0   # seconds — third-party must be older than this (reliable path)
+                                            
+                                            _DWR_STALE_THRESHOLD_4656 = 600.0  # seconds — lower bar for unreliable 4656 events (no remote LogonId-exact match)
+                                            _DWR_FRESHNESS_RATIO    = 10.0     # own-machine must be this many times fresher
+                                            _dwr_best_staleness     = abs(_dwr_best[0])  # seconds before event
+                                            # Fresh own-machine candidates: sessions within ±120s of event
+                                            _dwr_own_fresh_narrow = [
+                                                (d, ws, ip, lid) for (d, ws, ip, lid) in _dwr_own
+                                                if abs(d) <= 120
+                                            ]
+                                            _dwr_own_best_staleness = (
+                                                abs(min(_dwr_own_fresh_narrow, key=lambda x: abs(x[0]))[0])
+                                                if _dwr_own_fresh_narrow else None
+                                            )
+                                            # Freshness ratio: how many times fresher is own-machine vs third-party?
+                                            # Special case: own_best_staleness == 0 means session exactly at event → always wins.
+                                            if _dwr_own_best_staleness is None:
+                                                _dwr_freshness_ratio_ok = False  # no own-machine narrow session
+                                            elif _dwr_own_best_staleness == 0:
+                                                _dwr_freshness_ratio_ok = True   # perfect match → always wins
+                                            else:
+                                                _dwr_freshness_ratio_ok = (
+                                                    (_dwr_best_staleness / _dwr_own_best_staleness) >= _DWR_FRESHNESS_RATIO
+                                                )
+                                            
+                                            _dwr_logon_id_exact_is_reliable = (
+                                                _dwr_best_logon_id_exact
+                                                and (
+                                                    _s1bp_logon_id_is_reliable   # 4663: always reliable
+                                                    or (
+                                                        # 4656 + remote third-party LogonId-exact match:
+                                                        # treat as reliable when the matched 4624 is from a
+                                                        # confirmed non-own, non-loopback remote machine.
+                                                        _dwr_best[2] not in ("127.0.0.1", "::1", "", host)
+                                                        and _dwr_best[1].lower() != host.lower()
+                                                    )
+                                                )
+                                            )
+                                            
+                                            _dwr_stale_override_forced = False  # set True if own-machine LogonId match blocks sole-third-party bypass
+                                            
+                                            _DWR_SOLE_TP_WINDOW = 7200.0  # 2 hours — sessions older than this don't count for uniqueness
+                                            _dwr_unique_third_party_ips = set(
+                                                ip for (d, _, ip, _) in _dwr_remote
+                                                if abs(d) <= _DWR_SOLE_TP_WINDOW
+                                            )
+                                            # Track whether the 2h window was empty (all sessions older than 2h).
+                                            # When true the fallback below populates the set for staleness-guard
+                                            # purposes only — the sole-third-party bypass must NOT fire in that
+                                            # case because sessions that are >2h old give us no confidence that
+                                            # the sole third-party is the actor (it may just have a persistent
+                                            # background session).
+                                            _dwr_sole_tp_window_empty = not bool(_dwr_unique_third_party_ips)
+                                            if _dwr_sole_tp_window_empty:
+                                                # Fallback: use all sessions for staleness-guard selection
+                                                # (avoids empty-set edge case for _dwr_best selection),
+                                                # but sole-third-party bypass is suppressed (see below).
+                                                _dwr_unique_third_party_ips = set(
+                                                    ip for (_, _, ip, _) in _dwr_remote
+                                                )
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                    f"all {len(_dwr_remote)} third-party session(s) are older than "
+                                                    f"{_DWR_SOLE_TP_WINDOW:.0f}s (2h window empty). "
+                                                    f"Fallback: using all {len(_dwr_unique_third_party_ips)} unique IP(s) "
+                                                    f"for staleness-guard selection — "
+                                                    f"sole-third-party bypass SUPPRESSED (stale sessions cannot confirm actor). "
+                                                    f"unique_ips={_dwr_unique_third_party_ips}"
+                                                )
+                                            
+                                            _dwr_subj_matches_own = (
+                                                bool(_dwr_subj_logon_id)
+                                                and bool(_dwr_own_logon_ids)
+                                                and _dwr_subj_logon_id in _dwr_own_logon_ids
+                                            )
+                                            _dwr_sole_third_party_bypass = (
+                                                not is_dest_watch
+                                                
+                                                and (event_type == "deleted" or _pf_src_parent_add)
+                                                and not _dwr_best_logon_id_exact
+                                                and not _dwr_subj_matches_own   # own-machine LogonId match → own-machine is actor
+                                                and not _dwr_sole_tp_window_empty  # all sessions >2h old → cannot confirm sole actor
+                                                and len(_dwr_unique_third_party_ips) == 1
+                                            )
+                                            if _dwr_sole_tp_window_empty and len(_dwr_unique_third_party_ips) == 1:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h sole-third-party SUPPRESSED): "
+                                                    f"sole third-party WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                    f"staleness={abs(_dwr_best[0]):.0f}s — all sessions are outside the "
+                                                    f"{_DWR_SOLE_TP_WINDOW:.0f}s (2h) window. "
+                                                    f"Cannot conclude this machine is the actor; the file-server owner "
+                                                    f"may have deleted locally (no Network Logon generated). "
+                                                    f"Staleness guard will apply normally."
+                                                )
+                                            if _dwr_sole_third_party_bypass:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h sole-third-party): "
+                                                    f"source-watch {event_type!r} (parent_only={_s1bp_parent_only}) with exactly 1 unique third-party host within ±2h window "
+                                                    f"WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                    f"staleness={_dwr_best_staleness:.0f}s — BYPASSING staleness guard. "
+                                                    f"Sole recent third-party session is unambiguously the actor. "
+                                                    f"(unique_ips_2h={_dwr_unique_third_party_ips}; "
+                                                    f"PARENT-ONLY or no SubjectLogonId — not an attribution error.)"
+                                                )
+                                            elif _dwr_subj_matches_own and not _dwr_best_logon_id_exact and len(_dwr_unique_third_party_ips) == 1:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h sole-third-party BLOCKED): "
+                                                    f"SubjectLogonId={_dwr_subj_logon_id!r} matches own-machine TargetLogonId "
+                                                    f"— own-machine is the deletion actor, NOT the sole third-party "
+                                                    f"WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r}. "
+                                                    f"Staleness bypass suppressed."
+                                                )
+                                                # Force staleness override: the third-party session IS stale,
+                                                # and own-machine is the actor. Use the own-machine path.
+                                                _dwr_logon_id_exact_is_reliable = False  # keep guard active
+                                                _dwr_stale_override_forced = True  # override will fire below
+                                            # For unmatched 4656 events (no LogonId-exact match to a third-party
+                                            # remote machine): fire the staleness guard at the lower 600s threshold
+                                            # when own-machine has fresh sessions with a sufficient freshness ratio.
+                                            # For reliable matches (4663 or 4656+remote LogonId-exact): use full 3600s.
+                                            # SPECIAL CASE: source-watch add/modify events — own-machine IS a valid
+                                            # actor (the user at .106 can write directly to the source share).
+                                            # Use a tighter 120s threshold so that a third-party with a session
+                                            # from >2 minutes ago does not override own-machine's very fresh session
+                                            # (the backup app re-authenticates every few minutes, making own-machine
+                                            # sessions always look fresh and normally causing them to be deferred).
+                                            _DWR_STALE_THRESHOLD_SRC_MODIFY = 120.0   # 2 min — tighter gate for source-watch writes
+                                            _dwr_effective_threshold = (
+                                                _DWR_STALE_THRESHOLD               # reliable path: full 3600s
+                                                if _dwr_logon_id_exact_is_reliable
+                                                else _DWR_STALE_THRESHOLD_SRC_MODIFY   # source-watch add/modify: tight 120s
+                                                if (not is_dest_watch and event_type in ("added", "modified"))
+                                                else _DWR_STALE_THRESHOLD_4656      # other unreliable paths: 600s
+                                            )
+                                            _dwr_stale_override = (
+                                                # Forced: SubjectLogonId matched own-machine → third-party is wrong actor
+                                                _dwr_stale_override_forced
+                                                or (
+                                                    not _dwr_sole_third_party_bypass    # sole third-party → unambiguous actor, never override
+                                                    and not _dwr_logon_id_exact_is_reliable  # bypass only for reliable exact match
+                                                    and _dwr_best_staleness > _dwr_effective_threshold
+                                                    and bool(_dwr_own_fresh_narrow)
+                                                    and _dwr_freshness_ratio_ok
+                                                )
+                                            )
+                                            _dwr_log_own_stale = ("{:.1f}s".format(_dwr_own_best_staleness) if _dwr_own_best_staleness is not None else "none")
+                                            _dwr_log_ratio = ("{:.1f}x".format(_dwr_best_staleness / _dwr_own_best_staleness) if _dwr_own_best_staleness else "n/a")
+                                            _qna.info(
+                                                "[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h staleness-check): "
+                                                "event_type=%r best_third_party=(%r,%r,%+.1fs) logon_id_exact=%s logon_id_exact_reliable=%s "
+                                                "staleness=%.0fs effective_threshold=%.0fs (4656_threshold=%.0fs) own_fresh_narrow=%d "
+                                                "own_best_staleness=%s freshness_ratio=%s (need >=%.0fx) sole_third_party_bypass=%s stale_override=%s"
+                                                % (
+                                                    event_type,
+                                                    _dwr_best[1], _dwr_best[2], _dwr_best[0],
+                                                    _dwr_best_logon_id_exact, _dwr_logon_id_exact_is_reliable,
+                                                    _dwr_best_staleness, _dwr_effective_threshold, _DWR_STALE_THRESHOLD_4656,
+                                                    len(_dwr_own_fresh_narrow),
+                                                    _dwr_log_own_stale, _dwr_log_ratio, _DWR_FRESHNESS_RATIO,
+                                                    _dwr_sole_third_party_bypass, _dwr_stale_override,
+                                                )
+                                            )
+                                            if _dwr_best_logon_id_exact and _dwr_best_staleness > _dwr_effective_threshold:
+                                                if _dwr_logon_id_exact_is_reliable:
+                                                    _qna.info(
+                                                        f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                        f"STALENESS GUARD BYPASSED — best third-party "
+                                                        f"WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                        f"is {_dwr_best_staleness:.0f}s old but TargetLogonId={_dwr_best[3]!r} "
+                                                        f"exactly matches SubjectLogonId={_dwr_subj_logon_id!r} "
+                                                        f"({'EventID=4663 reliable session token' if _s1bp_logon_id_is_reliable else '4656+remote-machine LogonId-exact: SMB network session ID is authoritative'}). "
+                                                        f"Persistent session is stale by design — LogonId proof overrides freshness heuristic."
+                                                    )
+                                                else:
+                                                    _qna.info(
+                                                        f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                        f"LogonId-exact match found BUT 4656 event and matched session is "
+                                                        f"loopback/local — SubjectLogonId={_dwr_subj_logon_id!r} may be "
+                                                        f"an impersonation token (coincidental match with stale session "
+                                                        f"WorkstationName={_dwr_best[1]!r} TargetLogonId={_dwr_best[3]!r} "
+                                                        f"staleness={_dwr_best_staleness:.0f}s). "
+                                                        f"STALENESS GUARD WILL FIRE if own-machine has fresh narrow sessions."
+                                                    )
+                                            if _dwr_stale_override:
+                                                
+                                                _s1bp_local_user_raw = result.get("user", "")
+                                                
+                                                _burst_hit = _burst_cache_get(host, _s1bp_local_user_raw, require_remote=True, event_type=event_type)
+                                                if not _burst_hit:
+                                                    _qna.info(
+                                                        f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                        f"staleness-guard burst-cache SKIP — no exact-key hit for "
+                                                        f"host={host!r} server_local_user={_s1bp_local_user_raw!r}. "
+                                                        f"(Cross-user any-for-host hits intentionally ignored — "
+                                                        f"prior burst attribution must not bleed into a different actor's files.)"
+                                                    )
+                                                    
+                                                    _burst_hit_local = _burst_cache_get(_s1bp_local_user_raw and host, _s1bp_local_user_raw, require_remote=False, event_type=event_type) if _s1bp_local_user_raw else None
+                                                    if not _burst_hit_local:
+                                                        _burst_hit_local = _burst_cache_any_for_host(host, require_remote=False, event_type=event_type)
+                                                    if _burst_hit_local:
+                                                        _bhl_machine, _bhl_ip, _bhl_user = _burst_hit_local
+                                                        
+                                                        _bhl_is_own = (
+                                                            _bhl_machine.lower() == (_s1bp_own_host_resolved or "").lower()
+                                                            or _bhl_ip == (_s1bp_own_ip_resolved or "")
+                                                        )
+                                                        if not _bhl_is_own:
+                                                            _qna.info(
+                                                                f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h "
+                                                                f"staleness-guard local-sibling): "
+                                                                f"sibling file already attributed to local machine "
+                                                                f"machine={_bhl_machine!r} ip={_bhl_ip!r} user={_bhl_user!r}. "
+                                                                f"Reusing sibling's LOCAL attribution instead of promoting "
+                                                                f"own-machine (.106). Staleness guard SUPPRESSED for local-sibling match."
+                                                            )
+                                                            _old_user_dwr    = result.get("user", "")
+                                                            _old_machine_dwr = result.get("machine", "")
+                                                            _old_ip_dwr      = result.get("ip", "")
+                                                            result["machine"] = _bhl_machine
+                                                            result["ip"]      = _bhl_ip
+                                                            result["user"]    = _bhl_user
+                                                            _s1bp_matched = True
+                                                            _dwr_resolved = True
+                                                            _burst_hit    = _burst_hit_local  # reuse hit-path below
+
+                                                if _burst_hit:
+                                                    _burst_machine, _burst_ip, _burst_user = _burst_hit
+                                                    _old_user_dwr    = result.get("user", "")
+                                                    _old_machine_dwr = result.get("machine", "")
+                                                    _old_ip_dwr      = result.get("ip", "")
+                                                    result["machine"] = _burst_machine
+                                                    result["ip"]      = _burst_ip
+                                                    result["user"]    = _burst_user
+                                                    _s1bp_matched = True
+                                                    _dwr_resolved = True
+                                                    _qna.info(
+                                                        f"[_query_smb_audit] Strategy1b-post (burst-cache HIT): "
+                                                        f"staleness guard would have fired for "
+                                                        f"WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                        f"(staleness={_dwr_best_staleness:.0f}s > {_dwr_effective_threshold:.0f}s threshold) "
+                                                        f"BUT burst cache has confirmed remote actor for "
+                                                        f"host={host!r} server_local_user={_old_user_dwr!r} "
+                                                        f"→ reusing: machine={_burst_machine!r} ip={_burst_ip!r} user={_burst_user!r}. "
+                                                        f"Staleness guard SUPPRESSED. "
+                                                        f"server-local {_old_user_dwr!r}/{_old_machine_dwr!r}/{_old_ip_dwr!r} "
+                                                        f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                                    )
+                                                else:
+                                                    
+                                                    if (
+                                                        event_type == "deleted"
+                                                        and not is_dest_watch
+                                                        and not _s1bp_logon_id   # empty SubjectLogonId → cannot prove own-machine
+                                                    ):
+                                                        _qna.info(
+                                                            f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                            f"STALENESS GUARD fired but SubjectLogonId is EMPTY — "
+                                                            f"own-machine (.{_s1bp_own_ip_resolved}) NOT promoted. "
+                                                            f"Reason: empty LogonId means we cannot confirm own-machine "
+                                                            f"(.{_s1bp_own_ip_resolved}/{_s1bp_own_host_resolved}) deleted the files; "
+                                                            f"the file-server owner ({result.get('machine')!r}/{result.get('ip')!r}) "
+                                                            f"likely deleted locally (no Network Logon generated). "
+                                                            f"Keeping server-local identity. "
+                                                            f"Rejected stale third-party: "
+                                                            f"WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                            f"staleness={_dwr_best_staleness:.0f}s"
+                                                        )
+                                                        # Keep result as-is (server-local identity from 4663 already set).
+                                                        _s1bp_matched = True
+                                                        _dwr_resolved = True
+                                                    else:
+                                                        # For the forced path (_dwr_stale_override_forced), fall back to
+                                                        # _pf_own_fresh_safe if the narrow window is empty.
+                                                        _dwr_own_pool_for_attr = (
+                                                            _dwr_own_fresh_narrow
+                                                            or [(d, ws, ip, lid) for (d, ws, ip, lid) in _pf_own_fresh_safe]
+                                                        ) if '_pf_own_fresh_safe' in dir() else _dwr_own_fresh_narrow
+                                                        _dwr_best_own_narrow = min(
+                                                            _dwr_own_pool_for_attr, key=lambda x: abs(x[0])
+                                                        )
+                                                        _qna.info(
+                                                            f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                            f"STALENESS GUARD triggered (event_type={event_type!r}) — "
+                                                            f"best third-party candidate WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                            f"is {_dwr_best_staleness:.0f}s old (effective_threshold={_dwr_effective_threshold:.0f}s; "
+                                                            f"4656_threshold={_DWR_STALE_THRESHOLD_4656:.0f}s, 4663_threshold={_DWR_STALE_THRESHOLD:.0f}s) "
+                                                            f"AND own-machine has {len(_dwr_own_fresh_narrow)} fresh narrow-window session(s) within ±120s "
+                                                            f"(best own={_dwr_own_best_staleness:.1f}s, "
+                                                            f"freshness_ratio={(_dwr_best_staleness/_dwr_own_best_staleness) if _dwr_own_best_staleness else 0:.1f}x >= {_DWR_FRESHNESS_RATIO:.0f}x required). "
+                                                            f"Own-machine is dramatically fresher — preferring own-machine over stale third-party to avoid false attribution. "
+                                                            f"All third-party candidates (rejected): "
+                                                            f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2, _lid2) in _dwr_remote]}. "
+                                                            f"Own-machine winner: WorkstationName={_dwr_best_own_narrow[1]!r} "
+                                                            f"IpAddress={_dwr_best_own_narrow[2]!r} "
+                                                            f"time_diff={_dwr_best_own_narrow[0]:+.1f}s"
+                                                        )
+                                                        _dwr_machine = _dwr_best_own_narrow[1] if _dwr_best_own_narrow[1] else _dwr_best_own_narrow[2]
+                                                        _old_user_dwr    = result.get("user", "")
+                                                        _old_machine_dwr = result.get("machine", "")
+                                                        _old_ip_dwr      = result.get("ip", "")
+                                                        result["machine"] = _dwr_machine
+                                                        result["ip"]      = _dwr_best_own_narrow[2] if _dwr_best_own_narrow[2] else _old_ip_dwr
+                                                        result["user"]    = (
+                                                            f"{_dwr_machine}\\{_s1bp_4663_uname}"
+                                                            if _dwr_machine and _s1bp_4663_uname
+                                                            else _old_user_dwr
+                                                        )
+                                                        _s1bp_matched = True
+                                                        _dwr_resolved = True
+                                                        _qna.info(
+                                                            f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h staleness-guard): "
+                                                            f"server-local {_old_user_dwr!r}/{_old_machine_dwr!r}/{_old_ip_dwr!r} "
+                                                            f"-> own-machine {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                                        )
+                                            else:
+                                                # Third-party is fresh enough (or own-machine has no narrow sessions),
+                                                # OR the staleness guard was bypassed due to a LogonId-exact match.
+                                                # Use the third-party candidate as the actor.
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                    f"found {len(_dwr_remote)} third-party remote candidate(s): "
+                                                    f"{[(_ws2, _ip2, _lid2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2, _lid2) in _dwr_remote]}. "
+                                                    f"Best candidate staleness={_dwr_best_staleness:.0f}s "
+                                                    f"logon_id_exact={_dwr_best_logon_id_exact} subj_logon_id={_dwr_subj_logon_id!r} "
+                                                    f"(threshold={_DWR_STALE_THRESHOLD:.0f}s, "
+                                                    f"own-machine narrow sessions={len(_dwr_own_fresh_narrow)}). "
+                                                    f"Using: WorkstationName={_dwr_best[1]!r} "
+                                                    f"IpAddress={_dwr_best[2]!r} TargetLogonId={_dwr_best[3]!r} time_diff={_dwr_best[0]:+.1f}s — "
+                                                    f"overriding server-local identity."
+                                                )
+                                                _dwr_machine = _dwr_best[1] if _dwr_best[1] else _dwr_best[2]
+                                                _old_user_dwr    = result.get("user", "")
+                                                _old_machine_dwr = result.get("machine", "")
+                                                _old_ip_dwr      = result.get("ip", "")
+                                                result["machine"] = _dwr_machine
+                                                result["ip"]      = _dwr_best[2] if _dwr_best[2] else _old_ip_dwr
+                                                result["user"]    = (
+                                                    f"{_dwr_machine}\\{_s1bp_4663_uname}"
+                                                    if _dwr_machine and _s1bp_4663_uname
+                                                    else _old_user_dwr
+                                                )
+                                                _s1bp_matched = True
+                                                _dwr_resolved = True
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h remote): "
+                                                    f"server-local {_old_user_dwr!r}/{_old_machine_dwr!r}/{_old_ip_dwr!r} "
+                                                    f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                                )
+                                                
+                                                _burst_cache_put(
+                                                    host,
+                                                    _old_user_dwr,  # server-local user (e.g. DESKTOP-KGG55PU\User)
+                                                    result["machine"],
+                                                    result["ip"],
+                                                    result["user"],
+                                                    event_type=event_type,
+                                                )
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (burst-cache): "
+                                                    f"stored confirmed remote attribution for host={host!r} "
+                                                    f"server_local_user={_old_user_dwr!r} event_type={event_type!r} -> "
+                                                    f"machine={result['machine']!r} ip={result['ip']!r} "
+                                                    f"(TTL={_BURST_CACHE_TTL:.0f}s)"
+                                                )
+                                        else:
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                f"no third-party candidates found (own={len(_dwr_own)}); "
+                                                f"actor is likely server-local. Keeping server-local identity."
+                                            )
+                                    except Exception as _dwr_ex:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                            f"24h query failed: {_dwr_ex!r}; falling back to server-local identity."
+                                        )
+                                if not _dwr_resolved:
+                                    # No third-party remote found in 24h scan.
+                                    # For source-watch exact-add (deferred own-machine path):
+                                    # robocopy never writes to source, and no third-party was found,
+                                    # so own-machine IS the actor after all — use the deferred
+                                    # own-machine candidate (the backup-app machine user who manually
+                                    # copied/added the file from their machine).
+                                    _src_exact_own = "_pf_src_exact_add_own" in dir() and _pf_src_exact_add_own
+                                    if not is_dest_watch and event_type in ("added", "modified") and not _s1bp_parent_only and _src_exact_own:
+                                        _dwr_neg_src = [(d, ws, ip, lid) for (d, ws, ip, lid) in _src_exact_own if d <= 0]
+                                        _dwr_best_src = (
+                                            min(_dwr_neg_src, key=lambda x: abs(x[0])) if _dwr_neg_src
+                                            else min(_src_exact_own, key=lambda x: abs(x[0]))
+                                        )
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (pre-fetched dest-watch rescue): "
+                                            f"no third-party found in 24h scan for source-watch exact-add — "
+                                            f"falling back to own-machine (robocopy never writes to source, "
+                                            f"and no other LAN actor detected). "
+                                            f"WorkstationName={_dwr_best_src[1]!r} IpAddress={_dwr_best_src[2]!r} "
+                                            f"time_diff={_dwr_best_src[0]:+.1f}s"
+                                        )
+                                        result["machine"] = _dwr_best_src[1]
+                                        result["ip"]      = _dwr_best_src[2]
+                                        result["user"]    = (
+                                            f"{_dwr_best_src[1]}\\{_s1bp_4663_uname}"
+                                            if _dwr_best_src[1] and _s1bp_4663_uname
+                                            else result.get("user", "")
+                                        )
+                                    else:
+                                        # No third-party remote found — actor is server-local (owner
+                                        # operating the file server directly, or loopback session).
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (pre-fetched dest-watch rescue): "
+                                            f"no remote third-party found via 24h query; keeping server-local "
+                                            f"4656/4663 identity. user={result.get('user')!r} "
+                                            f"machine={result.get('machine')!r} ip={result.get('ip')!r}."
+                                        )
+                                        result["machine"] = result.get("machine") or host
+                                        result["ip"]      = host
+                                    _s1bp_matched = True
+                        else:
+                            # ── Burst cache rescue for PARENT-ONLY source-watch adds ──
+                            # When two files are added at nearly the same time (e.g. IMG_0019.pdf
+                            # and IMG_0020.pdf), the first file's 4656 event covers both via
+                            # folder match, making it PARENT-ONLY for the second file — so
+                            # there is no LogonId to correlate and own-machine is suppressed.
+                            # If the sibling file was ALREADY attributed (e.g. IMG_0020.pdf
+                            # → DESKTOP-FAGSHTO via LogonId-exact match), the burst cache
+                            # holds that result.  Reuse it here instead of returning UNKNOWN.
+                            # Record the server-local user BEFORE blanking it so the final
+                            # burst-cache rescue (at function end) can check after strategies
+                            # 4/5/6 finish — needed when the sibling resolves AFTER this point.
+                            _po_burst_server_user = result.get("user", "")
+                            if _po_burst_server_user:
+                                _s1bp_server_local_user_burst_key = _po_burst_server_user
+                            # Strategy A: exact key (server_local_user) lookup
+                            # Strategy B: any-host fallback
+                            # Both strategies are retried in a short polling loop (up to 6s,
+                            # 0.5s steps) because two concurrent files often run _query_smb_audit
+                            # in parallel — the sibling file (which gets the LogonId-exact 4656
+                            # match) may not have written to the burst cache yet when THIS file
+                            # reaches this rescue point.  The poll lets the sibling finish first.
+                            import time as _po_retry_time
+                            _po_burst_hit = None
+                            _po_burst_via_any = False
+                            _po_retry_max   = 12.0  # seconds — extended: concurrent wevtutil queries
+                                                    # can take 7-9s; 12s covers worst-case races
+                            _po_retry_step  = 0.3   # seconds between polls (faster = less UI lag)
+                            _po_retry_elapsed = 0.0
+                            _po_retry_attempt = 0
+                            while True:
+                                _po_burst_hit = _burst_cache_lookup(host, _po_burst_server_user, event_type=event_type) if _po_burst_server_user else _burst_cache_any_for_host(host, event_type=event_type)
+                                if not _po_burst_hit:
+                                    _po_burst_hit = _burst_cache_any_for_host(host, event_type=event_type)
+                                    if _po_burst_hit:
+                                        _po_burst_via_any = True
+                                if _po_burst_hit:
+                                    break
+                                if _po_retry_elapsed >= _po_retry_max:
+                                    break
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (parent-only burst-cache rescue): "
+                                    f"attempt {_po_retry_attempt + 1} — exact-key "
+                                    f"(server_local_user={_po_burst_server_user!r}) and any-host both "
+                                    f"MISS for host={host!r}. Sibling not resolved yet; "
+                                    f"retrying in {_po_retry_step:.1f}s "
+                                    f"(elapsed={_po_retry_elapsed:.1f}s / max={_po_retry_max:.1f}s)."
+                                )
+                                _po_retry_time.sleep(_po_retry_step)
+                                _po_retry_elapsed += _po_retry_step
+                                _po_retry_attempt += 1
+
+                            if _po_burst_hit:
+                                if _po_burst_via_any:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (parent-only burst-cache rescue): "
+                                        f"exact-key miss for server_local_user={_po_burst_server_user!r} "
+                                        f"but any-host fallback HIT for host={host!r} "
+                                        f"after {_po_retry_elapsed:.1f}s / {_po_retry_attempt} poll(s). "
+                                        f"-> machine={_po_burst_hit[0]!r} ip={_po_burst_hit[1]!r} user={_po_burst_hit[2]!r}"
+                                    )
+                                else:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (parent-only burst-cache rescue): "
+                                        f"exact-key HIT for server_local_user={_po_burst_server_user!r} "
+                                        f"host={host!r} after {_po_retry_elapsed:.1f}s / {_po_retry_attempt} poll(s). "
+                                        f"-> machine={_po_burst_hit[0]!r} ip={_po_burst_hit[1]!r} user={_po_burst_hit[2]!r}"
+                                    )
+                            else:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (parent-only burst-cache rescue): "
+                                    f"both exact-key (server_local_user={_po_burst_server_user!r}) "
+                                    f"and any-host fallback MISSED for host={host!r} "
+                                    f"after {_po_retry_elapsed:.1f}s / {_po_retry_attempt} poll(s). "
+                                    f"Burst cache is empty for this host — sibling not resolved within retry window."
+                                )
+                            if _po_burst_hit:
+                                _po_bc_machine, _po_bc_ip, _po_bc_user = _po_burst_hit
+                                result["user"]    = _po_bc_user
+                                result["machine"] = _po_bc_machine
+                                result["ip"]      = _po_bc_ip
+                                _s1bp_matched = True
+                            else:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: PARENT-ONLY 4656 "
+                                    f"(matched folder, not exact filename) — "
+                                    f"own-machine sessions SUPPRESSED to avoid false robocopy attribution. "
+                                    f"server_local_user={_po_burst_server_user!r} "
+                                    f"burst_cache_key=({host!r}, {_po_burst_server_user!r}). "
+                                    f"Burst cache miss after {_po_retry_elapsed:.1f}s polling. "
+                                    f"Final burst-cache rescue will retry after strategies 4/5/6; "
+                                    f"if a sibling file resolves first, retroactive BURST-PATCH in "
+                                    f"_on_file_change will still fix this Unknown row in the UI. "
+                                    f"Actor is UNKNOWN for now. own-machine candidates (suppressed): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _pf_own_fresh_safe]}"
+                                )
+                                result["user"]    = ""
+                                result["machine"] = ""
+                                result["ip"]      = ""
+                    else:
+                        # No own-machine 4624 found either. Either all sessions were loopback /
+                        # the file server itself, OR the ±120s narrow window simply missed a
+                        # third-party machine that connected earlier (e.g. >900s ago).
+                        # For dest-watch with a server-local identity, run a 24h query to check.
+                        _lc_resolved = False
+                        # GUARD: if we have a reliable 4663 SubjectLogonId that found NO
+                        # matching 4624 Network Logon, the actor is DEFINITIVELY LOCAL on the
+                        # file server.  Do NOT run the 24h query — it will find stale third-party
+                        # sessions from earlier bursts and wrongly override the local actor.
+                        _lc_confirmed_local = bool(_s1bp_logon_id and _s1bp_logon_id_is_reliable)
+                        if _lc_confirmed_local:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (local-fallback 24h): "
+                                f"SKIPPING 24h query — confirmed local actor via reliable 4663 "
+                                f"SubjectLogonId={_s1bp_logon_id!r} with no matching 4624 Network Logon. "
+                                f"Actor is the file-server machine itself ({result.get('user')!r} on {host!r}). "
+                                f"Stale third-party sessions from earlier bursts must not override this."
+                            )
+                        if not _lc_confirmed_local and (is_dest_watch or (not is_dest_watch and event_type == "deleted")) and result.get("user") and result.get("machine") and _win_user and _win_pass:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (local-fallback 24h): "
+                                f"no 4624 found in pre-fetched window; running 24h query to check "
+                                f"for remote third-party machines before assuming server-local actor."
+                            )
+                            try:
+                                import datetime as _lc_dt
+                                import xml.etree.ElementTree as _lc_et
+                                _lc_end   = (event_dt_utc + _lc_dt.timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S")
+                                _lc_start = (event_dt_utc - _lc_dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+                                # NOTE: Do NOT use XPath IpAddress != own-machine filter here —
+                                # same issue as the dest-watch rescue 24h query: the != operator
+                                # in XPath on Security log EventData can cause wevtutil to return
+                                # 0 results on some Windows versions.  Python filtering below
+                                # handles own-machine exclusion correctly.
+                                _lc_query = (
+                                    f"*[System[EventID=4624 and "
+                                    f"TimeCreated[@SystemTime>='{_lc_start}' and @SystemTime<='{_lc_end}']] "
+                                    f"and EventData[Data[@Name='LogonType']='3']]"
+                                )
+                                _lc_cmd = [
+                                    "wevtutil", "qe", "Security",
+                                    f"/r:{host}", f"/u:{_win_user}", f"/p:{_win_pass}",
+                                    "/rd:true", "/c:2000", "/f:xml", f"/q:{_lc_query}",
+                                ]
+                                _lc_result = _s1bp_sp.run(
+                                    _lc_cmd, capture_output=True, text=True, timeout=20,
+                                    creationflags=_CNW_1BP,
+                                )
+                                _lc_remote = []
+                                _lc_own_from_24h = []  # own-machine (.108) sessions from 24h query
+                                if _lc_result.returncode == 0 and _lc_result.stdout.strip():
+                                    _lc_xml  = "<root>" + _lc_result.stdout + "</root>"
+                                    _lc_root = _lc_et.fromstring(_lc_xml)
+                                    _lc_ns   = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                                    for _lc_ev in _lc_root:
+                                        try:
+                                            _lc_sys = _lc_ev.find("e:System", _lc_ns)
+                                            if _lc_sys is None:
+                                                continue
+                                            _lc_tc = _lc_sys.find("e:TimeCreated", _lc_ns)
+                                            if _lc_tc is None:
+                                                continue
+                                            _lc_dts  = _lc_tc.attrib.get("SystemTime", "")
+                                            _lc_evdt = _lc_dt.datetime.fromisoformat(
+                                                _lc_dts.replace("Z", "+00:00")
+                                            ).replace(tzinfo=None)
+                                            _lc_d = (_lc_evdt - event_dt_utc).total_seconds()
+                                            if _lc_d > 30 or _lc_d < -86400:
+                                                continue
+                                            _lc_edata = _lc_ev.find("e:EventData", _lc_ns)
+                                            if _lc_edata is None:
+                                                continue
+                                            _lc_map = {d.get("Name", ""): (d.text or "") for d in _lc_edata if d.get("Name")}
+                                            if _lc_map.get("LogonType", "") != "3":
+                                                continue
+                                            _lc_ws = _lc_map.get("WorkstationName", "").strip("-").strip()
+                                            _lc_ip = _lc_map.get("IpAddress", "").strip()
+                                            if _lc_ip in ("127.0.0.1", "::1", "", host) or _lc_ws.lower() == host.lower():
+                                                continue
+                                            _lc_is_own = (
+                                                (bool(_s1bp_own_ip_resolved) and _lc_ip == _s1bp_own_ip_resolved)
+                                                or (bool(_s1bp_own_host_resolved) and _lc_ws.lower() == _s1bp_own_host_resolved)
+                                            )
+                                            if _lc_is_own:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
+                                                    f"DEFER own-machine 4624 WorkstationName={_lc_ws!r} "
+                                                    f"IpAddress={_lc_ip!r} time_diff={_lc_d:+.1f}s"
+                                                )
+                                                _lc_own_from_24h.append((_lc_d, _lc_ws, _lc_ip))
+                                                continue
+                                            _lc_remote.append((_lc_d, _lc_ws, _lc_ip))
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
+                                                f"third-party 4624 WorkstationName={_lc_ws!r} "
+                                                f"IpAddress={_lc_ip!r} time_diff={_lc_d:+.1f}s"
+                                            )
+                                        except Exception:
+                                            continue
+                                if _lc_remote:
+                                    _lc_neg  = [(d, ws, ip) for (d, ws, ip) in _lc_remote if d <= 0]
+                                    _lc_best = (
+                                        min(_lc_neg,    key=lambda x: abs(x[0])) if _lc_neg
+                                        else min(_lc_remote, key=lambda x: abs(x[0]))
+                                    )
+                                    # ── Staleness guard (same as dest-watch-rescue 24h) ──────
+                                    # NOTE: guard disabled for deleted/renamed — robocopy never
+                                    # deletes, so all third-party sessions are valid actors
+                                    # regardless of age. Only applies to added/modified.
+                                    _LC_STALE_THRESHOLD = 3600.0
+                                    _lc_best_staleness  = abs(_lc_best[0])
+                                    # Build own-machine narrow sessions: prefer pre-fetched
+                                    # (already filtered ±120s), fall back to 24h own sessions.
+                                    _lc_own_fresh_narrow = [
+                                        (d, ws, ip) for (d, ws, ip, _lid) in _pf_own_fresh_safe
+                                        if abs(d) <= 120
+                                    ]
+                                    # If no pre-fetched own sessions (e.g. reliable 4663 path
+                                    # never populates _pf_own_fresh), use 24h own sessions
+                                    # within ±120s instead.
+                                    if not _lc_own_fresh_narrow:
+                                        _lc_own_fresh_narrow = [
+                                            (d, ws, ip) for (d, ws, ip) in _lc_own_from_24h
+                                            if abs(d) <= 120
+                                        ]
+                                    # Extra condition: a reliable 4663 SubjectLogonId that
+                                    # resolved to a loopback 4624 (127.0.0.1) means the actor
+                                    # is DEFINITIVELY LOCAL on the server — no stale third-party
+                                    # session should override that conclusion regardless of
+                                    # whether own-machine sessions happen to be in the window.
+                                    _lc_logon_confirmed_local = bool(
+                                        _s1bp_logon_id and _s1bp_logon_id_is_reliable
+                                    )
+                                    # When SubjectLogonId (4663) confirmed local via loopback
+                                    # 4624 match, the actor is DEFINITIVELY on the server itself.
+                                    # No third-party session — regardless of staleness — should
+                                    # ever override this. Bypass the staleness threshold check
+                                    # entirely when _lc_logon_confirmed_local is True.
+                                    _lc_stale_override = (
+                                        event_type not in ("deleted", "renamed")
+                                        and (
+                                            _lc_logon_confirmed_local  # definitive local: always override
+                                            or _lc_best_staleness > _LC_STALE_THRESHOLD
+                                        )
+                                        and (bool(_lc_own_fresh_narrow) or _lc_logon_confirmed_local)
+                                    )
+                                    
+                                    if _lc_stale_override and _s1bp_parent_only and not _lc_logon_confirmed_local:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
+                                            f"PARENT-ONLY GUARD — staleness guard would attribute to own-machine "
+                                            f"but 4663 match was for a different file (parent-only). "
+                                            f"Keeping server-local identity: user={result.get('user')!r} "
+                                            f"machine={result.get('machine')!r} ip={result.get('ip')!r}. "
+                                            f"Rejected third-party candidates: "
+                                            f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2) in _lc_remote]}"
+                                        )
+                                        _s1bp_matched = True
+                                        _lc_resolved  = True
+                                    elif _lc_stale_override:
+                                        if _lc_own_fresh_narrow:
+                                            _lc_best_own_n = min(_lc_own_fresh_narrow, key=lambda x: abs(x[0]))
+                                            _lc_guard_reason = (
+                                                f"confirmed-local 4663 logon AND own-machine has "
+                                                f"{len(_lc_own_fresh_narrow)} fresh narrow-window session(s) "
+                                                f"(WorkstationName={_lc_best_own_n[1]!r} IpAddress={_lc_best_own_n[2]!r} "
+                                                f"time_diff={_lc_best_own_n[0]:+.1f}s)"
+                                                if _lc_logon_confirmed_local else
+                                                f"own-machine has {len(_lc_own_fresh_narrow)} fresh narrow-window session(s) "
+                                                f"(WorkstationName={_lc_best_own_n[1]!r} IpAddress={_lc_best_own_n[2]!r} "
+                                                f"time_diff={_lc_best_own_n[0]:+.1f}s)"
+                                            )
+                                        else:
+                                            # Confirmed-local 4663: keep server-local identity (.109)
+                                            _lc_best_own_n = None
+                                            _lc_guard_reason = (
+                                                f"confirmed-local 4663 SubjectLogonId={_s1bp_logon_id!r} "
+                                                f"resolved to loopback — actor is definitively LOCAL on {host!r}. "
+                                                f"No own-machine sessions available; keeping server-local identity."
+                                            )
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
+                                            f"STALENESS GUARD (event_type={event_type!r}, not deleted/renamed) — "
+                                            f"best third-party WorkstationName={_lc_best[1]!r} "
+                                            f"IpAddress={_lc_best[2]!r} is {_lc_best_staleness:.0f}s old "
+                                            f"(threshold={_LC_STALE_THRESHOLD:.0f}s"
+                                            f"{'; confirmed-local 4663 override — threshold bypassed' if _lc_logon_confirmed_local and _lc_best_staleness <= _LC_STALE_THRESHOLD else ''}). "
+                                            f"Reason: {_lc_guard_reason}. "
+                                            f"Rejected third-party candidates: "
+                                            f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2) in _lc_remote]}"
+                                        )
+                                        _old_user_lc    = result.get("user", "")
+                                        _old_machine_lc = result.get("machine", "")
+                                        _old_ip_lc      = result.get("ip", "")
+                                        if _lc_best_own_n is not None:
+                                            # Attribute to own-machine (.108)
+                                            _lc_machine = _lc_best_own_n[1] if _lc_best_own_n[1] else _lc_best_own_n[2]
+                                            result["machine"] = _lc_machine
+                                            result["ip"]      = _lc_best_own_n[2] if _lc_best_own_n[2] else _old_ip_lc
+                                            result["user"]    = (
+                                                f"{_lc_machine}\\{_s1bp_4663_uname}"
+                                                if _lc_machine and _s1bp_4663_uname
+                                                else _old_user_lc
+                                            )
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h staleness-guard): "
+                                                f"server-local {_old_user_lc!r}/{_old_machine_lc!r}/{_old_ip_lc!r} "
+                                                f"-> own-machine {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                            )
+                                        else:
+                                            # Keep server-local (.109) — actor is definitively LOCAL
+                                            result["machine"] = result.get("machine") or host
+                                            result["ip"]      = host
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h staleness-guard): "
+                                                f"keeping server-local {_old_user_lc!r}/{result['machine']!r}/{result['ip']!r} "
+                                                f"— confirmed-local 4663 logon, no own-machine session to substitute."
+                                            )
+                                        _s1bp_matched = True
+                                        _lc_resolved  = True
+                                    else:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
+                                            f"found {len(_lc_remote)} third-party candidate(s): "
+                                            f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2) in _lc_remote]}. "
+                                            f"Best candidate staleness={_lc_best_staleness:.0f}s "
+                                            f"(threshold={_LC_STALE_THRESHOLD:.0f}s, "
+                                            f"own-machine narrow sessions={len(_lc_own_fresh_narrow)}). "
+                                            f"Using closest: WorkstationName={_lc_best[1]!r} "
+                                            f"IpAddress={_lc_best[2]!r} time_diff={_lc_best[0]:+.1f}s."
+                                        )
+                                        _lc_machine = _lc_best[1] if _lc_best[1] else _lc_best[2]
+                                        _old_user_lc    = result.get("user", "")
+                                        _old_machine_lc = result.get("machine", "")
+                                        _old_ip_lc      = result.get("ip", "")
+                                        result["machine"] = _lc_machine
+                                        result["ip"]      = _lc_best[2] if _lc_best[2] else _old_ip_lc
+                                        result["user"]    = (
+                                            f"{_lc_machine}\\{_s1bp_4663_uname}"
+                                            if _lc_machine and _s1bp_4663_uname
+                                            else _old_user_lc
+                                        )
+                                        _s1bp_matched = True
+                                        _lc_resolved  = True
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h remote): "
+                                            f"server-local {_old_user_lc!r}/{_old_machine_lc!r}/{_old_ip_lc!r} "
+                                            f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                        )
+                                else:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
+                                        f"no third-party found; actor is server-local."
+                                    )
+                            except Exception as _lc_ex:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
+                                    f"query failed: {_lc_ex!r}; keeping server-local identity."
+                                )
+                        if not _lc_resolved:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: pre-fetched 4624 events had "
+                                f"no usable remote candidate (all were loopback or file-server itself) "
+                                f"— actor was LOCAL. Keeping 4663: user={result.get('user')!r}"
+                            )
+                            result["machine"] = result.get("machine") or host
+                            result["ip"]      = host
+                            # ── Burst cache: store LOCAL attribution so concurrent PARENT-ONLY
+                            # sibling files can reuse it instead of returning Unknown.
+                            # CRITICAL: must store with local_actor=True so that the staleness-guard
+                            # burst-cache check (which uses require_remote=True) correctly skips this
+                            # entry and falls through to promote own-machine (.106) as the actor.
+                            # Without local_actor=True the entry looked like a confirmed remote entry,
+                            # causing the second sibling file to inherit the wrong server-local (.105)
+                            # identity instead of being correctly attributed to own-machine (.106).
+                            _lc_bk = locals().get("_s1bp_server_local_user_burst_key", "") or result.get("user", "")
+                            _lc_bm = result.get("machine", "")
+                            if _lc_bk and _lc_bm:
+                                _burst_cache_put(
+                                    host, _lc_bk,
+                                    _lc_bm,
+                                    result.get("ip", "") or host,
+                                    result.get("user", ""),
+                                    local_actor=True,
+                                    event_type=event_type,
+                                )
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched local-actor burst-cache): "
+                                    f"stored LOCAL attribution for host={host!r} "
+                                    f"server_local_user_key={_lc_bk!r} event_type={event_type!r} -> "
+                                    f"machine={_lc_bm!r} (TTL={_BURST_CACHE_TTL:.0f}s, local_actor=True)"
+                                )
+                # Either way (matched or local), we're done — skip the separate query path
+                result.pop("_s1b_server_local", None)
+                result.pop("_s1b_logon_id", None)
+                result.pop("_s1b_4624_events", None)
+                result.pop("_s1b_handle_logon_ids", None)
+                result.pop("_s1b_event_id", None)
+                result.pop("_s1b_parent_only_match", None)
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b/1c resolved attribution — "
+                    f"skipping NetSessionEnum/NetFileEnum. user={result.get('user')!r}"
+                )
+                # Skip the rest of Strategy1b-post (separate query path)
+                raise _S1BPostDone()  # use local sentinel to break out cleanly
+
+            # ── Slow path: separate wevtutil query (may fail with Access Denied) ─
+            if _s1bp_logon_id:
+                _s1bp_query = (
+                    f"*[System[EventID=4624] and "
+                    f"EventData[Data[@Name='TargetLogonId']='{_s1bp_logon_id}']]"
+                )
+                _s1bp_cmd = [
+                    "wevtutil", "qe", "Security",
+                    f"/r:{host}",
+                    f"/u:{_win_user}",
+                    f"/p:{_win_pass}",
+                    "/rd:true",
+                    "/c:1",
+                    "/f:xml",
+                    f"/q:{_s1bp_query}",
+                ]
+            else:
+                _s1bp_cmd = [
+                    "wevtutil", "qe", "Security",
+                    f"/r:{host}",
+                    f"/u:{_win_user}",
+                    f"/p:{_win_pass}",
+                    "/rd:true",
+                    "/c:2000",
+                    "/f:xml",
+                    "/q:*[System[EventID=4624] and EventData[Data[@Name='LogonType']='3']]",
+                ]
+            _s1bp_result = _s1bp_sp.run(
+                _s1bp_cmd,
+                capture_output=True, text=True, timeout=15,
+                creationflags=_CNW_1BP,
+            )
+            _s1bp_matched = False
+            # Remember whether we originally had a LogonId from 4663.
+            # If the LogonId exact query returns nothing, it means the session is a
+            # LOCAL (interactive/console) logon — Windows never emits Event 4624
+            # LogonType=3 for local actions. In that case we must NOT use the
+            # time-window closest fallback, which would incorrectly pick a stale
+            # remote session from an earlier backup job.
+            _s1bp_had_logon_id = bool(_s1bp_logon_id)
+            # When the direct logon-ID query returns no results, log diagnostics
+            # (including stderr) and try the fallback time-window scan.
+            if _s1bp_logon_id and (_s1bp_result.returncode != 0 or not _s1bp_result.stdout.strip()):
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b-post: direct TargetLogonId query "
+                    f"returned nothing for logon_id={_s1bp_logon_id!r} on {host!r}. "
+                    f"rc={_s1bp_result.returncode} stderr={_s1bp_result.stderr.strip()!r} "
+                    f"stdout_len={len(_s1bp_result.stdout)} "
+                    f"NOTE: Windows may store TargetLogonId with different zero-padding "
+                    f"or the 4624 may have already been overwritten by the Security log. "
+                    f"Trying fallback: query 4624 events near deletion time (±120s)."
+                )
+                # Fallback: query 4624 events near the deletion timestamp.
+                # IMPORTANT: when multiple machines have open SMB sessions to this
+                # file-server at the same time, this window may return 4624s for
+                # ALL of them (e.g. your backup session AND the folder owner's
+                # local logon). The correct candidate is the one whose 4624 is
+                # CLOSEST in time to the deletion (smallest abs(time_diff)),
+                # because a deletion from a remote machine opens (or recently used)
+                # an SMB session within seconds of the actual delete operation,
+                # while a stale background session (e.g. from an earlier backup)
+                # will have a much older 4624 timestamp.
+                import datetime as _dt1bp_fb
+                _fb_utc_str = event_dt_utc.strftime("%Y-%m-%dT%H:%M:%S")
+                _fb_start   = (event_dt_utc - _dt1bp_fb.timedelta(seconds=120)).strftime("%Y-%m-%dT%H:%M:%S")
+                _fb_end     = (event_dt_utc + _dt1bp_fb.timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S")
+                _fb_query   = (
+                    f"*[System[EventID=4624 and "
+                    f"TimeCreated[@SystemTime>='{_fb_start}' and @SystemTime<='{_fb_end}']] "
+                    f"and EventData[Data[@Name='LogonType']='3']]"
+                )
+                _fb_cmd = [
+                    "wevtutil", "qe", "Security",
+                    f"/r:{host}",
+                    f"/u:{_win_user}",
+                    f"/p:{_win_pass}",
+                    "/rd:true",
+                    "/c:50",
+                    "/f:xml",
+                    f"/q:{_fb_query}",
+                ]
+                _fb_result = _s1bp_sp.run(
+                    _fb_cmd, capture_output=True, text=True, timeout=15,
+                    creationflags=_CNW_1BP,
+                )
+                if _fb_result.returncode == 0 and _fb_result.stdout.strip():
+                    _s1bp_result = _fb_result
+                    _s1bp_logon_id = ""  # use time-window matching in loop below
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1b-post: ±120s fallback query "
+                        f"returned results — will select CLOSEST-in-time 4624 candidate"
+                    )
+                else:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1b-post: ±120s fallback also "
+                        f"returned nothing. The 4624 has rotated out of the Security log. "
+                        f"To fix: increase Security log max size on {host!r} (Event Viewer → "
+                        f"Windows Logs → Security → Properties → set max size to 512MB+). "
+                        f"Falling through to no-match (actor treated as LOCAL — Scenario 3)."
+                    )
+            # KEY SAFETY CHECK: if we originally had a SubjectLogonId from the 4663
+            # event but the direct TargetLogonId query returned nothing (no matching
+            # 4624 Network Logon exists), the logon session is LOCAL (interactive/
+            # console) — Windows never emits Event 4624 LogonType=3 for local actions.
+            # Block the ±120s time-window path to prevent picking stale remote 4624s
+            # from earlier backup sessions. Clearing _s1bp_result forces the no-match
+            # fallback below, correctly treating the actor as LOCAL (Scenario 3).
+            # IMPORTANT: only apply this when the matched event was 4663 (primary
+            # session LogonId). Event 4656 uses an impersonation token LogonId that
+            # will never match 4624 even for genuine remote actors, so we must NOT
+            # treat "no 4624 match" as LOCAL in that case.
+            if _s1bp_had_logon_id and not _s1bp_logon_id and _s1bp_logon_id_is_reliable:
+                # _s1bp_logon_id was cleared above after the exact query returned nothing.
+                # Event was 4663: SubjectLogonId is the primary session ID.  No matching
+                # 4624 Network Logon in the ±120s window normally means LOCAL actor.
+                #
+                # HOWEVER: a coworker who opened the share before deleting will have their
+                # 4624 OUTSIDE the ±120s narrow window.  Check wide-window (120–900s)
+                # pre-fetched 4624s for any third-party non-own, non-server candidate.
+                _s1bp_skip_xml = True  # default: treat as LOCAL
+                _s1b_4624_wide_here = result.get("_s1b_4624_wide", [])
+                _wide_remote_cands = []  # initialise so the 24h-fallback condition works in both branches
+                if _s1b_4624_wide_here:
+                    _wide_remote_cands = []
+                    _wide_own_cands    = []
+                    for (_wd, _wws, _wip, _wlid) in _s1b_4624_wide_here:
+                        if (_wip in ("127.0.0.1", "::1", "", host)
+                                or _wws.lower() == host.lower()):
+                            continue  # skip loopback / file-server itself
+                        _w_is_own = (
+                            (bool(_s1bp_own_ip_resolved) and _wip == _s1bp_own_ip_resolved)
+                            or (bool(_s1bp_own_host_resolved) and _wws.lower() == _s1bp_own_host_resolved)
+                        )
+                        if _w_is_own:
+                            _wide_own_cands.append((_wd, _wws, _wip, _wlid))
+                        else:
+                            _wide_remote_cands.append((_wd, _wws, _wip, _wlid))
+                    if _wide_remote_cands:
+                        # Genuine third-party machine had open session in 120-900s window.
+                        _wrc_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _wide_remote_cands if d <= 0]
+                        _wrc_best = (
+                            min(_wrc_neg,              key=lambda x: abs(x[0])) if _wrc_neg
+                            else min(_wide_remote_cands, key=lambda x: abs(x[0]))
+                        )
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post: SubjectLogonId present "
+                            f"(EventID={_s1bp_event_id}) but no narrow-window 4624 match — "
+                            f"found {len(_wide_remote_cands)} wide-window (120-900s) "
+                            f"third-party candidate(s): "
+                            f"{[(_wws2, _wip2, f'{_wd2:+.1f}s') for (_wd2, _wws2, _wip2, _) in _wide_remote_cands]}. "
+                            f"Using closest: WorkstationName={_wrc_best[1]!r} "
+                            f"IpAddress={_wrc_best[2]!r} time_diff={_wrc_best[0]:+.1f}s."
+                        )
+                        _wrc_remote_machine = _wrc_best[1] if _wrc_best[1] else _wrc_best[2]
+                        _old_user_w    = result.get("user", "")
+                        _old_machine_w = result.get("machine", "")
+                        _old_ip_w      = result.get("ip", "")
+                        result["machine"] = _wrc_remote_machine
+                        result["ip"]      = _wrc_best[2] if _wrc_best[2] else _old_ip_w
+                        result["user"]    = (
+                            f"{_wrc_remote_machine}\\{_s1bp_4663_uname}"
+                            if _wrc_remote_machine and _s1bp_4663_uname
+                            else _old_user_w
+                        )
+                        _s1bp_matched = True
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post (WideWindow-Remote): "
+                            f"server-local {_old_user_w!r}/{_old_machine_w!r}/{_old_ip_w!r} "
+                            f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                        )
+                        raise _S1BPostDone()
+                    else:
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post: SubjectLogonId present "
+                            f"(EventID={_s1bp_event_id}) — wide window (120-900s) had no "
+                            f"third-party candidates (own={len(_wide_own_cands)}). "
+                            f"Escalating to dedicated 24h 4624 query to catch persistent "
+                            f"coworker sessions (e.g. connected >900s ago). "
+                            f"user={result.get('user')!r}"
+                        )
+                        # Fall through — treated as "empty" for the 24h query below
+                if not _s1b_4624_wide_here or not _wide_remote_cands:
+                    # Either _s1b_4624_wide was empty, OR the wide window (120-900s) had
+                    # only own-machine entries. In both cases, run the dedicated 24h query
+                    # to catch coworkers whose sessions are >900s old.
+                    # Last resort: run a dedicated wide-window 4624 query going back
+                    # up to 24h to catch coworkers who opened the share hours ago.
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1b-post: SubjectLogonId present "
+                        f"(EventID={_s1bp_event_id}) — _s1b_4624_wide empty; "
+                        f"running dedicated 24h 4624 query to find persistent SMB sessions."
+                    )
+                    import datetime as _dt_wide_q
+                    _wq_end   = (event_dt_utc + _dt_wide_q.timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S")
+                    _wq_start = (event_dt_utc - _dt_wide_q.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+                    # Exclude own-machine IP in XPath to prevent backup-app polling sessions
+                    # NOTE: Do NOT use XPath IpAddress != own-machine filter — the != operator
+                    # in XPath on Security log EventData can return 0 results on some Windows
+                    # versions.  Python filtering handles own-machine exclusion correctly.
+                    _wq_query = (
+                        f"*[System[EventID=4624 and "
+                        f"TimeCreated[@SystemTime>='{_wq_start}' and @SystemTime<='{_wq_end}']] "
+                        f"and EventData[Data[@Name='LogonType']='3']]"
+                    )
+                    _wq_cmd = [
+                        "wevtutil", "qe", "Security",
+                        f"/r:{host}",
+                        f"/u:{_win_user}",
+                        f"/p:{_win_pass}",
+                        "/rd:true",
+                        "/c:2000",
+                        "/f:xml",
+                        f"/q:{_wq_query}",
+                    ]
+                    try:
+                        _wq_result = _s1bp_sp.run(
+                            _wq_cmd, capture_output=True, text=True, timeout=20,
+                            creationflags=_CNW_1BP,
+                        )
+                        if _wq_result.returncode == 0 and _wq_result.stdout.strip():
+                            import xml.etree.ElementTree as _wq_et
+                            import datetime as _wq_dt
+                            _wq_ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                            _wq_xml = "<root>" + _wq_result.stdout + "</root>"
+                            _wq_root = _wq_et.fromstring(_wq_xml)
+                            _wq_remote = []
+                            _wq_own    = []
+                            for _wq_ev in _wq_root:
+                                _wq_sys = _wq_ev.find("e:System", _wq_ns)
+                                if _wq_sys is None:
+                                    continue
+                                _wq_tc = _wq_sys.find("e:TimeCreated", _wq_ns)
+                                if _wq_tc is None:
+                                    continue
+                                _wq_dts = _wq_tc.attrib.get("SystemTime", "")
+                                try:
+                                    _wq_evdt = _wq_dt.datetime.fromisoformat(
+                                        _wq_dts.replace("Z", "+00:00")
+                                    ).replace(tzinfo=None)
+                                except Exception:
+                                    continue
+                                _wq_diff = (_wq_evdt - event_dt_utc).total_seconds()
+                                if _wq_diff > 30 or _wq_diff < -86400:
+                                    continue
+                                _wq_edata = _wq_ev.find("e:EventData", _wq_ns)
+                                if _wq_edata is None:
+                                    continue
+                                _wq_map = {d.get("Name", ""): (d.text or "") for d in _wq_edata if d.get("Name")}
+                                if _wq_map.get("LogonType", "") != "3":
+                                    continue
+                                _wq_ws  = _wq_map.get("WorkstationName", "").strip("-").strip()
+                                _wq_ip  = _wq_map.get("IpAddress", "").strip()
+                                if _wq_ip in ("127.0.0.1", "::1", "", host) or _wq_ws.lower() == host.lower():
+                                    continue
+                                _wq_is_own = (
+                                    (bool(_s1bp_own_ip_resolved) and _wq_ip == _s1bp_own_ip_resolved)
+                                    or (bool(_s1bp_own_host_resolved) and _wq_ws.lower() == _s1bp_own_host_resolved)
+                                )
+                                if _wq_is_own:
+                                    _wq_own.append((_wq_diff, _wq_ws, _wq_ip))
+                                else:
+                                    _wq_remote.append((_wq_diff, _wq_ws, _wq_ip))
+                            if _wq_remote:
+                                _wq_neg  = [(d, ws, ip) for (d, ws, ip) in _wq_remote if d <= 0]
+                                _wq_best = (
+                                    min(_wq_neg,     key=lambda x: abs(x[0])) if _wq_neg
+                                    else min(_wq_remote, key=lambda x: abs(x[0]))
+                                )
+                                # ── Staleness guard ──────────────────────────────────────────
+                                # NOTE: guard disabled for deleted/renamed — robocopy never
+                                # deletes, so all third-party sessions are valid actors
+                                # regardless of age. Only applies to added/modified.
+                                _WQ_STALE_THRESHOLD = 3600.0
+                                _wq_best_staleness  = abs(_wq_best[0])
+                                _wq_own_fresh_narrow = [
+                                    (d, ws, ip) for (d, ws, ip, _lid) in _pf_own_fresh_safe
+                                    if abs(d) <= 120
+                                ] if '_pf_own_fresh_safe' in dir() else []
+                                _wq_stale_override = (
+                                    event_type not in ("deleted", "renamed")
+                                    and _wq_best_staleness > _WQ_STALE_THRESHOLD
+                                    and bool(_wq_own_fresh_narrow)
+                                )
+                                if _wq_stale_override:
+                                    _wq_best_own_n = min(_wq_own_fresh_narrow, key=lambda x: abs(x[0]))
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (24h-WideWindow): "
+                                        f"STALENESS GUARD (event_type={event_type!r}, not deleted/renamed) — best third-party WorkstationName={_wq_best[1]!r} "
+                                        f"IpAddress={_wq_best[2]!r} is {_wq_best_staleness:.0f}s old "
+                                        f"(threshold={_WQ_STALE_THRESHOLD:.0f}s) AND own-machine has "
+                                        f"{len(_wq_own_fresh_narrow)} fresh narrow-window session(s). "
+                                        f"Rejecting stale third-party; attributing to own-machine: "
+                                        f"WorkstationName={_wq_best_own_n[1]!r} IpAddress={_wq_best_own_n[2]!r} "
+                                        f"time_diff={_wq_best_own_n[0]:+.1f}s. "
+                                        f"Rejected third-party candidates: "
+                                        f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2) in _wq_remote]}"
+                                    )
+                                    _wq_machine = _wq_best_own_n[1] if _wq_best_own_n[1] else _wq_best_own_n[2]
+                                    _old_user_wq    = result.get("user", "")
+                                    _old_machine_wq = result.get("machine", "")
+                                    _old_ip_wq      = result.get("ip", "")
+                                    result["machine"] = _wq_machine
+                                    result["ip"]      = _wq_best_own_n[2] if _wq_best_own_n[2] else _old_ip_wq
+                                    result["user"]    = (
+                                        f"{_wq_machine}\\{_s1bp_4663_uname}"
+                                        if _wq_machine and _s1bp_4663_uname
+                                        else _old_user_wq
+                                    )
+                                    _s1bp_matched = True
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (24h-WideWindow-StalenessGuard): "
+                                        f"server-local {_old_user_wq!r}/{_old_machine_wq!r}/{_old_ip_wq!r} "
+                                        f"-> own-machine {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                    )
+                                    raise _S1BPostDone()
+                                else:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post: 24h 4624 query found "
+                                        f"{len(_wq_remote)} third-party remote candidate(s): "
+                                        f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2) in _wq_remote]}. "
+                                        f"Best candidate staleness={_wq_best_staleness:.0f}s "
+                                        f"(threshold={_WQ_STALE_THRESHOLD:.0f}s, "
+                                        f"own-machine narrow sessions={len(_wq_own_fresh_narrow)}). "
+                                        f"Using closest: WorkstationName={_wq_best[1]!r} "
+                                        f"IpAddress={_wq_best[2]!r} time_diff={_wq_best[0]:+.1f}s."
+                                    )
+                                    _wq_machine = _wq_best[1] if _wq_best[1] else _wq_best[2]
+                                    _old_user_wq    = result.get("user", "")
+                                    _old_machine_wq = result.get("machine", "")
+                                    _old_ip_wq      = result.get("ip", "")
+                                    result["machine"] = _wq_machine
+                                    result["ip"]      = _wq_best[2] if _wq_best[2] else _old_ip_wq
+                                    result["user"]    = (
+                                        f"{_wq_machine}\\{_s1bp_4663_uname}"
+                                        if _wq_machine and _s1bp_4663_uname
+                                        else _old_user_wq
+                                    )
+                                    _s1bp_matched = True
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (24h-WideWindow-Remote): "
+                                        f"server-local {_old_user_wq!r}/{_old_machine_wq!r}/{_old_ip_wq!r} "
+                                        f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                    )
+                                    raise _S1BPostDone()
+                            else:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: 24h 4624 query found "
+                                    f"no third-party candidates (own={len(_wq_own)}). "
+                                    f"Actor is LOCAL. user={result.get('user')!r}"
+                                )
+                        else:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: 24h 4624 query returned "
+                                f"nothing (rc={_wq_result.returncode}). "
+                                f"Actor is LOCAL. user={result.get('user')!r}"
+                            )
+                    except Exception as _wq_ex:
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post: 24h 4624 query failed: {_wq_ex!r}. "
+                            f"Actor is LOCAL. user={result.get('user')!r}"
+                        )
+                # _s1bp_skip_xml stays True — force the no-match path (local actor)
+            else:
+                _s1bp_skip_xml = False
+            # _s1bp_own_host_resolved / _s1bp_own_ip_resolved already set above
+            # (before the fast-path block) so both paths share the same resolved values.
+            # Always initialise these so the post-loop code never hits UnboundLocalError
+            # when _s1bp_skip_xml=True or the fallback query returned empty stdout.
+            _s1bp_candidates = []
+            _s1bp_skipped_own = []
+            if not _s1bp_skip_xml and _s1bp_result.returncode == 0 and _s1bp_result.stdout.strip():
+                _s1bp_xml = "<root>" + _s1bp_result.stdout + "</root>"
+                try:
+                    _s1bp_root = _ET1bp.fromstring(_s1bp_xml)
+                except Exception:
+                    _s1bp_root = None
+                if _s1bp_root is not None:
+                    _ns1bp = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                    # For LogonId-exact queries: take the first (and only) match immediately.
+                    # For time-window fallback queries: COLLECT all valid candidates, then
+                    # pick the one CLOSEST in time to the deletion (smallest abs(time_diff)).
+                    # Rationale: a genuine deletion over SMB opens (or re-uses) an SMB session
+                    # close in time to the deletion, while a stale background session (e.g. a
+                    # backup that ran earlier) will have a much older 4624 timestamp. Picking
+                    # the closest candidate reliably identifies the actor without needing a
+                    # hard time threshold.
+                    for _s1bp_ev in _s1bp_root:
+                        try:
+                            _s1bp_sys  = _s1bp_ev.find("e:System", _ns1bp)
+                            _s1bp_dt_s = _s1bp_sys.find("e:TimeCreated", _ns1bp).attrib.get("SystemTime", "")
+                            _s1bp_evdt = _dt1bp.datetime.fromisoformat(_s1bp_dt_s.replace("Z", "+00:00")).replace(tzinfo=None)
+                            _s1bp_diff = (_s1bp_evdt - event_dt_utc).total_seconds()
+                            # Hard stop: never look back more than 24h
+                            if _s1bp_diff < -86400:
+                                break
+                            _s1bp_edata = _s1bp_ev.find("e:EventData", _ns1bp)
+                            _s1bp_map = {}
+                            if _s1bp_edata is not None:
+                                for _d in _s1bp_edata:
+                                    _n = _d.get("Name", "")
+                                    if _n:
+                                        _s1bp_map[_n] = _d.text or ""
+                            _s1bp_ws = _s1bp_map.get("WorkstationName", "").strip("-").strip()
+                            _s1bp_ip = _s1bp_map.get("IpAddress", "").strip()
+                            _s1bp_target_logon_id = _s1bp_map.get("TargetLogonId", "").strip()
+                            # Two matching strategies:
+                            # A) Logon ID match (preferred) — exact session correlation.
+                            # B) Time window match (fallback) — used when LogonId query failed.
+                            _logon_id_match = (
+                                bool(_s1bp_logon_id)
+                                and bool(_s1bp_target_logon_id)
+                                and _s1bp_logon_id.lower() == _s1bp_target_logon_id.lower()
+                            )
+                            _xpath_exact_query = bool(_s1bp_logon_id)
+                            # ±120s: matches the fallback query window above
+                            _time_window_match = (not _s1bp_logon_id) and abs(_s1bp_diff) <= 120
+                            if not _logon_id_match and not _xpath_exact_query and not _time_window_match:
+                                continue
+                            # Log only candidates that survive the filter — avoids hundreds of
+                            # "4624 candidate … logon_id_match=False xpath_exact=False time_window_match=False"
+                            # lines that are immediately skipped.
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: 4624 candidate "
+                                f"WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r} "
+                                f"TargetLogonId={_s1bp_target_logon_id!r} "
+                                f"time_diff={_s1bp_diff:+.1f}s "
+                                f"logon_id_match={_logon_id_match} "
+                                f"xpath_exact={_xpath_exact_query} "
+                                f"time_window_match={_time_window_match}"
+                            )
+                            # Skip loopback IPs
+                            if _s1bp_ip in ("127.0.0.1", "::1", ""):
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: SKIP loopback "
+                                    f"WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r}"
+                                )
+                                continue
+                            # Skip the file-server itself (local NTLM loopback).
+                            # Scenario 3 is handled by the no-match fallback below.
+                            if _s1bp_ws.lower() == host.lower() or _s1bp_ip == host:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: SKIP file-server "
+                                    f"loopback WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r} "
+                                    f"(matches host={host!r})"
+                                )
+                                continue
+                            # Skip our own backup machine in time-window mode — but only
+                            # if a third-party candidate also exists.  If the ONLY 4624s
+                            # are from our own machine, the backup-app user themselves
+                            # deleted the file and we must keep them as the actor.
+                            # We defer the decision: collect own-machine candidates
+                            # separately and fall back to them only when _s1bp_candidates
+                            # is still empty after scanning all events.
+                            # Only apply in time-window mode — LogonId-exact matches are
+                            # unambiguous and should never be deferred.
+                            if _time_window_match and not _logon_id_match and not _xpath_exact_query:
+                                _is_own_machine = (
+                                    (bool(_s1bp_own_ip_resolved) and _s1bp_ip == _s1bp_own_ip_resolved)
+                                    or (bool(_s1bp_own_host_resolved) and _s1bp_ws.lower() == _s1bp_own_host_resolved)
+                                )
+                                if _is_own_machine:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post: DEFER own-machine "
+                                        f"WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r} "
+                                        f"(own={_s1bp_own_host_resolved!r}/{_s1bp_own_ip_resolved!r}) "
+                                        f"time_diff={_s1bp_diff:+.1f}s "
+                                        f"— will use only if no third-party candidate exists"
+                                    )
+                                    _s1bp_skipped_own.append((_s1bp_diff, _s1bp_ws, _s1bp_ip))
+                                    continue
+                            # LogonId-exact: accept immediately and stop scanning.
+                            if _logon_id_match or _xpath_exact_query:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: ACCEPT LogonId-exact "
+                                    f"WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r} "
+                                    f"time_diff={_s1bp_diff:+.1f}s"
+                                )
+                                _s1bp_candidates = [(_s1bp_diff, _s1bp_ws, _s1bp_ip, _s1bp_target_logon_id)]
+                                break
+                            # Time-window fallback: collect all valid candidates.
+                            # We'll pick the closest after scanning all events.
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: QUEUED time-window candidate "
+                                f"WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r} "
+                                f"time_diff={_s1bp_diff:+.1f}s abs={abs(_s1bp_diff):.1f}s"
+                            )
+                            _s1bp_candidates.append((_s1bp_diff, _s1bp_ws, _s1bp_ip, _s1bp_target_logon_id))
+                        except Exception:
+                            continue
+                    # Pick the best candidate: for time-window mode, pick the one
+                    # closest to the deletion time (smallest abs(time_diff) where
+                    # time_diff <= 0, i.e. the most recent logon BEFORE the deletion).
+                    # A fresh remote deletion opens an SMB session within a few seconds;
+                    # a stale background session (e.g. from an earlier backup) will
+                    # have a much older timestamp and a larger abs(diff).\n                    # If all candidates are after the deletion (positive diff), still
+                    # pick the closest one (e.g. reconnect mid-operation).
+                    if not _s1bp_candidates and _s1bp_skipped_own:
+                        # No third-party remote 4624 found in the ±120s window.
+                        # Behaviour differs by event type:
+                        #   4663 (reliable SubjectLogonId): own-machine IS the actor —
+                        #       the backup-app user deleted the file.  Use it.
+                        #   4656 (impersonation token, LogonId unreliable): we cannot
+                        #       confirm the backup-app user deleted.  The coworker's
+                        #       4624 may be just outside the ±120s window.  Reporting
+                        #       own-machine would be a false attribution.  Leave
+                        #       _s1bp_candidates empty → UNKNOWN path below.
+                        if _s1bp_logon_id_is_reliable:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: no third-party 4624 found "
+                                f"(4663 match — reliable logon) — using own-machine as actor "
+                                f"(backup-app user deleted the file). "
+                                f"{len(_s1bp_skipped_own)} deferred candidate(s): "
+                                f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
+                            )
+                            _s1bp_candidates = [
+                                (d, ws, ip, "") for (d, ws, ip) in _s1bp_skipped_own
+                            ]
+                        else:
+                            if event_type == "deleted" and not is_dest_watch:
+                                # Source-watch deletion: robocopy never deletes source files,
+                                # BUT any other machine on the LAN (e.g. a coworker with no
+                                # backup app) can delete from the source share directly — their
+                                # SMB session may be hours old and outside the +-120s window.
+                                # Treat exactly like dest-watch deletions: leave _s1bp_candidates
+                                # empty (UNKNOWN) so the 24h rescue below can find the real actor.
+                                # If rescue finds nothing, the not-_s1bp_matched block will fall
+                                # back to own-machine automatically (same logic as dest-watch).
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: 4656 match + "
+                                    f"event_type='deleted' + is_dest_watch=False — could be own-machine "
+                                    f"or another LAN PC with stale SMB session.  Reporting UNKNOWN; "
+                                    f"24h rescue will determine real actor. "
+                                    f"own-machine candidates (suppressed for now): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
+                                )
+                                # Leave _s1bp_candidates empty -> 24h rescue path below.
+                            elif event_type == "deleted" and is_dest_watch:
+                                # Dest-watch deletion: the server owner / another LAN PC could have
+                                # deleted locally on the server (no remote 4624 would appear).
+                                # Do NOT blame own-machine — report UNKNOWN so UI is accurate.
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: 4656 match + "
+                                    f"event_type='deleted' + is_dest_watch=True — dest deletion may "
+                                    f"be server-local actor; cannot confirm own-machine without 4624. "
+                                    f"Reporting UNKNOWN. own-machine candidates (suppressed): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
+                                )
+                                # Leave _s1bp_candidates empty → UNKNOWN
+                            else:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post: 4656 match + "
+                                    f"event_type={event_type!r} — cannot confirm self (impersonation "
+                                    f"token; may be robocopy write). No non-own 4624 in ±120s window. "
+                                    f"Suppressing own-machine fallback to avoid false attribution. "
+                                    f"own-machine candidates (suppressed): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
+                                )
+                                # Leave _s1bp_candidates empty → UNKNOWN
+                    if _s1bp_candidates:
+                        # Four-priority selection (mirrors pre-fetched path logic):
+                        # P1: handle-LogonId match (TargetLogonId == SubjectLogonId of file handle open)
+                        # P2: tight-window (±60s) — machine just connected to perform the delete
+                        # P3: sole third-party host in wide window — only one non-own machine has a session
+                        # P4: absolute closest-in-time (last resort, ambiguous multi-host case)
+                        _slb_handle_lids = result.get("_s1b_handle_logon_ids", [])
+                        _slb_logon_match = None
+                        if _slb_handle_lids:
+                            _slb_lid_set = set(l.lower() for l in _slb_handle_lids)
+                            _slb_lid_matches = [
+                                (d, ws, ip, lid) for (d, ws, ip, lid) in _s1bp_candidates
+                                if lid.lower() in _slb_lid_set
+                            ]
+                            if _slb_lid_matches:
+                                _slb_lid_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _slb_lid_matches if d <= 0]
+                                _slb_logon_match = (
+                                    min(_slb_lid_neg,     key=lambda x: abs(x[0])) if _slb_lid_neg
+                                    else min(_slb_lid_matches, key=lambda x: abs(x[0]))
+                                )
+                        _slb_tight = [(d, ws, ip, lid) for (d, ws, ip, lid) in _s1bp_candidates if abs(d) <= 60]
+                        _slb_unique_hosts = set((ws.lower() or ip) for (_, ws, ip, _) in _s1bp_candidates)
+                        _slb_own_hosts = set()
+                        if _s1bp_own_host_resolved:
+                            _slb_own_hosts.add(_s1bp_own_host_resolved)
+                        if _s1bp_own_ip_resolved:
+                            _slb_own_hosts.add(_s1bp_own_ip_resolved)
+                        _slb_third_hosts = _slb_unique_hosts - _slb_own_hosts
+                        _slb_solo = None
+                        if len(_slb_third_hosts) == 1:
+                            _slb_solo_key = next(iter(_slb_third_hosts))
+                            _slb_solo_cands = [
+                                (d, ws, ip, lid) for (d, ws, ip, lid) in _s1bp_candidates
+                                if (ws.lower() or ip) == _slb_solo_key
+                            ]
+                            if _slb_solo_cands:
+                                _slb_solo_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _slb_solo_cands if d <= 0]
+                                _slb_solo = (
+                                    min(_slb_solo_neg,   key=lambda x: abs(x[0])) if _slb_solo_neg
+                                    else min(_slb_solo_cands, key=lambda x: abs(x[0]))
+                                )
+                        _s1bp_candidates_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _s1bp_candidates if d <= 0]
+                        _slb_closest = (
+                            min(_s1bp_candidates_neg, key=lambda x: abs(x[0]))
+                            if _s1bp_candidates_neg
+                            else min(_s1bp_candidates, key=lambda x: abs(x[0]))
+                        )
+                        if _slb_logon_match:
+                            _s1bp_best = _slb_logon_match
+                            _slb_sel = f"handle-LogonId-match"
+                        elif _slb_tight:
+                            _slb_tight_neg = [(d, ws, ip, lid) for (d, ws, ip, lid) in _slb_tight if d <= 0]
+                            _s1bp_best = (
+                                min(_slb_tight_neg, key=lambda x: abs(x[0])) if _slb_tight_neg
+                                else min(_slb_tight, key=lambda x: abs(x[0]))
+                            )
+                            _slb_sel = f"tight-window(±60s,{len(_slb_tight)}cand)"
+                        elif _slb_solo:
+                            _s1bp_best = _slb_solo
+                            _slb_sel = f"sole-third-party-host({_slb_solo_key!r})"
+                        else:
+                            _s1bp_best = _slb_closest
+                            _slb_sel = f"time-closest(ambiguous,{len(_slb_third_hosts)}-hosts)"
+                        # ── Burst-cache override for ambiguous time-window selections ──
+                        # When the selection is ambiguous (multiple third-party hosts), the
+                        # closest-in-time heuristic can pick the wrong machine.  If a sibling
+                        # file in the same burst was already confirmed to a specific machine
+                        # via LogonId-exact match, use that attribution instead.
+                        _slb_sel_is_ambiguous = (
+                            not _slb_logon_match
+                        )
+                        _slb_bc_overridden = False
+                        if _slb_sel_is_ambiguous:
+                            _slb_bc_server_user = result.get("user", "")
+                            _slb_bc_hit = _burst_cache_lookup(host, _slb_bc_server_user, event_type=event_type)
+                            if _slb_bc_hit:
+                                _slb_bc_machine, _slb_bc_ip, _slb_bc_user = _slb_bc_hit
+                                _slb_diff_orig, _slb_ws_orig, _slb_ip_orig, _ = _s1bp_best
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (burst-cache override): "
+                                    f"ambiguous time-window selection [{_slb_sel}] overridden by burst cache. "
+                                    f"Burst cache confirmed attribution: "
+                                    f"machine={_slb_bc_machine!r} ip={_slb_bc_ip!r} user={_slb_bc_user!r} "
+                                    f"(was: WorkstationName={_slb_ws_orig!r} IpAddress={_slb_ip_orig!r} "
+                                    f"time_diff={_slb_diff_orig:+.1f}s). "
+                                    f"Sibling file in same burst already attributed to this machine."
+                                )
+                                _slb_sel = f"burst-cache-override({_slb_sel})"
+                                _old_machine = result.get("machine", "")
+                                _old_ip      = result.get("ip", "")
+                                _old_user    = result.get("user", "")
+                                result["machine"] = _slb_bc_machine
+                                result["ip"]      = _slb_bc_ip
+                                result["user"]    = _slb_bc_user
+                                _s1bp_matched = True
+                                _slb_bc_overridden = True
+                                _match_method = f"TimeWindow-BurstCacheOverride"
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post ({_match_method}): "
+                                    f"server-local {_old_user!r}/{_old_machine!r}/{_old_ip!r} "
+                                    f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r} "
+                                    f"(burst-cache source: [{_slb_sel}])"
+                                )
+                        if not _slb_bc_overridden:
+                            _s1bp_diff, _s1bp_ws, _s1bp_ip, _s1bp_target_logon_id = _s1bp_best
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: SELECTED [{_slb_sel}] "
+                                f"from {len(_s1bp_candidates)} total: "
+                                f"WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r} "
+                                f"time_diff={_s1bp_diff:+.1f}s "
+                                f"(all candidates: {[(ws, ip, f'{d:+.1f}s') for (d, ws, ip, _) in _s1bp_candidates]})"
+                            )
+                        _old_machine = result.get("machine", "")
+                        _old_ip      = result.get("ip", "")
+                        _old_user    = result.get("user", "")
+                        if not _slb_bc_overridden:
+                            _s1bp_remote_machine = _s1bp_ws if _s1bp_ws else _s1bp_ip
+                            _s1bp_user_full = (
+                                f"{_s1bp_remote_machine}\\{_s1bp_4663_uname}"
+                                if _s1bp_remote_machine and _s1bp_4663_uname
+                                else _old_user
+                            )
+                            result["machine"] = _s1bp_remote_machine
+                            result["ip"]      = _s1bp_ip if _s1bp_ip else _old_ip
+                            result["user"]    = _s1bp_user_full
+                            _s1bp_matched = True
+                            _match_method = "LogonId" if (_logon_id_match or _xpath_exact_query) else "TimeWindow-Closest"
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (4624 {_match_method}): "
+                                f"server-local {_old_user!r}/{_old_machine!r}/{_old_ip!r} "
+                                f"-> remote {result['user']!r}/{result['machine']!r}/{result['ip']!r} "
+                                f"(WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r} "
+                                f"LogonId={_s1bp_logon_id!r} time_diff={_s1bp_diff:+.1f}s)"
+                            )
+                            # ── Burst cache: store so concurrent PARENT-ONLY sibling files
+                            # can reuse this attribution instead of returning Unknown.
+                            # The PreFetched path (~line 2576) has an identical call; this
+                            # covers the non-PreFetched (wide 24h query) path taken for
+                            # 'added' source-watch events where the narrow +-120s window had
+                            # no LogonId-exact match (the sibling LogonId was stale/old).
+                            if _old_user and result.get("machine"):
+                                # A LogonId-exact match is always authoritative regardless of
+                                # session age — see the same fix in the PreFetched path above.
+                                # Removing the ±120s restriction so persistent SMB sessions
+                                # (hours-old 4624) are correctly stored as logon_id_confirmed=True
+                                # and sibling deletions in the same burst reuse the attribution.
+                                _logon_confirmed_flag = ("LogonId" in _match_method)
+                                _burst_cache_put(
+                                    host, _old_user,
+                                    result["machine"],
+                                    result["ip"] or host,
+                                    result["user"],
+                                    event_type=event_type,
+                                    logon_id_confirmed=_logon_confirmed_flag,
+                                )
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (4624 {_match_method} burst-cache): "
+                                    f"stored confirmed attribution for host={host!r} "
+                                    f"server_local_user={_old_user!r} event_type={event_type!r} "
+                                    f"logon_id_confirmed={_logon_confirmed_flag} -> "
+                                    f"machine={result['machine']!r} ip={result['ip']!r} "
+                                    f"user={result['user']!r} (TTL={_BURST_CACHE_TTL:.0f}s)"
+                                )
+            # No remote 4624 found -> actor was LOCAL on the file-server (Scenario 3),
+            # OR all 4624s were from own backup machine (actor is a 3rd-party coworker
+            # whose 4624 was not in the log window — attribution is unknown).
+            if not _s1bp_matched:
+                result["machine"] = result.get("machine") or host
+                result["ip"]      = host
+                if _s1bp_skipped_own:
+                    # Save the server-local user from Strategy1b before potentially
+                    # clearing it — needed for dest-watch rescue below.
+                    _s1bp_server_local_user    = result.get("user", "")
+                    _s1bp_server_local_machine = result.get("machine", "")
+                    _s1bp_server_local_ip      = result.get("ip", "")
+
+                    if (is_dest_watch or event_type in ("deleted", "modified", "renamed")) and _s1bp_server_local_user and _s1bp_server_local_machine:
+                        
+                        _lar_confirmed_local = bool(_s1bp_logon_id and _s1bp_logon_id_is_reliable)
+                        if _lar_confirmed_local:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue burst-cache): "
+                                f"SKIPPING burst-cache and host-scan — confirmed local actor via reliable "
+                                f"4663 SubjectLogonId={_s1bp_logon_id!r} with no matching 4624 Network Logon. "
+                                f"Actor is the file-server machine itself ({_s1bp_server_local_user!r} on {host!r}). "
+                                f"Stale cached remote attribution from a previous burst must not override this."
+                            )
+                            _lar_burst_hit = None
+                        else:
+                            # For 'modified' events, limit the burst cache reuse to
+                            # _BURST_INTER_BURST_GAP seconds.  Without this, a prior save
+                            # by .106 (whose burst entry is still within the 30s TTL)
+                            # would override the server-local .105 attribution when .105
+                            # saves the same file shortly after.  The inter-burst gap
+                            # ensures only entries from the *current* save burst are reused.
+                            _lar_max_age = _BURST_INTER_BURST_GAP if event_type == "modified" else 0.0
+                            _lar_burst_hit = _burst_cache_lookup(host, _s1bp_server_local_user, event_type=event_type, max_age_secs=_lar_max_age)
+                            _lar_last_mod = _last_mod_actor_get(host, _s1bp_server_local_user)
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (local-actor-rescue debug): "
+                                f"event_type={event_type!r} lar_confirmed_local={_lar_confirmed_local} "
+                                f"lar_burst_hit={_lar_burst_hit} "
+                                f"lar_max_age={_lar_max_age:.0f}s "
+                                f"lar_last_mod_actor={_lar_last_mod!r} "
+                                f"sluser={_s1bp_server_local_user!r} "
+                                f"host={host!r}"
+                            )
+                        if not _lar_burst_hit and not _lar_confirmed_local and not is_dest_watch and event_type == "deleted":
+                            # Host-scan fallback: the burst cache may be keyed under a
+                            # different server_local_user (e.g. "DESKTOP-FAGSHTO\\User" from
+                            # the add event vs "DESKTOP-KGG55PU\\User" from the delete 4663).
+                            # Scan all cache entries for this host within TTL.
+                            # event_type filter: only reuse entries stored for 'deleted' events —
+                            # do NOT inherit attributions from 'added' bursts (different actor possible).
+                            with _burst_cache_lock:
+                                _lar_now = _time_mod.monotonic()
+                                for (_bc_host, _bc_sluser), (_bc_machine, _bc_ip, _bc_user, _bc_ts, _bc_la, _bc_etype, _bc_lid_conf) in list(_burst_cache.items()):
+                                    if _bc_host == host.lower() and (_lar_now - _bc_ts) < _BURST_CACHE_TTL:
+                                        # Skip if event_type mismatch (e.g. 'added' by .106 vs 'deleted' by .105)
+                                        if _bc_etype and _bc_etype != event_type:
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue burst-cache host-scan): "
+                                                f"SKIP host={host!r} sluser={_bc_sluser!r} — "
+                                                f"event_type mismatch: cached={_bc_etype!r} current={event_type!r} "
+                                                f"machine={_bc_machine!r} — prevents 'added' attribution bleeding into 'deleted'"
+                                            )
+                                            continue
+                                        _lar_burst_hit = (_bc_machine, _bc_ip, _bc_user)
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (local-actor rescue burst-cache host-scan): "
+                                            f"found cached remote attribution for host={host!r} "
+                                            f"via server_local_user={_bc_sluser!r} event_type={_bc_etype!r} "
+                                            f"(current server_local_user={_s1bp_server_local_user!r} had no direct hit). "
+                                            f"machine={_bc_machine!r} ip={_bc_ip!r} user={_bc_user!r}"
+                                        )
+                                        break
+                        if _lar_burst_hit:
+                            _lar_bc_machine, _lar_bc_ip, _lar_bc_user = _lar_burst_hit
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue burst-cache): "
+                                f"burst cache HIT — overriding server-local {_s1bp_server_local_user!r} "
+                                f"with confirmed remote machine={_lar_bc_machine!r} ip={_lar_bc_ip!r} "
+                                f"user={_lar_bc_user!r}. Skipping local-actor fallback."
+                            )
+                            result["user"]    = _lar_bc_user
+                            result["machine"] = _lar_bc_machine
+                            result["ip"]      = _lar_bc_ip
+                            _s1bp_matched = True
+                        elif not is_dest_watch and event_type == "deleted":
+                            
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                f"no burst cache hit; burst cache was empty (first deletion in burst). "
+                                f"Running dedicated 24h 4624 query to find persistent third-party "
+                                f"SMB sessions before falling back to server-local {_s1bp_server_local_user!r}. "
+                                f"own-machine deferred candidates: "
+                                f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
+                            )
+                            _lar_resolved = False
+                            try:
+                                import datetime as _lar_dt
+                                import xml.etree.ElementTree as _lar_et
+                                _lar_wq_end   = (event_dt_utc + _lar_dt.timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S")
+                                _lar_wq_start = (event_dt_utc - _lar_dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+                                _lar_wq_query = (
+                                    f"*[System[EventID=4624 and "
+                                    f"TimeCreated[@SystemTime>='{_lar_wq_start}' and @SystemTime<='{_lar_wq_end}']] "
+                                    f"and EventData[Data[@Name='LogonType']='3']]"
+                                )
+                                _lar_wq_cmd = [
+                                    "wevtutil", "qe", "Security",
+                                    f"/r:{host}",
+                                    f"/u:{_win_user}",
+                                    f"/p:{_win_pass}",
+                                    "/rd:true",
+                                    "/c:2000",
+                                    "/f:xml",
+                                    f"/q:{_lar_wq_query}",
+                                ]
+                                _lar_wq_result = _s1bp_sp.run(
+                                    _lar_wq_cmd, capture_output=True, text=True, timeout=20,
+                                    creationflags=_CNW_1BP,
+                                )
+                                if _lar_wq_result.returncode == 0 and _lar_wq_result.stdout.strip():
+                                    _lar_wq_ns   = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                                    _lar_wq_xml  = "<root>" + _lar_wq_result.stdout + "</root>"
+                                    _lar_wq_root = _lar_et.fromstring(_lar_wq_xml)
+                                    _lar_wq_remote       = []  # (diff, ws, ip, lid)
+                                    _lar_wq_own          = []
+                                    _lar_wq_own_fresh_n  = [(d, ws, ip) for (d, ws, ip) in _s1bp_skipped_own if abs(d) <= 120]
+                                    for _lar_ev in _lar_wq_root:
+                                        try:
+                                            _lar_sys = _lar_ev.find("e:System", _lar_wq_ns)
+                                            if _lar_sys is None:
+                                                continue
+                                            _lar_tc  = _lar_sys.find("e:TimeCreated", _lar_wq_ns)
+                                            if _lar_tc is None:
+                                                continue
+                                            _lar_dts = _lar_tc.attrib.get("SystemTime", "")
+                                            _lar_evdt = _lar_dt.datetime.fromisoformat(
+                                                _lar_dts.replace("Z", "+00:00")
+                                            ).replace(tzinfo=None)
+                                            _lar_d = (_lar_evdt - event_dt_utc).total_seconds()
+                                            if _lar_d > 30 or _lar_d < -86400:
+                                                continue
+                                            _lar_edata = _lar_ev.find("e:EventData", _lar_wq_ns)
+                                            if _lar_edata is None:
+                                                continue
+                                            _lar_map = {
+                                                dd.get("Name", ""): (dd.text or "")
+                                                for dd in _lar_edata if dd.get("Name")
+                                            }
+                                            if _lar_map.get("LogonType", "") != "3":
+                                                continue
+                                            _lar_ws  = _lar_map.get("WorkstationName", "").strip("-").strip()
+                                            _lar_ip  = _lar_map.get("IpAddress", "").strip()
+                                            _lar_lid = _lar_map.get("TargetLogonId", "").strip()
+                                            if _lar_ip in ("127.0.0.1", "::1", "", host) or _lar_ws.lower() == host.lower():
+                                                continue
+                                            _lar_is_own = (
+                                                (bool(_s1bp_own_ip_resolved) and _lar_ip == _s1bp_own_ip_resolved)
+                                                or (bool(_s1bp_own_host_resolved) and _lar_ws.lower() == _s1bp_own_host_resolved)
+                                            )
+                                            if _lar_is_own:
+                                                _lar_wq_own.append((_lar_d, _lar_ws, _lar_ip, _lar_lid))
+                                            else:
+                                                _lar_wq_remote.append((_lar_d, _lar_ws, _lar_ip, _lar_lid))
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                                    f"third-party 4624 WorkstationName={_lar_ws!r} "
+                                                    f"IpAddress={_lar_ip!r} TargetLogonId={_lar_lid!r} "
+                                                    f"time_diff={_lar_d:+.1f}s"
+                                                )
+                                        except Exception:
+                                            continue
+
+                                    if _lar_wq_remote:
+                                        # Identify unique third-party hosts
+                                        _lar_unique_ips = set(
+                                            (_ws.lower() or _ip)
+                                            for (_, _ws, _ip, _) in _lar_wq_remote
+                                        )
+                                        _lar_neg  = [(d, ws, ip, lid) for (d, ws, ip, lid) in _lar_wq_remote if d <= 0]
+                                        _lar_best = (
+                                            min(_lar_neg,          key=lambda x: abs(x[0])) if _lar_neg
+                                            else min(_lar_wq_remote, key=lambda x: abs(x[0]))
+                                        )
+                                        _lar_best_staleness = abs(_lar_best[0])
+                                        
+                                        _lar_subj_logon_id_lc = (_s1bp_logon_id or "").strip().lower()
+                                        _lar_own_logon_ids = {
+                                            lid.lower() for (_, _, _, lid) in _lar_wq_own if lid
+                                        }
+                                        
+                                        if not _lar_own_logon_ids and '_pf_own_fresh_safe' in dir():
+                                            _lar_own_logon_ids = {
+                                                lid.lower()
+                                                for (_, _, _, lid) in _pf_own_fresh_safe  # type: ignore[name-defined]
+                                                if lid
+                                            }
+                                        _lar_subj_matches_own = (
+                                            bool(_lar_subj_logon_id_lc)
+                                            and bool(_lar_own_logon_ids)
+                                            and _lar_subj_logon_id_lc in _lar_own_logon_ids
+                                        )
+                                        
+                                        _lar_sole_tp_window_empty = not any(
+                                            abs(d) <= _LAR_SOLE_TP_WINDOW
+                                            for (d, _, _, _) in _lar_wq_remote
+                                        )
+                                        _lar_own_fresh_narrow = [
+                                            (d, ws, ip, lid) for (d, ws, ip, lid) in _lar_wq_own
+                                            if abs(d) <= 120
+                                        ] + [
+                                            (d, ws, ip) for (d, ws, ip) in _s1bp_skipped_own
+                                            if abs(d) <= 120
+                                        ]
+                                        if _lar_sole_tp_window_empty and len(_lar_unique_ips) == 1:
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h sole-third-party SUPPRESSED): "
+                                                f"sole third-party {next(iter(_lar_unique_ips))!r} staleness={_lar_best_staleness:.0f}s "
+                                                f"is outside the {_LAR_SOLE_TP_WINDOW:.0f}s (2h) window. "
+                                                f"Cannot conclude this machine is the actor; the file-server owner "
+                                                f"may have deleted locally (no Network Logon generated). "
+                                                f"own_fresh_narrow={len(_lar_own_fresh_narrow)} "
+                                                f"Staleness guard will apply normally."
+                                            )
+                                        _lar_sole_bypass = (
+                                            len(_lar_unique_ips) == 1
+                                            and not _lar_subj_matches_own  # own-machine LogonId match → own is actor
+                                            and not _lar_sole_tp_window_empty  # all sessions >2h → cannot confirm sole actor
+                                        )
+                                        if not _lar_sole_bypass and len(_lar_unique_ips) == 1 and _lar_subj_matches_own:
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h sole-third-party BLOCKED): "
+                                                f"SubjectLogonId={_lar_subj_logon_id_lc!r} matches own-machine TargetLogonId "
+                                                f"— own-machine is the deletion actor, NOT the sole third-party "
+                                                f"WorkstationName={_lar_best[1]!r} IpAddress={_lar_best[2]!r}. "
+                                                f"Staleness bypass suppressed; falling back to own-machine / server-local identity."
+                                            )
+                                        
+                                        _lar_stale_override = (
+                                            not _lar_sole_bypass
+                                            and _lar_best_staleness > 3600.0
+                                            and bool(_lar_wq_own_fresh_n)
+                                        )
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                            f"found {len(_lar_wq_remote)} third-party candidate(s) from "
+                                            f"{len(_lar_unique_ips)} unique host(s): "
+                                            f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2, _) in _lar_wq_remote]}. "
+                                            f"best_staleness={_lar_best_staleness:.0f}s "
+                                            f"sole_third_party_bypass={_lar_sole_bypass} "
+                                            f"stale_override={_lar_stale_override} "
+                                            f"own_fresh_narrow={len(_lar_wq_own_fresh_n)}"
+                                        )
+                                        if not _lar_stale_override:
+                                            _lar_best_machine = _lar_best[1] if _lar_best[1] else _lar_best[2]
+                                            _lar_user_full = (
+                                                f"{_lar_best_machine}\\{_s1bp_4663_uname}"
+                                                if _lar_best_machine and _s1bp_4663_uname
+                                                else _s1bp_server_local_user
+                                            )
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h remote): "
+                                                f"server-local {_s1bp_server_local_user!r}/"
+                                                f"{_s1bp_server_local_machine!r}/{_s1bp_server_local_ip!r} "
+                                                f"-> remote {_lar_user_full!r}/{_lar_best_machine!r}/{_lar_best[2]!r} "
+                                                f"(WorkstationName={_lar_best[1]!r} IpAddress={_lar_best[2]!r} "
+                                                f"time_diff={_lar_best[0]:+.1f}s sole_bypass={_lar_sole_bypass})"
+                                            )
+                                            result["user"]    = _lar_user_full
+                                            result["machine"] = _lar_best_machine
+                                            result["ip"]      = _lar_best[2] if _lar_best[2] else _s1bp_server_local_ip
+                                            _s1bp_matched = True
+                                            _lar_resolved = True
+                                            
+                                            _burst_cache_put(
+                                                host, _s1bp_server_local_user,
+                                                _lar_best_machine, _lar_best[2] if _lar_best[2] else _s1bp_server_local_ip,
+                                                _lar_user_full,
+                                                event_type=event_type,
+                                            )
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h burst-cache): "
+                                                f"stored confirmed remote attribution for host={host!r} "
+                                                f"server_local_user={_s1bp_server_local_user!r} event_type={event_type!r} "
+                                                f"-> machine={_lar_best_machine!r} ip={_lar_best[2]!r} "
+                                                f"(TTL={_BURST_CACHE_TTL:.0f}s)"
+                                            )
+                                        else:
+                                            
+                                            if _lar_subj_matches_own and _lar_wq_own_fresh_n:
+                                                _lar_own_neg = [(d, ws, ip) for (d, ws, ip) in _lar_wq_own_fresh_n if d <= 0]
+                                                _lar_own_best_for_attr = (
+                                                    min(_lar_own_neg, key=lambda x: abs(x[0])) if _lar_own_neg
+                                                    else min(_lar_wq_own_fresh_n, key=lambda x: abs(x[0]))
+                                                )
+                                                _lar_om_machine = _lar_own_best_for_attr[1]
+                                                _lar_om_ip      = _lar_own_best_for_attr[2]
+                                                _lar_om_user    = (
+                                                    f"{_lar_om_machine}\\{_s1bp_4663_uname}"
+                                                    if _lar_om_machine and _s1bp_4663_uname
+                                                    else _s1bp_server_local_user
+                                                )
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                                    f"STALENESS GUARD fired + SubjectLogonId={_lar_subj_logon_id_lc!r} "
+                                                    f"matches own-machine — attributing to own-machine "
+                                                    f"WorkstationName={_lar_om_machine!r} IpAddress={_lar_om_ip!r} "
+                                                    f"instead of server-local."
+                                                )
+                                                result["user"]    = _lar_om_user
+                                                result["machine"] = _lar_om_machine
+                                                result["ip"]      = _lar_om_ip if _lar_om_ip else _s1bp_server_local_ip
+                                                _s1bp_matched = True
+                                                _lar_resolved = True
+                                            else:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                                    f"STALENESS GUARD fired — best third-party "
+                                                    f"WorkstationName={_lar_best[1]!r} IpAddress={_lar_best[2]!r} "
+                                                    f"staleness={_lar_best_staleness:.0f}s > 3600s AND "
+                                                    f"own-machine has {len(_lar_wq_own_fresh_n)} fresh narrow-window "
+                                                    f"session(s). Not sole third-party ({len(_lar_unique_ips)} hosts). "
+                                                    f"Falling back to server-local."
+                                                )
+                                    else:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                            f"24h query found no third-party candidates "
+                                            f"(own={len(_lar_wq_own)}). Falling back to server-local."
+                                        )
+                                else:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                        f"24h wevtutil query returned nothing or failed "
+                                        f"(rc={_lar_wq_result.returncode}). Falling back to server-local."
+                                    )
+                            except Exception as _lar_ex:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
+                                    f"24h query exception: {_lar_ex!r}. Falling back to server-local."
+                                )
+                            if not _lar_resolved:
+                                # 24h rescue found nothing or was blocked by staleness guard.
+                                # Fall back to server-local identity — best we can do.
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (local-actor rescue): "
+                                    f"own-machine 4624 candidates were suppressed (no remote network logon "
+                                    f"found) but server-local 4656/4663 provides valid actor identity. "
+                                    f"Keeping server-local: user={_s1bp_server_local_user!r} "
+                                    f"machine={_s1bp_server_local_machine!r} ip={_s1bp_server_local_ip!r}. "
+                                    f"own-machine candidates (suppressed): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
+                                )
+                                result["user"]    = _s1bp_server_local_user
+                                result["machine"] = _s1bp_server_local_machine
+                                result["ip"]      = _s1bp_server_local_ip
+                                _s1bp_matched = True
+                        else:
+                            # No burst cache hit.
+                            # For source-watch modifications/renames with deferred own-machine 4624s:
+                            # the backup app only READS source files, never modifies them, so
+                            # own-machine (DESKTOP-0EDUBAP) is the correct actor here.
+                            # Use the closest deferred own-machine candidate instead of server-local.
+                            if not is_dest_watch and event_type in ("modified", "renamed") and _s1bp_skipped_own:
+                                _som_best = min(_s1bp_skipped_own, key=lambda x: abs(x[0]))
+                                # Only trust the own-machine deferred candidate if it is fresh enough
+                                # to be causally related to this modification event.  A stale 4624
+                                # (e.g. from a backup session that ended >30 s ago) is likely
+                                # unrelated — the server owner (.105) may have modified the file
+                                # locally, which generates NO new 4624 at all.
+                                # For 'modified' events the threshold must be generous: Office apps
+                                # (Excel, Word) open a file and hold the SMB session open while the
+                                # user edits, then save — the 4624 Network Logon event can predate
+                                # the modification by 60–120 s or more (user opened the file, edited
+                                # for a minute, then Ctrl+S).  30 s caused edits by .106 to be
+                                # misattributed to server-local .105 because the SMB session logon
+                                # was ~31 s before the save.  120 s covers typical open-edit-save
+                                # cycles.  For 'renamed' keep 30 s — renames are instantaneous.
+                                # Outer bound: 120s for 'modified' (open-edit-save pattern),
+                                # 30s for 'renamed' (instantaneous).
+                                # Inner bound: _BURST_INTER_BURST_GAP (10s).  If the best
+                                # own-machine 4624 is older than the inter-burst gap AND the
+                                # server-local actor is available, prefer server-local — the
+                                # remote session belongs to a prior edit by a different user
+                                # (.106 saved, then .105 opened and saved; .106's 4624 is
+                                # now >10s stale but still within 120s, causing wrong attribution).
+                                _FRESH_SESSION_SECS = 120.0 if event_type == "modified" else 30.0
+                                _som_ws, _som_ip = _som_best[1], _som_best[2]
+                                _som_age = abs(_som_best[0])
+                                # Reject if stale beyond inter-burst gap ONLY when there is evidence
+                                # of a prior different actor (a burst cache entry exists from another
+                                # machine that was just rejected for being too old).  Without this
+                                # guard, a user who adds a file and immediately edits it (same session,
+                                # 28s open-to-save) would be misattributed to server-local because
+                                # their 4624 is >10s old.
+                                # Do a no-age-limit burst cache probe first, then fall back
+                                # to the longer-lived last-mod-actor cache.  Together these
+                                # detect a prior different actor even after the 30s burst
+                                # TTL has expired (e.g. .106 saved at T=0, .105 saves at T=43s).
+                                _som_prior_burst_check = _burst_cache_lookup(
+                                    host, _s1bp_server_local_user, event_type=event_type
+                                )  # no max_age_secs — we want to know if any burst entry exists
+                                _som_last_mod_actor_raw = _last_mod_actor_get(host, _s1bp_server_local_user)
+                                _som_prior_actor_machine = (
+                                    _som_prior_burst_check[0].lower() if _som_prior_burst_check
+                                    else (_som_last_mod_actor_raw or "")
+                                )
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (prior-actor debug): "
+                                    f"som_prior_burst_check={_som_prior_burst_check} "
+                                    f"som_last_mod_actor={_som_last_mod_actor_raw!r} "
+                                    f"som_prior_actor_machine={_som_prior_actor_machine!r} "
+                                    f"sluser={_s1bp_server_local_user!r} host={host!r}"
+                                )
+                                _som_own_machine_lower = (_som_ws or _som_ip or "").lower()
+                                _som_server_local_machine_lower = (_s1bp_server_local_machine or host).lower()
+                                # Inter-burst stale fires when ALL of:
+                                # 1. own-machine 4624 is older than inter-burst gap
+                                # 2. server-local actor is known
+                                # 3. there is a prior actor in cache (burst or last-mod-actor)
+                                # 4. the prior actor is NOT the server-local machine
+                                #    (i.e. the prior actor was a remote machine like .106)
+                                # The key insight: if prior actor == own-machine (.106) and
+                                # server-local != own-machine, the prior .106 session is stale
+                                # and .105 (server-local) is the current actor.
+                                # Condition 4 uses server-local, NOT own-machine, so that
+                                # the case '.106 → .105' correctly fires (prior=.106 != server-local=.105).
+                                _som_inter_burst_stale = (
+                                    _som_age > _BURST_INTER_BURST_GAP
+                                    and bool(_s1bp_server_local_user)
+                                    and bool(_som_prior_actor_machine)
+                                    and _som_prior_actor_machine != _som_server_local_machine_lower
+                                )
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (inter-burst-stale debug): "
+                                    f"som_age={_som_age:.1f}s gap={_BURST_INTER_BURST_GAP:.0f}s "
+                                    f"sluser={_s1bp_server_local_user!r} "
+                                    f"prior_actor={_som_prior_actor_machine!r} "
+                                    f"server_local_machine={_som_server_local_machine_lower!r} "
+                                    f"own_machine={_som_own_machine_lower!r} "
+                                    f"inter_burst_stale={_som_inter_burst_stale}"
+                                )
+                                if _som_age <= _FRESH_SESSION_SECS and not _som_inter_burst_stale:
+                                    _som_machine = _som_ws if _som_ws else _som_ip
+                                    _som_user = (
+                                        f"{_som_machine}\\{_s1bp_4663_uname}"
+                                        if _som_machine and _s1bp_4663_uname
+                                        else _s1bp_server_local_user
+                                    )
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (source-modified own-machine fallback): "
+                                        f"no burst cache hit for source-watch {event_type!r} — "
+                                        f"own-machine 4624 is FRESH (abs_diff={_som_age:.1f}s <= {_FRESH_SESSION_SECS:.0f}s, "
+                                        f"inter_burst_gap={_BURST_INTER_BURST_GAP:.0f}s not exceeded), "
+                                        f"backup app never modifies source files, so own-machine is the actor. "
+                                        f"Using deferred own-machine candidate: "
+                                        f"WorkstationName={_som_ws!r} IpAddress={_som_ip!r} time_diff={_som_best[0]:+.1f}s. "
+                                        f"server-local was: user={_s1bp_server_local_user!r} machine={_s1bp_server_local_machine!r}"
+                                    )
+                                    result["user"]    = _som_user
+                                    result["machine"] = _som_machine
+                                    result["ip"]      = _som_ip if _som_ip else _s1bp_server_local_ip
+                                    _s1bp_matched = True
+                                    _lc_burst_server_user = locals().get("_s1bp_server_local_user_burst_key", "") or _s1bp_server_local_user
+                                    if _lc_burst_server_user and _som_machine:
+                                        _burst_cache_put(
+                                            host, _lc_burst_server_user,
+                                            _som_machine,
+                                            _som_ip or host,
+                                            _som_user,
+                                            event_type=event_type,
+                                        )
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b-post (source-modified own-machine fallback burst-cache): "
+                                            f"stored own-machine attribution for host={host!r} "
+                                            f"server_local_user={_lc_burst_server_user!r} event_type={event_type!r} -> "
+                                            f"machine={_som_machine!r} ip={_som_ip!r} "
+                                            f"(TTL={_BURST_CACHE_TTL:.0f}s)"
+                                        )
+                                        # Also persist to the longer-lived last-mod-actor
+                                        # cache so the inter-burst stale check can detect
+                                        # a prior different actor even after the burst
+                                        # cache TTL has expired.
+                                        _last_mod_actor_put(
+                                            host, _lc_burst_server_user,
+                                            _som_machine, _som_ip or host, _som_user
+                                        )
+                                else:
+                                    # Own-machine 4624 is STALE — abs(time_diff) > 30 s.
+                                    # This deferred candidate is from an older SMB session
+                                    # unrelated to the current modification.  The server's
+                                    # local user (e.g. DESKTOP-KGG55PU\User) is the most
+                                    # likely actor and is the correct attribution.
+                                    _qna.warning(
+                                        f"[_query_smb_audit] Strategy1b-post (source-modified own-machine fallback SKIPPED): "
+                                        f"own-machine 4624 REJECTED "
+                                        f"(abs_diff={_som_age:.1f}s, "
+                                        f"reason={'inter_burst_stale' if _som_inter_burst_stale else 'exceeded_outer_threshold'}, "
+                                        f"outer_threshold={_FRESH_SESSION_SECS:.0f}s, "
+                                        f"inter_burst_gap={_BURST_INTER_BURST_GAP:.0f}s, event_type={event_type!r}) "
+                                        f"— prior-burst session from a different actor. "
+                                        f"WorkstationName={_som_ws!r} IpAddress={_som_ip!r} time_diff={_som_best[0]:+.1f}s. "
+                                        f"Falling back to server-local: user={_s1bp_server_local_user!r} machine={_s1bp_server_local_machine!r}"
+                                    )
+                                    result["user"]    = _s1bp_server_local_user
+                                    result["machine"] = _s1bp_server_local_machine
+                                    result["ip"]      = _s1bp_server_local_ip
+                                    _s1bp_matched = True
+                            else:
+                                # The 4656/4663 subject is the server's own local user account
+                                # (e.g. DESKTOP-KGG55PU\User). Best available — either the server
+                                # owner modified/deleted it, or a remote machine whose session is
+                                # too old for the narrow window. Keep it.
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (local-actor rescue): "
+                                    f"own-machine 4624 candidates were suppressed (no remote network logon "
+                                    f"found) but server-local 4656/4663 provides valid actor identity. "
+                                    f"Keeping server-local: user={_s1bp_server_local_user!r} "
+                                    f"machine={_s1bp_server_local_machine!r} ip={_s1bp_server_local_ip!r}. "
+                                    f"own-machine candidates (suppressed): "
+                                    f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
+                                )
+                                result["user"]    = _s1bp_server_local_user
+                                result["machine"] = _s1bp_server_local_machine
+                                result["ip"]      = _s1bp_server_local_ip
+                                _s1bp_matched = True
+                                # ── Burst cache: store so concurrent PARENT-ONLY sibling
+                                # files can reuse this LOCAL-actor attribution.  Without
+                                # this, sibling files with a parent-only 4656 match return
+                                # Unknown even though the actor is already identified.
+                                _lc_burst_server_user = locals().get("_s1bp_server_local_user_burst_key", "") or _s1bp_server_local_user
+                                if _lc_burst_server_user and _s1bp_server_local_machine:
+                                    _burst_cache_put(
+                                        host, _lc_burst_server_user,
+                                        _s1bp_server_local_machine,
+                                        _s1bp_server_local_ip or host,
+                                        _s1bp_server_local_user,
+                                        local_actor=True,
+                                        event_type=event_type,
+                                    )
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy1b-post (local-actor-rescue burst-cache): "
+                                        f"stored LOCAL attribution for host={host!r} "
+                                        f"server_local_user={_lc_burst_server_user!r} event_type={event_type!r} -> "
+                                        f"machine={_s1bp_server_local_machine!r} ip={_s1bp_server_local_ip!r} "
+                                        f"(TTL={_BURST_CACHE_TTL:.0f}s, local_actor=True)"
+                                    )
+                    else:
+                        # All candidates were own-machine and this is NOT a dest-watch,
+                        # OR no server-local user available. Report as unknown.
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post: no remote 4624 match "
+                            f"(logon_id={_s1bp_logon_id!r}) on {host!r} — own-machine candidates "
+                            f"were correctly filtered. Actor is UNKNOWN (not the backup machine, "
+                            f"not a confirmed local user). The real actor's 4624 Network Logon is "
+                            f"absent from the Security log. Fix: increase Security log max-size "
+                            f"and/or ensure the coworker's machine re-authenticates before deleting "
+                            f"(net use /delete then reconnect). "
+                            f"Setting attribution to UNKNOWN. "
+                            f"machine={result.get('machine')!r} ip={result.get('ip')!r}"
+                        )
+                        result["user"]    = ""
+                        result["machine"] = ""
+                        result["ip"]      = ""
+                else:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy1b-post: no remote 4624 match "
+                        f"(logon_id={_s1bp_logon_id!r}) on {host!r} -- actor was LOCAL. "
+                        f"Keeping 4663: user={result.get('user')!r} "
+                        f"machine={result.get('machine')!r} ip={result.get('ip')!r}"
+                    )
+                    # ── Burst cache: store LOCAL attribution so concurrent
+                    # PARENT-ONLY sibling files can reuse it instead of returning Unknown.
+                    _la_server_user = result.get("user", "")
+                    _la_server_machine = result.get("machine", "")
+                    _la_burst_key = locals().get("_s1bp_server_local_user_burst_key", "") or _la_server_user
+                    if _la_burst_key and _la_server_machine:
+                        _burst_cache_put(
+                            host, _la_burst_key,
+                            _la_server_machine,
+                            result.get("ip", "") or host,
+                            _la_server_user,
+                            local_actor=True,
+                            event_type=event_type,
+                        )
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post (local-actor burst-cache): "
+                            f"stored LOCAL attribution for host={host!r} "
+                            f"server_local_user_key={_la_burst_key!r} event_type={event_type!r} -> "
+                            f"machine={_la_server_machine!r} ip={result.get('ip', '')!r} "
+                            f"(TTL={_BURST_CACHE_TTL:.0f}s, local_actor=True)"
+                        )
+        except _S1BPostDone:
+            pass  # pre-fetched path handled everything cleanly
+        except Exception as _s1bp_err:
+            _qna.info(f"[_query_smb_audit] Strategy1b-post: unexpected error: {_s1bp_err!r}")
+
+    # Clean up any leftover internal keys regardless of path taken
+    result.pop("_s1b_server_local", None)
+    result.pop("_s1b_logon_id", None)
+    result.pop("_s1b_4624_events", None)
+    result.pop("_s1b_4624_wide", None)
+    result.pop("_s1b_handle_logon_ids", None)
+    result.pop("_s1b_event_id", None)
+    result.pop("_s1b_parent_only_match", None)
+
+    # Early-exit if Strategy1b or Strategy1c already found a user
+    if result.get("user"):
+        _qna.info(
+            f"[_query_smb_audit] Strategy1b/1c resolved attribution — "
+            f"skipping NetSessionEnum/NetFileEnum. user={result['user']!r}"
+        )
+        return result
+
+    # ── Strategy 4: NetSessionEnum — who has an open SMB session right now ────
+    # Works best for non-deletion events (session still open).
+    # For deletions the session may already be closed; we retry a few times
+    # because the coworker's SMB session teardown takes a moment after the
+    # delete completes.
+    try:
+        import win32net, socket as _socket, time as _s4_time
+        level  = 10  # SESSION_INFO_10: client_name + username
+        resume = 0
+
+        own_hostname = ""
+        own_ip       = ""
+        try:
+            own_hostname = _socket.gethostname().lower()
+            own_ip       = _socket.gethostbyname(own_hostname)
+        except Exception:
+            pass
+
+        # Authenticate to IPC$ first for better session enumeration.
+        _creds     = smb_audit_cfg or {}
+        _nas_user  = _creds.get("username", "")
+        _nas_pass  = _creds.get("password", "")
+        _ipc_ok    = False
+        if _nas_user and _nas_pass:
+            try:
+                import win32netcon as _w32nc4
+                _USE_IPC4  = getattr(_w32nc4, "USE_IPC", 3)
+                _use_info4 = {
+                    "remote":     f"\\\\{host}\\IPC$",
+                    "username":   _nas_user,
+                    "password":   _nas_pass,
+                    "domainname": "",
+                    "asg_type":   _USE_IPC4,
+                }
+                win32net.NetUseAdd(None, 1, _use_info4)
+                _ipc_ok = True
+                _qna.debug(
+                    f"[_query_smb_audit] Strategy4: IPC$ auth OK for {host!r} "
+                    f"user={_nas_user!r}"
+                )
+            except Exception as _ipc4_err:
+                _qna.debug(
+                    f"[_query_smb_audit] Strategy4: IPC$ auth failed for {host!r}: {_ipc4_err!r} "
+                    f"(may already be connected — proceeding anyway)"
+                )
+        else:
+            _qna.info(
+                f"[_query_smb_audit] Strategy4: no SMB credentials — "
+                f"NetSessionEnum on {host!r} may return empty without admin credentials. "
+                f"Add credentials in watch settings."
+            )
+
+        # For deletions retry up to 3× with 300 ms gaps — the SMB session that
+        # performed the delete may still be open for a brief window.
+        _is_deletion   = event_type in ("deleted", "delete")
+        # NOTE: by the time _get_editor_info is called (after the ~2s debounce),
+        # the SMB session for a deletion is almost always already closed.
+        # The real-time snapshot in watchdog._record is the primary attribution path.
+        # These retries are a last-resort fallback for cases where the session is
+        # still alive (e.g. the coworker kept other files open on the same share).
+        _max_s4_tries  = 5 if _is_deletion else 1
+        _s4_retry_wait = 0.5
+
+        # Use the process-level probe cache from watcher.py so we always call
+        # NetSessionEnum with the correct signature for this pywin32 build.
+        # The probe tests all 6 known variants on startup and caches the winner.
+        try:
+            _nse_fn = _get_net_session_enum_fn("[_query_smb_audit Strategy4] ")
+        except NameError:
+            # _get_net_session_enum_fn not imported (watcher not available)
+            _nse_fn = None
+
+        if _nse_fn is None:
+            _qna.info(
+                "[_query_smb_audit] Strategy4: NetSessionEnum not available — "
+                "either win32net is not installed or all 16 calling conventions "
+                "(6 string-server + 6 None-server + 4 no-server) failed on probe. Skipping."
+            )
+        else:
+            _qna.info(
+                f"[_query_smb_audit] Strategy4: probe-cached NetSessionEnum ready — "
+                f"starting {_max_s4_tries} attempt(s) on {host!r}"
+            )
+
+        def _run_s4():
+            if _nse_fn is None:
+                return []
+            try:
+                return _nse_fn(host)
+            except Exception as _e:
+                _qna.debug(f"[_query_smb_audit] Strategy4: NetSessionEnum call failed: {_e!r}")
+                return []
+
+        _matched = False
+        _s4_all_own_filtered = False  # True when sessions existed but all were own-machine
+        if _nse_fn is not None:
+            _s4_first_sess = _run_s4()
+            for _s4_try in range(1, _max_s4_tries + 1):
+                sessions = _s4_first_sess if _s4_try == 1 else _run_s4()
+                _qna.info(
+                    f"[_query_smb_audit] Strategy4 (NetSessionEnum) attempt {_s4_try}/{_max_s4_tries}: "
+                    f"host={host!r} own_hostname={own_hostname!r} own_ip={own_ip!r} "
+                    f"ipc_auth_ok={_ipc_ok} sessions_count={len(sessions)} "
+                    f"event_type={event_type!r}"
+                )
+                for sess in sessions:
+                    client   = (sess.get("client_name") or "").lstrip("\\").lower()
+                    uname    = sess.get("user_name") or sess.get("username") or ""
+                    num_open = sess.get("num_opens") or sess.get("sesi10_num_opens", "?")
+                    idle_sec = sess.get("idle_time") or sess.get("num_users", "?")
+                    try:
+                        client_ip = _socket.gethostbyname(client) if client else ""
+                    except Exception:
+                        client_ip = client
+                    _is_own = (
+                        client == own_hostname or
+                        (own_ip and client_ip == own_ip)
+                    )
+                    _verdict = (
+                        "no client name" if not client else
+                        "is own machine" if _is_own else
+                        "no username"    if not uname else
+                        "MATCH"
+                    )
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy4: session "
+                        f"client={client!r} ip={client_ip!r} user={uname!r} "
+                        f"opens={num_open!r} idle={idle_sec!r} "
+                        f"own_host={own_hostname!r} own_ip={own_ip!r} "
+                        f"verdict={_verdict!r}"
+                    )
+                    if _verdict == "MATCH":
+                        # BUG-FIX: NetSessionEnum's client_name (sesi10_cname) is
+                        # only ever a real Windows computer name when the client
+                        # mounted the share by NAME (\\HOSTNAME\share). If they
+                        # connected by IP literal (\\192.168.254.106\share — which
+                        # is exactly how this coworker accesses the share per the
+                        # watch setup), Windows reports the client's IP address
+                        # itself as the "client name", so `client` and `client_ip`
+                        # end up identical and the History table's MACHINE column
+                        # just shows the IP a second time instead of a hostname.
+                        # Try to resolve a real machine name (reverse DNS, then
+                        # NetBIOS nbtstat) before giving up and falling back to a
+                        # clearly-labeled "PC (<ip>)" placeholder.
+                        _s4_machine = client
+                        if not client or client == client_ip:
+                            _s4_resolved_name = _resolve_smb_host_name(client_ip or client)
+                            if _s4_resolved_name:
+                                _s4_machine = _s4_resolved_name
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy4: resolved client "
+                                    f"machine NAME for ip={client_ip!r} → "
+                                    f"{_s4_resolved_name!r} (reverse-DNS/NetBIOS)"
+                                )
+                            else:
+                                _s4_machine = f"PC ({client_ip or client})"
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy4: could not resolve "
+                                    f"a machine NAME for ip={client_ip!r} (reverse-DNS "
+                                    f"and NetBIOS nbtstat both failed — coworker's PC "
+                                    f"may have NetBIOS-over-TCPIP disabled, or no PTR "
+                                    f"record exists on this LAN) — showing {_s4_machine!r} "
+                                    f"instead of a bare duplicate IP"
+                                )
+                        result["user"]    = uname
+                        result["machine"] = _s4_machine
+                        result["ip"]      = client_ip
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy4: MATCH → user={uname!r} "
+                            f"machine={_s4_machine!r} ip={client_ip!r} "
+                            f"(attempt {_s4_try}/{_max_s4_tries})"
+                        )
+                        _matched = True
+                        break
+                # If this attempt had sessions but all were own-machine filtered,
+                # that means the actor was LOCAL on the PC (not via SMB network).
+                if not _matched and sessions and all(
+                    (sess.get("client_name") or "").lstrip("\\").lower() == own_hostname or
+                    (own_ip and (lambda c: _socket.gethostbyname(c) if c else "")(
+                        (sess.get("client_name") or "").lstrip("\\").lower()
+                    ) == own_ip)
+                    for sess in sessions
+                ):
+                    _s4_all_own_filtered = True
+                if _matched:
+                    return result
+                if _s4_try < _max_s4_tries:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy4: attempt {_s4_try} found no usable session — "
+                        f"retrying in {_s4_retry_wait}s"
+                    )
+                    _s4_time.sleep(_s4_retry_wait)
+
+        _qna.info(
+            f"[_query_smb_audit] Strategy4: no usable session found after {_max_s4_tries} attempt(s). "
+            f"Likely causes: (1) session closed before enumeration, "
+            f"(2) SMB credentials not set (admin rights needed for NetSessionEnum), "
+            f"(3) coworker used a different Windows account. "
+            f"own_hostname={own_hostname!r} own_ip={own_ip!r} ipc_auth_ok={_ipc_ok!r}"
+        )
+        if _s4_all_own_filtered:
+            result["_all_sessions_own_machine"] = True
+    except ImportError:
+        _qna.info(
+            "[_query_smb_audit] Strategy4: win32net not available — "
+            "pywin32 is not installed; cannot run NetSessionEnum"
+        )
+    except Exception as _s4_err:
+        _qna.info(f"[_query_smb_audit] Strategy4: NetSessionEnum FAILED: {_s4_err!r}")
+
+    # ── Strategy 5: NetFileEnum — enumerate open files with their owning user ─
+    # Complements NetSessionEnum: even when the SMB session has closed (which
+    # happens within ~300 ms of a delete), file handles held by
+    # other processes on the remote PC may keep the user's entry in the file table
+    # briefly. Also works when NetSessionEnum raises TypeError (pywin32 build
+    # issue) because NetFileEnum uses a different internal call path.
+    #
+    # Correct pywin32 signature: NetFileEnum(server, basepath, level, resumeHandle)
+    # = 4 args. Some older builds drop basepath: (server, level, resume) = 3 args.
+    if not result.get("user"):
+        try:
+            import win32net as _w32nfe5, socket as _sock5
+            _fe5_entries: list = []
+            _fe5_sig_used = ""
+            _qna.info(
+                f"[_query_smb_audit] Strategy5 (NetFileEnum): probing signatures "
+                f"on {host!r} has_creds={bool((smb_audit_cfg or {}).get('username'))}"
+            )
+            # Authenticate IPC$ first for session enumeration
+            _creds5    = smb_audit_cfg or {}
+            _u5, _p5   = _creds5.get("username", ""), _creds5.get("password", "")
+            _ipc5_ok   = False
+            if _u5 and _p5:
+                try:
+                    import win32netcon as _w32nc5
+                    _USE_IPC5 = getattr(_w32nc5, "USE_IPC", 3)
+                    _w32nfe5.NetUseAdd(None, 1, {
+                        "remote": f"\\\\{host}\\IPC$",
+                        "username": _u5, "password": _p5,
+                        "domainname": "", "asg_type": _USE_IPC5,
+                    })
+                    _ipc5_ok = True
+                    _qna.info(f"[_query_smb_audit] Strategy5: IPC$ auth OK for {host!r}")
+                except Exception as _ipc5e:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy5: IPC$ auth failed: {_ipc5e!r} "
+                        f"(proceeding anyway — may already be connected)"
+                    )
+            else:
+                _qna.info(
+                    f"[_query_smb_audit] Strategy5: no SMB credentials — "
+                    f"NetFileEnum on {host!r} may be rejected. Add credentials in watch settings."
+                )
+
+            # Probe all known signatures — string-server first, then None-server,
+            # then no-server (some pywin32 builds have no server slot at all;
+            # passing any non-integer as arg[0] raises "X cannot be interpreted
+            # as an integer").
+            _fe5_variants = [
+                # ── String-server variants ──────────────────────────────────────
+                ("(host,'',3,0)",    lambda: _w32nfe5.NetFileEnum(host, "",   3, 0)),
+                ("(host,None,3,0)",  lambda: _w32nfe5.NetFileEnum(host, None, 3, 0)),
+                ("(host,3,0)",       lambda: _w32nfe5.NetFileEnum(host, 3, 0)),
+                ("(host,3)",         lambda: _w32nfe5.NetFileEnum(host, 3)),
+                # 5-arg legacy (server, basepath, username, level, resume) — tried last
+                ("(host,'','',3,0)", lambda: _w32nfe5.NetFileEnum(host, "", "", 3, 0)),
+                # ── None-server variants (IPC$ connection already open) ─────────
+                ("(None,'',3,0)",    lambda: _w32nfe5.NetFileEnum(None, "",   3, 0)),
+                ("(None,None,3,0)",  lambda: _w32nfe5.NetFileEnum(None, None, 3, 0)),
+                ("(None,3,0)",       lambda: _w32nfe5.NetFileEnum(None, 3, 0)),
+                ("(None,3)",         lambda: _w32nfe5.NetFileEnum(None, 3)),
+                # ── No-server variants: first arg IS the level ──────────────────
+                ("(3,0)",            lambda: _w32nfe5.NetFileEnum(3, 0)),
+                ("(3,)",             lambda: _w32nfe5.NetFileEnum(3)),
+            ]
+            _fe5_access_denied = False  # track if any variant hit Access Denied
+            for _fe5_sig, _fe5_call in _fe5_variants:
+                try:
+                    _fe5_result = _fe5_call()
+                    if isinstance(_fe5_result, tuple) and len(_fe5_result) >= 1:
+                        _fe5_entries = list(_fe5_result[0])
+                    else:
+                        _fe5_entries = list(_fe5_result)
+                    _fe5_sig_used = _fe5_sig
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy5: signature {_fe5_sig!r} ACCEPTED "
+                        f"— {len(_fe5_entries)} open file(s) on {host!r}"
+                    )
+                    break
+                except TypeError as _fe5_te:
+                    _qna.debug(
+                        f"[_query_smb_audit] Strategy5: signature {_fe5_sig!r} → TypeError: {_fe5_te!r}"
+                    )
+                except Exception as _fe5e:
+                    _fe5e_str = str(_fe5e)
+                    _fe5_is_access_denied = (
+                        "Access is denied" in _fe5e_str or
+                        "access denied" in _fe5e_str.lower() or
+                        getattr(_fe5e, "winerror", None) == 5
+                    )
+                    if _fe5_is_access_denied:
+                        _fe5_access_denied = True
+                        _qna.debug(
+                            f"[_query_smb_audit] Strategy5: signature {_fe5_sig!r} → "
+                            f"ACCESS DENIED — SMB account {(smb_audit_cfg or {}).get('username')!r} "
+                            f"lacks NetFileEnum rights on {host!r}. "
+                            f"FIX: grant admin/audit rights to this account on the Windows PC "
+                            f"(use an account with admin rights on the Windows PC). "
+                            f"Continuing probe in case another signature variant works."
+                        )
+                        # Don't break — try remaining variants; some SMB hosts accept
+                        # None-server form even when string-server returns Access Denied.
+                        continue
+                    _qna.debug(
+                        f"[_query_smb_audit] Strategy5: signature {_fe5_sig!r} → "
+                        f"{type(_fe5e).__name__}: {_fe5e!r} — stopping probe"
+                    )
+                    break  # non-TypeError, non-AccessDenied = wrong pywin32 build — stop
+
+            if not _fe5_sig_used:
+                if _fe5_access_denied:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy5: all 11 signatures returned "
+                        f"'Access is denied' or TypeError for {host!r}. "
+                        f"ROOT CAUSE: the SMB account configured in watch settings does not have "
+                        f"NetFileEnum admin rights. "
+                        f"FIX: ensure the account has administrator rights on the Windows PC. "
+                        f""
+                        f"Without this, deletion attribution will rely on Security Event Log "
+                        f"Enable object auditing (SACL) on the shared folder for best results. "
+                        f"ipc5_ok={_ipc5_ok} nas_user={(smb_audit_cfg or {}).get('username')!r}"
+                    )
+                else:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy5: all 11 signatures failed "
+                        f"(5 string-server + 4 None-server + 2 no-server) — "
+                        f"this pywin32 build may not support NetFileEnum on {host!r} "
+                        f"ipc5_ok={_ipc5_ok}"
+                    )
+
+            _own_hostname5 = ""
+            try:
+                _own_hostname5 = _sock5.gethostname().lower()
+            except Exception:
+                pass
+
+            # Dump every raw entry at INFO so they always appear in logs
+            for _fe5_idx, _fe5 in enumerate(_fe5_entries):
+                _fe5_user = (
+                    _fe5.get("fi3_username") or _fe5.get("username") or
+                    _fe5.get("fi2_username") or ""
+                )
+                _fe5_path = (
+                    _fe5.get("fi3_pathname") or _fe5.get("pathname") or
+                    _fe5.get("fi2_pathname") or _fe5.get("path") or ""
+                )
+                _qna.info(
+                    f"[_query_smb_audit] Strategy5: entry [{_fe5_idx}] "
+                    f"user={_fe5_user!r} path={_fe5_path!r} "
+                    f"all_keys={list(_fe5.keys())!r} all_vals={dict(_fe5)!r}"
+                )
+                if not _fe5_user:
+                    continue
+                _fe5_user_lower = _fe5_user.lower()
+                _fe5_is_own = (
+                    _fe5_user_lower == _own_hostname5 or
+                    _fe5_user_lower.endswith("\\" + _own_hostname5)
+                )
+                _qna.info(
+                    f"[_query_smb_audit] Strategy5: filter user={_fe5_user!r} "
+                    f"is_own={_fe5_is_own} own_hostname={_own_hostname5!r}"
+                )
+                if _fe5_is_own:
+                    continue
+                # Accept this entry — NetFileEnum gives no client IP so
+                # use SMB host as best available machine reference
+                result["user"]    = _fe5_user
+                result["machine"] = host
+                result["ip"]      = host
+                _qna.info(
+                    f"[_query_smb_audit] Strategy5 (NetFileEnum): MATCH → "
+                    f"user={_fe5_user!r} path={_fe5_path!r}"
+                )
+                break
+
+            if not result.get("user"):
+                _qna.info(
+                    f"[_query_smb_audit] Strategy5: no usable entry after filtering "
+                    f"{len(_fe5_entries)} raw file(s). "
+                    f"sig={_fe5_sig_used!r} own_hostname={_own_hostname5!r} host={host!r} "
+                    f"ipc5_ok={_ipc5_ok}"
+                )
+        except ImportError:
+            _qna.info("[_query_smb_audit] Strategy5: win32net not available — skipping")
+        except Exception as _s5_err:
+            _qna.info(f"[_query_smb_audit] Strategy5: unexpected error: {_s5_err!r}")
+
+    # ── Strategy 6: Windows PC — enumerate sessions using all calling conventions ─
+    # Designed for the Windows/Mac PC-to-PC SMB scenario.
+    # (Windows/Mac PC). The key difference from Strategy 4:
+    #   - Strategy 4 filters by own_host/own_ip and returns the FIRST non-own session.
+    #   - Strategy 6 dumps ALL sessions including their usernames and IPs, so we can
+    #     see exactly what is being filtered and why. This is the primary debug path
+    #     for the "same-host PC" scenario where source=\\PC\share1 and dest=\\PC\share2.
+    #   - It also tries win32security.LookupAccountSid on the DELETED file's ACL if
+    #     the file still exists in the recycle bin or a temp location on the Windows PC.
+    #   - For Windows PCs, NetSessionEnum called from the BACKUP machine (192.168.254.106)
+    #     targeting the WINDOWS PC (192.168.254.108) will enumerate SMB clients connected
+    #     TO the Windows PC. This returns sessions from ALL clients — including the backup
+    #     machine itself. The own_ip filter must exclude 192.168.254.106 (backup machine)
+    #     but MUST NOT exclude 192.168.254.108 (coworker on the Windows PC console/RDP).
+    #   - IMPORTANT: a coworker logged in LOCALLY on 192.168.254.108 deleting via Explorer
+    #     does NOT generate a NetSessionEnum entry — they are local, not an SMB client.
+    #     For local-console deletions, ONLY the Security Event Log (Strategy 1) works.
+    if True:  # Always run for Windows/Mac PC SMB targets
+        try:
+            import win32net as _w32s6, socket as _sock6
+            _s6_own_host = ""
+            _s6_own_ip   = ""
+            try:
+                _s6_own_host = _sock6.gethostname().lower()
+                _s6_own_ip   = _sock6.gethostbyname(_s6_own_host)
+            except Exception:
+                pass
+
+            _s6_creds = smb_audit_cfg or {}
+            _s6_user  = _s6_creds.get("username", "")
+            _s6_pass  = _s6_creds.get("password", "")
+            _s6_ipc_ok = False
+            _s6_raw_sessions_count = 0
+            if _s6_user and _s6_pass:
+                try:
+                    import win32netcon as _w32nc6
+                    _USE_IPC6  = getattr(_w32nc6, "USE_IPC", 3)
+                    _use_info6 = {
+                        "remote":     f"\\\\{host}\\IPC$",
+                        "username":   _s6_user,
+                        "password":   _s6_pass,
+                        "domainname": "",
+                        "asg_type":   _USE_IPC6,
+                    }
+                    _w32s6.NetUseAdd(None, 1, _use_info6)
+                    _s6_ipc_ok = True
+                    _qna.info(f"[_query_smb_audit] Strategy6: IPC$ auth OK for {host!r} user={_s6_user!r}")
+                except Exception as _s6_ipc_err:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy6: IPC$ auth FAILED for {host!r}: {_s6_ipc_err!r} "
+                        f"(proceeding — may already be connected)"
+                    )
+            else:
+                _qna.info(
+                    f"[_query_smb_audit] Strategy6: no credentials — "
+                    f"NetSessionEnum on Windows PC {host!r} may be denied. "
+                    f"Add the Windows PC admin credentials in watch settings."
+                )
+
+            _s6_fn = _get_net_session_enum_fn("[_query_smb_audit Strategy6] ")
+            if _s6_fn is None:
+                _qna.info(
+                    "[_query_smb_audit] Strategy6: NetSessionEnum not available — "
+                    "all 16 pywin32 calling conventions failed at probe time."
+                )
+            else:
+                _s6_max = 5 if event_type in ("deleted", "delete") else 1
+                _qna.info(
+                    f"[_query_smb_audit] Strategy6 (Windows PC NetSessionEnum): "
+                    f"attempting {_s6_max} attempt(s) on {host!r} "
+                    f"own_host={_s6_own_host!r} own_ip={_s6_own_ip!r} "
+                    f"ipc_ok={_s6_ipc_ok}"
+                )
+                import time as _s6_time
+                for _s6_try in range(1, _s6_max + 1):
+                    _s6_sessions_raw = []
+                    try:
+                        _s6_sessions_raw = _s6_fn(host)
+                    except Exception as _s6_call_err:
+                        _qna.info(f"[_query_smb_audit] Strategy6: call failed attempt {_s6_try}: {_s6_call_err!r}")
+                    _s6_raw_sessions_count += len(_s6_sessions_raw)
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy6: attempt {_s6_try}/{_s6_max} — "
+                        f"{len(_s6_sessions_raw)} raw session(s) on {host!r}"
+                    )
+                    # Log ALL sessions — even own-machine ones — for debugging
+                    _s6_matched = False
+                    for _s6_sess in _s6_sessions_raw:
+                        _s6_client = (_s6_sess.get("client_name") or "").lstrip("\\").lower()
+                        _s6_uname  = _s6_sess.get("user_name") or _s6_sess.get("username") or ""
+                        _s6_opens  = _s6_sess.get("num_opens") or _s6_sess.get("sesi10_num_opens", "?")
+                        try:
+                            _s6_cip = _sock6.gethostbyname(_s6_client) if _s6_client else ""
+                        except Exception:
+                            _s6_cip = _s6_client
+                        _s6_is_own = (
+                            _s6_client == _s6_own_host or
+                            (_s6_own_ip and _s6_cip == _s6_own_ip)
+                        )
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy6: session "
+                            f"client={_s6_client!r} ip={_s6_cip!r} "
+                            f"user={_s6_uname!r} opens={_s6_opens!r} "
+                            f"is_own_machine={_s6_is_own} "
+                            f"own_host={_s6_own_host!r} own_ip={_s6_own_ip!r}"
+                        )
+                        if not _s6_client:
+                            _qna.info("[_query_smb_audit] Strategy6: skipping — no client name")
+                            continue
+                        if _s6_is_own:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy6: FILTERED OUT own-machine session "
+                                f"client={_s6_client!r} user={_s6_uname!r} — this is the backup machine"
+                            )
+                            continue
+                        if not _s6_uname:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy6: skipping session client={_s6_client!r} "
+                                f"— no username (anonymous/machine connection)"
+                            )
+                            continue
+                        # This is a non-own, named session — this is the coworker!
+                        result["user"]    = _s6_uname
+                        result["machine"] = _s6_client
+                        result["ip"]      = _s6_cip
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy6: MATCH → "
+                            f"user={_s6_uname!r} machine={_s6_client!r} ip={_s6_cip!r} "
+                            f"(attempt {_s6_try}/{_s6_max})"
+                        )
+                        _s6_matched = True
+                        break
+                    if _s6_matched:
+                        return result
+                    if _s6_try < _s6_max:
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy6: attempt {_s6_try} — "
+                            f"no non-own session found yet, retrying in 0.5s. "
+                            f"NOTE: if the coworker deleted the file locally on the Windows PC "
+                            f"(not via SMB), they will NEVER appear in NetSessionEnum — "
+                            f"only Strategy1 (Security Event Log) can identify local deletions."
+                        )
+                        _s6_time.sleep(0.5)
+
+                if not _s6_matched:
+                    _qna.info(
+                        f"[_query_smb_audit] Strategy6: no non-own session after {_s6_max} attempt(s). "
+                        f"DIAGNOSIS for Windows PC {host!r}: "
+                        f"(A) If 0 raw sessions: credentials lack admin rights on the PC, or "
+                        f"'File and Printer Sharing' is disabled on the PC "
+                        f"(Control Panel → Network → Sharing Center → Advanced → enable). "
+                        f"(B) If sessions shown but all filtered: the coworker deleted the file "
+                        f"LOCALLY on the Windows PC (Explorer/desktop), not via SMB from another machine. "
+                        f"In this case ONLY Strategy1 (Security Event Log + object auditing SACL) can "
+                        f"identify the actor. Enable SACL: right-click the shared folder on {host!r} → "
+                        f"Properties → Security → Advanced → Auditing → Add principal=Everyone, "
+                        f"Type=All, Access=Delete/Delete subfolders and files."
+                    )
+                    if event_type in ("deleted", "delete"):
+                        # Zero raw sessions is ambiguous: it may mean the session closed,
+                        # credentials/firewall prevented enumeration, or the target PC
+                        # has no active SMB session. Do not assume "Local user" yet.
+                        # Strategy6b can still try to identify a console user.
+                        _qna.debug(
+                            f"[_query_smb_audit] Strategy6: zero raw sessions on {host!r} — "
+                            f"cannot infer local deletion without better evidence"
+                        )
+                        # Strategy 6b: Query console user on Windows PC (local deletion candidate)
+                        # When no SMB sessions exist, try to identify who is logged in at the PC console.
+                        try:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy6b (console user): "
+                                f"Querying who is logged into {host!r} console (local deletion detected)"
+                            )
+                            import subprocess as _s6b_sp
+                            _CNW = getattr(_s6b_sp, "CREATE_NO_WINDOW", 0)
+
+                            def _run_remote_cmd(_cmd):
+                                try:
+                                    _res = _s6b_sp.run(
+                                        _cmd,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=8,
+                                        creationflags=_CNW,
+                                    )
+                                    if _res.returncode == 0:
+                                        return _res.stdout.strip()
+                                except Exception as _err:
+                                    _qna.debug(
+                                        f"[_query_smb_audit] Strategy6b: remote command failed: {_cmd!r} {_err!r}"
+                                    )
+                                return ""
+
+                            def _parse_wmic_username(_stdout):
+                                for _line in _stdout.splitlines():
+                                    if _line.lower().startswith("username="):
+                                        return _line.split("=", 1)[1].strip()
+                                return ""
+
+                            def _parse_queryuser_output(_stdout):
+                                for _line in _stdout.splitlines():
+                                    _line = _line.strip()
+                                    if not _line or _line.lower().startswith("username") or _line.lower().startswith("sessionname"):
+                                        continue
+                                    if _line.startswith(">"):
+                                        _line = _line[1:].strip()
+                                    parts = [p for p in _line.split() if p]
+                                    if parts:
+                                        return parts[0]
+                                return ""
+
+                            _s6b_parsed_user = ""
+
+                            # ── Strategy6b-A: NetWkstaUserEnum ──────────────────────────────────
+                            # Most reliable method when SMB admin creds are available.
+                            # Enumerates ALL users logged into the remote PC (console + RDP),
+                            # unlike NetSessionEnum which only sees network/SMB clients.
+                            # This catches local-console deletions that NetSessionEnum misses.
+                            try:
+                                import win32net as _w32wksta
+                                _wksta_data, _wksta_total, _wksta_resume = _w32wksta.NetWkstaUserEnum(host, 1, 0)
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy6b (NetWkstaUserEnum): "
+                                    f"{len(_wksta_data)} user(s) logged into {host!r}: "
+                                    f"{[e.get('username') for e in _wksta_data]}"
+                                )
+                                for _wksta_entry in _wksta_data:
+                                    _wksta_user = _wksta_entry.get("username", "")
+                                    _wksta_dom  = _wksta_entry.get("logon_domain", "")
+                                    # Skip machine accounts (end with $) and our own backup host
+                                    if not _wksta_user or _wksta_user.endswith("$"):
+                                        _qna.debug(
+                                            f"[_query_smb_audit] Strategy6b (NetWkstaUserEnum): "
+                                            f"skip machine/system account {_wksta_user!r}"
+                                        )
+                                        continue
+                                    if _wksta_user.lower() in (_s6_own_host, _s6_own_host + "$"):
+                                        _qna.debug(
+                                            f"[_query_smb_audit] Strategy6b (NetWkstaUserEnum): "
+                                            f"skip own-machine account {_wksta_user!r}"
+                                        )
+                                        continue
+                                    _wksta_full = f"{_wksta_dom}\\{_wksta_user}" if _wksta_dom else _wksta_user
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy6b (NetWkstaUserEnum): "
+                                        f"MATCH → user={_wksta_full!r} logon_domain={_wksta_dom!r} on {host!r}"
+                                    )
+                                    _s6b_parsed_user = _wksta_full
+                                    break
+                            except ImportError:
+                                _qna.info("[_query_smb_audit] Strategy6b (NetWkstaUserEnum): win32net not available")
+                            except Exception as _wksta_err:
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy6b (NetWkstaUserEnum): "
+                                    f"failed for {host!r}: {_wksta_err!r}. "
+                                    f"FIX: ensure the SMB account in watch settings has local admin rights on {host!r}, "
+                                    f"and that 'File and Printer Sharing' is enabled on the remote PC."
+                                )
+
+                            # ── Strategy6b-B: WMIC computersystem UserName ───────────────────────
+                            # BUG FIX: credentials must appear AFTER /node:HOST in WMIC argument
+                            # order: wmic /node:HOST /user:U /password:P computersystem get UserName
+                            # (previously they were inserted at index 1, before /node:, which is wrong)
+                            if not _s6b_parsed_user:
+                                _s6b_wmic_cmd = ["wmic", "/node:" + host]
+                                if _s6_user and _s6_pass:
+                                    _s6b_wmic_cmd += ["/user:" + _s6_user, "/password:" + _s6_pass]
+                                _s6b_wmic_cmd += ["computersystem", "get", "UserName", "/format:list"]
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy6b (WMIC): running "
+                                    f"wmic /node:{host!r} [...] computersystem get UserName "
+                                    f"(creds={'yes' if _s6_user else 'no — add admin creds in watch settings'})"
+                                )
+                                try:
+                                    _s6b_wmic_res = _s6b_sp.run(
+                                        _s6b_wmic_cmd,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=10,
+                                        creationflags=_CNW,
+                                    )
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy6b (WMIC): "
+                                        f"returncode={_s6b_wmic_res.returncode} "
+                                        f"stdout={_s6b_wmic_res.stdout.strip()!r} "
+                                        f"stderr={_s6b_wmic_res.stderr.strip()!r}"
+                                    )
+                                    if _s6b_wmic_res.returncode == 0 and _s6b_wmic_res.stdout:
+                                        _s6b_parsed_user = _parse_wmic_username(_s6b_wmic_res.stdout)
+                                        if _s6b_parsed_user:
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy6b (WMIC): "
+                                                f"MATCH → user={_s6b_parsed_user!r} on {host!r}"
+                                            )
+                                except Exception as _wmic_exc:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy6b (WMIC): exception: {_wmic_exc!r}"
+                                    )
+
+                            # ── Strategy6b-C: query user / quser ────────────────────────────────
+                            if not _s6b_parsed_user:
+                                for _s6b_cmd in [
+                                    ["query", "user", "/server:" + host],
+                                    ["quser", "/server:" + host],
+                                ]:
+                                    _qna.info(
+                                        f"[_query_smb_audit] Strategy6b (query user): "
+                                        f"running {' '.join(_s6b_cmd)!r}"
+                                    )
+                                    try:
+                                        _s6b_qu_res = _s6b_sp.run(
+                                            _s6b_cmd,
+                                            capture_output=True,
+                                            text=True,
+                                            timeout=8,
+                                            creationflags=_CNW,
+                                        )
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy6b (query user): "
+                                            f"returncode={_s6b_qu_res.returncode} "
+                                            f"stdout={_s6b_qu_res.stdout.strip()!r} "
+                                            f"stderr={_s6b_qu_res.stderr.strip()!r}"
+                                        )
+                                        if _s6b_qu_res.returncode == 0 and _s6b_qu_res.stdout:
+                                            _s6b_parsed_user = _parse_queryuser_output(_s6b_qu_res.stdout)
+                                            if _s6b_parsed_user:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy6b (query user): "
+                                                    f"MATCH → user={_s6b_parsed_user!r} on {host!r}"
+                                                )
+                                                break
+                                    except Exception as _qu_exc:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy6b (query user): "
+                                            f"exception for {' '.join(_s6b_cmd)!r}: {_qu_exc!r}"
+                                        )
+
+                            if _s6b_parsed_user and _s6b_parsed_user.lower() != "system":
+                                _s6b_client_ip = host
+                                _s6b_session_type = "console"
+                                result["user"] = _s6b_parsed_user
+                                result["machine"] = host
+                                result["ip"] = _s6b_client_ip
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy6b (console user): MATCH → "
+                                    f"user={_s6b_parsed_user!r} machine={host!r} ip={_s6b_client_ip!r} "
+                                    f"session_type={_s6b_session_type!r}"
+                                )
+                                return result
+
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy6b: no usable console user found by WMIC or query user. "
+                                f"Check whether the target PC allows remote console queries and whether the provided credentials have admin rights."
+                            )
+                        except Exception as _s6b_err:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy6b (console user): exception: {_s6b_err!r}"
+                            )
+        except ImportError:
+            _qna.info("[_query_smb_audit] Strategy6: win32net not available — skipping")
+        except Exception as _s6_err:
+            _qna.info(f"[_query_smb_audit] Strategy6: unexpected error: {_s6_err!r}")
+
+    if not result.get("machine"):
+        _resolved_machine = _resolve_smb_host_name(host)
+        if _resolved_machine:
+            if result.get("user"):
+                # A strategy succeeded and gave us a user — the resolved name
+                # is meaningful context (the share host), store it.
+                result["machine"] = _resolved_machine
+                _qna.info(
+                    f"[_query_smb_audit] resolved SMB host {host!r} to machine name "
+                    f"{_resolved_machine!r} for display"
+                )
+            else:
+                # All strategies failed — user is Unknown.
+                # _resolved_machine here is the SHARE SERVER's own hostname
+                # (e.g. DESKTOP-KGG55PU for 192.168.254.109), NOT the actor's
+                # machine. Storing it as "machine" would mislead the UI into
+                # showing the wrong PC as the culprit.
+                # Leave machine empty so the UI displays "Unknown" cleanly.
+                result["user"] = "Unknown"
+                _qna.info(
+                    f"[_query_smb_audit] resolved SMB host {host!r} to {_resolved_machine!r} "
+                    f"but this is the SHARE SERVER name, not the actor's machine — "
+                    f"omitting from result to avoid misleading attribution"
+                )
+
+    # ── Final burst cache check (race-condition rescue) ──────────────────────
+    # When two files are added concurrently (e.g. IMG_0019.pdf + IMG_0020.pdf),
+    # Strategy1b-post for the first file may run before the second file finishes
+    # attribution, so the burst cache is empty at that moment (Fix 2 misses it).
+    # By the time all strategies 4/5/6 exhaust (~2-4s later), the sibling file
+    # has resolved and its burst cache entry is now available.  Re-check here
+    # as a last resort before returning UNKNOWN.
+    # A short retry loop (up to 4s) handles the race where strategies 4/5/6 are
+    # fast (access-denied) but the sibling's wevtutil query is still in flight.
+    if not result.get("user") or result.get("user") == "Unknown":
+        # The server-local user key for the burst cache was recorded by
+        # Strategy1b-post into _s1bp_server_local_user_burst_key (set below
+        # at the same time as _s1bp_server_local_user in Strategy1b-post).
+        _final_sluser = locals().get("_s1bp_server_local_user_burst_key", "")
+        import time as _fb_time
+        _fb_retry_max   = 10.0  # seconds — extended: sibling wevtutil may still be running after
+                                # strategies 4/5/6 exhaust; 10s covers the observed 7-9s wevtutil lag
+        _fb_retry_step  = 0.3   # poll more frequently for lower attribution latency
+        _fb_retry_elapsed = 0.0
+        _fb_retry_attempt = 0
+        _final_burst_hit = None
+        while True:
+            # Strategy A: exact key match (fastest, most precise)
+            _final_burst_hit = _burst_cache_lookup(host, _final_sluser, event_type=event_type) if _final_sluser else None
+            # Strategy B: any entry for this host (handles cases where the sibling
+            # resolved with a different server_local_user key, or the key was not
+            # recorded because the parent-only path was not taken)
+            if not _final_burst_hit:
+                _final_burst_hit = _burst_cache_any_for_host(host, event_type=event_type)
+            if _final_burst_hit:
+                break
+            if _fb_retry_elapsed >= _fb_retry_max:
+                break
+            _qna.info(
+                f"[_query_smb_audit] Final burst-cache rescue: attempt {_fb_retry_attempt + 1} — "
+                f"MISS for host={host!r} server_local_user_key={_final_sluser!r}. "
+                f"Sibling may still be resolving; retrying in {_fb_retry_step:.1f}s "
+                f"(elapsed={_fb_retry_elapsed:.1f}s / max={_fb_retry_max:.1f}s)."
+            )
+            _fb_time.sleep(_fb_retry_step)
+            _fb_retry_elapsed += _fb_retry_step
+            _fb_retry_attempt += 1
+
+        if _final_burst_hit:
+            _fb_machine, _fb_ip, _fb_user = _final_burst_hit
+            _qna.info(
+                f"[_query_smb_audit] Final burst-cache rescue: "
+                f"all strategies exhausted but burst cache HIT for "
+                f"host={host!r} server_local_user_key={_final_sluser!r} "
+                f"after {_fb_retry_elapsed:.1f}s / {_fb_retry_attempt} poll(s). "
+                f"-> machine={_fb_machine!r} ip={_fb_ip!r} user={_fb_user!r}. "
+                f"Concurrent sibling file resolved while this file's strategies were running."
+            )
+            result["user"]    = _fb_user
+            result["machine"] = _fb_machine
+            result["ip"]      = _fb_ip
+        else:
+            _qna.info(
+                f"[_query_smb_audit] Final burst-cache rescue: MISS "
+                f"host={host!r} server_local_user_key={_final_sluser!r} "
+                f"after {_fb_retry_elapsed:.1f}s / {_fb_retry_attempt} poll(s). "
+                f"If a sibling file resolves AFTER this function returns, the retroactive "
+                f"BURST-PATCH in _on_file_change will still fix this Unknown row in the UI."
+            )
+
+    _qna.info(
+        f"[_query_smb_audit] EXHAUSTED all strategies — returning partial result: "
+        f"user={result.get('user')!r} machine={result.get('machine')!r} ip={result.get('ip')!r}. "
+        f"SUMMARY for Windows/Mac PC target {host!r}: "
+        f"The most reliable fix is enabling object auditing (SACL) on the shared folder on the "
+        f"Windows PC and using Strategy1 (Security Event Log). "
+        f"See Strategy1/Strategy4 log entries above for specific next steps."
+    )
+    return result
+
+
+def _get_editor_info(filepath: str, detection_source: str = "",
+                     timestamp_iso: str = "", event_type: str = "",
+                     smb_audit_cfg: dict | None = None,
+                     smb_sessions_snapshot: list | None = None,
+                     force_local: bool = False,
+                     is_dest_watch: bool = False,
+                     local_smb_host: str = "",
+                     _skip_owner_lookup: bool = False) -> dict:
+    """
+    Return the user + machine + IP that performed a file operation.
+
+    force_local=True: skip all UNC/SMB audit logic and return the local
+    machine's identity directly.  Use this when the caller knows the action
+    was performed by this machine (e.g. backup_diff entries — the backup job
+    itself copies the files, so the actor is always the local machine).
+
+    For UNC/network paths this tries multiple strategies to get the real
+    remote client rather than falling back to the local machine:
+
+      1. win32security owner lookup (works while file exists)
+      2. Windows Security Event Log (Event ID 4663/4660)
+      3. NetFileEnum (open file handles with owning user)
+      4. NetSessionEnum (active SMB sessions)
+      5. SMB host IP as last resort (labeled honestly)
+
+    Attribution rules for UNC/network paths (\\\\host\\share\\...):
+
+    - detection_source == "watchdog" on a UNC path:
+        Try win32security owner lookup first (reliable while file exists).
+        If that fails (file deleted / pywin32 absent), escalate to audit log
+        queries and NetSessionEnum before giving up.
+    - detection_source == "unc_poll" / "unc_notify":
+        File snapshot diff — skip owner lookup (may be stale), go straight
+        to audit log + NetSessionEnum.
+    - Local path: original behaviour (local hostname + win32security owner),
+        UNLESS local_smb_host is set — in that case the local path is also
+        served as an SMB share and changes may come from remote clients.
+        Setting local_smb_host=<server_ip> routes through the full SMB audit
+        pipeline (NetSessionEnum, Security Event Log) so the coworker who
+        wrote the file over the network is correctly identified instead of
+        always showing the server/folder owner.
+    """
+    import os, socket, logging as _gei_log
+    _gei = _gei_log.getLogger(__name__)
+    info = {"user": "", "machine": "", "ip": ""}
+
+    # ── Local-path-as-SMB-share redirect ────────────────────────────────────
+    # When the watch is on a local drive path (e.g. D:\testshare) that is also
+    # shared via SMB to coworkers, file changes can originate from any connected
+    # client.  win32security.GetFileSecurity on a local path always returns the
+    # file OWNER (the share host account), never the remote client that wrote it.
+    # By passing local_smb_host=<this machine's IP> we re-enter _get_editor_info
+    # as if the path were a UNC path on that host, activating the full SMB audit
+    # pipeline (NetSessionEnum, Security Event Log 4663) which CAN identify the
+    # remote actor.
+    if local_smb_host and not force_local and not filepath.startswith("\\\\"):
+        # Build a synthetic UNC filepath so the UNC branch is triggered.
+        # Strip the drive letter (e.g. "D:\testshare\file.png" → "testshare\file.png")
+        # then prepend \\<host>\ to form \\<host>\testshare\file.png.
+        import re as _lsh_re
+        _lsh_path_stripped = _lsh_re.sub(r'^[A-Za-z]:\\', '', filepath)
+        _lsh_unc = f"\\\\{local_smb_host}\\{_lsh_path_stripped}"
+        _gei.info(
+            f"[_get_editor_info] local_smb_host={local_smb_host!r} — redirecting "
+            f"local path {filepath!r} through UNC SMB audit as {_lsh_unc!r} "
+            f"with _skip_owner_lookup=True (see Step1 below for why)"
+        )
+        return _get_editor_info(
+            _lsh_unc,
+            detection_source=detection_source,
+            timestamp_iso=timestamp_iso,
+            event_type=event_type,
+            smb_audit_cfg=smb_audit_cfg,
+            smb_sessions_snapshot=smb_sessions_snapshot,
+            force_local=False,
+            is_dest_watch=is_dest_watch,
+            local_smb_host="",   # prevent infinite recursion
+            # BUG-FIX: the UNC host here (local_smb_host) IS this machine — it's
+            # a loopback redirect, not a real remote server. win32security.
+            # GetFileSecurity() on \\<own-ip>\share\file resolves to the exact
+            # same local NTFS owner as the plain local path would, REGARDLESS
+            # of which remote SMB client actually wrote the file. Step1 was
+            # therefore always "succeeding" here with the wrong answer (the
+            # share owner) and returning immediately — before Steps 2-4 ever
+            # got a chance to consult NetSessionEnum / the session cache /
+            # the Security Event Log, which CAN see the real remote client.
+            # This is the actual cause of changes always being attributed to
+            # the local owner's IP even when a coworker made them.
+            _skip_owner_lookup=True,
+        )
+
+    # ── Fast path: caller knows this action was performed by the local machine ─
+    # Skip all UNC/SMB audit logic and resolve local identity directly.
+    # Used for backup_diff entries where the backup job itself is the actor.
+    if force_local:
+        try:
+            info["machine"] = socket.gethostname()
+        except Exception:
+            pass
+        try:
+            info["ip"] = socket.gethostbyname(info["machine"]) if info["machine"] else ""
+        except Exception:
+            pass
+        # force_local means "the local machine ran the backup job" — always
+        # identify the LOCAL user, never the file owner on a remote server.
+        # GetFileSecurity on a UNC path returns the server-side owner
+        # (e.g. BUILTIN\Administrators from robocopy), so we skip it here.
+        # BUG-FIX: USER used to be rendered as "MACHINE\username" here (e.g.
+        # "DESKTOP-0EDUBAP\user") while SMB-attributed rows show just
+        # "username" — the History table already has a separate MACHINE
+        # column, so the prefix was redundant and made the two row styles
+        # look inconsistent side by side. Now both paths show the bare
+        # username only.
+        _fl_resolved = False
+        try:
+            import win32api
+            _uname = win32api.GetUserName()
+            info["user"] = _uname
+            _fl_resolved = True
+        except Exception:
+            pass
+        if not _fl_resolved:
+            _uname  = os.environ.get("USERNAME", "")
+            if _uname:
+                info["user"] = _uname
+        _gei.debug(
+            f"[_get_editor_info] force_local=True → "
+            f"user={info['user']!r} machine={info['machine']!r}"
+        )
+        return info
+
+    def _unc_host(path: str):
+        norm = path.replace("\\", "/")
+        if norm.startswith("//"):
+            parts = norm.lstrip("/").split("/")
+            return parts[0] if parts else "", True
+        return "", False
+
+    remote_host, is_unc = _unc_host(filepath)
+
+    _gei.debug(
+        f"[_get_editor_info] ENTER filepath={filepath!r} is_unc={is_unc} "
+        f"remote_host={remote_host!r} detection_source={detection_source!r} "
+        f"event_type={event_type!r} has_smb_snapshot={bool(smb_sessions_snapshot)} "
+        f"has_nas_creds={bool((smb_audit_cfg or {}).get('username'))}"
+    )
+
+    if is_unc and remote_host:
+        _gei.debug(f"[_get_editor_info] UNC path — SMB host={remote_host!r}")
+
+        # Step 0: use pre-captured SMB session snapshot if available.
+        # The snapshot is taken at watchdog fire time — before the 2s debounce
+        # delay closes the session. This is the only reliable way to identify
+        # who deleted a file on a Windows SMB share.
+        if smb_sessions_snapshot:
+            _gei.info(
+                f"[_get_editor_info] Step0 (SMB snapshot): "
+                f"{len(smb_sessions_snapshot)} entry(s) available — "
+                f"entries={smb_sessions_snapshot!r} "
+                f"detection_source={detection_source!r}"
+            )
+            _snap = smb_sessions_snapshot[0]  # most recently active session
+            info["user"]    = _snap.get("username", "")
+            info["machine"] = _snap.get("machine", "")
+            info["ip"]      = _snap.get("ip", "")
+            _snap_src = _snap.get("source", "NetSessionEnum")
+            _gei.info(
+                f"[_get_editor_info] Step0: using first snapshot entry "
+                f"user={info['user']!r} machine={info['machine']!r} "
+                f"ip={info['ip']!r} source={_snap_src!r}"
+            )
+            if info["user"]:
+                _gei.info(
+                    f"[_get_editor_info] Step0 SUCCESS — returning early "
+                    f"(source={_snap_src!r} user={info['user']!r})"
+                )
+                return info
+            _gei.info(
+                f"[_get_editor_info] Step0: snapshot entry had empty username — "
+                f"continuing to Step1. full entry={_snap!r}"
+            )
+        else:
+            _gei.info(
+                f"[_get_editor_info] Step0: no SMB snapshot available "
+                f"(detection_source={detection_source!r} — snapshot only captured by watchdog)"
+            )
+
+        # Step 0b: SMB Session Cache — covers sessions opened hours ago.
+        # If Step0 (live snapshot) found nothing, consult the background
+        # session poller cache which records every session seen in the last
+        # 24 hours.  The entry closest in time to (and before) the deletion
+        # is used.  This correctly handles: "session opened at 8am, file
+        # deleted at 7pm" — the 4624 Network Logon event is long gone, but
+        # we saw the session in our 60s poll at some point during the day.
+        #
+        # IMPORTANT: NetSessionEnum (used by the poller) only sees NETWORK/SMB
+        # sessions — machines that connected to the UNC host via SMB.  When the
+        # UNC host owner deletes files LOCALLY (via Explorer or an app running
+        # directly on that PC), they do NOT appear in NetSessionEnum at all.
+        # In that case, every machine listed in the cache is merely a bystander
+        # (has the folder open over the network) NOT the actor.
+        #
+        # To avoid misattributing to a bystander (e.g. the backup machine .106
+        # that has the folder open for monitoring), we apply two extra filters:
+        #   1. Exclude any session whose IP resolves to the UNC host itself
+        #      (the host can't be its own SMB client for a local deletion).
+        #   2. If the event_type is "deleted" and the ONLY remaining session(s)
+        #      in cache are machines that just have the folder open (not the
+        #      folder owner's host), treat the deletion as local on the UNC host.
+        #      Signal "local_actor" so Step5 labels it correctly instead of
+        #      pinning blame on a bystander.
+        _session_cache_candidates = []
+        _step0b_local_actor = False   # set True when local deletion is detected
+        if not info.get("user") and remote_host:
+            try:
+                import datetime as _dt_gei, socket as _sc_gei
+                from watcher import get_cached_session_at_time as _get_cached_sess
+                _event_ts = 0.0
+                try:
+                    _event_ts = _dt_gei.datetime.fromisoformat(timestamp_iso).timestamp()
+                except Exception:
+                    _event_ts = _dt_gei.datetime.utcnow().timestamp()
+                _own_h_gei = ""
+                _own_ip_gei = ""
+                try:
+                    _own_h_gei  = _sc_gei.gethostname().lower()
+                    _own_ip_gei = _sc_gei.gethostbyname(_own_h_gei)
+                except Exception:
+                    pass
+
+                # Resolve the UNC host IP so we can exclude it from sessions.
+                # NetSessionEnum runs ON the UNC host; it would never show
+                # the host itself as a remote client — but guard against it anyway.
+                _unc_host_ip = ""
+                try:
+                    _unc_host_ip = _sc_gei.gethostbyname(remote_host)
+                except Exception:
+                    _unc_host_ip = remote_host
+
+                _cached_raw = _get_cached_sess(
+                    remote_host, _event_ts,
+                    own_host=_own_h_gei, own_ip=_own_ip_gei,
+                )
+
+                # Extra filter: remove any session whose IP is the UNC host itself.
+                # (Shouldn't happen in practice but makes attribution 100% safe.)
+                _cached = []
+                for _cs in _cached_raw:
+                    _cs_ip = (_cs.get("ip") or "").strip()
+                    _cs_m  = (_cs.get("machine") or "").strip().lower()
+                    if _unc_host_ip and _cs_ip == _unc_host_ip:
+                        _gei.info(
+                            f"[_get_editor_info] Step0b: SKIPPING session from "
+                            f"machine={_cs_m!r} ip={_cs_ip!r} — IP matches UNC host "
+                            f"{remote_host!r} ({_unc_host_ip!r}); cannot be a remote actor"
+                        )
+                        continue
+                    if _cs_m and _cs_m == remote_host.lower():
+                        _gei.info(
+                            f"[_get_editor_info] Step0b: SKIPPING session from "
+                            f"machine={_cs_m!r} — hostname matches UNC host {remote_host!r}"
+                        )
+                        continue
+                    _cached.append(_cs)
+
+                _gei.info(
+                    f"[_get_editor_info] Step0b (session cache): "
+                    f"raw={len(_cached_raw)} after_unc_host_filter={len(_cached)} "
+                    f"for host={remote_host!r} unc_host_ip={_unc_host_ip!r} "
+                    f"own_ip={_own_ip_gei!r} event_type={event_type!r} "
+                    f"cached_machines={[s.get('machine') for s in _cached]!r}"
+                )
+
+                if _cached:
+                    if len(_cached) == 1:
+                        # Only one non-own, non-UNC-host session in cache.
+                        # BUG-FIX: A single bystander session (e.g. machine .106
+                        # that merely has the folder open for monitoring) must NOT
+                        # be attributed as the actor of a deletion event.
+                        # The UNC host owner (.105) deleted locally — they have NO
+                        # SMB session — so the only cached entry is the backup app
+                        # machine that is watching the folder.
+                        #
+                        # Heuristic: if event_type == "deleted" AND the single
+                        # cached machine IP matches the app's own IP (_own_ip_gei),
+                        # that is clearly the backup-app machine, not the deleter.
+                        # We catch this BEFORE returning to avoid misattribution.
+                        _cbest = _cached[0]
+                        _cbest_ip = (_cbest.get("ip") or "").strip()
+                        _cbest_m  = (_cbest.get("machine") or "").strip().lower()
+
+                        # Is this the backup-app machine itself?
+                        _is_app_machine = (
+                            (_own_ip_gei and _cbest_ip == _own_ip_gei) or
+                            (_own_h_gei and _cbest_m == _own_h_gei)
+                        )
+
+                        if _is_app_machine and event_type == "deleted":
+                            # The only cached session IS the backup-app machine.
+                            # The real actor deleted locally on the UNC host.
+                            # Do NOT attribute to the backup machine.
+                            _step0b_local_actor = True
+                            _gei.info(
+                                f"[_get_editor_info] Step0b: single cached session "
+                                f"machine={_cbest_m!r} ip={_cbest_ip!r} IS the backup-app "
+                                f"machine (own_ip={_own_ip_gei!r} own_host={_own_h_gei!r}). "
+                                f"event_type={event_type!r} — this is a LOCAL DELETION on "
+                                f"the UNC host {remote_host!r} (the owner acted directly on "
+                                f"that PC, not via SMB). "
+                                f"NOT attributing to the backup-app machine. "
+                                f"Step0b LOCAL_ACTOR flag set — will fall through to Step5 "
+                                f"local-user label."
+                            )
+                        else:
+                            _gei.info(
+                                f"[_get_editor_info] Step0b: single session — "
+                                f"actor candidate: user={_cbest.get('username')!r} "
+                                f"machine={_cbest_m!r} ip={_cbest_ip!r} "
+                                f"is_app_machine={_is_app_machine} event_type={event_type!r}"
+                            )
+                            info["user"]    = _cbest.get("username", "")
+                            info["machine"] = _cbest.get("machine", "")
+                            info["ip"]      = _cbest.get("ip", "")
+                            if info["user"]:
+                                _gei.info(
+                                    f"[_get_editor_info] Step0b SUCCESS — returning early "
+                                    f"(single cached session, user={info['user']!r})"
+                                )
+                                return info
+                    else:
+                        # Multiple sessions — can't discriminate here alone.
+                        # Pass all candidates to _query_smb_audit as a hint so
+                        # it can combine with the 4663 SubjectLogonId → the
+                        # server-local actor can be excluded (no SMB session for
+                        # local actions) and the correct remote session selected.
+                        _gei.info(
+                            f"[_get_editor_info] Step0b: {len(_cached)} sessions — "
+                            f"ambiguous, passing to audit query for 4663 correlation. "
+                            f"candidates: {[s.get('machine') for s in _cached]}"
+                        )
+                        _session_cache_candidates = _cached
+                else:
+                    _gei.info(
+                        f"[_get_editor_info] Step0b: session cache empty or no "
+                        f"qualifying session found near event time for host={remote_host!r} "
+                        f"(raw={len(_cached_raw)} all filtered by own-machine or UNC-host-IP check)"
+                    )
+                    if _cached_raw and not _cached and event_type == "deleted":
+                        # All raw sessions were the backup app machine — local actor.
+                        _step0b_local_actor = True
+                        _gei.info(
+                            f"[_get_editor_info] Step0b: all {len(_cached_raw)} raw session(s) "
+                            f"filtered out (own-machine / UNC-host-IP). "
+                            f"event_type={event_type!r}: LOCAL_ACTOR flag set."
+                        )
+            except Exception as _s0b_err:
+                _gei.debug(f"[_get_editor_info] Step0b: error — {_s0b_err!r}")
+
+        # Step 1: win32security owner lookup (only reliable while file exists)
+        # BUG-FIX: skip this entirely when _skip_owner_lookup is set. That flag
+        # means filepath got here via the local-share loopback redirect (the
+        # "UNC host" is actually THIS machine). GetFileSecurity() in that case
+        # reads the exact same local NTFS owner the plain local path would —
+        # it CANNOT see which remote SMB client wrote the file — so "success"
+        # here just means "confidently wrong, returns immediately, and Steps
+        # 2-4 (which CAN see the real remote actor via NetSessionEnum / the
+        # session cache / Security Event Log) never run." Was previously
+        # the #1 cause of changes always being attributed to the local owner.
+        if _skip_owner_lookup:
+            _gei.info(
+                f"[_get_editor_info] Step1 (win32security): SKIPPED — "
+                f"_skip_owner_lookup=True (this is a local-share loopback "
+                f"redirect; the UNC host {remote_host!r} is this machine "
+                f"itself, so the file owner would always resolve to the "
+                f"share owner, never the real remote writer). "
+                f"Falling through to Steps 2-4 (NetSessionEnum / session "
+                f"cache / Security Event Log) for real attribution."
+            )
+        elif detection_source in ("watchdog", "unc_poll", "unc_notify"):
+            try:
+                import win32security
+                sd  = win32security.GetFileSecurity(
+                    filepath, win32security.OWNER_SECURITY_INFORMATION)
+                sid = sd.GetSecurityDescriptorOwner()
+                name, domain, _ = win32security.LookupAccountSid(None, sid)
+                try:
+                    info["machine"] = socket.gethostname()
+                except Exception:
+                    pass
+                try:
+                    info["ip"] = socket.gethostbyname(info["machine"]) if info["machine"] else ""
+                except Exception:
+                    pass
+                info["user"] = name
+                _gei.debug(f"[_get_editor_info] Step1 (win32security): SUCCESS user={info['user']!r}")
+                return info
+            except Exception as _s1e:
+                _gei.debug(
+                    f"[_get_editor_info] Step1 (win32security): FAILED — {_s1e!r} "
+                    f"(file deleted before owner lookup, or pywin32 absent) — falling through to audit"
+                )
+        else:
+            _gei.info(
+                f"[_get_editor_info] Step1 (win32security): SKIPPED "
+                f"(detection_source={detection_source!r} — only runs for watchdog events)"
+            )
+
+        # Steps 2–4: audit log + NetSessionEnum
+        _gei.info(f"[_get_editor_info] Steps2-4: calling _query_smb_audit for {remote_host!r} is_dest_watch={is_dest_watch}")
+        audit = _query_smb_audit(
+            remote_host, filepath,
+            event_type or "unknown",
+            timestamp_iso or __import__("datetime").datetime.now().isoformat(),
+            smb_audit_cfg=smb_audit_cfg or {},
+            is_dest_watch=is_dest_watch,
+        )
+        _gei.info(
+            f"[_get_editor_info] Steps2-4: _query_smb_audit returned "
+            f"user={audit.get('user')!r} machine={audit.get('machine')!r} ip={audit.get('ip')!r}"
+        )
+
+        # Step 2b: session cache disambiguation for multi-session case.
+        # If the audit resolved the actor to LOCAL (machine == remote_host,
+        # meaning the deletion was by the folder-owner on DESKTOP-KGG55PU
+        # themselves), that's correct — trust it.
+        # If the audit result is UNKNOWN (empty user/machine) AND we have
+        # multiple cached sessions, we still can't identify *which* remote
+        # machine deleted.  Log all candidates honestly.
+        # If audit resolved to a specific remote machine AND that machine is
+        # in our session cache, that confirms the result.
+        # If audit resolved to own-machine but event was 4656 (suppressed in
+        # the new logic → UNKNOWN), check if session cache can narrow it.
+        if not audit.get("user") and _session_cache_candidates:
+            _gei.info(
+                f"[_get_editor_info] Step2b: audit returned UNKNOWN but session cache "
+                f"has {len(_session_cache_candidates)} candidate(s): "
+                f"{[s.get('machine') for s in _session_cache_candidates]}. "
+                f"Cannot determine which remote machine performed the deletion "
+                f"(multiple sessions open, no 4663 LogonId match, and event log "
+                f"4624 too old to correlate). Reporting UNKNOWN with session hints."
+            )
+            # Surface the candidates in the result as a hint (shown in debug log).
+            # We do NOT guess — with multiple open sessions and no LogonId, any
+            # attribution would be a coin flip.  The user sees UNKNOWN.
+            audit["session_cache_candidates"] = [
+                s.get("machine", "") for s in _session_cache_candidates
+            ]
+
+        if audit.get("user") or (audit.get("machine") and audit.get("machine") != remote_host):
+            info.update(audit)
+            info.pop("session_cache_candidates", None)
+            _gei.debug(f"[_get_editor_info] Steps2-4: accepted audit result → user={info['user']!r}")
+            return info
+        _gei.info(
+            f"[_get_editor_info] Steps2-4: audit returned no usable identity "
+            f"(user empty and machine=SMB host) — falling to Step5 Unknown"
+        )
+
+        # Step 5: SMB host known but identity unavailable — label it honestly.
+        # Do NOT leave user blank — a blank user triggers false-attribution
+        # logic elsewhere. "Unknown" + attribution_unknown flag tells the UI
+        # to render it with a warning style rather than as a real identity.
+        _resolved_remote = _resolve_smb_host_name(remote_host)
+        info["machine"]             = _resolved_remote or remote_host
+        info["attribution_unknown"] = True
+        try:
+            info["ip"] = socket.gethostbyname(remote_host)
+        except Exception:
+            info["ip"] = remote_host
+
+        # If Strategy4/6 found sessions but ALL were filtered as the backup
+        # machine itself, the actor was acting LOCALLY on the Windows PC
+        # (Explorer, app, etc.) — not via a network SMB session.  In that
+        # case label them "Local user" which is more informative than "Unknown"
+        # and makes clear that SACL auditing is the only fix.
+        # Also handle the Step0b detection: if the only session cache entry was
+        # the backup-app machine itself (a bystander) and event_type==deleted,
+        # we also flag it as a local deletion.
+        _all_own = audit.get("_all_sessions_own_machine", False)
+        _local_likely = audit.get("_local_deletion_likely", False)
+        if _all_own or _local_likely or _step0b_local_actor:
+            info["user"]    = "Local user"
+            info["machine"] = f"PC ({_resolved_remote or remote_host})"
+            _local_source = (
+                "Step0b: only cached session was the backup-app machine (bystander)" if _step0b_local_actor
+                else ("all NetSessionEnum sessions were the backup machine itself" if _all_own
+                      else "no SMB sessions were found")
+            )
+            _gei.info(
+                f"[_get_editor_info] Step5: LOCAL USER — "
+                f"{_local_source} "
+                f"for {remote_host!r}. The deletion was performed directly on the Windows PC "
+                f"(locally via Explorer or an app). NetSessionEnum only sees network/SMB sessions — "
+                f"local actors are invisible to it. To identify the specific user account, enable SACL "
+                f"auditing on the shared folder on {remote_host!r} and allow 'Remote Event Log Management' "
+                f"through the firewall so BackupSys can read Security Event Log 4663. "
+                f"step0b_local_actor={_step0b_local_actor} _all_own={_all_own} _local_likely={_local_likely}"
+            )
+            return info
+        # If SMB credentials were supplied but audit returned nothing, give
+        # a more specific hint. If no credentials at all, say so.
+        _creds = smb_audit_cfg or {}
+        # Detect same-host scenario: destination is on the same Windows host as source.
+        # The __dest watch_id suffix is NOT available here, but we can detect it by
+        # checking whether 'filepath' contains a known dest-indicator.  More
+        # robustly we check if the remote_host matches our own outbound IP — if it
+        # doesn't (i.e. remote_host is not our own machine), then the actor is remote.
+        _is_dest_filepath = False
+        try:
+            import socket as _sock_step5
+            _own_ip_step5 = _sock_step5.gethostbyname(_sock_step5.gethostname())
+            # If remote_host is NOT our own machine, this is a remote SMB path.
+            # A same-host deletion means source and dest share a Windows host
+            # so the actor *must* be identified via Win32 session enumeration —
+            # enumeration cannot distinguish the backup machine from a coworker
+            # when both connect to the same Windows host.
+            _is_dest_filepath = (remote_host != _own_ip_step5)
+        except Exception:
+            pass
+
+        if _creds.get("username"):
+            info["user"] = "Unknown"   # creds given but log had no match
+            _gei.info(
+                f"[_get_editor_info] Step5: UNKNOWN — credentials were provided but "
+                f"all 4 audit strategies (Win Security Log, "
+                f"NetSessionEnum, NetFileEnum, Windows-PC NetSessionEnum) returned nothing. "
+                f"Diagnostics: "
+                f"(1) WINDOWS PC TARGET ({remote_host!r}): Strategy1 (Security Event Log) is "
+                f"the most reliable method. Check Strategy1 log entries above for the specific "
+                f"error. Common causes: "
+                f"(a) 'Remote Event Log Management' firewall rule disabled on the Windows PC — "
+                f"enable at: Control Panel → Windows Defender Firewall → Allow an app → "
+                f"Remote Event Log Management → tick Private; "
+                f"(b) Object auditing (SACL) not configured on the shared folder — "
+                f"right-click folder on {remote_host!r} → Properties → Security → Advanced → "
+                f"Auditing → Add principal=Everyone, Type=All, Access=Delete. "
+                f"(2) If the coworker deleted the file LOCALLY on the Windows PC console "
+                f"(Explorer/desktop), they do NOT generate an SMB session — "
+                f"NetSessionEnum (Strategies 4/5/6) will NEVER see them. "
+                f"Only the Security Event Log + SACL auditing can identify local actors. "
+                f"(3) NetSessionEnum probe tried 16 variants; "
+                f"if all raised TypeError try 'pip install --upgrade pywin32'. "
+                f"(4) NetFileEnum probe tried 11 variants; "
+                f"if last raised 'Access is denied' the credentials lack admin rights. "
+                f"(5) SMB credentials may be wrong or lack admin rights on {remote_host!r} — "
+                f"verify by logging into the Windows PC with those credentials. "
+                + (
+                f"(6) SAME-HOST WINDOWS PC: source and destination are both on {remote_host!r}. "
+                f"Win32 session-enum cannot identify a coworker who accesses the PC locally. "
+                f"Security Event Log with SACL is the ONLY reliable solution. "
+                if _is_dest_filepath else ""
+                ) +
+                f"smb_audit_cfg_user={_creds.get('username')!r} nas_host={remote_host!r} "
+                f"detection_source={detection_source!r} filepath={filepath!r}"
+            )
+        else:
+            info["user"] = "Unknown"   # no creds — audit was never attempted
+            _gei.info(
+                f"[_get_editor_info] Step5: UNKNOWN — no SMB credentials configured. "
+                f"For a Windows PC target ({remote_host!r}), add the Windows account "
+                f"credentials (username/password) in watch settings. "
+                f"FIX CHECKLIST: "
+                f"(1) Add credentials in watch settings (username/password for {remote_host!r}), "
+                f"(2) Enable 'Remote Event Log Management' firewall rule on the Windows PC, "
+                f"(3) Enable SACL auditing on the shared folder: "
+                f"right-click folder → Security → Advanced → Auditing → Everyone/Delete. "
+                + (
+                f"SAME-HOST WINDOWS PC: source and destination are both on {remote_host!r}. "
+                f"WHY ATTRIBUTION ALWAYS FAILS HERE: "
+                f"NetSessionEnum/NetFileEnum only see NETWORK SMB sessions — "
+                f"a user who acts LOCALLY on {remote_host!r} (e.g. via Explorer or a local app) "
+                f"does NOT create an SMB session, so Win32 session-enum returns nothing. "
+                f"The ONLY way to identify local actors on a Windows PC is the "
+                f"Windows Security Event Log with SACL object auditing enabled: "
+                f"right-click the shared folder on {remote_host!r} → Properties → Security → "
+                f"Advanced → Auditing → Add → Principal=Everyone, Type=All, "
+                f"Access=Delete/Delete subfolders and files. "
+                f"Then add Windows admin credentials in watch settings so "
+                f"BackupSys can read the Security Event Log remotely. "
+                if _is_dest_filepath else ""
+                ) +
+                f"nas_host={remote_host!r} detection_source={detection_source!r}"
+            )
+        return info
+
+    # ── Local path ────────────────────────────────────────────────────────────
     try:
         info["machine"] = socket.gethostname()
     except Exception:
@@ -589,103 +7052,53 @@ def _get_editor_info(filepath: str) -> dict:
         info["ip"] = socket.gethostbyname(info["machine"]) if info["machine"] else ""
     except Exception:
         pass
+
+    # Try win32security file-owner lookup first (works if file still exists).
+    # For deleted files this will fail — fall through to identity-based methods.
+    # BUG-FIX: same uniformity fix as the force_local branch above — show just
+    # the username, since the MACHINE column already carries the machine name
+    # and "DOMAIN\user" / "MACHINE\user" here made rows look inconsistent next
+    # to SMB-attributed rows (which only ever show the bare username).
+    _local_user_resolved = False
     try:
-        # Try pywin32 first for file owner
         import win32security
         sd   = win32security.GetFileSecurity(filepath, win32security.OWNER_SECURITY_INFORMATION)
         sid  = sd.GetSecurityDescriptorOwner()
         name, domain, _ = win32security.LookupAccountSid(None, sid)
-        info["user"] = f"{domain}\\{name}"
+        info["user"] = name
+        _local_user_resolved = True
     except Exception:
-        # Fallback: current logged-in user (not perfect but better than nothing)
+        pass
+
+    if not _local_user_resolved:
+        # File is gone (deleted) — identify the current user instead.
         try:
-            info["user"] = os.getlogin()
+            import win32api
+            _uname = win32api.GetUserName()
+            info["user"] = _uname
+            _local_user_resolved = True
         except Exception:
-            try:
-                info["user"] = os.environ.get("USERNAME", "")
-            except Exception:
-                pass
+            pass
+
+    if not _local_user_resolved:
+        # Final fallback: read username from environment variables.
+        _uname = os.environ.get("USERNAME", "")
+        if _uname:
+            info["user"] = _uname
+
     return info
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Remote Upload Helpers (SFTP / FTPS / FTP / SMB / HTTPS) ───────────────────
+# ── Remote Upload Helpers (SFTP / FTPS / FTP / HTTPS) ─────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# All upload logic lives in transport_utils.py.  Uploads are handled directly
-# through backup_engine._upload_to_destination() which calls transport_utils
-# functions.  If transport_utils cannot be imported (e.g. a packaging edge case)
-# a clear error dict is returned instead of crashing — but in normal use the
-# module is always present.
-# ──────────────────────────────────────────────────────────────────────────────
 
 from transport_utils import (
     upload_to_sftp  as _tu_sftp,
     upload_to_ftp   as _tu_ftp,
-    upload_to_smb   as _tu_smb,
     upload_to_https as _tu_https,
 )
 _TRANSPORT_UTILS_AVAILABLE = True
-
-
-def _ensure_smb_mounted(smb_cfg: dict):
-    """
-    Ensure SMB share is accessible and mounted if needed.
-    
-    smb_cfg: { path, user, pass, domain }
-    Returns: (ok: bool, error_msg: str)
-    """
-    import subprocess
-    import os
-    
-    path = smb_cfg.get("path", "").strip()
-    user = smb_cfg.get("user", "").strip()
-    password = smb_cfg.get("pass", "")
-    domain = smb_cfg.get("domain", "").strip()
-    
-    if not path:
-        return False, "SMB path not provided"
-    
-    # Normalize path to UNC format
-    path = path.replace("/", "\\")
-    if not path.startswith("\\\\"):
-        return False, "SMB path must start with \\\\"
-    
-    # Extract server and share from UNC path
-    parts = path.strip("\\").split("\\")
-    if len(parts) < 2:
-        return False, "Invalid SMB path format"
-    server = parts[0]
-    share = parts[1]
-    
-    unc_root = f"\\\\{server}\\{share}"
-    
-    # Try to authenticate if credentials provided
-    if user:
-        net_user = f"{domain}\\{user}" if domain else user
-        try:
-            result = subprocess.run(
-                ["net", "use", unc_root, f"/user:{net_user}", password],
-                capture_output=True, text=True, timeout=15, check=False
-            )
-            # net use returns 0 on success, 2 if already connected
-            if result.returncode not in (0, 2):
-                return False, f"Failed to authenticate with SMB share: {result.stderr.strip()}"
-        except subprocess.TimeoutExpired:
-            return False, "Timeout authenticating with SMB share"
-        except Exception as e:
-            return False, f"SMB authentication error: {e}"
-    
-    # Check if the share is accessible
-    try:
-        if not os.path.exists(unc_root):
-            return False, f"SMB share {unc_root} is not accessible"
-    except Exception as e:
-        return False, f"Cannot access SMB share: {e}"
-    
-    return True, ""
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Email + Webhook Notification Helpers ──────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1064,19 +7477,26 @@ class DriveTriggerMonitor(QObject):
 
 class BackupWorker(QThread):
     # current, total, fname, elapsed_s, is_scanning, bytes_done, total_bytes
-    progress    = pyqtSignal(int, int, str, float, bool, int, int)
+    # bytes_done / total_bytes use 'object' to avoid Qt 32-bit int overflow on files > 2 GB
+    progress    = pyqtSignal(int, int, str, float, bool, object, object)
     finished    = pyqtSignal(dict)               # result dict
     log_message = pyqtSignal(str)                # status text
+    ui_status   = pyqtSignal(str)                # one-shot guaranteed UI label (e.g. "robocopy", "uptodate")
 
     def __init__(self, watch: dict, cfg: dict, triggered_by: str = "manual", changed_paths=None):
         super().__init__()   # BUG FIX: was super().__init__(self)  · passing self as own parent
-        self.watch         = watch
-        self.cfg           = cfg
-        self.triggered_by  = triggered_by
-        self.changed_paths = changed_paths  # watcher-tracked changed files for fast scan
-        self._stop_event   = threading.Event()   # set this to interrupt retry sleep or signal cancel
-        self._pause_event  = threading.Event()   # set = running, cleared = paused
-        self._pause_event.set()                  # FIX: must start SET (running); cleared only on pause()
+        self.watch           = watch
+        self.cfg             = cfg
+        self.triggered_by    = triggered_by
+        self.changed_paths   = changed_paths  # watcher-tracked changed files for fast scan
+        self._stop_event     = threading.Event()   # set this to interrupt retry sleep or signal cancel
+        self._pause_event    = threading.Event()   # set = running, cleared = paused
+        self._pause_event.set()                    # FIX: must start SET (running); cleared only on pause()
+        # Optional callback fired on the WORKER THREAD immediately before finished.emit().
+        # Used to set _post_backup_finish before the Qt signal crosses to the main thread,
+        # closing the race window where watchdog "modified" events fire after the backup
+        # completes but before _on_backup_done runs and sets the grace-window timestamp.
+        self.on_complete_cb: Optional[Callable] = None
         self.pre_backup_cmd  = watch.get("pre_backup_cmd", "")
         self.post_backup_cmd = watch.get("post_backup_cmd", "")
         self.verify_remote_uploads = bool(cfg.get("verify_remote_uploads", False))
@@ -1103,7 +7523,7 @@ class BackupWorker(QThread):
         _is_network_src = _src_path.startswith("\\\\") or _src_path.startswith("//")
         if _is_network_src:
             self.log_message.emit(
-                f"Starting backup: {w['name']} … (network source — scanning may take several minutes)"
+                f"Starting backup: {w['name']} … (network source — scanning files over SMB)"
             )
         else:
             self.log_message.emit(f"Starting backup: {w['name']} …")
@@ -1162,10 +7582,25 @@ class BackupWorker(QThread):
         # Fast check: sample up to 20 paths from the snapshot; if more than
         # half are missing, the snapshot is stale — discard it so the next
         # backup builds a fresh one without scanning ghost files.
-        if snapshot:
+        #
+        # IMPORTANT: skip this check for network/UNC sources (\\host\share).
+        # Path.exists() on a UNC path is unreliable in the worker thread —
+        # the network share may not be immediately accessible, causing every
+        # snapshot entry to appear "missing" and the valid snapshot to be
+        # silently discarded.  This was the cause of the "Never backed up"
+        # state persisting across runs on SMB sources even after a successful
+        # backup: the snapshot was saved correctly but thrown away here on the
+        # very next run, forcing a full 10 GB re-copy every time.
+        _src_path_str = w.get("path", "")
+        _is_network_source = (
+            _src_path_str.startswith("\\\\") or   # UNC  \\host\share
+            _src_path_str.startswith("//") or         # POSIX-style UNC
+            w.get("type", "local") not in ("local",)  # SFTP / FTP / WebDAV
+        )
+        if snapshot and not _is_network_source:
             try:
                 import pathlib as _pl
-                _src_root = _pl.Path(w.get("path", ""))
+                _src_root = _pl.Path(_src_path_str)
                 _sample_keys = list(snapshot.keys())[:20]
                 _missing = sum(
                     1 for _k in _sample_keys
@@ -1187,7 +7622,13 @@ class BackupWorker(QThread):
         # average-since-start.  This prevents the ETA from shooting to "2 hours"
         # just because the throttler paused between files.
         _speed_window: list = []   # [(time, bytes_done), ...]
-        _SPEED_WINDOW_SEC   = 8    # look back 8 seconds for rate calculation
+        _SPEED_WINDOW_SEC   = 30   # look back 30 seconds for rate calculation
+        # High-watermark for bytes_done: prevents the progress bar from jumping
+        # backward when _poll_dest_progress and _read_stdout emit conflicting
+        # values concurrently (e.g. poll sees full file size on disk while
+        # _read_stdout is still parsing per-file % lines for the same file).
+        _bytes_hwm: list = [0]
+
 
         def cb(copied, total, fname, bytes_done=0, total_bytes=0):
             # Raise InterruptedError so run_backup()'s inner loop propagates
@@ -1199,6 +7640,27 @@ class BackupWorker(QThread):
             if _copy_start[0] is None:
                 _copy_start[0] = now
             elapsed = now - _copy_start[0]
+
+            # Sentinel values from the engine — emit on ui_status (BlockingQueuedConnection)
+            # so the UI updates *before* the engine continues (e.g. before robocopy starts).
+            # Guard: if cancel was requested, skip the blocking emit entirely — the worker
+            # is about to raise InterruptedError anyway and we must not block here waiting
+            # for the main thread to process a signal it may not get to promptly.
+            if fname.startswith("\x00"):
+                if not self._stop_event.is_set():
+                    self.ui_status.emit(fname)
+                return
+
+            # Enforce high-watermark: bytes_done must never go backward.
+            # _read_stdout thread and _poll_dest_progress on the worker thread
+            # race and can emit conflicting byte counts for the same file,
+            # causing the bar to oscillate (e.g. 65% <-> 100%). Clamping to
+            # max(seen) eliminates all backward jumps.
+            if bytes_done > 0:
+                if bytes_done >= _bytes_hwm[0]:
+                    _bytes_hwm[0] = bytes_done
+                else:
+                    bytes_done = _bytes_hwm[0]
 
             # Maintain rolling window — drop samples older than _SPEED_WINDOW_SEC
             _speed_window.append((now, bytes_done))
@@ -1256,34 +7718,14 @@ class BackupWorker(QThread):
                     result = {"status": "cancelled", "error": "Cancelled during retry wait", "watch_id": w["id"]}
                     break
 
-            # ── Pre-backup: mount SMB share if dest_type is smb ──────────
-            dest_type = cfg.get("dest_type", "local")
-            if dest_type == "smb":
-                smb_cfg = cfg.get("dest_smb", {})
-                smb_unc = smb_cfg.get("path", "").strip()
-                # Self-heal: fix stale local destination saved before the SMB _save_general fix
-                dest_cur = cfg.get("destination", "")
-                if smb_unc and not (dest_cur.startswith("\\") or dest_cur.startswith("//")):
-                    cfg["destination"] = smb_unc
-                ok, smb_err = _ensure_smb_mounted(smb_cfg)
-                if not ok:
-                    self.log_message.emit(f"⚠ SMB mount failed: {smb_err}")
-                    result = {"status": "failed", "error": f"SMB mount failed: {smb_err}", "watch_id": w["id"]}
-                    continue  # try again on next attempt
-
             try:
                 _src = w["path"]
-                if os.name == "nt" and (_src.startswith("\\\\") or _src.startswith("//")):
-                    _src_smb = dict(w.get("smb_cfg") or {})
-                    _src_smb["path"] = _src
-                    ok, smb_err = _ensure_smb_mounted(_src_smb)
-                    if not ok:
-                        self.log_message.emit(f"⚠ {w['name']}: SMB source mount failed: {smb_err}")
-                        result = {"status": "failed", "error": f"SMB source mount failed: {smb_err}", "watch_id": w["id"]}
-                        continue
-
-                # Resolve destination: per-watch overrides global cfg destination
-                _w_dest = w.get("destination", "").strip() or cfg.get("destination", "")
+                _w_dest = w.get("destination", "").strip()
+                if not _w_dest:
+                    _watch_label = w.get("name", w.get("id", "unknown"))
+                    self._append_log(f"⚠ Watch '{_watch_label}' has no destination set — skipping backup.")
+                    result = {"status": "failure", "error": "No destination configured", "watch_id": w["id"], "files_copied": 0, "total_size_bytes": 0}
+                    break
                 # Build destinations list for multi-destination support
                 _destinations = w.get("destinations", [])
                 if not _destinations:
@@ -1321,7 +7763,7 @@ class BackupWorker(QThread):
 
                 # ── Resolve source type and credentials ───────────────────────
                 _src_type = w.get("type", "local")
-                _src_smb_cfg    = w.get("smb_cfg", {}) if _src_type == "smb" else None
+
                 _src_webdav_cfg = w.get("webdav_cfg", {}) if _src_type == "webdav" else None
                 _src_sftp_cfg   = w.get("sftp_cfg", {}) if _src_type in ("sftp", "ftps") else None
                 _src_ftp_cfg    = w.get("ftp_cfg", {}) if _src_type == "ftp" else None
@@ -1354,9 +7796,9 @@ class BackupWorker(QThread):
                     source_type       = _src_type,
                     source_sftp_cfg   = _src_sftp_cfg,
                     source_ftp_cfg    = _src_ftp_cfg,
-                    source_smb_cfg    = _src_smb_cfg,
                     source_webdav_cfg = _src_webdav_cfg,
                     verify_after      = self.verify_after,
+                    force_robocopy    = w.get("force_robocopy", False),
                 )
             except InterruptedError:
                 # User pressed ▶ Cancel  · treat as a clean cancellation not a failure
@@ -1365,1055 +7807,40 @@ class BackupWorker(QThread):
             except Exception as e:
                 result = {"status": "failed", "error": str(e), "watch_id": w["id"]}
 
-            if result.get("status") == "success":
+            # ── Save snapshot and config after every successful backup ────────
+            # This MUST happen on the worker thread (here) so that _on_backup_done
+            # can safely call _load_config() and pick up the updated last_backup,
+            # backup_count, and snapshot.  If we emit finished first and let the
+            # main thread save, the freshly-loaded config overwrites these fields.
+            if result.get("status") in ("success", "partial_failure") and BACKEND_AVAILABLE:
+                try:
+                    new_snap = result.get("snapshot") or {}
+                    config_manager.update_watch_snapshot(
+                        cfg,
+                        w["id"],
+                        new_snap,
+                        result.get("timestamp", ""),
+                        result.get("total_size_bytes", 0),
+                        dest_type,
+                    )
+                except Exception as _se:
+                    logger.warning(f"[worker] Could not save snapshot for {w['id']}: {_se}")
+
+            # Break retry loop on success or cancel (only retry on failure)
+            if result.get("status") != "failed":
                 break
-            if attempt < max_attempts:
-                self.log_message.emit(f"⚠ Backup failed (attempt {attempt}): {result.get('error', '')}")
 
-        if result.get("status") == "success":
-            config_manager.update_watch_snapshot(
-                cfg, w["id"],
-                result.get("snapshot", {}),
-                result["timestamp"],
-                result.get("total_size_bytes", 0),
-                dest_type=dest_type,
-            )
-            self.log_message.emit(
-                f"▶ {w['name']}: {result['files_copied']} file(s) · {result['total_size']}"
-                f" · {_fmt_duration(result.get('duration_s', 0.0))}"
-            )
-
-            # ── Email notification on success ──────────────────────────
-            # Build effective config with per-watch notification overrides applied.
-            _notify_ov = w.get("notify_overrides", {})
-            _eff_cfg = dict(cfg)
-            if _notify_ov.get("webhook_url"):
-                _eff_cfg = {**_eff_cfg, "webhook_url": _notify_ov["webhook_url"]}
-            if _notify_ov.get("ntfy_topic"):
-                _nc = dict(_eff_cfg.get("ntfy_config", {}))
-                _nc["topic"] = _notify_ov["ntfy_topic"]
-                _eff_cfg = {**_eff_cfg, "ntfy_config": _nc}
-
-            ec = _eff_cfg.get("email_config", {})
-            if ec.get("enabled") and ec.get("notify_on_success"):
-                try:
-                    # Use notification_utils rich format when available
-                    from notification_utils import build_backup_email as _bld_email
-                    subject, body = _bld_email({
-                        **result,
-                        "watch_name": w["name"],
-                        "files_copied": result.get("files_copied", 0),
-                        "total_size": result.get("total_size", "0 B"),
-                        "duration_s": result.get("duration_s", 0),
-                        "backup_id": result.get("backup_id", result.get("id", "N/A")),
-                    })
-                except ImportError:
-                    subject = f"✅ Backup complete: {w['name']}"
-                    body    = (
-                        f"Watch:         {w['name']}\n"
-                        f"Source:        {w['path']}\n"
-                        f"Files copied:  {result['files_copied']}\n"
-                        f"Total size:    {result['total_size']}\n"
-                        f"Duration:      {result.get('duration_s', 0):.1f}s\n"
-                        f"Triggered by:  {self.triggered_by}\n"
-                        f"Timestamp:     {result['timestamp']}\n"
-                    )
-                _send_email_notification(_eff_cfg, subject, body)
-
-            # ── Webhook notification ───────────────────────────────────
-            _send_webhook(_eff_cfg, result)
-
-            # ── ntfy push notification ─────────────────────────────────
-            if _NOTIFICATION_DISPATCH_AVAILABLE:
-                try:
-                    _nu_dispatch_ntfy(_eff_cfg, {**result, "watch_name": w["name"]})
-                except Exception as _ntfy_exc:
-                    logger.warning("ntfy dispatch error: %s", _ntfy_exc)
-            else:
-                logger.debug("dispatch_ntfy unavailable (notification_utils missing or broken)")
-
-            # ── Telegram + Pushover notifications ──────────────────────
-            if _NOTIFICATION_DISPATCH_AVAILABLE:
-                try:
-                    _nu_dispatch_telegram(_eff_cfg, {**result, "watch_name": w["name"]})
-                    _nu_dispatch_pushover(_eff_cfg, {**result, "watch_name": w["name"]})
-                except Exception as _tg_exc:
-                    logger.warning("Telegram/Pushover dispatch error: %s", _tg_exc)
-            else:
-                logger.debug("dispatch_telegram/dispatch_pushover unavailable (notification_utils missing or broken)")
-
-            # ── Remote upload result (surfaced from backup_engine.run_backup) ──
-            # The engine handles all SFTP/FTP/FTPS/SMB/HTTPS/GDrive uploads
-            # internally and stores the outcome in result["cloud_upload"].
-            dest_type = cfg.get("dest_type", "local")
-            # BUG FIX: also show upload result when watch has per-watch cloud_config (e.g. GDrive)
-            _has_watch_cloud = bool((w.get("cloud_config") or {}).get("access_token"))
-            if dest_type not in ("local",) or _has_watch_cloud:
-                upload_res = result.get("cloud_upload") or {}
-                if upload_res.get("ok"):
-                    # FIX: use the actual provider name, not the global dest_type.
-                    # When global dest_type is "local" but per-watch GDrive is set,
-                    # dest_type.upper() was incorrectly showing "LOCAL upload done".
-                    _provider = (w.get("cloud_config") or {}).get("provider", dest_type).upper()
-                    self.log_message.emit(
-                        f"☁  {_provider} upload done: "
-                        f"{upload_res.get('uploaded', 0)} file(s)"
-                    )
-                    # ── Post-upload verification warnings ──────────────────────
-                    _verify_warns = upload_res.get("warnings") or upload_res.get("verify_warnings", [])
-                    if _verify_warns:
-                        for _vw in _verify_warns:
-                            self.log_message.emit(f"⚠ Remote verify ({_provider}): {_vw}")
-                        self.log_message.emit(
-                            f"⚠ {_provider}: {len(_verify_warns)} file(s) failed post-upload "
-                            f"checksum verification — transfer may be corrupted. "
-                            f"Re-running the backup is recommended."
-                        )
-                elif upload_res:
-                    _err_msg = upload_res.get("error", "unknown error")
-                    self.log_message.emit(f"⚠ {dest_type.upper()} upload failed: {_err_msg}")
-                    _ec = cfg.get("email_config", {})
-                    if _ec.get("enabled") and _ec.get("notify_on_failure", True):
-                        _send_email_notification(cfg,
-                            f"⚠ BackupSys · {dest_type.upper()} upload failed: {w['name']}",
-                            f"Backup completed but remote upload failed.\n\n"
-                            f"  Watch:      {w['name']}\n"
-                            f"  Dest type:  {dest_type.upper()}\n"
-                            f"  Error:      {_err_msg}\n"
-                            f"  Backup ID:  {result.get('backup_id', 'N/A')}\n"
-                            f"  Timestamp:  {result.get('timestamp', '')[:19]}\n\n"
-                            f"The backup is stored locally and will be retried on the next run."
-                        )
-                    _send_webhook(cfg, {**result, "status": "upload_failed",
-                                        "upload_error": _err_msg, "upload_dest": dest_type})
-
-        else:
-            self.log_message.emit(f"⚠ {w['name']}: {result.get('error', 'unknown error')}")
-
-            # ── Email + webhook on failure ─────────────────────────────
-            # Apply per-watch notification overrides (same logic as success block).
-            _notify_ov = w.get("notify_overrides", {})
-            _eff_cfg = dict(cfg)
-            if _notify_ov.get("webhook_url"):
-                _eff_cfg = {**_eff_cfg, "webhook_url": _notify_ov["webhook_url"]}
-            if _notify_ov.get("ntfy_topic"):
-                _nc = dict(_eff_cfg.get("ntfy_config", {}))
-                _nc["topic"] = _notify_ov["ntfy_topic"]
-                _eff_cfg = {**_eff_cfg, "ntfy_config": _nc}
-
-            ec = _eff_cfg.get("email_config", {})
-            if ec.get("enabled") and ec.get("notify_on_failure", True):
-                try:
-                    from notification_utils import build_backup_email as _bld_email
-                    subject, body = _bld_email({
-                        **result,
-                        "watch_name": w["name"],
-                        "status": result.get("status", "failed"),
-                        "error": result.get("error", "Unknown error"),
-                    })
-                except ImportError:
-                    subject = f"⚠ Backup failed: {w['name']}"
-                    body    = (
-                        f"Watch:     {w['name']}\n"
-                        f"Source:    {w['path']}\n"
-                        f"Error:     {result.get('error', 'unknown')}\n"
-                        f"Triggered: {self.triggered_by}\n"
-                        f"Timestamp: {result.get('timestamp', '')}\n"
-                    )
-                _send_email_notification(_eff_cfg, subject, body)
-            _send_webhook(_eff_cfg, result)
-            # ── ntfy push notification ─────────────────────────────────
-            if _NOTIFICATION_DISPATCH_AVAILABLE:
-                try:
-                    _nu_dispatch_ntfy(_eff_cfg, {**result, "watch_name": w["name"]})
-                except Exception as _ntfy_exc:
-                    logger.warning("ntfy dispatch error: %s", _ntfy_exc)
-            else:
-                logger.debug("dispatch_ntfy unavailable (notification_utils missing or broken)")
-            # ── Telegram + Pushover notifications ──────────────────────
-            if _NOTIFICATION_DISPATCH_AVAILABLE:
-                try:
-                    _nu_dispatch_telegram(_eff_cfg, {**result, "watch_name": w["name"]})
-                    _nu_dispatch_pushover(_eff_cfg, {**result, "watch_name": w["name"]})
-                except Exception as _tg_exc:
-                    logger.warning("Telegram/Pushover dispatch error: %s", _tg_exc)
-            else:
-                logger.debug("dispatch_telegram/dispatch_pushover unavailable (notification_utils missing or broken)")
-
-        self.finished.emit(result)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Restore Worker ─────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-class RestoreWorker(QThread):
-    """Runs restore_backup / restore_full_chain off the main thread so the UI stays responsive."""
-    progress  = pyqtSignal(int, int, str)   # step, total_steps, label
-    finished  = pyqtSignal(dict)            # result dict
-
-    def __init__(self, mode: str, kwargs: dict, parent=None):
-        super().__init__(parent)
-        self.mode   = mode    # "single" or "chain"
-        self.kwargs = kwargs
-
-    def run(self):
-        try:
-            if self.mode == "chain":
-                def _progress_cb(step, total, label):
-                    self.progress.emit(step, total, label)
-                result = backup_engine.restore_full_chain(
-                    progress_cb=_progress_cb, **self.kwargs
-                )
-            else:
-                result = backup_engine.restore_backup(**self.kwargs)
-        except Exception as e:
-            result = {"ok": False, "error": str(e), "files_restored": 0, "skipped": 0, "errors": [str(e)]}
-        self.finished.emit(result)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Auto-Shutdown Countdown Dialog ────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ShutdownCountdownDialog(QDialog):
-    """60-second countdown before auto-shutdown.  Cancel button aborts shutdown."""
-
-    def __init__(self, parent=None, countdown: int = 60):
-        super().__init__(parent)
-        self._remaining = countdown
-        self._cancelled = False
-        self.setWindowTitle("Auto-Shutdown")
-        self.setModal(True)
-        self.setFixedSize(400, 180)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(24, 24, 24, 24)
-
-        icon_lbl = QLabel("🖥  All backups completed")
-        icon_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
-        layout.addWidget(icon_lbl)
-
-        self._msg_lbl = QLabel()
-        self._msg_lbl.setWordWrap(True)
-        self._msg_lbl.setStyleSheet("font-size: 12px; color: #d1d5db;")
-        layout.addWidget(self._msg_lbl)
-
-        btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("Cancel Shutdown")
-        cancel_btn.setObjectName("secondary")
-        cancel_btn.clicked.connect(self._cancel)
-        shutdown_now_btn = QPushButton("Shut Down Now")
-        shutdown_now_btn.setObjectName("danger")
-        shutdown_now_btn.clicked.connect(self._shutdown_now)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(shutdown_now_btn)
-        layout.addLayout(btn_row)
-
-        self._update_label()
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(1000)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
-
-    def _update_label(self):
-        self._msg_lbl.setText(
-            f"The computer will shut down in <b>{self._remaining}</b> second(s).\n"
-            "Click <b>Cancel Shutdown</b> to abort."
-        )
-
-    def _tick(self):
-        self._remaining -= 1
-        if self._remaining <= 0:
-            self._timer.stop()
-            self.accept()   # accepted → caller triggers shutdown
-        else:
-            self._update_label()
-
-    def _cancel(self):
-        self._timer.stop()
-        self._cancelled = True
-        self.reject()
-
-    def _shutdown_now(self):
-        self._timer.stop()
-        self.accept()
-
-    def was_cancelled(self) -> bool:
-        return self._cancelled
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Admin Password Dialog ──────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-class PasswordDialog(QDialog):
-    def __init__(self, parent=None, mode="verify"):
-        super().__init__(parent)
-        self.mode = mode
-        self.setWindowTitle("Admin Authentication")
-        self.setMinimumWidth(360)
-        self.setModal(True)
-        self._pending_reset = False  # True when forgot-password flow is in progress
-
-        # ── Load persistent lockout state ─────────────────────────────────────
-        import time as _time
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        self._attempts = int(s.value(ADMIN_ATTEMPTS_KEY, 0))
-        lockout_until  = float(s.value(ADMIN_LOCKOUT_KEY, 0))
-        remaining_secs = lockout_until - _time.time()
-        if remaining_secs > 0:
-            self._locked = True
-        else:
-            self._locked = False
-            if self._attempts >= 5:
-                # Lockout expired — clear persisted counter
-                self._attempts = 0
-                s.setValue(ADMIN_ATTEMPTS_KEY, 0)
-                s.setValue(ADMIN_LOCKOUT_KEY, 0)
-
-        self._build_ui()
-
-        # If already locked, start the UI countdown for the remaining time
-        if self._locked:
-            ms_left = max(1000, int(remaining_secs * 1000))
-            self.pw_input.setEnabled(False)
-            self.error_lbl.setText(
-                f"Too many attempts · locked for {int(remaining_secs)}s"
-            )
-            QTimer.singleShot(ms_left, self._unlock)
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(24, 24, 24, 24)
-
-        icon_lbl = QLabel("🔒")
-        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_lbl.setStyleSheet("font-size: 36px;")
-        layout.addWidget(icon_lbl)
-
-        self.title_lbl = QLabel("Admin Access Required" if self.mode == "verify" else "Set Admin Password")
-        self.title_lbl.setObjectName("heading")
-        self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.title_lbl)
-
-        self.sub_lbl = QLabel("Enter the admin password to continue" if self.mode == "verify"
-                             else "Choose a password to protect admin settings")
-        self.sub_lbl.setObjectName("subheading")
-        self.sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.sub_lbl)
-
-        self.pw_input = QLineEdit()
-        self.pw_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.pw_input.setPlaceholderText("Password")
-        layout.addWidget(self.pw_input)
-
-        self.pw_confirm = QLineEdit()
-        self.pw_confirm.setEchoMode(QLineEdit.EchoMode.Password)
-        self.pw_confirm.setPlaceholderText("Confirm password")
-        self.pw_confirm.setVisible(self.mode != "verify")
-        layout.addWidget(self.pw_confirm)
-
-        self.error_lbl = QLabel("")
-        self.error_lbl.setObjectName("status_err")
-        self.error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.error_lbl)
-
-        btn_row = QHBoxLayout()
-        self.forgot_btn = QPushButton("Forgot password?")
-        self.forgot_btn.setObjectName("secondary")
-        self.forgot_btn.setMaximumWidth(140)
-        self.forgot_btn.clicked.connect(self._forgot_password)
-        self.forgot_btn.setVisible(self.mode == "verify")
-
-        cancel = QPushButton("Cancel")
-        cancel.setObjectName("secondary")
-        cancel.clicked.connect(self.reject)
-
-        self.ok_btn = QPushButton("Confirm" if self.mode == "verify" else "Set Password")
-        self.ok_btn.clicked.connect(self._submit)
-        self.pw_input.returnPressed.connect(self._submit)
-
-        btn_row.addWidget(self.forgot_btn)
-        btn_row.addStretch()
-        btn_row.addWidget(cancel)
-        btn_row.addWidget(self.ok_btn)
-        layout.addLayout(btn_row)
-
-    def _submit(self):
-        if self._locked:
-            return  # silently ignore while locked
-        pw = self.pw_input.text()
-        if not pw:
-            self.error_lbl.setText("Password cannot be empty")
-            return
-
-        if self.mode == "set":
-            if pw != self.pw_confirm.text():
-                self.error_lbl.setText("Passwords do not match")
-                return
-            self._save_password(pw)
-            # If this was triggered by "Forgot password?", the old key is now
-            # safely replaced — nothing extra to remove (save overwrites it).
-            self._pending_reset = False
-            self.accept()
-        else:
-            if self._verify_password(pw):
-                # Successful login — clear the failed attempt counter
-                s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-                s.setValue(ADMIN_ATTEMPTS_KEY, 0)
-                s.setValue(ADMIN_LOCKOUT_KEY, 0)
-                self.accept()
-            else:
-                import time as _time
-                self._attempts += 1
-                self.pw_input.clear()
-                s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-                s.setValue(ADMIN_ATTEMPTS_KEY, self._attempts)
-                # Lockout: 30-second cooldown after 5 consecutive failures
-                if self._attempts >= 5:
-                    self._locked = True
-                    lockout_until = _time.time() + 30
-                    s.setValue(ADMIN_LOCKOUT_KEY, lockout_until)
-                    self.error_lbl.setText("Too many attempts  · locked for 30 seconds")
-                    self.pw_input.setEnabled(False)
-                    QTimer.singleShot(30_000, self._unlock)
-                else:
-                    remaining = 5 - self._attempts
-                    self.error_lbl.setText(
-                        f"Incorrect password ({remaining} attempt{'s' if remaining != 1 else ''} left)"
-                    )
-
-    def _forgot_password(self):
-        reply = QMessageBox.question(
-            self,
-            "Reset Admin Password",
-            "This will remove the existing admin password and let you set a new one. Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # Don't delete the old password yet — only wipe it once the user
-        # successfully saves a new one (handled in _submit via _pending_reset).
-        self._pending_reset = True
-
-        self.mode = "set"
-        self.title_lbl.setText("Set Admin Password")
-        self.sub_lbl.setText("Choose a password to protect admin settings")
-        self.ok_btn.setText("Set Password")
-        self.forgot_btn.setVisible(False)
-        self.pw_confirm.setVisible(True)
-        self.pw_input.clear()
-        self.pw_confirm.clear()
-        self.error_lbl.setText("")
-
-    def _unlock(self):
-        """Called after the 30-second lockout expires."""
-        self._attempts = 0
-        self._locked   = False
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        s.setValue(ADMIN_ATTEMPTS_KEY, 0)
-        s.setValue(ADMIN_LOCKOUT_KEY, 0)
-        self.pw_input.setEnabled(True)
-        self.error_lbl.setText("You may try again")
-
-    def _hash(self, pw: str) -> str:
-        """Return a salted PBKDF2-HMAC-SHA256 hash of the password.
-
-        Format: <hex-salt>:<hex-hash>   (salt is 16 random bytes)
-        On verification the stored salt is reused so the hash is deterministic.
-        """
-        import os as _os, hashlib as _hl
-        salt = _os.urandom(16)
-        h = _hl.pbkdf2_hmac("sha256", pw.encode(), salt, 260_000)
-        return salt.hex() + ":" + h.hex()
-
-    def _hash_verify(self, pw: str, stored: str) -> bool:
-        """Verify *pw* against a stored '<salt_hex>:<hash_hex>' string.
-        Also accepts legacy plain-SHA256 hashes (64-char hex, no colon) so
-        existing passwords continue to work after the upgrade.
-        """
-        import hashlib as _hl
-        if ":" not in stored:
-            # Legacy plain-SHA256  · accept it but user should reset password
-            return _hl.sha256(pw.encode()).hexdigest() == stored
-        try:
-            salt_hex, hash_hex = stored.split(":", 1)
-            salt = bytes.fromhex(salt_hex)
-            h    = _hl.pbkdf2_hmac("sha256", pw.encode(), salt, 260_000)
-            return h.hex() == hash_hex
-        except Exception:
-            return False
-
-    def _save_password(self, pw: str):
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        s.setValue(ADMIN_PASS_KEY, self._hash(pw))
-
-    def _verify_password(self, pw: str) -> bool:
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        stored = s.value(ADMIN_PASS_KEY, "")
-        if not stored:
-            # No password set yet >any input grants access
-            return True
-        return self._hash_verify(pw, stored)
-
-    @staticmethod
-    def has_password() -> bool:
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        return bool(s.value(ADMIN_PASS_KEY, ""))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Add Watch Dialog ───────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AddWatchDialog(QDialog):
-    def __init__(self, parent=None, cfg=None, edit_watch_id=None):
-        super().__init__(parent)
-        self.cfg = cfg or {}
-        # When set, this dialog is editing an existing watch — skip duplicate
-        # checks for the watch's own path/name so saves are never blocked.
-        self._edit_watch_id = edit_watch_id
-        self.setWindowTitle("Add Watched Folder / Network Path")
-        self.setMinimumWidth(520)
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
-        layout.setContentsMargins(24, 24, 24, 24)
-
-        title = QLabel("Add Folder / File to Watch")
-        title.setObjectName("heading")
-        layout.addWidget(title)
-
-        form = QFormLayout()
-        form.setSpacing(10)
-
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("e.g. My Documents")
-        form.addRow("Name:", self.name_input)
-
-        # Source type selector
-        self.source_type = QComboBox()
-        self.source_type.addItems([
-            "Local / Mapped Drive",
-            "Network Share (SMB)",
-            "WebDAV / Nextcloud",
-            "SFTP",
-            "FTPS",
-            "FTP (plain)",
-        ])
-        self.source_type.currentIndexChanged.connect(self._on_source_type_changed)
-        form.addRow("Source Type:", self.source_type)
-
-        # Local path row
-        self.local_widget = QWidget()
-        path_row = QHBoxLayout(self.local_widget)
-        path_row.setContentsMargins(0,0,0,0)
-        self.path_input = QLineEdit()
-        self.path_input.setPlaceholderText("C:\\Users\\you\\Documents")
-        browse_btn = QPushButton("Browse")
-        browse_btn.setObjectName("secondary")
-        browse_btn.setMaximumWidth(80)
-        browse_btn.clicked.connect(self._browse)
-        path_row.addWidget(self.path_input)
-        path_row.addWidget(browse_btn)
-        form.addRow("Path:", self.local_widget)
-
-        # SMB row
-        self.smb_widget = QWidget()
-        smb_layout = QVBoxLayout(self.smb_widget)
-        smb_layout.setContentsMargins(0,0,0,0)
-        smb_layout.setSpacing(6)
-
-        self.smb_path_input = QLineEdit()
-        self.smb_path_input.setPlaceholderText("\\\\server\\share\\folder  or  //server/share/folder")
-        smb_layout.addWidget(self.smb_path_input)
-
-        smb_cred_row = QHBoxLayout()
-        self.smb_user = QLineEdit()
-        self.smb_user.setPlaceholderText("Username (optional)")
-        self.smb_pass = QLineEdit()
-        self.smb_pass.setPlaceholderText("Password (optional)")
-        self.smb_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.smb_domain = QLineEdit()
-        self.smb_domain.setPlaceholderText("Domain (optional)")
-        smb_cred_row.addWidget(self.smb_user)
-        smb_cred_row.addWidget(self.smb_pass)
-        smb_cred_row.addWidget(self.smb_domain)
-        smb_layout.addLayout(smb_cred_row)
-
-        smb_help = QLabel("Example: \\\\192.168.1.100\\shared\\Documents")
-        smb_help.setStyleSheet("color:#6b7280; font-size:10px;")
-        smb_layout.addWidget(smb_help)
-
-        self.smb_widget.setVisible(False)
-        form.addRow("SMB Path:", self.smb_widget)
-
-        # WebDAV source row
-        self.webdav_widget = QWidget()
-        webdav_layout = QVBoxLayout(self.webdav_widget)
-        webdav_layout.setContentsMargins(0, 0, 0, 0)
-        webdav_layout.setSpacing(6)
-
-        self.webdav_url = QLineEdit()
-        self.webdav_url.setPlaceholderText("https://cloud.example.com/remote.php/dav/files/user/")
-        webdav_layout.addWidget(self.webdav_url)
-
-        webdav_cred_row = QHBoxLayout()
-        self.webdav_user = QLineEdit()
-        self.webdav_user.setPlaceholderText("Username")
-        self.webdav_pass = QLineEdit()
-        self.webdav_pass.setPlaceholderText("Password / App token")
-        self.webdav_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        webdav_cred_row.addWidget(self.webdav_user)
-        webdav_cred_row.addWidget(self.webdav_pass)
-        webdav_layout.addLayout(webdav_cred_row)
-
-        webdav_help = QLabel("Example: https://nextcloud.example.com/remote.php/dav/files/alice/Docs")
-        webdav_help.setStyleSheet("color:#6b7280; font-size:10px;")
-        webdav_layout.addWidget(webdav_help)
-
-        self.webdav_widget.setVisible(False)
-        form.addRow("WebDAV URL:", self.webdav_widget)
-
-        # ── SFTP / FTPS source ────────────────────────────────────────────────
-        self.src_sftp_widget = QWidget()
-        sftp_src_layout = QFormLayout(self.src_sftp_widget)
-        sftp_src_layout.setContentsMargins(0, 0, 0, 0)
-        sftp_src_layout.setSpacing(4)
-        self.src_sftp_host = QLineEdit(); self.src_sftp_host.setPlaceholderText("hostname or IP")
-        self.src_sftp_port = QSpinBox(); self.src_sftp_port.setRange(1, 65535); self.src_sftp_port.setValue(22)
-        self.src_sftp_user = QLineEdit(); self.src_sftp_user.setPlaceholderText("username")
-        self.src_sftp_pass = QLineEdit(); self.src_sftp_pass.setPlaceholderText("password")
-        self.src_sftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.src_sftp_path = QLineEdit(); self.src_sftp_path.setPlaceholderText("/remote/folder/to/watch")
-        self.src_sftp_key  = QLineEdit(); self.src_sftp_key.setPlaceholderText("path to private key (optional)")
-        sftp_src_layout.addRow("Host:", self.src_sftp_host)
-        sftp_src_layout.addRow("Port:", self.src_sftp_port)
-        sftp_src_layout.addRow("User:", self.src_sftp_user)
-        sftp_src_layout.addRow("Password:", self.src_sftp_pass)
-        sftp_src_layout.addRow("Remote Path:", self.src_sftp_path)
-        sftp_src_layout.addRow("Key File:", self.src_sftp_key)
-        self.src_sftp_widget.setVisible(False)
-        form.addRow("SFTP:", self.src_sftp_widget)
-
-        # ── FTP (plain) source ────────────────────────────────────────────────
-        self.src_ftp_widget = QWidget()
-        ftp_src_layout = QFormLayout(self.src_ftp_widget)
-        ftp_src_layout.setContentsMargins(0, 0, 0, 0)
-        ftp_src_layout.setSpacing(4)
-        self.src_ftp_host = QLineEdit(); self.src_ftp_host.setPlaceholderText("hostname or IP")
-        self.src_ftp_port = QSpinBox(); self.src_ftp_port.setRange(1, 65535); self.src_ftp_port.setValue(21)
-        self.src_ftp_user = QLineEdit(); self.src_ftp_user.setPlaceholderText("username")
-        self.src_ftp_pass = QLineEdit(); self.src_ftp_pass.setPlaceholderText("password")
-        self.src_ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.src_ftp_path = QLineEdit(); self.src_ftp_path.setPlaceholderText("/remote/folder/to/watch")
-        _ftp_src_warn = QLabel("⚠ FTP sends credentials in plaintext — prefer FTPS or SFTP.")
-        _ftp_src_warn.setWordWrap(True)
-        _ftp_src_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
-        ftp_src_layout.addRow("Host:", self.src_ftp_host)
-        ftp_src_layout.addRow("Port:", self.src_ftp_port)
-        ftp_src_layout.addRow("User:", self.src_ftp_user)
-        ftp_src_layout.addRow("Password:", self.src_ftp_pass)
-        ftp_src_layout.addRow("Remote Path:", self.src_ftp_path)
-        ftp_src_layout.addRow("", _ftp_src_warn)
-        self.src_ftp_widget.setVisible(False)
-        form.addRow("FTP:", self.src_ftp_widget)
-
-        self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(0, 1440)
-        self.interval_spin.setValue(0)
-        self.interval_spin.setSuffix(" min (0 = use global)")
-        form.addRow("Interval:", self.interval_spin)
-
-        # Per-watch destination
-        dest_widget = QWidget()
-        dest_row = QHBoxLayout(dest_widget)
-        dest_row.setContentsMargins(0, 0, 0, 0)
-        self.dest_input = QLineEdit()
-        self.dest_input.setPlaceholderText(
-            "Leave blank to use global destination  ·  or enter e.g. \\\\server\\share\\folder"
-        )
-        dest_browse_btn = QPushButton("Browse")
-        dest_browse_btn.setObjectName("secondary")
-        dest_browse_btn.setMaximumWidth(80)
-        dest_browse_btn.clicked.connect(self._browse_dest)
-        dest_row.addWidget(self.dest_input)
-        dest_row.addWidget(dest_browse_btn)
-        form.addRow("Destination:", dest_widget)
-
-        self.compress_combo = QComboBox()
-        self.compress_combo.addItem("Off", 0)
-        self.compress_combo.addItem("Fast (level 1)", 1)
-        self.compress_combo.addItem("Balanced (level 6)", 6)
-        self.compress_combo.addItem("Best (level 9)", 9)
-        self.compress_combo.setCurrentIndex(2)  # Default to "Balanced (level 6)"
-        form.addRow("Compression:", self.compress_combo)
-
-        # Sync mode is always ON — files are copied directly into the destination.
-        # No versioned timestamped subfolders are created.
-        self._sync_mode = True
-
-        layout.addLayout(form)
-
-        # ── "More Options…" collapsible section ──────────────────────────────
-        self._more_btn = QPushButton("▸  More Options…")
-        self._more_btn.setObjectName("secondary")
-        self._more_btn.setCheckable(True)
-        self._more_btn.setChecked(False)
-        self._more_btn.toggled.connect(self._toggle_more_options)
-        layout.addWidget(self._more_btn)
-
-        self._more_widget = QWidget()
-        self._more_widget.setVisible(False)
-        more_form = QFormLayout(self._more_widget)
-        more_form.setSpacing(10)
-        more_form.setContentsMargins(0, 4, 0, 4)
-
-        # Schedule times
-        self.add_schedule_widget = ScheduleTableWidget()
-        more_form.addRow("Schedule times:", self.add_schedule_widget)
-
-        # Retention
-
-        # Max backups
-
-        # Max file size
-        self.add_max_file_size_spin = QSpinBox()
-        self.add_max_file_size_spin.setRange(0, 100000)
-        self.add_max_file_size_spin.setValue(0)
-        self.add_max_file_size_spin.setSuffix(" MB  (0 = no limit)")
-        self.add_max_file_size_spin.setToolTip(
-            "Files larger than this are skipped during backup. Set to 0 to back up all files."
-        )
-        more_form.addRow("Skip files over:", self.add_max_file_size_spin)
-
-        # Exclude patterns
-        self.add_excl_edit = QTextEdit()
-        self.add_excl_edit.setMaximumHeight(80)
-        self.add_excl_edit.setPlaceholderText(
-            "One glob per line, e.g.  *.tmp  or  __pycache__"
-        )
-        more_form.addRow("Exclusions:", self.add_excl_edit)
-
-        # Encryption key
-        enc_container = QWidget()
-        enc_row = QHBoxLayout(enc_container)
-        enc_row.setContentsMargins(0, 0, 0, 0)
-        self.add_encrypt_input = QLineEdit()
-        self.add_encrypt_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.add_encrypt_input.setPlaceholderText("44-char encryption key  (leave blank to disable)")
-        enc_show = QCheckBox("Show")
-        enc_show.toggled.connect(
-            lambda on: self.add_encrypt_input.setEchoMode(
-                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
-            )
-        )
-        enc_gen = QPushButton("Generate")
-        enc_gen.setObjectName("secondary")
-        enc_gen.setMaximumWidth(80)
-        enc_gen.clicked.connect(self._generate_encrypt_key)
-        enc_row.addWidget(self.add_encrypt_input)
-        enc_row.addWidget(enc_show)
-        enc_row.addWidget(enc_gen)
-        more_form.addRow("Encrypt key:", enc_container)
-
-        # Pre / post backup commands
-        self.add_pre_cmd_input = QLineEdit()
-        self.add_pre_cmd_input.setPlaceholderText(
-            "Command to run before backup  (e.g. net stop myservice)"
-        )
-        more_form.addRow("Pre-backup:", self.add_pre_cmd_input)
-
-        self.add_post_cmd_input = QLineEdit()
-        self.add_post_cmd_input.setPlaceholderText(
-            "Command to run after backup  (e.g. net start myservice)"
-        )
-        more_form.addRow("Post-backup:", self.add_post_cmd_input)
-
-        layout.addWidget(self._more_widget)
-
-        self.error_lbl = QLabel("")
-        self.error_lbl.setObjectName("status_err")
-        layout.addWidget(self.error_lbl)
-
-        btn_row = QHBoxLayout()
-        cancel = QPushButton("Cancel")
-        cancel.setObjectName("secondary")
-        cancel.clicked.connect(self.reject)
-        self._submit_btn = QPushButton("Add Watch")
-        self._submit_btn.setObjectName("success")
-        self._submit_btn.clicked.connect(self._submit)
-        btn_row.addWidget(cancel)
-        btn_row.addWidget(self._submit_btn)
-        layout.addLayout(btn_row)
-
-    def _toggle_more_options(self, checked: bool):
-        self._more_widget.setVisible(checked)
-        self._more_btn.setText(
-            "▾  More Options…" if checked else "▸  More Options…"
-        )
-        self.adjustSize()
-
-    def _generate_encrypt_key(self):
-        import secrets, base64
-        raw = secrets.token_bytes(33)   # 33 bytes → 44 base64 chars
-        key = base64.urlsafe_b64encode(raw).decode()[:44]
-        self.add_encrypt_input.setText(key)
-        self.add_encrypt_input.setEchoMode(QLineEdit.EchoMode.Normal)
-
-    def _on_source_type_changed(self, idx):
-        self.local_widget.setVisible(idx == 0)
-        self.smb_widget.setVisible(idx == 1)
-        self.webdav_widget.setVisible(idx == 2)
-        is_sftp = idx in (3, 4)   # SFTP or FTPS
-        is_ftp  = idx == 5        # FTP plain
-        self.src_sftp_widget.setVisible(is_sftp)
-        self.src_ftp_widget.setVisible(is_ftp)
-        # For remote sources the path field is not used — hide the local path row
-        is_remote = idx in (3, 4, 5)
-        self.local_widget.setVisible(idx == 0 and not is_remote)
-
-    def _browse_dest(self):
-        """Browse for a per-watch destination folder."""
-        path = QFileDialog.getExistingDirectory(self, "Select Destination Folder")
-        if path:
-            self.dest_input.setText(path)
-
-    def _browse(self):
-        msg = QMessageBox(self)
-        msg.setWindowTitle("What to watch?")
-        msg.setText("Do you want to watch a folder or a single file?")
-        folder_btn = msg.addButton("Folder", QMessageBox.ButtonRole.AcceptRole)
-        file_btn   = msg.addButton("File",   QMessageBox.ButtonRole.AcceptRole)
-        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        msg.exec()
-        clicked = msg.clickedButton()
-        if clicked == folder_btn:
-            path = QFileDialog.getExistingDirectory(self, "Select Folder to Watch")
-        elif clicked == file_btn:
-            path, _ = QFileDialog.getOpenFileName(self, "Select File to Watch")
-        else:
-            return
-        if path:
-            self.path_input.setText(path)
-            if not self.name_input.text():
-                self.name_input.setText(Path(path).name)
-
-    def _validate_and_warn(self, path_str: str, name: str) -> bool:
-        """
-        Run all validations on path_str. Shows error_lbl for hard failures,
-        QMessageBox warnings for soft issues (user can proceed).
-        Returns True if OK to proceed, False to abort.
-        """
-        import os, stat as _stat, re
-
-        p = Path(path_str)
-
-        # ── Hard failures ─────────────────────────────────────────────────────
-
-        # 1. Empty
-        if not path_str:
-            self.error_lbl.setText("Path is required.")
-            return False
-
-        # 2. Suspicious / malicious characters
-        if any(c in path_str for c in ('\x00', '\r', '\n')):
-            self.error_lbl.setText("Path contains invalid characters.")
-            return False
-
-        # 3. Overly long path (Windows MAX_PATH = 260)
-        if len(path_str) > 32767:
-            self.error_lbl.setText("Path is too long (max 32767 characters).")
-            return False
-
-        # 4. Does not exist
-        if not p.exists():
-            self.error_lbl.setText("Path does not exist. Check the spelling or connect the drive.")
-            return False
-
-        # 5. Neither file nor directory (device node, pipe, etc.)
-        if not p.is_file() and not p.is_dir():
-            self.error_lbl.setText("Path must point to a file or folder, not a device or pipe.")
-            return False
-
-        # 6. Read permission check
-        try:
-            if p.is_dir():
-                os.listdir(path_str)
-            else:
-                open(path_str, "rb").close()
-        except PermissionError:
-            self.error_lbl.setText("No read permission on this path. Run as administrator or check folder permissions.")
-            return False
-        except Exception as e:
-            self.error_lbl.setText(f"Cannot access path: {e}")
-            return False
-
-        # 7. Duplicate path  · already being watched
-        existing_paths = [
-            w.get("path", "").strip().lower()
-            for w in self.cfg.get("watches", [])
-            if w.get("id") != self._edit_watch_id          # skip self when editing
-        ]
-        if path_str.strip().lower() in existing_paths:
-            self.error_lbl.setText("This path is already in your watch list.")
-            return False
-
-        # 8. Duplicate name  · already used
-        existing_names = [
-            w.get("name", "").strip().lower()
-            for w in self.cfg.get("watches", [])
-            if w.get("id") != self._edit_watch_id          # skip self when editing
-        ]
-        if name.strip().lower() in existing_names:
-            self.error_lbl.setText(f"A watch named \"{name}\" already exists. Choose a different name.")
-            return False
-
-        # 9. Name too long
-        if len(name) > 64:
-            self.error_lbl.setText("Name is too long (max 64 characters).")
-            return False
-
-        # 10. Name contains only valid characters (no / \ : * ? " < > |)
-        if re.search(r'[/\\:*?"<>|]', name):
-            self.error_lbl.setText("Name cannot contain: / \\ : * ? \" < > |")
-            return False
-
-        # 11. Watching a dangerous system root (e.g. C:\ or /)
-        try:
-            resolved = p.resolve()
-            if len(resolved.parts) <= 1:
-                self.error_lbl.setText(
-                    "Watching a root drive (e.g. C:\\) is not allowed.\n"
-                    "Please choose a specific folder instead."
-                )
-                return False
-        except Exception:
-            pass
-
-        # 12. Path is inside an existing watched folder (sub-folder overlap)
-        for w in self.cfg.get("watches", []):
-            if w.get("id") == self._edit_watch_id:         # skip self when editing
-                continue
-            wp = w.get("path", "")
+        # Fire the pre-emit callback on this worker thread so that
+        # _post_backup_finish is set BEFORE the finished signal is delivered
+        # to the main thread.  This prevents watchdog "modified" events
+        # (which arrive on their own thread simultaneously) from slipping
+        # through the suppressor grace window during the Qt signal delay.
+        if self.on_complete_cb is not None:
             try:
-                if path_str.lower().startswith(wp.lower().rstrip("/\\") + os.sep) \
-                        or wp.lower().startswith(path_str.lower().rstrip("/\\") + os.sep):
-                    self.error_lbl.setText(
-                        f"This path overlaps with existing watch \"{w.get('name', wp)}\"."
-                        " Nested watches can cause duplicate backups."
-                    )
-                    return False
+                self.on_complete_cb(w["id"])
             except Exception:
                 pass
-
-        # ── Soft warnings (user may still proceed) ────────────────────────────
-
-        warnings = []
-
-        # 13. Hidden folder / file
-        try:
-            if os.name == "nt":
-                import ctypes
-                attrs = ctypes.windll.kernel32.GetFileAttributesW(path_str)
-                if attrs != -1 and (attrs & 0x2):
-                    warnings.append("This path is hidden. Make sure you intend to back it up.")
-            else:
-                if p.name.startswith("."):
-                    warnings.append("This path appears to be a hidden file or folder.")
-        except Exception:
-            pass
-
-        # 14. Very large source folder (>2 GB warning)
-        # Skip recursive size scan for network paths — scanning a large SMB share
-        # (e.g. 2 TB) over the network on the main thread causes the UI to freeze.
-        _is_network_path = path_str.startswith("//") or path_str.startswith("\\\\")
-        _src_size_bytes = 0   # shared with check 15 to avoid a second full scan
-        _src_size_complete = False  # True only if scan finished without hitting the timeout
-        try:
-            import time as _time
-            if p.is_dir() and not _is_network_path:
-                total = 0
-                _scan_deadline = _time.monotonic() + 2.0  # never block main thread > 2 s
-                for fp in p.rglob("*"):
-                    if _time.monotonic() > _scan_deadline:
-                        break
-                    if fp.is_file():
-                        try:
-                            total += fp.stat().st_size
-                        except Exception:
-                            pass
-                    if total > 2 * 1024 ** 3:
-                        break
-                else:
-                    _src_size_complete = True  # loop finished normally — scan is authoritative
-                _src_size_bytes = total
-                if total > 2 * 1024 ** 3:
-                    gb = total / 1024 ** 3
-                    warnings.append(
-                        f"This folder appears to be larger than 2 GB ({gb:.1f} GB estimated).\n"
-                        "First backup may take a long time."
-                    )
-        except Exception:
-            pass
-
-        # 15. Destination disk space check (local destination only)
-        # Reuses the size already measured in check 14 — no second rglob scan.
-        try:
-            dest = self.cfg.get("destination", "")
-            if dest and not (dest.startswith("//") or dest.startswith("\\\\")) and Path(dest).exists():
-                free = shutil.disk_usage(dest).free
-                if p.is_file():
-                    src_size = p.stat().st_size
-                elif not _is_network_path and _src_size_complete:
-                    # _src_size_bytes was fully measured in check 14 — safe to compare
-                    src_size = _src_size_bytes
-                else:
-                    src_size = 0  # skip: network source, or check-14 scan timed out
-                if src_size and src_size > free * 0.9:
-                    warnings.append(
-                        f"Destination may not have enough free space.\n"
-                        f"Source: {src_size // 1024 ** 2} MB  |  "
-                        f"Destination free: {free // 1024 ** 2} MB"
-                    )
-        except Exception:
-            pass
-
-        # 16. Network path is slow / unreliable warning
-        try:
-            if path_str.startswith("//") or path_str.startswith("\\\\"):
-                import time as _time
-                t0 = _time.time()
-                os.listdir(path_str)
-                elapsed = _time.time() - t0
-                if elapsed > 3.0:
-                    warnings.append(
-                        f"Network share responded slowly ({elapsed:.1f}s).\n"
-                        "Backups may time out on a slow connection."
-                    )
-        except Exception:
-            pass
-
-        # ── Show soft warning dialog if any ──────────────────────────────────
-        if warnings:
-            msg = "\n\n".join(f"⚠ {w}" for w in warnings)
-            reply = QMessageBox.warning(
-                self, "Warning  · Review Before Adding",
-                msg + "\n\nDo you want to add this watch anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return False
-
-        return True
+        self.finished.emit(result)
 
     def _submit(self):
         try:
@@ -2430,20 +7857,12 @@ class AddWatchDialog(QDialog):
             return
 
         src_idx   = self.source_type.currentIndex()
-        is_smb    = src_idx == 1
-        is_webdav = src_idx == 2
-        is_sftp   = src_idx in (3, 4)
-        is_ftp    = src_idx == 5
+        # idx 0=Local, 1=WebDAV, 2=SFTP, 3=FTPS, 4=FTP
+        is_webdav = src_idx == 1
+        is_sftp   = src_idx in (2, 3)
+        is_ftp    = src_idx == 4
 
-        if is_smb:
-            path_str = self.smb_path_input.text().strip().replace("/", "\\")
-            if not path_str:
-                self.error_lbl.setText("SMB path is required.")
-                return
-            if not (path_str.startswith("//") or path_str.startswith("\\\\")):
-                self.error_lbl.setText("SMB path must start with // or \\\\ (e.g. //server/share)")
-                return
-        elif is_webdav:
+        if is_webdav:
             path_str = self.webdav_url.text().strip()
             if not path_str:
                 self.error_lbl.setText("WebDAV URL is required.")
@@ -2477,22 +7896,10 @@ class AddWatchDialog(QDialog):
                 return
             path_str = self.src_ftp_path.text().strip()
         else:
+            # Local, Mapped Drive, or UNC path — all use the same path_input
             path_str = self.path_input.text().strip()
 
         self.error_lbl.setText("")
-        if is_smb:
-            ok, err = _ensure_smb_mounted({
-                "path":   path_str,
-                "user":   self.smb_user.text().strip(),
-                "pass":   self.smb_pass.text(),
-                "domain": self.smb_domain.text().strip(),
-            })
-            if not ok:
-                if self._edit_watch_id:
-                    pass   # path unchanged — don't block save on connectivity
-                else:
-                    self.error_lbl.setText(f"Cannot connect to SMB share: {err}")
-                    return
 
         # Remote sources (SFTP/FTPS/FTP/WebDAV) — skip local filesystem validation
         if is_sftp or is_ftp or is_webdav:
@@ -2502,18 +7909,16 @@ class AddWatchDialog(QDialog):
         if self._validate_and_warn(path_str, name):
             self.accept()
 
+
     def get_values(self):
         src_idx   = self.source_type.currentIndex()
-        is_smb    = src_idx == 1
-        is_webdav = src_idx == 2
-        is_sftp   = src_idx in (3, 4)
-        is_ftps   = src_idx == 4
-        is_ftp    = src_idx == 5
+        # idx 0=Local, 1=WebDAV, 2=SFTP, 3=FTPS, 4=FTP
+        is_webdav = src_idx == 1
+        is_sftp   = src_idx in (2, 3)
+        is_ftps   = src_idx == 3
+        is_ftp    = src_idx == 4
 
-        if is_smb:
-            path     = self.smb_path_input.text().strip()
-            src_type = "smb"
-        elif is_webdav:
+        if is_webdav:
             path     = self.webdav_url.text().strip()
             src_type = "webdav"
         elif is_sftp:
@@ -2523,6 +7928,7 @@ class AddWatchDialog(QDialog):
             path     = self.src_ftp_path.text().strip()
             src_type = "ftp"
         else:
+            # Local, Mapped Drive, or UNC path — all treated as local
             path     = self.path_input.text().strip()
             src_type = "local"
 
@@ -2538,12 +7944,7 @@ class AddWatchDialog(QDialog):
             "compression":      self.compress_combo.currentData(),
             "sync_mode":        True,
             "destination":      self.dest_input.text().strip(),
-            "source_type":      src_type,
-            "is_smb":           is_smb,
-            "smb_user":         self.smb_user.text().strip() if is_smb else "",
-            "smb_pass":         self.smb_pass.text() if is_smb else "",
-            "smb_domain":       self.smb_domain.text().strip() if is_smb else "",
-            "is_webdav":        is_webdav,
+            "source_type":      src_type,            "is_webdav":        is_webdav,
             "webdav_user":      self.webdav_user.text().strip() if is_webdav else "",
             "webdav_pass":      self.webdav_pass.text() if is_webdav else "",
             "is_sftp":          is_sftp,
@@ -2566,6 +7967,7 @@ class AddWatchDialog(QDialog):
             "encrypt_key":      self.add_encrypt_input.text().strip(),
             "pre_backup_cmd":   self.add_pre_cmd_input.text().strip(),
             "post_backup_cmd":  self.add_post_cmd_input.text().strip(),
+            "force_robocopy":   self.force_robocopy_check.isChecked(),
         }
 
 
@@ -2580,7 +7982,6 @@ class _DestinationEntryDialog(QDialog):
         ("sftp",   "SFTP"),
         ("ftps",   "FTPS"),
         ("ftp",    "FTP (plain)"),
-        ("smb",    "Network Share (SMB)"),
         ("https",  "HTTPS API"),
         ("webdav", "WebDAV / Nextcloud"),
         ("rclone", "rclone"),
@@ -2656,27 +8057,6 @@ class _DestinationEntryDialog(QDialog):
         form.addRow("", self._ftp_widget)
         self._ftp_widget.setVisible(False)
 
-        # ── SMB ───────────────────────────────────────────────────────────────
-        self._smb_widget = QWidget()
-        ml = QFormLayout(self._smb_widget)
-        ml.setContentsMargins(0, 0, 0, 0); ml.setSpacing(4)
-        self._smb_server = QLineEdit(); self._smb_server.setPlaceholderText("nas or 192.168.1.100")
-        self._smb_share  = QLineEdit(); self._smb_share.setPlaceholderText("backups")
-        self._smb_user   = QLineEdit(); self._smb_user.setPlaceholderText("username (optional)")
-        self._smb_pass   = QLineEdit(); self._smb_pass.setPlaceholderText("password (optional)")
-        self._smb_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._smb_path   = QLineEdit(); self._smb_path.setPlaceholderText("subfolder (optional)")
-        ml.addRow("Server:", self._smb_server); ml.addRow("Share:", self._smb_share)
-        ml.addRow("User:", self._smb_user);     ml.addRow("Password:", self._smb_pass)
-        ml.addRow("Path:", self._smb_path)
-        
-        # Test button for SMB
-        self._smb_test_btn = QPushButton("Test Connection")
-        self._smb_test_btn.clicked.connect(self._test_smb_connection)
-        ml.addRow("", self._smb_test_btn)
-        
-        form.addRow("", self._smb_widget)
-        self._smb_widget.setVisible(False)
 
         # ── HTTPS API ─────────────────────────────────────────────────────────
         self._https_widget = QWidget()
@@ -2786,7 +8166,6 @@ class _DestinationEntryDialog(QDialog):
         type_key = self._TYPE_LABELS[idx][0]
         self._sftp_widget.setVisible(type_key in ("sftp", "ftps"))
         self._ftp_widget.setVisible(type_key == "ftp")
-        self._smb_widget.setVisible(type_key == "smb")
         self._https_widget.setVisible(type_key == "https")
         self._webdav_widget.setVisible(type_key == "webdav")
         self._rclone_widget.setVisible(type_key == "rclone")
@@ -2816,12 +8195,6 @@ class _DestinationEntryDialog(QDialog):
             self._ftp_user.setText(cfg.get("username", ""))
             self._ftp_pass.setText(cfg.get("password", ""))
             self._ftp_path.setText(cfg.get("remote_path", ""))
-        elif type_key == "smb":
-            self._smb_server.setText(cfg.get("server", ""))
-            self._smb_share.setText(cfg.get("share", ""))
-            self._smb_user.setText(cfg.get("username", ""))
-            self._smb_pass.setText(cfg.get("password", ""))
-            self._smb_path.setText(cfg.get("remote_path", ""))
         elif type_key == "https":
             self._https_url.setText(cfg.get("url", ""))
             self._https_token.setText(cfg.get("token", ""))
@@ -2876,16 +8249,15 @@ class _DestinationEntryDialog(QDialog):
                 "use_tls": False,
             }
 
-        elif type_key == "smb":
-            server = self._smb_server.text().strip()
-            if not server:
+            if not path:
                 return {}
             config = {
-                "server": server,
-                "share": self._smb_share.text().strip(),
-                "username": self._smb_user.text().strip(),
-                "password": self._smb_pass.text(),
-                "remote_path": self._smb_path.text().strip(),
+                "path": path,
+                "server": "",
+                "share": "",
+                "username": "",
+                "password": "",
+                "remote_path": "",
             }
 
         elif type_key == "https":
@@ -2973,32 +8345,6 @@ class _DestinationEntryDialog(QDialog):
             QMessageBox.critical(self, "FTP  ·  Failed",
                 f'Could not connect:\n\n{result.get("error", "Unknown error")}')
 
-    def _test_smb_connection(self):
-        # Build UNC path from server and share
-        server = self._smb_server.text().strip()
-        share = self._smb_share.text().strip()
-        if not server or not share:
-            QMessageBox.warning(self, "Missing", "Please enter both SMB server and share.")
-            return
-        cfg = {
-            "path":   f"\\\\{server}\\{share}",
-            "user":   self._smb_user.text().strip(),
-            "pass":   self._smb_pass.text(),
-            "domain": "",  # Dialog doesn't have domain field
-        }
-        try:
-            from transport_utils import test_smb_connection
-            result = test_smb_connection(cfg)
-        except Exception as e:
-            QMessageBox.critical(self, "SMB Test Failed", str(e))
-            return
-        if result.get("ok"):
-            QMessageBox.information(self, "SMB  ·  Connected ✓",
-                f"Successfully connected to:\n{cfg['path']}")
-        else:
-            QMessageBox.critical(self, "SMB  ·  Failed",
-                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
-
     def _test_https_connection(self):
         cfg = {
             "url":        self._https_url.text().strip(),
@@ -3059,6 +8405,7 @@ class _DestinationEntryDialog(QDialog):
             proc = subprocess.run(
                 ["rclone", "listremotes"],
                 capture_output=True, text=True, timeout=10,
+                creationflags=_WIN_NO_WINDOW,
             )
         except FileNotFoundError:
             QMessageBox.critical(
@@ -3165,7 +8512,9 @@ class EditWatchDialog(QDialog):
         self.dest_type = dest_type
         self.setWindowTitle(f"Edit Watch  · {watch.get('name', '')}")
         self.setMinimumWidth(500)
+        self._is_dirty = False
         self._build_ui()
+        self._connect_dirty_signals()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -3176,6 +8525,7 @@ class EditWatchDialog(QDialog):
         title.setObjectName("heading")
         layout.addWidget(title)
 
+        # ── Basic settings ────────────────────────────────────────────────────
         form = QFormLayout()
         form.setSpacing(10)
 
@@ -3186,6 +8536,30 @@ class EditWatchDialog(QDialog):
         path_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
         form.addRow("Path:", path_lbl)
 
+        edit_dest_widget = QWidget()
+        edit_dest_row = QHBoxLayout(edit_dest_widget)
+        edit_dest_row.setContentsMargins(0, 0, 0, 0)
+        self.dest_input = QLineEdit(self.watch.get("destination", ""))
+        self.dest_input.setPlaceholderText(
+            "Required — enter backup destination folder  ·  e.g. \\\\server\\share\\folder"
+        )
+        edit_dest_browse = QPushButton("Browse")
+        edit_dest_browse.setObjectName("secondary")
+        edit_dest_browse.setMaximumWidth(80)
+        self._dest_ok_lbl = QLabel("✓ Folder selected")
+        self._dest_ok_lbl.setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;")
+        self._dest_ok_lbl.hide()
+        def _on_dest_browse():
+            folder = QFileDialog.getExistingDirectory(self, "Select Destination Folder")
+            if folder:
+                self.dest_input.setText(folder)
+                _flash_browse_ok(self, self._dest_ok_lbl, self.dest_input)
+        edit_dest_browse.clicked.connect(_on_dest_browse)
+        edit_dest_row.addWidget(self.dest_input)
+        edit_dest_row.addWidget(edit_dest_browse)
+        edit_dest_row.addWidget(self._dest_ok_lbl)
+        form.addRow("Destination:", edit_dest_widget)
+
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(0, 1440)
         self.interval_spin.setValue(self.watch.get("interval_min", 0))
@@ -3193,9 +8567,47 @@ class EditWatchDialog(QDialog):
         form.addRow("Interval:", self.interval_spin)
 
         self.watch_schedule_widget = ScheduleTableWidget()
-        _w_sched = self.watch.get("schedule_times", [])
-        self.watch_schedule_widget.set_entries(_w_sched)
+        self.watch_schedule_widget.set_entries(self.watch.get("schedule_times", []))
         form.addRow("Schedule times:", self.watch_schedule_widget)
+
+        self.compress_combo = QComboBox()
+        self.compress_combo.addItem("Off", 0)
+        self.compress_combo.addItem("Fast (level 1)", 1)
+        self.compress_combo.addItem("Balanced (level 6)", 6)
+        self.compress_combo.addItem("Best (level 9)", 9)
+        current_compression = self.watch.get("compression", False)
+        if current_compression is True or current_compression == 6:
+            self.compress_combo.setCurrentIndex(2)
+        elif current_compression == 1:
+            self.compress_combo.setCurrentIndex(1)
+        elif current_compression == 9:
+            self.compress_combo.setCurrentIndex(3)
+        else:
+            self.compress_combo.setCurrentIndex(0)
+        form.addRow("Compression:", self.compress_combo)
+
+        layout.addLayout(form)
+
+        # ── Advanced settings toggle ──────────────────────────────────────────
+        self._adv_toggle = QPushButton("▶  Advanced settings")
+        self._adv_toggle.setObjectName("secondary")
+        self._adv_toggle.setStyleSheet(
+            "text-align:left; padding:6px 10px; font-size:12px; "
+            "color:#9ca3af; border:1px solid #374151; border-radius:4px;"
+        )
+        self._adv_toggle.setCheckable(True)
+        self._adv_toggle.setChecked(False)
+        self._adv_toggle.toggled.connect(self._on_adv_toggled)
+        layout.addWidget(self._adv_toggle)
+
+        # ── Advanced container ────────────────────────────────────────────────
+        self._adv_widget = QWidget()
+        adv_layout = QVBoxLayout(self._adv_widget)
+        adv_layout.setSpacing(10)
+        adv_layout.setContentsMargins(0, 4, 0, 0)
+
+        adv_form = QFormLayout()
+        adv_form.setSpacing(10)
 
         self.force_full_interval_spin = QSpinBox()
         self.force_full_interval_spin.setRange(0, 3650)
@@ -3207,9 +8619,8 @@ class EditWatchDialog(QDialog):
             "if the global setting is also 0).  -1 disables forced-full even when "
             "the global setting is active."
         )
-        form.addRow("Force full every:", self.force_full_interval_spin)
+        adv_form.addRow("Force full every:", self.force_full_interval_spin)
 
-        # ── Drive trigger ──────────────────────────────────────────────────────
         self.drive_trigger_label_input = QLineEdit()
         self.drive_trigger_label_input.setText(self.watch.get("drive_trigger_label", ""))
         self.drive_trigger_label_input.setPlaceholderText("MY_BACKUP  (case-insensitive volume label)")
@@ -3217,7 +8628,7 @@ class EditWatchDialog(QDialog):
             "Back up this watch automatically when a drive with this volume label "
             "is connected.  Leave blank to disable.  Case-insensitive."
         )
-        form.addRow("Drive trigger (label):", self.drive_trigger_label_input)
+        adv_form.addRow("Drive trigger (label):", self.drive_trigger_label_input)
 
         self.drive_trigger_serial_input = QLineEdit()
         self.drive_trigger_serial_input.setText(self.watch.get("drive_trigger_serial", ""))
@@ -3227,7 +8638,7 @@ class EditWatchDialog(QDialog):
             "is connected.  Find the serial with:  vol C:  (or the drive letter) "
             "in CMD.  Either label OR serial match triggers the backup."
         )
-        form.addRow("Drive trigger (serial):", self.drive_trigger_serial_input)
+        adv_form.addRow("Drive trigger (serial):", self.drive_trigger_serial_input)
 
         _dt_note = QLabel(
             "💡 Tip: use volume label for portability across machines; use serial "
@@ -3235,7 +8646,7 @@ class EditWatchDialog(QDialog):
         )
         _dt_note.setStyleSheet("color: #94a3b8; font-size: 11px;")
         _dt_note.setWordWrap(True)
-        form.addRow("", _dt_note)
+        adv_form.addRow("", _dt_note)
 
         self.max_file_size_spin = QDoubleSpinBox()
         self.max_file_size_spin.setRange(0, 100000)
@@ -3246,7 +8657,7 @@ class EditWatchDialog(QDialog):
             "Skip any single file larger than this size. "
             "Useful to avoid accidentally backing up video files or database dumps."
         )
-        form.addRow("Skip files over:", self.max_file_size_spin)
+        adv_form.addRow("Skip files over:", self.max_file_size_spin)
 
         self.max_backup_bytes_spin = QDoubleSpinBox()
         self.max_backup_bytes_spin.setRange(0, 1_000_000)
@@ -3258,158 +8669,30 @@ class EditWatchDialog(QDialog):
             "Stop new backups for this watch once total backup storage exceeds this limit. "
             "Old backups must be deleted to free space."
         )
-        form.addRow("Storage quota:", self.max_backup_bytes_spin)
+        adv_form.addRow("Storage quota:", self.max_backup_bytes_spin)
 
-        self.compress_combo = QComboBox()
-        self.compress_combo.addItem("Off", 0)
-        self.compress_combo.addItem("Fast (level 1)", 1)
-        self.compress_combo.addItem("Balanced (level 6)", 6)
-        self.compress_combo.addItem("Best (level 9)", 9)
-        # Set current index based on existing compression value
-        current_compression = self.watch.get("compression", False)
-        if current_compression is True or current_compression == 6:
-            self.compress_combo.setCurrentIndex(2)  # Balanced
-        elif current_compression == 1:
-            self.compress_combo.setCurrentIndex(1)  # Fast
-        elif current_compression == 9:
-            self.compress_combo.setCurrentIndex(3)  # Best
-        else:
-            self.compress_combo.setCurrentIndex(0)  # Off
-        form.addRow("Compression:", self.compress_combo)
-
-        # Per-watch destination
-        edit_dest_widget = QWidget()
-        edit_dest_row = QHBoxLayout(edit_dest_widget)
-        edit_dest_row.setContentsMargins(0, 0, 0, 0)
-        self.dest_input = QLineEdit(self.watch.get("destination", ""))
-        self.dest_input.setPlaceholderText(
-            "Leave blank to use global destination  ·  or enter e.g. \\\\server\\share\\folder"
+        self.force_robocopy_check = QCheckBox(
+            "Force robocopy for same-host UNC  "
+            "(tick when source & dest are on the same Windows host and transfers are slow)"
         )
-        edit_dest_browse = QPushButton("Browse")
-        edit_dest_browse.setObjectName("secondary")
-        edit_dest_browse.setMaximumWidth(80)
-        edit_dest_browse.clicked.connect(
-            lambda: self.dest_input.setText(
-                QFileDialog.getExistingDirectory(self, "Select Destination Folder")
-                or self.dest_input.text()
-            )
+        self.force_robocopy_check.setChecked(self.watch.get("force_robocopy", False))
+        self.force_robocopy_check.setToolTip(
+            "When source and destination are on the same Windows host, BackupSys normally\n"
+            ""
+            "Enable this if same-host UNC transfers are slow (ODX not supported).\n"
+            "robocopy /MT:8 /J will be used instead — routes bytes through your PC but\n"
+            "runs 8 parallel threads and is much faster when ODX is unavailable.\n\n"
+            "Note: robocopy requires Compression = Off. Ticking this will set compression\n"
+            "to Off automatically."
         )
-        edit_dest_row.addWidget(self.dest_input)
-        edit_dest_row.addWidget(edit_dest_browse)
-        form.addRow("Destination:", edit_dest_widget)
+        adv_form.addRow("", self.force_robocopy_check)
 
-        # ── Multi-destinations (proper list widget) ─────────────────────────────
-        from PyQt6.QtWidgets import QListWidget, QListWidgetItem
-        dest_list_group = QGroupBox("Additional Destinations")
-        dest_list_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
-        dest_list_outer = QVBoxLayout(dest_list_group)
-        dest_list_outer.setSpacing(6)
-        dest_list_outer.setContentsMargins(8, 8, 8, 8)
-
-        _dest_note = QLabel("Backups are copied to every destination listed here after each run.")
-        _dest_note.setStyleSheet("color:#6b7280; font-size:10px;")
-        _dest_note.setWordWrap(True)
-        dest_list_outer.addWidget(_dest_note)
-
-        self._dest_list_widget = QListWidget()
-        self._dest_list_widget.setMaximumHeight(100)
-        self._dest_list_widget.setAlternatingRowColors(True)
-        for _d in self.watch.get("destinations", []):
-            _item = QListWidgetItem(_DestinationEntryDialog.dest_label(_d))
-            _item.setData(Qt.ItemDataRole.UserRole, _d)
-            self._dest_list_widget.addItem(_item)
-        dest_list_outer.addWidget(self._dest_list_widget)
-
-        dest_btn_row = QHBoxLayout()
-        _add_dest_btn = QPushButton("➕ Add Destination")
-        _add_dest_btn.setObjectName("secondary")
-        _add_dest_btn.clicked.connect(self._add_destination)
-        _edit_dest_btn = QPushButton("✏ Edit")
-        _edit_dest_btn.setObjectName("secondary")
-        _edit_dest_btn.clicked.connect(self._edit_destination)
-        _remove_dest_btn = QPushButton("🗑 Remove")
-        _remove_dest_btn.setObjectName("danger")
-        _remove_dest_btn.clicked.connect(self._remove_destination)
-        dest_btn_row.addWidget(_add_dest_btn)
-        dest_btn_row.addWidget(_edit_dest_btn)
-        dest_btn_row.addWidget(_remove_dest_btn)
-        dest_btn_row.addStretch()
-        dest_list_outer.addLayout(dest_btn_row)
-        form.addRow("", dest_list_group)
-
-        # Sync mode is always ON — files are copied directly into the destination.
         self._sync_mode = True
-
         self.skip_auto_check = QCheckBox("Skip auto backup  (manual only)")
         self.skip_auto_check.setChecked(self.watch.get("skip_auto_backup", False))
-        form.addRow("", self.skip_auto_check)
+        adv_form.addRow("", self.skip_auto_check)
 
-        # ── Pre / Post backup hooks ─────────────────────────────────────────
-        hooks_group = QGroupBox("Backup Hooks (optional)")
-        hooks_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
-        hooks_layout = QFormLayout(hooks_group)
-        hooks_layout.setSpacing(6)
-        hooks_layout.setContentsMargins(8, 10, 8, 8)
-
-        _hook_note = QLabel(
-            "Runs a shell command before/after backup. If pre-command fails, backup is skipped."
-        )
-        _hook_note.setStyleSheet("color:#6b7280; font-size:10px;")
-        _hook_note.setWordWrap(True)
-        hooks_layout.addRow(_hook_note)
-
-        self.pre_cmd_input = QLineEdit(self.watch.get("pre_backup_cmd", ""))
-        self.pre_cmd_input.setPlaceholderText(
-            "e.g.  net stop MyService  or  /scripts/flush_db.sh"
-        )
-        hooks_layout.addRow("Pre-backup:", self.pre_cmd_input)
-
-        self.post_cmd_input = QLineEdit(self.watch.get("post_backup_cmd", ""))
-        self.post_cmd_input.setPlaceholderText(
-            "e.g.  net start MyService  or  /scripts/notify.sh"
-        )
-        hooks_layout.addRow("Post-backup:", self.post_cmd_input)
-        form.addRow("", hooks_group)
-
-        # ── Per-watch Notification Overrides ────────────────────────────────
-        _pn = self.watch.get("notify_overrides", {})
-        notify_ov_group = QGroupBox("Notification Overrides (optional)")
-        notify_ov_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
-        notify_ov_layout = QFormLayout(notify_ov_group)
-        notify_ov_layout.setSpacing(6)
-        notify_ov_layout.setContentsMargins(8, 10, 8, 8)
-
-        _pn_note = QLabel(
-            "Leave blank to use the global settings. "
-            "Set a value here to override for this watch only."
-        )
-        _pn_note.setStyleSheet("color:#6b7280; font-size:10px;")
-        _pn_note.setWordWrap(True)
-        notify_ov_layout.addRow(_pn_note)
-
-        self.watch_webhook_input = QLineEdit(_pn.get("webhook_url", ""))
-        self.watch_webhook_input.setPlaceholderText(
-            "https://hooks.slack.com/…  or  https://discord.com/api/webhooks/…"
-        )
-        self.watch_webhook_input.setToolTip(
-            "Override the global webhook URL for this watch only.\n"
-            "Useful for routing alerts to a specific Slack channel or Discord server."
-        )
-        notify_ov_layout.addRow("Webhook URL:", self.watch_webhook_input)
-
-        self.watch_ntfy_topic_input = QLineEdit(_pn.get("ntfy_topic", ""))
-        self.watch_ntfy_topic_input.setPlaceholderText(
-            "e.g.  my-critical-watch-alerts"
-        )
-        self.watch_ntfy_topic_input.setToolTip(
-            "Override the global ntfy topic for this watch only.\n"
-            "The server URL and token are still taken from global ntfy settings."
-        )
-        notify_ov_layout.addRow("ntfy topic:", self.watch_ntfy_topic_input)
-
-        form.addRow("", notify_ov_group)
-
-        # ── Encryption ──────────────────────────────────────────────────────
+        # Encryption
         enc_row = QHBoxLayout()
         self.encrypt_input = QLineEdit(self.watch.get("encrypt_key", ""))
         self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Password)
@@ -3453,7 +8736,7 @@ class EditWatchDialog(QDialog):
         )
         enc_row.addWidget(copy_key_btn)
         enc_row.addWidget(rotate_key_btn)
-        form.addRow("Encrypt key:", enc_row)
+        adv_form.addRow("Encrypt key:", enc_row)
 
         self.color_input = QLineEdit(self.watch.get("color", ""))
         self.color_input.setPlaceholderText("#2563eb  (optional color label)")
@@ -3476,26 +8759,27 @@ class EditWatchDialog(QDialog):
         color_row.addWidget(pick_color_btn)
         color_widget = QWidget()
         color_widget.setLayout(color_row)
-        form.addRow("Color:", color_widget)
+        adv_form.addRow("Color:", color_widget)
 
         self.notes_input = QLineEdit(self.watch.get("notes", ""))
         self.notes_input.setPlaceholderText("Optional notes")
-        form.addRow("Notes:", self.notes_input)
+        adv_form.addRow("Notes:", self.notes_input)
 
         self.tags_input = QLineEdit(", ".join(self.watch.get("tags", [])))
         self.tags_input.setPlaceholderText("e.g. work, important, daily  (comma-separated)")
-        form.addRow("Tags:", self.tags_input)
+        adv_form.addRow("Tags:", self.tags_input)
 
-        # Exclusions
         excl_label = QLabel("Exclude patterns  (one per line):")
         excl_label.setStyleSheet("color:#9ca3af;")
-        form.addRow("", excl_label)
+        adv_form.addRow("", excl_label)
+        _raw_excl = [p for p in self.watch.get("exclude_patterns", []) if not p.startswith("!")]
+        _raw_incl = [p[1:] for p in self.watch.get("exclude_patterns", []) if p.startswith("!")]
         self.excl_edit = QTextEdit()
         self.excl_edit.setMaximumHeight(100)
-        self.excl_edit.setPlainText("\n".join(self.watch.get("exclude_patterns", [])))
-        form.addRow("Exclusions:", self.excl_edit)
+        self.excl_edit.setPlainText("\n".join(_raw_excl))
+        self.excl_edit.setTabChangesFocus(True)
+        adv_form.addRow("Exclusions:", self.excl_edit)
 
-        # Include-only (whitelist) patterns
         incl_label = QLabel(
             "Include-only patterns  (one per line, e.g. <code>*.docx</code>):<br>"
             "<span style='color:#6b7280; font-size:11px;'>"
@@ -3505,24 +8789,110 @@ class EditWatchDialog(QDialog):
         incl_label.setTextFormat(Qt.TextFormat.RichText)
         incl_label.setWordWrap(True)
         incl_label.setStyleSheet("color:#9ca3af;")
-        form.addRow("", incl_label)
-        # Load: strip leading "!" that the engine uses internally
-        _raw_excl = [p for p in self.watch.get("exclude_patterns", []) if not p.startswith("!")]
-        _raw_incl = [p[1:] for p in self.watch.get("exclude_patterns", []) if p.startswith("!")]
-        self.excl_edit.setPlainText("\n".join(_raw_excl))
+        adv_form.addRow("", incl_label)
         self.incl_edit = QTextEdit()
         self.incl_edit.setMaximumHeight(80)
         self.incl_edit.setPlaceholderText("e.g.\n*.docx\n*.xlsx\n*.pdf")
         self.incl_edit.setPlainText("\n".join(_raw_incl))
-        form.addRow("Include only:", self.incl_edit)
+        self.incl_edit.setTabChangesFocus(True)
+        adv_form.addRow("Include only:", self.incl_edit)
 
-        # ── Per-watch bandwidth override ─────────────────────────────────────
+        adv_layout.addLayout(adv_form)
+
+        # Additional Destinations
+        from PyQt6.QtWidgets import QListWidget, QListWidgetItem
+        dest_list_group = QGroupBox("Additional Destinations")
+        dest_list_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
+        dest_list_outer = QVBoxLayout(dest_list_group)
+        dest_list_outer.setSpacing(6)
+        dest_list_outer.setContentsMargins(8, 8, 8, 8)
+        _dest_note = QLabel("Backups are copied to every destination listed here after each run.")
+        _dest_note.setStyleSheet("color:#6b7280; font-size:10px;")
+        _dest_note.setWordWrap(True)
+        dest_list_outer.addWidget(_dest_note)
+        self._dest_list_widget = QListWidget()
+        self._dest_list_widget.setMaximumHeight(100)
+        self._dest_list_widget.setAlternatingRowColors(True)
+        for _d in self.watch.get("destinations", []):
+            _item = QListWidgetItem(_DestinationEntryDialog.dest_label(_d))
+            _item.setData(Qt.ItemDataRole.UserRole, _d)
+            self._dest_list_widget.addItem(_item)
+        dest_list_outer.addWidget(self._dest_list_widget)
+        dest_btn_row = QHBoxLayout()
+        _add_dest_btn = QPushButton("➕ Add Destination")
+        _add_dest_btn.setObjectName("secondary")
+        _add_dest_btn.clicked.connect(self._add_destination)
+        _edit_dest_btn = QPushButton("✏ Edit")
+        _edit_dest_btn.setObjectName("secondary")
+        _edit_dest_btn.clicked.connect(self._edit_destination)
+        _remove_dest_btn = QPushButton("🗑 Remove")
+        _remove_dest_btn.setObjectName("danger")
+        _remove_dest_btn.clicked.connect(self._remove_destination)
+        dest_btn_row.addWidget(_add_dest_btn)
+        dest_btn_row.addWidget(_edit_dest_btn)
+        dest_btn_row.addWidget(_remove_dest_btn)
+        dest_btn_row.addStretch()
+        dest_list_outer.addLayout(dest_btn_row)
+        adv_layout.addWidget(dest_list_group)
+
+        # Backup Hooks
+        hooks_group = QGroupBox("Backup Hooks (optional)")
+        hooks_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
+        hooks_layout = QFormLayout(hooks_group)
+        hooks_layout.setSpacing(6)
+        hooks_layout.setContentsMargins(8, 10, 8, 8)
+        _hook_note = QLabel(
+            "Runs a shell command before/after backup. If pre-command fails, backup is skipped."
+        )
+        _hook_note.setStyleSheet("color:#6b7280; font-size:10px;")
+        _hook_note.setWordWrap(True)
+        hooks_layout.addRow(_hook_note)
+        self.pre_cmd_input = QLineEdit(self.watch.get("pre_backup_cmd", ""))
+        self.pre_cmd_input.setPlaceholderText("e.g.  net stop MyService  or  /scripts/flush_db.sh")
+        hooks_layout.addRow("Pre-backup:", self.pre_cmd_input)
+        self.post_cmd_input = QLineEdit(self.watch.get("post_backup_cmd", ""))
+        self.post_cmd_input.setPlaceholderText("e.g.  net start MyService  or  /scripts/notify.sh")
+        hooks_layout.addRow("Post-backup:", self.post_cmd_input)
+        adv_layout.addWidget(hooks_group)
+
+        # Notification Overrides
+        _pn = self.watch.get("notify_overrides", {})
+        notify_ov_group = QGroupBox("Notification Overrides (optional)")
+        notify_ov_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
+        notify_ov_layout = QFormLayout(notify_ov_group)
+        notify_ov_layout.setSpacing(6)
+        notify_ov_layout.setContentsMargins(8, 10, 8, 8)
+        _pn_note = QLabel(
+            "Leave blank to use the global settings. "
+            "Set a value here to override for this watch only."
+        )
+        _pn_note.setStyleSheet("color:#6b7280; font-size:10px;")
+        _pn_note.setWordWrap(True)
+        notify_ov_layout.addRow(_pn_note)
+        self.watch_webhook_input = QLineEdit(_pn.get("webhook_url", ""))
+        self.watch_webhook_input.setPlaceholderText(
+            "https://hooks.slack.com/…  or  https://discord.com/api/webhooks/…"
+        )
+        self.watch_webhook_input.setToolTip(
+            "Override the global webhook URL for this watch only.\n"
+            "Useful for routing alerts to a specific Slack channel or Discord server."
+        )
+        notify_ov_layout.addRow("Webhook URL:", self.watch_webhook_input)
+        self.watch_ntfy_topic_input = QLineEdit(_pn.get("ntfy_topic", ""))
+        self.watch_ntfy_topic_input.setPlaceholderText("e.g.  my-critical-watch-alerts")
+        self.watch_ntfy_topic_input.setToolTip(
+            "Override the global ntfy topic for this watch only.\n"
+            "The server URL and token are still taken from global ntfy settings."
+        )
+        notify_ov_layout.addRow("ntfy topic:", self.watch_ntfy_topic_input)
+        adv_layout.addWidget(notify_ov_group)
+
+        # Bandwidth Override
         bw_group = QGroupBox("Bandwidth Override  (leave at 0 to use global setting)")
         bw_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
         bw_outer = QVBoxLayout(bw_group)
         bw_outer.setSpacing(6)
         bw_outer.setContentsMargins(8, 12, 8, 8)
-
         bw_form = QFormLayout()
         bw_form.setSpacing(8)
         self._watch_bw_spin = QDoubleSpinBox()
@@ -3532,11 +8902,9 @@ class EditWatchDialog(QDialog):
         self._watch_bw_spin.setValue(float(self.watch.get("max_backup_mbps", 0.0)))
         bw_form.addRow("Max bandwidth:", self._watch_bw_spin)
         bw_outer.addLayout(bw_form)
-
         bw_sched_lbl = QLabel("Per-watch schedule (optional — overrides max bandwidth during time windows):")
         bw_sched_lbl.setStyleSheet("color:#6b7280; font-size:10px;")
         bw_outer.addWidget(bw_sched_lbl)
-
         self._watch_bw_table = QTableWidget()
         self._watch_bw_table.setColumnCount(3)
         self._watch_bw_table.setHorizontalHeaderLabels(["Start (HH:MM)", "End (HH:MM)", "Max MB/s"])
@@ -3547,7 +8915,6 @@ class EditWatchDialog(QDialog):
         self._watch_bw_table.setMaximumHeight(120)
         self._watch_bw_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         bw_outer.addWidget(self._watch_bw_table)
-
         bw_btn_row = QHBoxLayout()
         _bw_add = QPushButton("Add Rule")
         _bw_add.setObjectName("secondary")
@@ -3559,33 +8926,399 @@ class EditWatchDialog(QDialog):
         bw_btn_row.addWidget(_bw_remove)
         bw_btn_row.addStretch()
         bw_outer.addLayout(bw_btn_row)
-
-        # Populate saved schedule
         for rule in self.watch.get("bandwidth_schedule", []):
             self._watch_bw_add_rule_data(
                 rule.get("start", "00:00"),
                 rule.get("end", "06:00"),
                 rule.get("max_mbps", 0.0),
             )
+        adv_layout.addWidget(bw_group)
 
-        layout.addWidget(bw_group)
+        # NAS / SMB Credentials (nested collapsible inside advanced)
+        self._nas_creds_toggle = QPushButton("▶  PC Credentials  (required for who-did-it tracking)")
+        self._nas_creds_toggle.setObjectName("secondary")
+        self._nas_creds_toggle.setStyleSheet(
+            "text-align:left; padding:6px 10px; font-size:12px; "
+            "color:#9ca3af; border:1px solid #374151; border-radius:4px;"
+        )
+        self._nas_creds_toggle.setCheckable(True)
+        self._nas_creds_toggle.setChecked(False)
+        self._nas_creds_toggle.toggled.connect(self._on_nas_creds_toggled)
+        adv_layout.addWidget(self._nas_creds_toggle)
 
-        layout.addLayout(form)
+        self._nas_creds_widget = QWidget()
+        nas_form = QFormLayout(self._nas_creds_widget)
+        nas_form.setContentsMargins(12, 4, 0, 4)
+        nas_form.setSpacing(8)
+        _nas_hint = QLabel(
+            "Enter the Windows/Mac account credentials for the PC sharing this folder.\n"
+            "Must be an administrator account on that PC — this is what BackupSys\n"
+            "uses to query who added, modified, or deleted files (who-did-it tracking).\n"
+            "Use the same username/password you log into that PC with."
+        )
+        _nas_hint.setStyleSheet("color:#6b7280; font-size:11px;")
+        _nas_hint.setWordWrap(True)
+        nas_form.addRow("", _nas_hint)
+        self.nas_user_input = QLineEdit()
+        self.nas_user_input.setPlaceholderText("SMB username  (e.g. john or DOMAIN\\john)")
+        nas_form.addRow("Username:", self.nas_user_input)
+        self.nas_pass_input = QLineEdit()
+        self.nas_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.nas_pass_input.setPlaceholderText("SMB password")
+        nas_form.addRow("Password:", self.nas_pass_input)
+        self._nas_test_btn = QPushButton("Test Connection")
+        self._nas_test_btn.setObjectName("secondary")
+        self._nas_test_btn.setFixedWidth(130)
+        self._nas_test_btn.clicked.connect(self._test_nas_credentials)
+        self._nas_test_lbl = QLabel("")
+        self._nas_test_lbl.setStyleSheet("font-size:11px;")
+        _nas_test_row = QHBoxLayout()
+        _nas_test_row.setContentsMargins(0, 0, 0, 0)
+        _nas_test_row.addWidget(self._nas_test_btn)
+        _nas_test_row.addWidget(self._nas_test_lbl)
+        _nas_test_row.addStretch()
+        _nas_test_widget = QWidget()
+        _nas_test_widget.setLayout(_nas_test_row)
+        nas_form.addRow("", _nas_test_widget)
+        self._nas_creds_widget.hide()
+        adv_layout.addWidget(self._nas_creds_widget)
+
+        _nas_cfg = self.watch.get("smb_audit_cfg", {})
+        if _nas_cfg.get("username"):
+            self.nas_user_input.setText(_nas_cfg.get("username", ""))
+            self.nas_pass_input.setText(_nas_cfg.get("password", ""))
+            self._nas_creds_toggle.setChecked(True)
+
+        self._adv_widget.hide()
+        layout.addWidget(self._adv_widget)
+
+        # Same-host UNC auto-detection (spans basic dest_input and advanced force_robocopy_check)
+        def _detect_same_host_edit():
+            src = self.watch.get("path", "")
+            dst = self.dest_input.text().strip()
+            try:
+                src_host = backup_engine._unc_host(src)
+                dst_host = backup_engine._unc_host(dst)
+                is_same  = bool(src_host and src_host == dst_host)
+            except Exception:
+                is_same  = False
+            self.force_robocopy_check.blockSignals(True)
+            self.force_robocopy_check.setChecked(is_same)
+            self.force_robocopy_check.blockSignals(False)
+            self.compress_combo.setCurrentIndex(0 if is_same else
+                (0 if self.watch.get("compression", 0) == 0 else
+                 1 if self.watch.get("compression", 0) == 1 else
+                 3 if self.watch.get("compression", 0) == 9 else 2))
+            self.compress_combo.setEnabled(not is_same)
+
+        def _on_force_robocopy_toggled(checked):
+            self.compress_combo.setCurrentIndex(0 if checked else 0)
+            self.compress_combo.setEnabled(not checked)
+
+        self.force_robocopy_check.toggled.connect(_on_force_robocopy_toggled)
+        self.dest_input.textChanged.connect(lambda _: _detect_same_host_edit())
+        _detect_same_host_edit()
+
+        # Auto-expand advanced section if any advanced field already has a value
+        _pn2 = self.watch.get("notify_overrides", {})
+        if any([
+            self.watch.get("encrypt_key", ""),
+            self.watch.get("pre_backup_cmd", ""),
+            self.watch.get("post_backup_cmd", ""),
+            _pn2.get("webhook_url", ""),
+            _pn2.get("ntfy_topic", ""),
+            self.watch.get("color", ""),
+            self.watch.get("notes", ""),
+            self.watch.get("tags", []),
+            self.watch.get("exclude_patterns", []),
+            self.watch.get("max_file_size_mb", 0),
+            int(self.watch.get("force_full_interval_days", 0)),
+            self.watch.get("drive_trigger_label", ""),
+            self.watch.get("drive_trigger_serial", ""),
+            self.watch.get("force_robocopy", False),
+            self.watch.get("skip_auto_backup", False),
+            self.watch.get("max_backup_bytes", 0),
+            self.watch.get("bandwidth_schedule", []),
+            self.watch.get("max_backup_mbps", 0),
+            self.watch.get("destinations", []),
+            self.watch.get("smb_audit_cfg", {}).get("username", ""),
+        ]):
+            self._adv_toggle.setChecked(True)
 
         self.error_lbl = QLabel("")
         self.error_lbl.setObjectName("status_err")
         layout.addWidget(self.error_lbl)
 
         btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 16, 0, 0)
         cancel = QPushButton("Cancel")
         cancel.setObjectName("secondary")
         cancel.clicked.connect(self.reject)
         save = QPushButton("Save Changes")
         save.setObjectName("success")
+        save.setStyleSheet("padding: 10px 32px; font-weight: 700; font-size: 13px;")
+        save.setMinimumWidth(140)
+        save.setDefault(True)
+        save.setToolTip("Save Changes (Ctrl+Enter)")
         save.clicked.connect(self._submit)
         btn_row.addWidget(cancel)
         btn_row.addWidget(save)
         layout.addLayout(btn_row)
+
+        QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self._submit)
+
+        # ── Tab order: basic fields → advanced toggle → advanced fields → buttons
+        # Qt skips hidden widgets automatically, so advanced fields (inside
+        # _adv_widget, hidden by default) are silently bypassed until expanded.
+        _tab_seq = [
+            # Basic fields
+            self.name_input,
+            self.dest_input, edit_dest_browse,
+            self.interval_spin,
+            self.watch_schedule_widget,
+            self.compress_combo,
+            # Advanced section toggle
+            self._adv_toggle,
+            # Advanced: general
+            self.force_full_interval_spin,
+            self.drive_trigger_label_input, self.drive_trigger_serial_input,
+            self.max_file_size_spin, self.max_backup_bytes_spin,
+            self.force_robocopy_check, self.skip_auto_check,
+            # Advanced: encryption
+            self.encrypt_input, gen_key_btn, show_key_btn, copy_key_btn, rotate_key_btn,
+            # Advanced: label/notes/tags
+            self.color_input, pick_color_btn,
+            self.notes_input, self.tags_input,
+            # Advanced: patterns
+            self.excl_edit, self.incl_edit,
+            # Advanced: additional destinations list + buttons
+            self._dest_list_widget, _add_dest_btn, _edit_dest_btn, _remove_dest_btn,
+            # Advanced: hooks
+            self.pre_cmd_input, self.post_cmd_input,
+            # Advanced: notification overrides
+            self.watch_webhook_input, self.watch_ntfy_topic_input,
+            # Advanced: bandwidth
+            self._watch_bw_spin, self._watch_bw_table, _bw_add, _bw_remove,
+            # Advanced: NAS / SMB credentials
+            self._nas_creds_toggle,
+            self.nas_user_input, self.nas_pass_input, self._nas_test_btn,
+            # Bottom buttons
+            cancel, save,
+        ]
+        for _i in range(len(_tab_seq) - 1):
+            QWidget.setTabOrder(_tab_seq[_i], _tab_seq[_i + 1])
+
+    def _connect_dirty_signals(self):
+        """Connect input-change signals to mark the dialog as dirty."""
+        _d = lambda *_: setattr(self, "_is_dirty", True)
+        for w in (
+            self.name_input, self.dest_input,
+            self.pre_cmd_input, self.post_cmd_input,
+            self.drive_trigger_label_input, self.drive_trigger_serial_input,
+            self.encrypt_input, self.color_input, self.notes_input,
+            self.tags_input, self.watch_webhook_input, self.watch_ntfy_topic_input,
+            self.nas_user_input, self.nas_pass_input,
+        ):
+            w.textChanged.connect(_d)
+        self.excl_edit.textChanged.connect(_d)
+        self.incl_edit.textChanged.connect(_d)
+        self.interval_spin.valueChanged.connect(_d)
+        self.force_full_interval_spin.valueChanged.connect(_d)
+        self.max_file_size_spin.valueChanged.connect(_d)
+        self.max_backup_bytes_spin.valueChanged.connect(_d)
+        self._watch_bw_spin.valueChanged.connect(_d)
+        self.compress_combo.currentIndexChanged.connect(_d)
+        self.skip_auto_check.toggled.connect(_d)
+        self.force_robocopy_check.toggled.connect(_d)
+
+    def reject(self):
+        # Cancel button — user intentionally dismissed; clear dirty so closeEvent
+        # doesn't prompt.
+        self._is_dirty = False
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._is_dirty:
+            from PyQt6.QtWidgets import QMessageBox
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("Discard changes?")
+            dlg.setText(
+                "You have unsaved changes. Are you sure you want to close without saving?"
+            )
+            dlg.setIcon(QMessageBox.Icon.Question)
+            go_back = dlg.addButton("Go Back",  QMessageBox.ButtonRole.RejectRole)
+            dlg.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+            dlg.setDefaultButton(go_back)
+            dlg.exec()
+            if dlg.clickedButton() is go_back:
+                event.ignore()
+                return
+        event.accept()
+
+    def _on_adv_toggled(self, checked: bool):
+        arrow = "▼" if checked else "▶"
+        self._adv_toggle.setText(f"{arrow}  Advanced settings")
+        self._adv_widget.setVisible(checked)
+        self.adjustSize()
+
+    def _on_nas_creds_toggled(self, checked: bool):
+        arrow = "▼" if checked else "▶"
+        self._nas_creds_toggle.setText(
+            f"{arrow}  PC Credentials  (required for who-did-it tracking)"
+        )
+        self._nas_creds_widget.setVisible(checked)
+        self.adjustSize()
+
+    def _test_nas_credentials(self):
+        """Test SMB credentials by authenticating to IPC$ and running NetSessionEnum."""
+        import threading
+        _user = self.nas_user_input.text().strip()
+        _pass = self.nas_pass_input.text()
+        def _unc_host(p):
+            import re as _re
+            m = _re.match(r'^[/\\\\]+([^/\\\\]+)', p.strip())
+            return m.group(1) if m else ""
+
+        _host = _unc_host(self.watch.get("path", ""))
+
+        if not _user or not _pass:
+            self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
+            self._nas_test_lbl.setText("⚠  Enter username and password first")
+            return
+        if not _host:
+            self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
+            self._nas_test_lbl.setText("⚠  Watch path is not a UNC path")
+            return
+
+        self._nas_test_btn.setEnabled(False)
+        self._nas_test_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
+        self._nas_test_lbl.setText("Testing…")
+
+        def _do_test():
+            # ── Why subprocess + net use instead of win32net ──────────────────
+            # win32net.NetUseAdd / NetShareEnum always go through the Windows
+            # OS SMB session cache.  When the PC already has ANY active
+            # connection to the target host (mapped drive, Explorer window, etc.)
+            # Windows reuses the cached token and never validates the typed
+            # credentials — so wrong passwords still show "Connected".
+            #
+            # There is no reliable way to flush that cache while other processes
+            # hold connections open.  The only escape hatch is to authenticate
+            # in a *separate process* under a *different logon session*.
+            #
+            # `net use \\host\IPC$ /user:domain\user pass` spawned via
+            # subprocess runs in an isolated logon context and is forced to
+            # present the supplied credentials to the server — the parent
+            # process's cached session is irrelevant.  Exit code 0 = auth OK,
+            # non-zero = bad credentials.  We immediately delete the temp
+            # connection so it doesn't linger.
+            import subprocess, sys, re as _re
+            _ipc = f"\\\\{_host}\\IPC$"
+            _CREATE_NO_WINDOW = 0x08000000
+
+            _cmd_add = [
+                "net", "use", _ipc,
+                _pass,
+                f"/user:{_user}",
+                "/persistent:no",
+            ]
+            _cmd_del = ["net", "use", _ipc, "/delete", "/yes"]
+
+            def _cleanup():
+                try:
+                    subprocess.run(_cmd_del, capture_output=True, timeout=5,
+                                   creationflags=_CREATE_NO_WINDOW)
+                except Exception:
+                    pass
+
+            def _run_net_use():
+                try:
+                    return subprocess.run(
+                        _cmd_add, capture_output=True, text=True,
+                        timeout=15, creationflags=_CREATE_NO_WINDOW,
+                    )
+                except subprocess.TimeoutExpired:
+                    return None  # caller checks for None → timeout
+                except Exception as _e:
+                    raise
+
+            try:
+                _result = _run_net_use()
+            except Exception as _e:
+                return False, f"\u274c  Could not run credential check: {_e}"
+            finally:
+                _cleanup()
+
+            if _result is None:
+                # Timeout — almost always means an existing SMB session to this
+                # host is blocking IPC$ re-authentication (Windows error 1219).
+                # Try: delete the existing IPC$ connection, then retry.
+                _cleanup()
+                try:
+                    _result = _run_net_use()
+                except Exception as _e:
+                    return False, f"\u274c  Could not run credential check: {_e}"
+                finally:
+                    _cleanup()
+                if _result is None:
+                    return False, "\u274c  Timed out \u2014 server unreachable"
+
+            # error 1219 = existing SMB session with different credentials
+            _out_txt = (_result.stderr or _result.stdout or "").strip()
+            if _result.returncode != 0 and "1219" in _out_txt:
+                # Delete the conflicting session, then retry once
+                _cleanup()
+                try:
+                    _result = _run_net_use()
+                except Exception as _e:
+                    return False, f"\u274c  Could not run credential check: {_e}"
+                finally:
+                    _cleanup()
+                if _result is None:
+                    return False, "\u274c  Timed out \u2014 server unreachable"
+                # Re-read the output from the retry so the final message
+                # reflects what actually happened the second time, not the
+                # stale first-attempt text (which would otherwise mask a
+                # second 1219, or hide that the retry actually succeeded
+                # for a different reason).
+                _out_txt = (_result.stderr or _result.stdout or "").strip()
+
+            if _result.returncode == 0:
+                _n_shares = 0
+                try:
+                    import win32net
+                    _shares, _, _ = win32net.NetShareEnum(_host, 0)
+                    _n_shares = len(_shares)
+                except Exception:
+                    pass
+                _share_txt = f" ({_n_shares} share(s) visible)" if _n_shares else ""
+                return True, f"\u2705  Connected \u2014 credentials verified{_share_txt}"
+            else:
+                _err = _re.sub(r"\s+", " ", _out_txt)
+                return False, _format_net_use_error(_err)
+
+        def _run():
+            _ok, _msg = _do_test()
+            from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(
+                self, "_on_nas_test_result",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(bool, _ok),
+                Q_ARG(str, _msg),
+            )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    from PyQt6.QtCore import pyqtSlot as _pyqtSlot
+    @_pyqtSlot(bool, str)
+    def _on_nas_test_result(self, ok: bool, msg: str):
+        self._nas_test_btn.setEnabled(True)
+        if ok:
+            self._nas_test_lbl.setStyleSheet("color:#22c55e; font-size:11px;")
+        else:
+            self._nas_test_lbl.setStyleSheet("color:#ef4444; font-size:11px;")
+        self._nas_test_lbl.setText(msg)
+
 
     def _watch_bw_add_rule(self):
         """Add a blank bandwidth schedule row to the per-watch table."""
@@ -3629,6 +9362,7 @@ class EditWatchDialog(QDialog):
         if key and len(key) != 44:
             self.error_lbl.setText(f"Encryption key must be exactly 44 characters (got {len(key)}).")
             return
+        self._is_dirty = False
         self.accept()
 
     def _generate_key(self):
@@ -3720,19 +9454,12 @@ class EditWatchDialog(QDialog):
             return
 
         # Find backup directories for this watch
-        dest = ""
+        dest = self.watch.get("destination", "").strip()
         watch_id = self.watch.get("id", "")
-        try:
-            if hasattr(self, "_parent_cfg"):
-                dest = self._parent_cfg.get("destination", "")
-            elif self.parent() and hasattr(self.parent(), "cfg"):
-                dest = self.parent().cfg.get("destination", "")
-        except Exception:
-            pass
 
         if not dest:
             QMessageBox.warning(self, "Key Rotation",
-                "Could not determine backup destination. Save the watch first, then rotate.")
+                "This watch has no destination set. Save the watch with a destination first, then rotate.")
             return
 
         if not BACKEND_AVAILABLE:
@@ -3862,6 +9589,7 @@ class EditWatchDialog(QDialog):
             "destination":        self.dest_input.text().strip(),
             "destinations":       destinations,
             "skip_auto_backup":   self.skip_auto_check.isChecked(),
+            "force_robocopy":     self.force_robocopy_check.isChecked(),
             "color":              self.color_input.text().strip(),
             "notes":              self.notes_input.text().strip(),
             "tags":               tags,
@@ -3882,7 +9610,1120 @@ class EditWatchDialog(QDialog):
                 "webhook_url": self.watch_webhook_input.text().strip(),
                 "ntfy_topic":  self.watch_ntfy_topic_input.text().strip(),
             },
+            # SMB credentials (for who-did-it attribution)
+            "nas_user": self.nas_user_input.text().strip(),
+            "nas_pass": self.nas_pass_input.text(),
         }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Add / Edit Watch Dialog ────────────────────────────────────────════════════
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AddWatchDialog(QDialog):
+    """Dialog for adding a new watched folder (or editing an existing one).
+
+    Public attributes (read/written externally by _edit_watch):
+        name_input      QLineEdit
+        source_type     QComboBox   index 0 = local, 1 = WebDAV, 2 = SFTP, 3 = FTP
+        path_input      QLineEdit
+        interval_spin   QSpinBox
+        dest_input      QLineEdit
+        compress_combo  QComboBox   index 0=Off 1=Fast 2=Balanced 3=Best
+        _submit_btn     QPushButton
+    """
+
+    _SOURCE_TYPES = [
+        ("Local / Mapped Drive", "local"),
+        ("WebDAV",               "webdav"),
+        ("SFTP / FTPS",          "sftp"),
+        ("FTP",                  "ftp"),
+    ]
+
+    def __init__(self, parent=None, *, cfg: dict | None = None, edit_watch_id: str | None = None):
+        super().__init__(parent)
+        self._cfg            = cfg or {}
+        self._edit_watch_id  = edit_watch_id
+        self.setWindowTitle("Add Watched Folder · Backup System")
+        self.setMinimumWidth(540)
+        self.setModal(True)
+        self._is_dirty = False
+        self._build_ui()
+        self._connect_dirty_signals()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(0)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        # ── Scrollable body ───────────────────────────────────────────────────
+        from PyQt6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.Shape.NoFrame)
+        body_widget = QWidget()
+        body = QVBoxLayout(body_widget)
+        body.setSpacing(16)
+        body.setContentsMargins(24, 20, 24, 16)
+        scroll.setWidget(body_widget)
+        root.addWidget(scroll, 1)
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        title = QLabel("Add Watched Folder")
+        title.setObjectName("heading")
+        title.setStyleSheet("font-size:15px; font-weight:700; margin-bottom:4px;")
+        body.addWidget(title)
+
+        # ── Section: Source ───────────────────────────────────────────────────
+        src_group = QFrame()
+        src_group.setStyleSheet(
+            "QFrame { background:#1e2433; border:1px solid #2d3748; border-radius:8px; }"
+        )
+        src_layout = QFormLayout(src_group)
+        src_layout.setContentsMargins(16, 14, 16, 14)
+        src_layout.setSpacing(10)
+        src_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        _sec_label_style = "font-size:11px; font-weight:600; color:#6b7280; letter-spacing:0.5px;"
+
+        _src_sec = QLabel("SOURCE")
+        _src_sec.setStyleSheet(_sec_label_style)
+        src_layout.addRow("", _src_sec)
+
+        # Name
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g.  Documents Backup")
+        src_layout.addRow("Name:", self.name_input)
+
+        # Source type — the key dropdown
+        self.source_type = QComboBox()
+        for label, _ in self._SOURCE_TYPES:
+            self.source_type.addItem(label)
+        self.source_type.currentIndexChanged.connect(self._on_source_type_changed)
+        src_layout.addRow("Source type:", self.source_type)
+
+        # ── Local path (shown for Local/Mapped Drive) ─────────────────────────
+        self._local_path_widget = QWidget()
+        _lp = QHBoxLayout(self._local_path_widget)
+        _lp.setContentsMargins(0, 0, 0, 0)
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("C:\\Users\\you\\Documents  or  \\\\192.168.1.100\\share")
+        _browse_btn = QPushButton("Browse")
+        _browse_btn.setObjectName("secondary")
+        _browse_btn.setFixedWidth(76)
+        _browse_btn.clicked.connect(self._browse_path)
+        self._path_ok_lbl = QLabel("✓ Folder selected")
+        self._path_ok_lbl.setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;")
+        self._path_ok_lbl.hide()
+        _lp.addWidget(self.path_input)
+        _lp.addWidget(_browse_btn)
+        _lp.addWidget(self._path_ok_lbl)
+        src_layout.addRow("Source path:", self._local_path_widget)
+
+        # ── WebDAV inline fields ───────────────────────────────────────────────
+        self._webdav_widget = QWidget()
+        _wdv = QFormLayout(self._webdav_widget)
+        _wdv.setContentsMargins(0, 0, 0, 0)
+        _wdv.setSpacing(8)
+        self.webdav_url_input  = QLineEdit()
+        self.webdav_url_input.setPlaceholderText("https://dav.example.com/remote.php/webdav/")
+        self.webdav_user_input = QLineEdit()
+        self.webdav_user_input.setPlaceholderText("username")
+        self.webdav_pass_input = QLineEdit()
+        self.webdav_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.webdav_pass_input.setPlaceholderText("password")
+        _wdv.addRow("URL:",      self.webdav_url_input)
+        _wdv.addRow("Username:", self.webdav_user_input)
+        _wdv.addRow("Password:", self.webdav_pass_input)
+        self._webdav_widget.hide()
+        src_layout.addRow("", self._webdav_widget)
+
+        # ── SFTP inline fields ─────────────────────────────────────────────────
+        self._sftp_widget = QWidget()
+        _sftp = QFormLayout(self._sftp_widget)
+        _sftp.setContentsMargins(0, 0, 0, 0)
+        _sftp.setSpacing(8)
+        self.sftp_host_input = QLineEdit()
+        self.sftp_host_input.setPlaceholderText("sftp.example.com")
+        self.sftp_port_spin  = QSpinBox()
+        self.sftp_port_spin.setRange(1, 65535)
+        self.sftp_port_spin.setValue(22)
+        self.sftp_user_input = QLineEdit()
+        self.sftp_user_input.setPlaceholderText("username")
+        self.sftp_pass_input = QLineEdit()
+        self.sftp_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sftp_pass_input.setPlaceholderText("password  (or leave blank to use key file)")
+        self.sftp_key_input  = QLineEdit()
+        self.sftp_key_input.setPlaceholderText("/home/user/.ssh/id_rsa  (optional)")
+        _sftp.addRow("Host:",     self.sftp_host_input)
+        _sftp.addRow("Port:",     self.sftp_port_spin)
+        _sftp.addRow("Username:", self.sftp_user_input)
+        _sftp.addRow("Password:", self.sftp_pass_input)
+        _sftp.addRow("Key file:", self.sftp_key_input)
+        self._sftp_widget.hide()
+        src_layout.addRow("", self._sftp_widget)
+
+        # ── FTP inline fields ──────────────────────────────────────────────────
+        self._ftp_widget = QWidget()
+        _ftp = QFormLayout(self._ftp_widget)
+        _ftp.setContentsMargins(0, 0, 0, 0)
+        _ftp.setSpacing(8)
+        self.ftp_host_input = QLineEdit()
+        self.ftp_host_input.setPlaceholderText("ftp.example.com")
+        self.ftp_port_spin  = QSpinBox()
+        self.ftp_port_spin.setRange(1, 65535)
+        self.ftp_port_spin.setValue(21)
+        self.ftp_user_input = QLineEdit()
+        self.ftp_user_input.setPlaceholderText("username")
+        self.ftp_pass_input = QLineEdit()
+        self.ftp_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ftp_pass_input.setPlaceholderText("password")
+        _ftp.addRow("Host:",     self.ftp_host_input)
+        _ftp.addRow("Port:",     self.ftp_port_spin)
+        _ftp.addRow("Username:", self.ftp_user_input)
+        _ftp.addRow("Password:", self.ftp_pass_input)
+        self._ftp_widget.hide()
+        src_layout.addRow("", self._ftp_widget)
+
+        body.addWidget(src_group)
+
+        # ── Section: Destination ──────────────────────────────────────────────
+        dst_group = QFrame()
+        dst_group.setStyleSheet(
+            "QFrame { background:#1e2433; border:1px solid #2d3748; border-radius:8px; }"
+        )
+        dst_layout = QFormLayout(dst_group)
+        dst_layout.setContentsMargins(16, 14, 16, 14)
+        dst_layout.setSpacing(10)
+        dst_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        _dst_sec = QLabel("DESTINATION")
+        _dst_sec.setStyleSheet(_sec_label_style)
+        dst_layout.addRow("", _dst_sec)
+
+        _dest_widget = QWidget()
+        _dest_row = QHBoxLayout(_dest_widget)
+        _dest_row.setContentsMargins(0, 0, 0, 0)
+        self.dest_input = QLineEdit()
+        self.dest_input.setPlaceholderText(
+            "Required — enter backup destination folder  ·  e.g. \\\\server\\share\\folder"
+        )
+        _dest_browse = QPushButton("Browse")
+        _dest_browse.setObjectName("secondary")
+        _dest_browse.setFixedWidth(76)
+        _dest_browse.clicked.connect(self._browse_dest)
+        self._dest_ok_lbl = QLabel("✓ Folder selected")
+        self._dest_ok_lbl.setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;")
+        self._dest_ok_lbl.hide()
+        _dest_row.addWidget(self.dest_input)
+        _dest_row.addWidget(_dest_browse)
+        _dest_row.addWidget(self._dest_ok_lbl)
+        dst_layout.addRow("Destination:", _dest_widget)
+
+        # ── SMB Credentials (shown only for Local/Mapped Drive) ────────────────
+        # Placed here, right after Destination, so it's obvious it relates to
+        # the UNC share the user just typed.
+        self._nas_audit_frame = QFrame()
+        self._nas_audit_frame.setStyleSheet(
+            "QFrame { background:#161d2e; border:1px solid #2d3748; border-radius:6px; }"
+        )
+        _nas_inner = QFormLayout(self._nas_audit_frame)
+        _nas_inner.setContentsMargins(14, 12, 14, 12)
+        _nas_inner.setSpacing(8)
+        _nas_inner.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._nas_hdr = QLabel("WHO-DID-IT TRACKING  (optional)")
+        self._nas_hdr.setStyleSheet(_sec_label_style)
+        _nas_inner.addRow("", self._nas_hdr)
+
+        _nas_hint = QLabel(
+"Enter the SMB credentials BackupSys uses to connect to this share.\n"
+            "Any account with read access works — same username/password as Windows Explorer.\n"
+            "Required for who-did-it tracking (identifies who changed files)."
+        )
+        _nas_hint.setStyleSheet("color:#6b7280; font-size:11px;")
+        _nas_hint.setWordWrap(True)
+        _nas_inner.addRow("", _nas_hint)
+
+        self.nas_user_input = QLineEdit()
+        self.nas_user_input.setPlaceholderText("SMB username  (e.g. john or DOMAIN\\john)")
+        _nas_inner.addRow("Username:", self.nas_user_input)
+
+        self.nas_pass_input = QLineEdit()
+        self.nas_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.nas_pass_input.setPlaceholderText("SMB password")
+        _nas_inner.addRow("Password:", self.nas_pass_input)
+
+        self._nas_test_btn = QPushButton("Test Connection")
+        self._nas_test_btn.setObjectName("secondary")
+        self._nas_test_btn.setFixedWidth(130)
+        self._nas_test_btn.clicked.connect(self._test_nas_credentials)
+        self._nas_test_lbl = QLabel("")
+        self._nas_test_lbl.setStyleSheet("font-size:11px;")
+        _nas_test_row = QHBoxLayout()
+        _nas_test_row.setContentsMargins(0, 0, 0, 0)
+        _nas_test_row.addWidget(self._nas_test_btn)
+        _nas_test_row.addWidget(self._nas_test_lbl)
+        _nas_test_row.addStretch()
+        _nas_test_widget = QWidget()
+        _nas_test_widget.setLayout(_nas_test_row)
+        _nas_inner.addRow("", _nas_test_widget)
+
+        dst_layout.addRow("", self._nas_audit_frame)
+
+        # ── Auto-detect UNC → mark credentials as required ────────────────
+        def _on_path_or_dest_changed(_text=""):
+            import re as _pd_re
+            def _is_unc(p):
+                return bool(_pd_re.match(r"^[/\\\\]{2}[^/\\\\]+[/\\\\]", p.strip()))
+            _sp = self.path_input.text().strip()
+            _dp = self.dest_input.text().strip()
+            _unc = _is_unc(_sp) or _is_unc(_dp)
+            if _unc:
+                self._nas_hdr.setText("WHO-DID-IT TRACKING  ⚠️ REQUIRED for network path")
+                self._nas_hdr.setStyleSheet("font-size:10px; font-weight:700; letter-spacing:1px; color:#f59e0b;")
+                self._nas_audit_frame.setStyleSheet(
+                    "QFrame { background:#1a1700; border:2px solid #f59e0b; border-radius:6px; }")
+            else:
+                self._nas_hdr.setText("WHO-DID-IT TRACKING  (optional)")
+                self._nas_hdr.setStyleSheet(_sec_label_style)
+                self._nas_audit_frame.setStyleSheet(
+                    "QFrame { background:#161d2e; border:1px solid #2d3748; border-radius:6px; }")
+
+        self.path_input.textChanged.connect(_on_path_or_dest_changed)
+        self.dest_input.textChanged.connect(_on_path_or_dest_changed)
+        # Run once in case paths are pre-filled (edit mode)
+        _on_path_or_dest_changed()
+
+        body.addWidget(dst_group)
+
+        # ── Section: Schedule & Options (collapsible) ─────────────────────────
+        opt_group = QFrame()
+        opt_group.setStyleSheet(
+            "QFrame { background:#1e2433; border:1px solid #2d3748; border-radius:8px; }"
+        )
+        opt_outer = QVBoxLayout(opt_group)
+        opt_outer.setContentsMargins(0, 0, 0, 0)
+        opt_outer.setSpacing(0)
+
+        self._opts_toggle = QPushButton("▶  Schedule & Options")
+        self._opts_toggle.setCheckable(True)
+        self._opts_toggle.setChecked(False)
+        self._opts_toggle.setStyleSheet(
+            "text-align:left; padding:10px 16px; font-size:12px; font-weight:600;"
+            "color:#9ca3af; background:transparent; border:none; border-radius:8px;"
+        )
+        self._opts_toggle.toggled.connect(self._on_opts_toggled)
+        opt_outer.addWidget(self._opts_toggle)
+
+        self._opts_widget = QWidget()
+        opt_form = QFormLayout(self._opts_widget)
+        opt_form.setContentsMargins(16, 4, 16, 14)
+        opt_form.setSpacing(10)
+        opt_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(0, 1440)
+        self.interval_spin.setValue(0)
+        self.interval_spin.setSuffix(" min  (0 = use global)")
+        opt_form.addRow("Interval:", self.interval_spin)
+
+        self.compress_combo = QComboBox()
+        self.compress_combo.addItem("Off",                0)
+        self.compress_combo.addItem("Fast (level 1)",     1)
+        self.compress_combo.addItem("Balanced (level 6)", 6)
+        self.compress_combo.addItem("Best (level 9)",     9)
+        opt_form.addRow("Compression:", self.compress_combo)
+
+        _enc_widget = QWidget()
+        _enc_row = QHBoxLayout(_enc_widget)
+        _enc_row.setContentsMargins(0, 0, 0, 0)
+        self.encrypt_input = QLineEdit()
+        self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.encrypt_input.setPlaceholderText("44-char key  (leave blank to disable encryption)")
+        _gen_btn = QPushButton("Generate")
+        _gen_btn.setObjectName("secondary")
+        _gen_btn.setFixedWidth(80)
+        _gen_btn.clicked.connect(self._generate_key)
+        _enc_row.addWidget(self.encrypt_input)
+        _enc_row.addWidget(_gen_btn)
+        opt_form.addRow("Encrypt key:", _enc_widget)
+
+        _excl_lbl = QLabel("Exclude patterns  (one per line):")
+        _excl_lbl.setStyleSheet("color:#9ca3af; font-size:11px;")
+        opt_form.addRow("", _excl_lbl)
+        self.excl_edit = QTextEdit()
+        self.excl_edit.setMaximumHeight(60)
+        self.excl_edit.setPlaceholderText("*.tmp\n~$*\nThumbs.db")
+        self.excl_edit.setTabChangesFocus(True)
+        opt_form.addRow("Exclusions:", self.excl_edit)
+
+        self.pre_cmd_input = QLineEdit()
+        self.pre_cmd_input.setPlaceholderText("Command to run before backup  (optional)")
+        self.post_cmd_input = QLineEdit()
+        self.post_cmd_input.setPlaceholderText("Command to run after backup  (optional)")
+        opt_form.addRow("Pre-backup cmd:",  self.pre_cmd_input)
+        opt_form.addRow("Post-backup cmd:", self.post_cmd_input)
+
+        self._opts_widget.hide()
+        opt_outer.addWidget(self._opts_widget)
+        body.addWidget(opt_group)
+
+        # ── Error label ───────────────────────────────────────────────────────
+        self._err_label = QLabel("")
+        self._err_label.setStyleSheet("color:#e05a5a; font-size:12px;")
+        self._err_label.setWordWrap(True)
+        self._err_label.hide()
+        body.addWidget(self._err_label)
+
+        # ── Buttons (fixed at bottom, outside scroll) ─────────────────────────
+        btn_bar = QWidget()
+        btn_bar.setStyleSheet("background:#111827; border-top:1px solid #2d3748;")
+        btn_row = QHBoxLayout(btn_bar)
+        btn_row.setContentsMargins(24, 16, 24, 16)
+        btn_row.addStretch()
+        _cancel_btn = QPushButton("Cancel")
+        _cancel_btn.setObjectName("secondary")
+        _cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(_cancel_btn)
+        self._submit_btn = QPushButton("Add Watch")
+        self._submit_btn.setObjectName("success")
+        self._submit_btn.setStyleSheet("padding: 10px 32px; font-weight: 700; font-size: 13px;")
+        self._submit_btn.setMinimumWidth(140)
+        self._submit_btn.setDefault(True)
+        self._submit_btn.setToolTip("Add Watch (Ctrl+Enter)")
+        self._submit_btn.clicked.connect(self._on_submit)
+        btn_row.addWidget(self._submit_btn)
+        root.addWidget(btn_bar)
+
+        QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self._on_submit)
+
+        # ── Tab order: top-to-bottom, logical groups ───────────────────────────
+        # Qt automatically skips hidden widgets when cycling focus, so we can
+        # include all source-type-specific fields here; the wrong-type fields
+        # are invisible and will be transparently bypassed.
+        _tab_seq = [
+            self.name_input,
+            self.source_type,
+            # Local path + browse
+            self.path_input, _browse_btn,
+            # WebDAV (hidden unless selected)
+            self.webdav_url_input, self.webdav_user_input, self.webdav_pass_input,
+            # SFTP (hidden unless selected)
+            self.sftp_host_input, self.sftp_port_spin,
+            self.sftp_user_input, self.sftp_pass_input, self.sftp_key_input,
+            # FTP / FTPS (hidden unless selected)
+            self.ftp_host_input, self.ftp_port_spin,
+            self.ftp_user_input, self.ftp_pass_input,
+            # Destination
+            self.dest_input, _dest_browse,
+            # NAS credentials (hidden when source is not local)
+            self.nas_user_input, self.nas_pass_input, self._nas_test_btn,
+            # Schedule & Options toggle then inner fields
+            self._opts_toggle,
+            self.interval_spin, self.compress_combo,
+            self.encrypt_input, _gen_btn,
+            self.excl_edit,
+            self.pre_cmd_input, self.post_cmd_input,
+            # Bottom bar
+            _cancel_btn, self._submit_btn,
+        ]
+        for _i in range(len(_tab_seq) - 1):
+            QWidget.setTabOrder(_tab_seq[_i], _tab_seq[_i + 1])
+
+    def _on_source_type_changed(self, index: int):
+        _, src = self._SOURCE_TYPES[index]
+        self._local_path_widget.setVisible(src == "local")
+        self._webdav_widget.setVisible(src == "webdav")
+        self._sftp_widget.setVisible(src == "sftp")
+        self._ftp_widget.setVisible(src == "ftp")
+        # SMB credentials panel only makes sense for local/UNC paths
+        self._nas_audit_frame.setVisible(src == "local")
+
+    def _on_nas_creds_toggled(self, checked: bool):
+        # Legacy slot kept for EditWatchSettingsWidget compatibility
+        pass
+
+    def _test_nas_credentials(self):
+        """Test SMB credentials by authenticating to IPC$ and running NetSessionEnum."""
+        import threading
+        _user = self.nas_user_input.text().strip()
+        _pass = self.nas_pass_input.text()
+
+        # Get the host from source or destination path — try all candidates
+        def _unc_host(p):
+            """Extract host from a UNC path like \\\\host\\share or //host/share."""
+            import re as _re
+            # Normalise: replace any run of backslashes or forward slashes at start
+            m = _re.match(r'^[/\\\\]+([^/\\\\]+)', p.strip())
+            return m.group(1) if m else ""
+
+        _host = ""
+        for _candidate in [
+            getattr(self, "path_input", None),
+            getattr(self, "dest_input", None),
+        ]:
+            if _candidate is not None:
+                _p = _candidate.text().strip()
+                _h = _unc_host(_p)
+                if _h:
+                    _host = _h
+                    break
+        if not _host and hasattr(self, "watch"):
+            _host = _unc_host(self.watch.get("path", ""))
+
+        if not _user or not _pass:
+            self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
+            self._nas_test_lbl.setText("⚠  Enter username and password first")
+            return
+        if not _host:
+            self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
+            self._nas_test_lbl.setText("⚠  Enter a UNC source/destination path first")
+            return
+
+        self._nas_test_btn.setEnabled(False)
+        self._nas_test_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
+        self._nas_test_lbl.setText("Testing…")
+
+        def _do_test():
+            ok, msg = False, ""
+            # ── Why subprocess + net use instead of win32net ──────────────────
+            # win32net.NetUseAdd / NetShareEnum always go through the Windows
+            # OS SMB session cache.  When the PC already has ANY active
+            # connection to the target host (mapped drive, Explorer window, etc.)
+            # Windows reuses the cached token and never validates the typed
+            # credentials — so wrong passwords still show "Connected".
+            #
+            # There is no reliable way to flush that cache while other processes
+            # hold connections open.  The only escape hatch is to authenticate
+            # in a *separate process* under a *different logon session*.
+            #
+            # `net use \\host\IPC$ /user:user pass` spawned via subprocess runs
+            # in an isolated logon context and is forced to present the supplied
+            # credentials to the server — the parent process's cached session is
+            # irrelevant.  Exit code 0 = auth OK, non-zero = bad credentials.
+            # We immediately delete the temp connection so it doesn't linger.
+            import subprocess, re as _re
+            _ipc = f"\\\\{_host}\\IPC$"
+            _CREATE_NO_WINDOW = 0x08000000
+
+            _cmd_add = [
+                "net", "use", _ipc,
+                _pass,
+                f"/user:{_user}",
+                "/persistent:no",
+            ]
+            _cmd_del = ["net", "use", _ipc, "/delete", "/yes"]
+
+            def _cleanup():
+                try:
+                    subprocess.run(_cmd_del, capture_output=True, timeout=5,
+                                   creationflags=_CREATE_NO_WINDOW)
+                except Exception:
+                    pass
+
+            def _run_net_use():
+                try:
+                    return subprocess.run(
+                        _cmd_add, capture_output=True, text=True,
+                        timeout=15, creationflags=_CREATE_NO_WINDOW,
+                    )
+                except subprocess.TimeoutExpired:
+                    return None
+                except Exception as _e:
+                    raise
+
+            try:
+                _result = _run_net_use()
+            except Exception as _e:
+                return False, f"\u274c  Could not run credential check: {_e}"
+            finally:
+                _cleanup()
+
+            if _result is None:
+                # Timeout — likely existing SMB session blocking IPC$ (error 1219).
+                # Delete the conflicting connection and retry once.
+                _cleanup()
+                try:
+                    _result = _run_net_use()
+                except Exception as _e:
+                    return False, f"\u274c  Could not run credential check: {_e}"
+                finally:
+                    _cleanup()
+                if _result is None:
+                    return False, "\u274c  Timed out \u2014 server unreachable"
+
+            _out_txt = (_result.stderr or _result.stdout or "").strip()
+            if _result.returncode != 0 and "1219" in _out_txt:
+                _cleanup()
+                try:
+                    _result = _run_net_use()
+                except Exception as _e:
+                    return False, f"\u274c  Could not run credential check: {_e}"
+                finally:
+                    _cleanup()
+                if _result is None:
+                    return False, "\u274c  Timed out \u2014 server unreachable"
+                # Re-read the output from the retry — the original _out_txt
+                # is stale and would otherwise mask whatever the retry
+                # actually returned (including a second 1219).
+                _out_txt = (_result.stderr or _result.stdout or "").strip()
+
+            if _result.returncode == 0:
+                _n_shares = 0
+                try:
+                    import win32net
+                    _shares, _, _ = win32net.NetShareEnum(_host, 0)
+                    _n_shares = len(_shares)
+                except Exception:
+                    pass
+                _share_txt = f" ({_n_shares} share(s) visible)" if _n_shares else ""
+                ok = True
+                msg = f"\u2705  Connected \u2014 credentials verified{_share_txt}"
+            else:
+                ok = False
+                msg = _format_net_use_error(_out_txt)
+            return ok, msg
+
+        def _run():
+            _ok, _msg = _do_test()
+            from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(
+                self, "_on_nas_test_result",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(bool, _ok),
+                Q_ARG(str, _msg),
+            )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    from PyQt6.QtCore import pyqtSlot as _pyqtSlot
+    @_pyqtSlot(bool, str)
+    def _on_nas_test_result(self, ok: bool, msg: str):
+        self._nas_test_btn.setEnabled(True)
+        if ok:
+            self._nas_test_lbl.setStyleSheet("color:#22c55e; font-size:11px;")
+        else:
+            self._nas_test_lbl.setStyleSheet("color:#ef4444; font-size:11px;")
+        self._nas_test_lbl.setText(msg)
+
+
+    def _on_opts_toggled(self, checked: bool):
+        arrow = "▼" if checked else "▶"
+        self._opts_toggle.setText(f"{arrow}  Schedule & Options")
+        self._opts_widget.setVisible(checked)
+
+    def _browse_path(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
+        if folder:
+            self.path_input.setText(folder)
+            _flash_browse_ok(self, self._path_ok_lbl, self.path_input)
+
+    def _browse_dest(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Destination Folder")
+        if folder:
+            self.dest_input.setText(folder)
+            _flash_browse_ok(self, self._dest_ok_lbl, self.dest_input)
+
+    def _generate_key(self):
+        try:
+            if BACKEND_AVAILABLE:
+                key = backup_engine.generate_encryption_key()
+            else:
+                from cryptography.fernet import Fernet
+                key = Fernet.generate_key().decode()
+            self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.encrypt_input.setText(key)
+            QApplication.clipboard().setText(key)
+            QMessageBox.information(
+                self, "Key Generated",
+                f"A new encryption key has been generated and copied to your clipboard.\n\n"
+                f"⚠ IMPORTANT: Save this key somewhere safe!\n"
+                f"Without it you cannot restore your encrypted backups.\n\n{key}"
+            )
+        except Exception as e:
+            self._err_label.setText(f"Key generation failed: {e}")
+            self._err_label.show()
+
+    def _connect_dirty_signals(self):
+        """Connect input-change signals to mark the dialog as dirty."""
+        _d = lambda *_: setattr(self, "_is_dirty", True)
+        # Text inputs
+        for w in (
+            self.name_input, self.dest_input,
+            self.nas_user_input, self.nas_pass_input,
+            self.encrypt_input,
+        ):
+            w.textChanged.connect(_d)
+        # Source-type specific inputs (may not all exist at connect time, guard each)
+        for attr in ("path_input", "webdav_url_input", "sftp_host_input", "ftp_host_input",
+                     "pre_cmd_input", "post_cmd_input"):
+            _w = getattr(self, attr, None)
+            if _w is not None:
+                _w.textChanged.connect(_d)
+        # Exclusion/include text edits
+        self.excl_edit.textChanged.connect(_d)
+        # Spinboxes & combos
+        self.interval_spin.valueChanged.connect(_d)
+        self.compress_combo.currentIndexChanged.connect(_d)
+        self.source_type.currentIndexChanged.connect(_d)
+
+    def reject(self):
+        # Cancel button — user intentionally dismissed; clear dirty so closeEvent
+        # doesn't prompt.
+        self._is_dirty = False
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._is_dirty:
+            from PyQt6.QtWidgets import QMessageBox
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("Discard changes?")
+            dlg.setText(
+                "You have unsaved inputs. Are you sure you want to close without adding the watch?"
+            )
+            dlg.setIcon(QMessageBox.Icon.Question)
+            go_back = dlg.addButton("Go Back",  QMessageBox.ButtonRole.RejectRole)
+            dlg.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+            dlg.setDefaultButton(go_back)
+            dlg.exec()
+            if dlg.clickedButton() is go_back:
+                event.ignore()
+                return
+        event.accept()
+
+    def _on_submit(self):
+        name = self.name_input.text().strip()
+        if not name:
+            self._err_label.setText("Name is required.")
+            self._err_label.show()
+            self.name_input.setFocus()
+            return
+
+        idx = self.source_type.currentIndex()
+        _, src = self._SOURCE_TYPES[idx]
+
+        if src == "local":
+            path = self.path_input.text().strip()
+            if not path:
+                self._err_label.setText("Source path is required.")
+                self._err_label.show()
+                self.path_input.setFocus()
+                return
+        elif src == "webdav":
+            path = self.webdav_url_input.text().strip()
+            if not path:
+                self._err_label.setText("WebDAV URL is required.")
+                self._err_label.show()
+                return
+        elif src == "sftp":
+            path = self.sftp_host_input.text().strip()
+            if not path:
+                self._err_label.setText("SFTP host is required.")
+                self._err_label.show()
+                return
+        else:  # ftp
+            path = self.ftp_host_input.text().strip()
+            if not path:
+                self._err_label.setText("FTP host is required.")
+                self._err_label.show()
+                return
+
+        key = self.encrypt_input.text().strip()
+        if key and len(key) != 44:
+            self._err_label.setText(f"Encryption key must be exactly 44 characters (got {len(key)}).")
+            self._err_label.show()
+            return
+
+        # ── Auto-detect UNC paths and require credentials ─────────────────
+        # If either source or destination is a UNC path (\\host\share),
+        # credentials are required for who-did-it tracking and SACL setup.
+        import re as _sub_re
+        def _is_unc(p):
+            return bool(_sub_re.match(r"^[/\\\\]{2}[^/\\\\]+[/\\\\]", p.strip()))
+
+        _dest_path = self.dest_input.text().strip()
+        if not _dest_path:
+            self._err_label.setText("Destination is required — enter the backup folder path.")
+            self._err_label.show()
+            self.dest_input.setFocus()
+            return
+
+        _src_path  = self.path_input.text().strip() if src == "local" else ""
+        _needs_creds = _is_unc(_src_path) or _is_unc(_dest_path)
+
+        # Temporarily disabled — credentials are optional for now
+        # if _needs_creds:
+        #     _cred_user = self.nas_user_input.text().strip()
+        #     _cred_pass = self.nas_pass_input.text().strip()
+        #     if not _cred_user or not _cred_pass:
+        #         # Auto-expand the credentials section so the user sees it
+        #         self._nas_creds_toggle.setChecked(True)
+        #         self._nas_creds_widget.setVisible(True)
+        #         self._err_label.setText(
+        #             "\u26a0\ufe0f  PC Credentials are required when the source or destination "
+        #             "is a network path (\\\\host\\...).\n"
+        #             "Enter the admin username and password for that Windows PC below."
+        #         )
+        #         self._err_label.show()
+        #         self.nas_user_input.setFocus()
+        #         return
+
+        self._err_label.hide()
+        self._is_dirty = False
+        self.accept()
+    # ── Data extraction ───────────────────────────────────────────────────────
+
+    def get_values(self) -> dict:
+        idx = self.source_type.currentIndex()
+        _, src = self._SOURCE_TYPES[idx]
+
+        if src == "local":
+            path = self.path_input.text().strip()
+        elif src == "webdav":
+            path = self.webdav_url_input.text().strip()
+        elif src == "sftp":
+            path = self.sftp_host_input.text().strip()
+        else:
+            path = self.ftp_host_input.text().strip()
+
+        excl = [ln.strip() for ln in self.excl_edit.toPlainText().splitlines() if ln.strip()]
+
+        result = {
+            "name":             self.name_input.text().strip(),
+            "path":             path,
+            "source_type":      src,
+            "destination":      self.dest_input.text().strip(),
+            "interval_min":     self.interval_spin.value(),
+            "compression":      self.compress_combo.currentData(),
+            "encrypt_key":      self.encrypt_input.text().strip(),
+            "exclude_patterns": excl,
+            "schedule_times":   [],
+            "max_file_size_mb": 0,
+            "pre_backup_cmd":   self.pre_cmd_input.text().strip(),
+            "post_backup_cmd":  self.post_cmd_input.text().strip(),
+            # SMB credentials (for who-did-it attribution)
+            # smb_audit_cfg credentials for who-did-it tracking on Windows/Mac PC SMB shares
+            "nas_user":         self.nas_user_input.text().strip(),
+            "nas_pass":         self.nas_pass_input.text(),
+            
+            # remote-source flags
+            "is_webdav":        src == "webdav",
+            "is_sftp":          src == "sftp",
+            "is_ftp":           src == "ftp",
+        }
+
+        if src == "webdav":
+            result["webdav_user"] = self.webdav_user_input.text().strip()
+            result["webdav_pass"] = self.webdav_pass_input.text()
+
+        if src == "sftp":
+            result["sftp_host"] = self.sftp_host_input.text().strip()
+            result["sftp_port"] = self.sftp_port_spin.value()
+            result["sftp_user"] = self.sftp_user_input.text().strip()
+            result["sftp_pass"] = self.sftp_pass_input.text()
+            result["sftp_key"]  = self.sftp_key_input.text().strip()
+
+        if src == "ftp":
+            result["ftp_host"] = self.ftp_host_input.text().strip()
+            result["ftp_port"] = self.ftp_port_spin.value()
+            result["ftp_user"] = self.ftp_user_input.text().strip()
+            result["ftp_pass"] = self.ftp_pass_input.text()
+
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Password Dialog ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PasswordDialog(QDialog):
+    """Dialog for setting or verifying the admin password.
+
+    mode="set"    – prompts for a new password (with confirmation).
+    mode="verify" – prompts for the current password and validates it.
+
+    The password hash is stored in QSettings so it persists across sessions.
+    """
+
+    _SETTINGS_KEY = "admin_password_hash"
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _hash(password: str) -> str:
+        """Return a SHA-256 hex digest of the password."""
+        return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def has_password() -> bool:
+        """Return True if an admin password has previously been saved."""
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        return bool(s.value(PasswordDialog._SETTINGS_KEY, ""))
+
+    @staticmethod
+    def _save_hash(h: str) -> None:
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s.setValue(PasswordDialog._SETTINGS_KEY, h)
+
+    @staticmethod
+    def _load_hash() -> str:
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        return s.value(PasswordDialog._SETTINGS_KEY, "")
+
+    # ── construction ─────────────────────────────────────────────────────────
+
+    def __init__(self, parent=None, *, mode: str = "verify"):
+        super().__init__(parent)
+        if mode not in ("set", "verify"):
+            raise ValueError(f"PasswordDialog: unknown mode {mode!r}")
+        self._mode = mode
+        self._forgot_clicked = False  # set True if the user resets via "Forgot password?"
+        self._build_ui()
+        self.setModal(True)
+
+    def _build_ui(self):
+        if self._mode == "set":
+            self.setWindowTitle("Set Admin Password · Backup System")
+        else:
+            self.setWindowTitle("Admin Login · Backup System")
+
+        self.setMinimumWidth(360)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 24, 24, 20)
+
+        # ── title label ──
+        title = QLabel("Set Admin Password" if self._mode == "set" else "Enter Admin Password")
+        title.setStyleSheet("font-size:14px; font-weight:700;")
+        layout.addWidget(title)
+
+        # ── password field ──
+        self._pw_input = QLineEdit()
+        self._pw_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw_input.setPlaceholderText("Password")
+        layout.addWidget(self._pw_input)
+
+        # ── confirm field (set-mode only) ──
+        self._confirm_input = None
+        if self._mode == "set":
+            self._confirm_input = QLineEdit()
+            self._confirm_input.setEchoMode(QLineEdit.EchoMode.Password)
+            self._confirm_input.setPlaceholderText("Confirm password")
+            layout.addWidget(self._confirm_input)
+
+        # ── "Forgot password?" link (verify-mode only) ──
+        if self._mode == "verify":
+            forgot_row = QHBoxLayout()
+            forgot_row.addStretch()
+            forgot_btn = QPushButton("Forgot password?")
+            forgot_btn.setObjectName("secondary")
+            forgot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            forgot_btn.setStyleSheet(
+                "QPushButton{border:none; background:transparent; color:#5a8fd6; "
+                "text-decoration:underline; font-size:12px; padding:0;}"
+            )
+            forgot_btn.clicked.connect(self._forgot_password)
+            forgot_row.addWidget(forgot_btn)
+            layout.addLayout(forgot_row)
+
+        # ── error label (hidden until needed) ──
+        self._err_label = QLabel("")
+        self._err_label.setStyleSheet("color: #e05a5a; font-size: 12px;")
+        self._err_label.setWordWrap(True)
+        self._err_label.hide()
+        layout.addWidget(self._err_label)
+
+        # ── buttons ──
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("secondary")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        ok_label = "Set Password" if self._mode == "set" else "Unlock"
+        ok_btn = QPushButton(ok_label)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._on_accept)
+        btn_row.addWidget(ok_btn)
+
+        layout.addLayout(btn_row)
+
+        # Allow Enter key to submit
+        self._pw_input.returnPressed.connect(self._on_accept)
+        if self._confirm_input:
+            self._confirm_input.returnPressed.connect(self._on_accept)
+
+    # ── logic ─────────────────────────────────────────────────────────────────
+
+    def _show_error(self, msg: str):
+        self._err_label.setText(msg)
+        self._err_label.show()
+
+    def _forgot_password(self):
+        """Let the user reset the admin password when they can't remember it.
+
+        Since this PIN only guards the in-app Admin panel (anyone with physical
+        or remote access to the PC can already reach the program files), we
+        allow a reset after an explicit confirmation rather than locking the
+        admin out permanently.
+        """
+        reply = QMessageBox.question(
+            self, "Reset Admin Password",
+            "This will erase the current admin password.\n"
+            "Anyone using this PC will then be able to set a new one.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s.remove(self._SETTINGS_KEY)
+        s.sync()
+
+        self._forgot_clicked = True
+        self.reject()  # close this "verify" dialog; caller opens a "set" dialog
+
+    def _on_accept(self):
+        pw = self._pw_input.text()
+
+        if not pw:
+            self._show_error("Password cannot be empty.")
+            return
+
+        if self._mode == "set":
+            confirm = self._confirm_input.text() if self._confirm_input else pw
+            if pw != confirm:
+                self._show_error("Passwords do not match.")
+                self._confirm_input.clear()
+                self._confirm_input.setFocus()
+                return
+            if len(pw) < 4:
+                self._show_error("Password must be at least 4 characters.")
+                return
+            self._save_hash(self._hash(pw))
+            QMessageBox.information(self, "Password Set", "Admin password has been updated.")
+            self.accept()
+
+        else:  # verify
+            stored = self._load_hash()
+            if not stored:
+                # No password set – grant access silently
+                self.accept()
+                return
+            if self._hash(pw) == stored:
+                self.accept()
+            else:
+                self._show_error("Incorrect password. Please try again.")
+                self._pw_input.clear()
+                self._pw_input.setFocus()
+
+
+def _flash_browse_ok(parent, lbl: "QLabel", field: "QLineEdit") -> None:
+    """Show a green confirmation label next to a Browse field for 3 s, or until manual edit."""
+    lbl.show()
+    _attr = f"_browse_ok_timer_{id(lbl)}"
+    existing = getattr(parent, _attr, None)
+    if existing is not None:
+        try:
+            existing.stop()
+        except Exception:
+            pass
+    t = QTimer(parent)
+    t.setSingleShot(True)
+    t.timeout.connect(lbl.hide)
+    t.start(3000)
+    setattr(parent, _attr, t)
+    def _hide_once(*_):
+        lbl.hide()
+        try:
+            field.textChanged.disconnect(_hide_once)
+        except Exception:
+            pass
+    QTimer.singleShot(0, lambda: field.textChanged.connect(_hide_once))
+
+
+def _fmt_past_ts(iso: str) -> tuple[str, str]:
+    """Return (display_text, tooltip) for a past ISO timestamp shown in the watch table."""
+    if not iso:
+        return "", ""
+    try:
+        from datetime import datetime, timezone, timedelta
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc).astimezone()
+        else:
+            dt = dt.astimezone()
+        now = datetime.now(dt.tzinfo)
+        diff = now - dt
+        total_secs = diff.total_seconds()
+        mins = int(total_secs // 60)
+        today = now.date()
+        yesterday = (now - timedelta(days=1)).date()
+        try:
+            time_str = dt.strftime("%-I:%M %p")
+        except ValueError:
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+        if total_secs < 60:
+            display = "Just now"
+        elif total_secs < 3600:
+            display = f"{mins} minute{'s' if mins != 1 else ''} ago"
+        elif dt.date() == today:
+            display = f"Today at {time_str}"
+        elif dt.date() == yesterday:
+            display = f"Yesterday at {time_str}"
+        else:
+            try:
+                display = dt.strftime("%b %-d") + f" at {time_str}"
+            except ValueError:
+                display = dt.strftime("%b %d").lstrip("0") + f" at {time_str}"
+        return display, iso
+    except Exception:
+        return iso, iso
+
+
+def _fmt_future_ts(iso: str) -> tuple[str, str]:
+    """Return (display_text, tooltip) for a future ISO timestamp shown in the watch table."""
+    if not iso:
+        return "", ""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc).astimezone()
+        else:
+            dt = dt.astimezone()
+        now = datetime.now(dt.tzinfo)
+        diff = dt - now
+        total_secs = diff.total_seconds()
+        mins = int(total_secs // 60) + 1
+        today = now.date()
+        try:
+            time_str = dt.strftime("%-I:%M %p")
+        except ValueError:
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+        if total_secs < 0:
+            display, tooltip = _fmt_past_ts(iso)
+            return display, tooltip
+        elif total_secs < 3600:
+            display = f"In {mins} minute{'s' if mins != 1 else ''}"
+        elif dt.date() == today:
+            display = f"Today at {time_str}"
+        else:
+            try:
+                display = dt.strftime("%b %-d") + f" at {time_str}"
+            except ValueError:
+                display = dt.strftime("%b %d").lstrip("0") + f" at {time_str}"
+        return display, iso
+    except Exception:
+        return iso, iso
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3951,7 +10792,6 @@ class AdminPanel(QDialog):
         self.dest_type_combo = QComboBox()
         self.dest_type_combo.addItems([
             "Local / Mapped Drive",
-            "Network Share (SMB)",
             "SFTP",
             "FTPS",
             "FTP",
@@ -3964,42 +10804,18 @@ class AdminPanel(QDialog):
         dest_type_row.addWidget(self.dest_type_combo, stretch=1)
         dg_main.addLayout(dest_type_row)
 
-        # Local destination
-        self.dest_local_widget = QWidget()
-        dl = QHBoxLayout(self.dest_local_widget)
-        dl.setContentsMargins(0,0,0,0)
+        # Local destination — per-watch only; no global path field.
+        # dest_input kept as a hidden stub so _load_values() and _save_general() compile.
         self.dest_input = QLineEdit()
-        self.dest_input.setPlaceholderText("C:\\BackupData")
-        browse_dest = QPushButton("Browse")
-        browse_dest.setObjectName("secondary")
-        browse_dest.setMaximumWidth(80)
-        browse_dest.clicked.connect(self._browse_dest)
-        dl.addWidget(self.dest_input)
-        dl.addWidget(browse_dest)
+        self.dest_local_widget = QWidget()
+        _dest_info = QLabel("Local destination paths are configured per-watch (Edit Watch → Destination).")
+        _dest_info.setWordWrap(True)
+        _dest_info.setStyleSheet("color:#94a3b8; font-size:11px;")
+        _dest_local_layout = QVBoxLayout(self.dest_local_widget)
+        _dest_local_layout.setContentsMargins(0, 0, 0, 0)
+        _dest_local_layout.addWidget(_dest_info)
         dg_main.addWidget(self.dest_local_widget)
 
-        # SMB destination
-        self.dest_smb_widget = QWidget()
-        dsl = QVBoxLayout(self.dest_smb_widget)
-        dsl.setContentsMargins(0,0,0,0)
-        dsl.setSpacing(4)
-        self.dest_smb_path = QLineEdit()
-        self.dest_smb_path.setPlaceholderText("\\\\nas\\backups")
-        dsl.addWidget(self.dest_smb_path)
-        smb_creds = QHBoxLayout()
-        self.dest_smb_user   = QLineEdit(); self.dest_smb_user.setPlaceholderText("Username")
-        self.dest_smb_pass   = QLineEdit(); self.dest_smb_pass.setPlaceholderText("Password"); self.dest_smb_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.dest_smb_domain = QLineEdit(); self.dest_smb_domain.setPlaceholderText("Domain")
-        smb_creds.addWidget(self.dest_smb_user)
-        smb_creds.addWidget(self.dest_smb_pass)
-        smb_creds.addWidget(self.dest_smb_domain)
-        dsl.addLayout(smb_creds)
-        smb_test_btn = QPushButton("Test Connection")
-        smb_test_btn.setObjectName("secondary")
-        smb_test_btn.clicked.connect(self._test_smb)
-        dsl.addWidget(smb_test_btn)
-        self.dest_smb_widget.setVisible(False)
-        dg_main.addWidget(self.dest_smb_widget)
 
         # SFTP / FTPS destination
         self.dest_sftp_widget = QWidget()
@@ -4397,6 +11213,31 @@ class AdminPanel(QDialog):
         _startup_note.setWordWrap(True)
         _startup_note.setStyleSheet("color: #888; font-size: 11px;")
         stl.addWidget(_startup_note)
+
+        # ── Auto-SACL for owned SMB shares ─────────────────────────────────
+        self.auto_sacl_smb_check = QCheckBox(
+            "Auto-enable file auditing on all shared folders owned by this PC (recommended)"
+        )
+        self.auto_sacl_smb_check.setToolTip(
+            "When enabled, BackupSys will automatically configure Windows object-auditing\n"
+            "(SACL) on every SMB share hosted by this PC at startup — even if you have\n"
+            "not added those folders to your own watch list.\n\n"
+            "This ensures that when a coworker's BackupSys app watches one of your shared\n"
+            "folders, the Windows Security Event Log will record who made each change\n"
+            "(add / modify / delete / rename), so 'Change History' shows the real user\n"
+            "name instead of 'Unknown'.\n\n"
+            "Disabling this only affects folders you own but have not personally added\n"
+            "to your watches — your own watched folders are always audited."
+        )
+        stl.addWidget(self.auto_sacl_smb_check)
+        _auto_sacl_note = QLabel(
+            "Requires Administrator approval (one-time UAC prompt per folder). "
+            "Only applies to Windows shared folders hosted on this PC."
+        )
+        _auto_sacl_note.setWordWrap(True)
+        _auto_sacl_note.setStyleSheet("color: #888; font-size: 11px;")
+        stl.addWidget(_auto_sacl_note)
+
         gl.addWidget(startup_group)
 
         # ── Auto-Shutdown ───────────────────────────────────────────────────
@@ -4519,9 +11360,11 @@ class AdminPanel(QDialog):
         btn_row = QHBoxLayout()
         add_btn = QPushButton("➕ Add Watch")
         add_btn.setObjectName("success")
+        add_btn.setToolTip("Add Watch (Ctrl+N)")
         add_btn.clicked.connect(self._add_watch)
         refresh_btn = QPushButton("↻ Refresh")
         refresh_btn.setObjectName("secondary")
+        refresh_btn.setToolTip("Refresh watch list (F5)")
         refresh_btn.clicked.connect(self._refresh_watch_table)
         btn_row.addStretch()
         btn_row.addWidget(refresh_btn)
@@ -4533,6 +11376,10 @@ class AdminPanel(QDialog):
             "Name", "Path", "Status", "Last Backup", "Duration",
             "Next Backup", "Runs", "Failed", "Size", "History", "Destination", "", ""
         ])
+        self.watch_table.horizontalHeaderItem(4).setToolTip("How long the last backup took to complete")
+        self.watch_table.horizontalHeaderItem(6).setToolTip("Total number of backups completed for this watch")
+        self.watch_table.horizontalHeaderItem(7).setToolTip("Number of backup attempts that failed")
+        self.watch_table.horizontalHeaderItem(8).setToolTip("Total size of all backup data for this watch")
         for col in range(11):
             self.watch_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.watch_table.horizontalHeader().setSectionResizeMode(1,  QHeaderView.ResizeMode.Stretch)
@@ -4550,7 +11397,73 @@ class AdminPanel(QDialog):
         self.watch_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.watch_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.watch_table.setMinimumHeight(160)
-        wl.addWidget(self.watch_table)
+
+        # ── Empty-state widget (shown when no watches exist) ───────────────────
+        _empty = QWidget()
+        _empty.setMinimumHeight(220)
+        _ev = QVBoxLayout(_empty)
+        _ev.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _ev.setSpacing(10)
+        _folder_icon = QLabel("📁")
+        _folder_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _folder_icon.setStyleSheet("font-size: 52px; color: #374151;")
+        _ev.addWidget(_folder_icon)
+        _empty_heading = QLabel("No watches yet")
+        _empty_heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _empty_heading.setStyleSheet("font-size: 16px; font-weight: 700; color: #9ca3af;")
+        _ev.addWidget(_empty_heading)
+        _empty_sub = QLabel("Add a folder to start monitoring and backing it up automatically.")
+        _empty_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _empty_sub.setWordWrap(True)
+        _empty_sub.setStyleSheet("font-size: 12px; color: #6b7280;")
+        _ev.addWidget(_empty_sub)
+        _empty_add_btn = QPushButton("＋  Add Watch")
+        _empty_add_btn.setObjectName("success")
+        _empty_add_btn.setStyleSheet("padding: 10px 32px; font-weight: 700; font-size: 13px;")
+        _empty_add_btn.setMinimumWidth(160)
+        _empty_add_btn.setFixedHeight(42)
+        _empty_add_btn.clicked.connect(self._add_watch)
+        _empty_btn_wrapper = QHBoxLayout()
+        _empty_btn_wrapper.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _empty_btn_wrapper.addWidget(_empty_add_btn)
+        _ev.addSpacing(8)
+        _ev.addLayout(_empty_btn_wrapper)
+
+        # ── Search bar ───────────────────────────────────────────────────────
+        self._watch_search = QLineEdit()
+        self._watch_search.setPlaceholderText("Search watches by name or path…")
+        self._watch_search.setClearButtonEnabled(True)
+        self._watch_search.setFixedHeight(34)
+        self._watch_search.setStyleSheet(
+            "QLineEdit { border:1px solid #374151; border-radius:6px; padding:4px 10px;"
+            " background:#1e293b; color:#f1f5f9; font-size:13px; }"
+            "QLineEdit:focus { border-color:#3b82f6; }"
+        )
+        self._watch_search.textChanged.connect(self._filter_watch_table)
+        wl.addWidget(self._watch_search)
+
+        # ── No-matches placeholder (stack index 2) ───────────────────────────
+        _no_matches = QWidget()
+        _no_matches.setMinimumHeight(140)
+        _nm_v = QVBoxLayout(_no_matches)
+        _nm_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _nm_v.setSpacing(6)
+        _nm_icon = QLabel("🔍")
+        _nm_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _nm_icon.setStyleSheet("font-size:36px;")
+        _nm_v.addWidget(_nm_icon)
+        _nm_lbl = QLabel("No matches found")
+        _nm_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _nm_lbl.setStyleSheet("font-size:14px; font-weight:600; color:#9ca3af;")
+        _nm_v.addWidget(_nm_lbl)
+
+        # Stack: index 0 = empty state, index 1 = table, index 2 = no matches
+        from PyQt6.QtWidgets import QStackedWidget
+        self._watch_table_stack = QStackedWidget()
+        self._watch_table_stack.addWidget(_empty)             # index 0
+        self._watch_table_stack.addWidget(self.watch_table)   # index 1
+        self._watch_table_stack.addWidget(_no_matches)        # index 2
+        wl.addWidget(self._watch_table_stack)
 
         tabs.addTab(watches_tab, "Watches")
 
@@ -4631,16 +11544,10 @@ class AdminPanel(QDialog):
         self.gd_folder_id = QLineEdit()
         self.gd_folder_id.setPlaceholderText("Google Drive folder ID (leave blank for root)")
         self.gd_folder_id.setToolTip(
-            "The ID of the Drive folder where backups are stored.\n"
-            "Click 'Browse…' to pick a folder from your Drive."
+            "The ID of the Drive folder where backups are stored."
         )
         gd_folder_row = QHBoxLayout()
         gd_folder_row.addWidget(self.gd_folder_id)
-        gd_browse_btn = QPushButton("Browse…")
-        gd_browse_btn.setObjectName("secondary")
-        gd_browse_btn.setToolTip("List your Drive folders and select one.")
-        gd_browse_btn.clicked.connect(self._pick_gdrive_folder)
-        gd_folder_row.addWidget(gd_browse_btn)
         gd_folder_widget = QWidget()
         gd_folder_widget.setLayout(gd_folder_row)
         agl.addRow("GDrive folder:", gd_folder_widget)
@@ -4955,6 +11862,11 @@ class AdminPanel(QDialog):
         log_clear_btn.clicked.connect(self._clear_log_file)
         log_toolbar.addWidget(log_clear_btn)
 
+        log_export_btn = QPushButton("💾 Export Log")
+        log_export_btn.setObjectName("secondary")
+        log_export_btn.clicked.connect(self._export_log)
+        log_toolbar.addWidget(log_export_btn)
+
         ll.addLayout(log_toolbar)
 
         # ── Log viewer ─────────────────────────────────────────────────────────
@@ -5076,44 +11988,45 @@ class AdminPanel(QDialog):
 
         layout.addWidget(tabs)
 
+        # ── Keyboard shortcuts ────────────────────────────────────────────────
+        # Ctrl+N: Add Watch
+        QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self._add_watch)
+        # F5: Refresh watch table
+        QShortcut(QKeySequence("F5"), self).activated.connect(self._refresh_watch_table)
+        # Ctrl+F: Focus the watch search box (switches to Watches tab first)
+        def _focus_watch_search():
+            self._tabs.setCurrentWidget(self._watches_tab)
+            self._watch_search.setFocus()
+            self._watch_search.selectAll()
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(_focus_watch_search)
+        # Delete: remove selected watch (only fires when watch table has focus)
+        _del_sc = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.watch_table)
+        _del_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _del_sc.activated.connect(self._remove_watch_for_selected)
+        # Enter: Backup Now for selected watch
+        _enter_sc = QShortcut(QKeySequence(Qt.Key.Key_Return), self.watch_table)
+        _enter_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _enter_sc.activated.connect(self._backup_now_for_selected)
+        # Space: Backup Now for selected watch
+        _space_sc = QShortcut(QKeySequence(Qt.Key.Key_Space), self.watch_table)
+        _space_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _space_sc.activated.connect(self._backup_now_for_selected)
+
     def _on_dest_type_changed(self, idx: int) -> None:
         """Show/hide destination sub-panels based on combo selection."""
+        # idx 0=Local, 1=SFTP, 2=FTPS, 3=FTP, 4=HTTPS, 5=rclone, 6=WebDAV, 7=GDrive
         self.dest_local_widget.setVisible(idx == 0)
-        self.dest_smb_widget.setVisible(idx == 1)
-        self.dest_sftp_widget.setVisible(idx == 2)
-        self.dest_ftp_widget.setVisible(idx == 3 or idx == 4)
-        self.dest_https_widget.setVisible(idx == 5)
-        self.dest_rclone_widget.setVisible(idx == 6)
-        self.dest_webdav_widget.setVisible(idx == 7)
-        self.dest_gdrive_widget.setVisible(idx == 8)
+        self.dest_sftp_widget.setVisible(idx == 1)
+        self.dest_ftp_widget.setVisible(idx == 2 or idx == 3)
+        self.dest_https_widget.setVisible(idx == 4)
+        self.dest_rclone_widget.setVisible(idx == 5)
+        self.dest_webdav_widget.setVisible(idx == 6)
+        self.dest_gdrive_widget.setVisible(idx == 7)
 
     def _browse_dest(self):
         path = QFileDialog.getExistingDirectory(self, "Select Backup Destination")
         if path:
             self.dest_input.setText(path)
-
-    def _test_smb(self):
-        cfg = {
-            "path":   self.dest_smb_path.text().strip(),
-            "user":   self.dest_smb_user.text().strip(),
-            "pass":   self.dest_smb_pass.text(),
-            "domain": self.dest_smb_domain.text().strip(),
-        }
-        if not cfg["path"]:
-            QMessageBox.warning(self, "Missing", "Please enter an SMB path first.")
-            return
-        try:
-            from transport_utils import test_smb_connection
-            result = test_smb_connection(cfg)
-        except Exception as e:
-            QMessageBox.critical(self, "SMB Test Failed", str(e))
-            return
-        if result.get("ok"):
-            QMessageBox.information(self, "SMB  ·  Connected ✓",
-                f"Successfully connected to:\n{cfg['path']}")
-        else:
-            QMessageBox.critical(self, "SMB  ·  Failed",
-                f"Could not connect:\n\n{result.get('message', 'Unknown error')}")
 
     def _test_rclone(self):
         cfg = {
@@ -5145,6 +12058,7 @@ class AdminPanel(QDialog):
             proc = subprocess.run(
                 ["rclone", "listremotes"],
                 capture_output=True, text=True, timeout=10,
+                creationflags=_WIN_NO_WINDOW,
             )
         except FileNotFoundError:
             QMessageBox.critical(
@@ -5330,93 +12244,6 @@ class AdminPanel(QDialog):
         except Exception as exc:
             QMessageBox.critical(self, "Error removing host", str(exc))
 
-    def _browse_smb_network(self):
-        def parse_net_view_hosts(output: str) -> list:
-            hosts = []
-            for line in output.splitlines():
-                line = line.strip()
-                if line.startswith("\\\\"):
-                    token = line.split()[0]
-                    if token.startswith("\\\\"):
-                        host = token.lstrip("\\")
-                        if host and host not in hosts:
-                            hosts.append(host)
-            return hosts
-
-        def parse_net_view_shares(output: str, host: str) -> list:
-            shares = []
-            for line in output.splitlines():
-                line = line.strip()
-                if not line.startswith("\\\\"):
-                    continue
-                token = line.split()[0]
-                if token.startswith("\\\\"):
-                    path = token[len(f"\\\\{host}\\"):]
-                    if path and path not in shares:
-                        shares.append(path)
-            return shares
-
-        try:
-            proc = subprocess.run(["net", "view"], capture_output=True, text=True, timeout=10)
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr.strip() or "Failed to enumerate network computers")
-            hosts = parse_net_view_hosts(proc.stdout)
-            if not hosts:
-                raise RuntimeError("No hosts")
-        except Exception:
-            QMessageBox.warning(self, "Browse Network", "No network computers found. Enter the server and share name manually.")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Browse Network")
-        dlg.setModal(True)
-        dlg.setMinimumSize(420, 320)
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("Select a network computer:"))
-        host_list = QListWidget()
-        host_list.addItems(hosts)
-        host_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        layout.addWidget(host_list)
-        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btn_box.button(QDialogButtonBox.StandardButton.Ok).setText("Next")
-        btn_box.accepted.connect(dlg.accept)
-        btn_box.rejected.connect(dlg.reject)
-        layout.addWidget(btn_box)
-        if dlg.exec() != QDialog.DialogCode.Accepted or not host_list.selectedItems():
-            return
-
-        selected_host = host_list.selectedItems()[0].text()
-        try:
-            proc = subprocess.run(["net", "view", f"\\\\{selected_host}"], capture_output=True, text=True, timeout=10)
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr.strip() or "Failed to enumerate shares")
-            shares = parse_net_view_shares(proc.stdout, selected_host)
-            if not shares:
-                raise RuntimeError("No shares")
-        except Exception:
-            QMessageBox.warning(self, "Browse Network", "No network computers found. Enter the server and share name manually.")
-            return
-
-        dlg2 = QDialog(self)
-        dlg2.setWindowTitle("Select SMB Share")
-        dlg2.setModal(True)
-        dlg2.setMinimumSize(420, 320)
-        layout2 = QVBoxLayout(dlg2)
-        layout2.addWidget(QLabel(f"Select a share on \\\\{selected_host}:"))
-        share_list = QListWidget()
-        share_list.addItems(shares)
-        share_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        layout2.addWidget(share_list)
-        btn_box2 = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btn_box2.accepted.connect(dlg2.accept)
-        btn_box2.rejected.connect(dlg2.reject)
-        layout2.addWidget(btn_box2)
-        if dlg2.exec() != QDialog.DialogCode.Accepted or not share_list.selectedItems():
-            return
-
-        selected_share = share_list.selectedItems()[0].text()
-        self.dest_smb_path.setText(f"\\\\{selected_host}\\{selected_share}")
-
     def _test_sftp(self):
         cfg = {
             "host":     self.sftp_host.text().strip(),
@@ -5543,26 +12370,19 @@ class AdminPanel(QDialog):
     def _load_values(self):
         dtype   = self.cfg.get("dest_type", "local")
         idx_map = {
-            "local": 0,
-            "smb": 1,
-            "sftp": 2,
-            "ftps": 3,
-            "ftp": 4,
-            "https": 5,
-            "rclone": 6,
-            "webdav": 7,
-            "cloud":  8,
-            "gdrive": 8,
+            "local": 0,            "sftp":  1,
+            "ftps":  2,
+            "ftp":   3,
+            "https": 4,
+            "rclone": 5,
+            "webdav": 6,
+            "cloud":  7,
+            "gdrive": 7,
         }
         idx     = idx_map.get(dtype, 0)
         self.dest_type_combo.setCurrentIndex(idx)
         self._on_dest_type_changed(idx)
-        self.dest_input.setText(self.cfg.get("destination", ""))
-        smb = self.cfg.get("dest_smb", {})
-        self.dest_smb_path.setText(smb.get("path", ""))
-        self.dest_smb_user.setText(smb.get("user", ""))
-        self.dest_smb_pass.setText(smb.get("pass", ""))
-        self.dest_smb_domain.setText(smb.get("domain", ""))
+        self.dest_input.setText("")
         sftp = self.cfg.get("dest_sftp", {})
         self.sftp_host.setText(sftp.get("host", ""))
         self.sftp_port.setValue(sftp.get("port", 22))
@@ -5594,9 +12414,9 @@ class AdminPanel(QDialog):
         # Sync dest_type combo for webdav and cloud/gdrive
         _dt = self.cfg.get("dest_type", "local")
         if _dt == "webdav":
+            self.dest_type_combo.setCurrentIndex(6)
+        elif _dt in ("gdrive", "cloud"):
             self.dest_type_combo.setCurrentIndex(7)
-        elif _dt == "gdrive":
-            self.dest_type_combo.setCurrentIndex(8)
         self.auto_check.setChecked(self.cfg.get("auto_backup", False))
         unit = self.cfg.get("interval_unit", "minutes")
         self.interval_unit.setCurrentIndex(1 if unit == "seconds" else 0)
@@ -5629,6 +12449,7 @@ class AdminPanel(QDialog):
         self.force_full_global_spin.setValue(int(self.cfg.get("force_full_interval_days", 0)))
         self.startup_check.setChecked(self._is_startup_enabled())
         self.shutdown_check.setChecked(self.cfg.get("auto_shutdown_on_complete", False))
+        self.auto_sacl_smb_check.setChecked(self.cfg.get("auto_sacl_owned_smb_shares", True))
         self._refresh_watch_table()
         self._refresh_cloud_combo()
         self._check_cloud_connections()
@@ -5851,14 +12672,14 @@ class AdminPanel(QDialog):
                             encoding="utf-8"
                         )
                     import subprocess, os
-                    subprocess.Popen(["notepad.exe", str(env_path)])
+                    subprocess.Popen(["notepad.exe", str(env_path)], creationflags=_WIN_NO_WINDOW)
                     _dlg.accept()
                 except Exception as _ce:
                     QMessageBox.warning(_dlg, "Error", f"Could not create file:\n{_ce}")
 
             def _open_folder():
                 import subprocess
-                subprocess.Popen(["explorer.exe", str(env_path.parent)])
+                subprocess.Popen(["explorer.exe", str(env_path.parent)], creationflags=_WIN_NO_WINDOW)
 
             _create_btn.clicked.connect(_create_template)
             _open_btn.clicked.connect(_open_folder)
@@ -5978,18 +12799,47 @@ class AdminPanel(QDialog):
         # QSettings stay consistent and backups don't use stale tokens.
         _access  = tokens.get("access_token", "")
         _refresh = tokens.get("refresh_token", "")
+        # Also persist the OAuth client credentials so that the Google API
+        # client library can automatically refresh the access token when it
+        # expires (e.g. when the user clicks Browse after the token ages out).
+        # Without these, google-auth raises "deleted_client" even though the
+        # credentials are valid -- it just cannot refresh without client_id/secret.
+        _client_id     = self.GDRIVE_CLIENT_ID
+        _client_secret = self.GDRIVE_CLIENT_SECRET
         _changed = False
         for w in self.cfg.get("watches", []):
             for cc in w.get("cloud_configs", []):
                 if cc.get("provider") == "gdrive":
                     cc["access_token"]  = _access
                     cc["refresh_token"] = _refresh
+                    cc["client_id"]     = _client_id
+                    cc["client_secret"] = _client_secret
                     _changed = True
             if w.get("cloud_config", {}).get("provider") == "gdrive":
                 w["cloud_config"]["access_token"]  = _access
                 w["cloud_config"]["refresh_token"] = _refresh
+                w["cloud_config"]["client_id"]     = _client_id
+                w["cloud_config"]["client_secret"] = _client_secret
                 _changed = True
         if _changed and BACKEND_AVAILABLE:
+            try:
+                config_manager.save(self.cfg)
+            except Exception:
+                pass
+
+        # Always persist a top-level fallback entry so that cloud upload works even
+        # when no watches have been created yet.  Without this, cloud config
+        # finds no cloud_config in any watch and falls back to an empty dict,
+        # causing google-auth to raise "deleted_client" because it has no
+        # client_id / client_secret to refresh the access token with.
+        self.cfg["_cloud_default_gdrive"] = {
+            "provider":      "gdrive",
+            "access_token":  _access,
+            "refresh_token": _refresh,
+            "client_id":     _client_id,
+            "client_secret": _client_secret,
+        }
+        if BACKEND_AVAILABLE:
             try:
                 config_manager.save(self.cfg)
             except Exception:
@@ -6356,84 +13206,6 @@ class AdminPanel(QDialog):
                     f"⚠ {name} token expired  · go to Settings >Cloud tab to reconnect"
                 )
 
-    def _pick_gdrive_folder(self):
-        """Fetch the user's Drive folders and let them pick one from a dialog."""
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QListWidgetItem, QDialogButtonBox, QLabel
-
-        # Load current cloud config to get tokens
-        cfg = config_manager.load()
-        cloud_cfg = None
-        for w in cfg.get("watches", []):
-            cc = w.get("cloud_config", {})
-            if cc.get("provider") == "gdrive":
-                cloud_cfg = cc
-                break
-        if cloud_cfg is None:
-            cloud_cfg = cfg.get("_cloud_default_gdrive", {})
-
-        if not cloud_cfg or not cloud_cfg.get("access_token"):
-            QMessageBox.warning(self, "Not Connected",
-                "Connect your Google Drive account first (click 'Connect Google Drive').")
-            return
-
-        try:
-            from googleapiclient.discovery import build
-            import google.oauth2.credentials as _gc
-            _creds = _gc.Credentials(
-                token         = cloud_cfg.get("access_token"),
-                refresh_token = cloud_cfg.get("refresh_token"),
-                client_id     = cloud_cfg.get("client_id"),
-                client_secret = cloud_cfg.get("client_secret"),
-                token_uri     = "https://oauth2.googleapis.com/token",
-            )
-            service = build("drive", "v3", credentials=_creds)
-            result  = service.files().list(
-                q="mimeType='application/vnd.google-apps.folder' and trashed=false",
-                fields="files(id, name)",
-                orderBy="name",
-                pageSize=100,
-            ).execute()
-            folders = result.get("files", [])
-        except Exception as e:
-            QMessageBox.critical(self, "Drive Error",
-                f"Could not list Drive folders:\n{e}\n\nTry reconnecting your account.")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Select Google Drive Folder")
-        dlg.setMinimumSize(420, 380)
-        vlay = QVBoxLayout(dlg)
-        vlay.addWidget(QLabel("Choose the Drive folder where backups will be stored:"))
-
-        lst = QListWidget()
-        root_item = QListWidgetItem("📁  My Drive (root)")
-        root_item.setData(0x100, "")           # folder_id = ""
-        root_item.setData(0x101, "My Drive (root)")
-        lst.addItem(root_item)
-        for f in folders:
-            item = QListWidgetItem(f"📁  {f['name']}")
-            item.setData(0x100, f["id"])
-            item.setData(0x101, f["name"])
-            lst.addItem(item)
-        lst.setCurrentRow(0)
-        vlay.addWidget(lst)
-
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(dlg.accept)
-        btns.rejected.connect(dlg.reject)
-        vlay.addWidget(btns)
-
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            sel = lst.currentItem()
-            if sel:
-                fid   = sel.data(0x100)
-                fname = sel.data(0x101)
-                self.gd_folder_id.setText(fid)
-                self.gd_folder_id.setToolTip(f"Folder: {fname}  (ID: {fid or 'root'})")
-                QMessageBox.information(self, "Folder Selected",
-                    f"Backups will be stored in:\n📁 {fname}"
-                    + (f"\n(ID: {fid})" if fid else ""))
-
     def _save_cloud(self):
         """Save the current cloud assignment to ALL checked watches at once."""
         # Collect checked watches from the checklist
@@ -6485,18 +13257,63 @@ class AdminPanel(QDialog):
 
         try:
             config_manager.save(self.cfg)
-            if cloud_configs:
-                providers = ", ".join(c["provider"].upper() for c in cloud_configs)
+            if saved_names:
                 names_str = ", ".join(saved_names)
                 QMessageBox.information(self, "Saved",
                     f"Cloud assignment saved to {len(saved_names)} watch(es).\n\n"
-                    f"Watches:   {names_str}\n"
-                    f"Providers: {providers}")
+                    f"Watches:  {names_str}\n"
+                    f"Provider: GDrive")
             else:
                 QMessageBox.information(self, "Saved",
                     "Cloud assignment cleared for all watches.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save: {e}")
+
+    def _apply_local_sacl_with_feedback(self, path: str):
+        """Run _apply_sacl_local in a background thread and show a feedback dialog on failure.
+
+        Polls every 500 ms on the main thread so the dialog appears as soon as the
+        background work finishes (typically a few seconds — no arbitrary long delay).
+        On failure a non-blocking QMessageBox is shown with a Retry button.
+        """
+        import threading as _sacl_t
+        _result = [None, ""]    # [ok: bool, msg: str]
+        _done   = _sacl_t.Event()
+
+        def _worker(p=path):
+            ok, msg = _apply_sacl_local(p)
+            _result[:] = [ok, msg]
+            _done.set()
+
+        _sacl_t.Thread(target=_worker, daemon=True).start()
+
+        def _poll():
+            if not _done.is_set():
+                QTimer.singleShot(500, _poll)
+                return
+            ok, _msg = _result
+            if ok:
+                return
+            try:
+                dlg = QMessageBox(self)
+                dlg.setWindowTitle("SACL Setup — Permission Required")
+                dlg.setIcon(QMessageBox.Icon.Warning)
+                dlg.setText(
+                    "<b>Administrator permission was not granted.</b><br><br>"
+                    "File auditing could not be enabled for this folder. "
+                    "Click <b>Retry</b> to try again now, or <b>Dismiss</b> to skip — "
+                    "the folder will still be backed up normally."
+                )
+                dlg.setTextFormat(Qt.TextFormat.RichText)
+                retry_btn = dlg.addButton("Retry",   QMessageBox.ButtonRole.ActionRole)
+                dlg.addButton("Dismiss", QMessageBox.ButtonRole.RejectRole)
+                dlg.exec()
+                if dlg.clickedButton() is retry_btn:
+                    self._apply_local_sacl_with_feedback(path)
+            except Exception:
+                pass
+
+        QTimer.singleShot(500, _poll)
 
     def _add_watch(self):
         dlg = AddWatchDialog(self, cfg=self.cfg)
@@ -6504,19 +13321,19 @@ class AdminPanel(QDialog):
             try:
                 v        = dlg.get_values()
                 src_type = v.get("source_type", "local")
-                config_manager.add_watch(
+                # Use the watch returned by add_watch() directly — do NOT call
+                # get_watch_by_path() here.  That function returns the *first*
+                # match for the path, which is the wrong watch when two entries
+                # share the same source path (e.g. two watches on the same Windows host
+                # share with different destinations).  Using the returned watch
+                # guarantees we always apply extra metadata to the new entry.
+                w = config_manager.add_watch(
                     self.cfg,
                     v["name"],
                     v["path"],
                     watch_type=src_type,
                     interval_min=v["interval_min"],
-                    smb_cfg={
-                        "user":   v["smb_user"],
-                        "pass":   v["smb_pass"],
-                        "domain": v["smb_domain"],
-                    } if v.get("is_smb") else {},
                 )
-                w = config_manager.get_watch_by_path(self.cfg, v["path"])
                 if w:
                     extra_meta: dict = {
                         "compression":      v.get("compression", False),
@@ -6557,6 +13374,42 @@ class AdminPanel(QDialog):
                             "use_tls":  False,
                         }
                     config_manager.update_watch_meta(self.cfg, w["id"], **extra_meta)
+                    # Persist SMB credentials directly on the watch dict
+                    # (update_watch_meta doesn't handle this field)
+                    for _w in self.cfg.get("watches", []):
+                        if _w["id"] == w["id"]:
+                            if v.get("nas_user"):
+                                _w["smb_audit_cfg"] = {
+                                    "username": v.get("nas_user", ""),
+                                    "password": v.get("nas_pass", ""),
+                                    
+                                }
+                            else:
+                                _w.pop("smb_audit_cfg", None)
+                            break
+                    config_manager.save(self.cfg)
+                    # ── Auto-configure SACL on remote Windows PC ──────────
+                    _sacl_path = v.get("path", "")
+                    _sacl_host = None
+                    import re as _aw_re
+                    _unc_m = _aw_re.match(r"^\\\\([^\\]+)\\", _sacl_path)
+                    if _unc_m:
+                        _sacl_host = _unc_m.group(1)
+                    _sacl_cfg = v.get("nas_user") and {
+                        "username": v.get("nas_user", ""),
+                        "password": v.get("nas_pass", ""),
+                    }
+                    if _sacl_host and _sacl_cfg:
+                        import threading as _sacl_th
+                        def _sacl_bg(host=_sacl_host, path=_sacl_path, cfg=_sacl_cfg):
+                            ok, msg = _apply_sacl_remote(host, path, cfg)
+                            import logging; logging.getLogger(__name__).info(
+                                f"[_add_watch] SACL auto-config: ok={ok} msg={msg!r}")
+                        _sacl_th.Thread(target=_sacl_bg, daemon=True).start()
+                    elif not _sacl_host and src_type == "local":
+                        # Local path on *this* PC — apply SACL without WinRM/SMB.
+                        # Uses the feedback helper so the user sees a dialog on UAC decline.
+                        self._apply_local_sacl_with_feedback(_sacl_path)
                 self._refresh_watch_table()
                 self._refresh_cloud_combo()
                 self.watches_changed.emit()
@@ -6566,18 +13419,176 @@ class AdminPanel(QDialog):
     def _remove_watch(self):
         btn = self.sender()
         wid = btn.property("watch_id")
-        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
-        watch_name = watch.get("name", "this watch") if watch else "this watch"
+        self._remove_watch_by_id(wid)
+
+    def _remove_watch_by_id(self, wid):
+        watches = self.cfg.get("watches", [])
+        watch = next((w for w in watches if w["id"] == wid), None)
+        if not watch:
+            return
+        watch_name = watch.get("name", "this watch")
         reply = QMessageBox.question(
             self, "Delete Watch",
             f"Delete <b>{watch_name}</b> from the watch list?<br><br>Your backup files will <b>not</b> be deleted.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            config_manager.remove_watch(self.cfg, wid)
-            self._refresh_watch_table()
-            self._refresh_cloud_combo()
-            self.watches_changed.emit()
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Commit any in-flight pending removal before starting a new one
+        self._commit_pending_removal()
+
+        # Soft-delete: remove from in-memory config only — disk write is deferred
+        original_index = next((i for i, w in enumerate(watches) if w["id"] == wid), -1)
+        import copy as _copy
+        saved_watch = _copy.deepcopy(watch)
+        watches[:] = [w for w in watches if w["id"] != wid]
+        self._refresh_watch_table()
+        self._refresh_cloud_combo()
+        self.watches_changed.emit()
+
+        # 5-second commit timer
+        _timer = QTimer(self)
+        _timer.setSingleShot(True)
+        _timer.timeout.connect(self._commit_pending_removal)
+        _timer.start(5000)
+
+        self._pending_removal = {
+            "watch": saved_watch,
+            "index": original_index,
+            "timer": _timer,
+        }
+        self._show_undo_snackbar(watch_name)
+
+    def _remove_watch_for_selected(self):
+        """Delete key shortcut: remove the currently-selected watch table row."""
+        if self._watch_table_stack.currentIndex() != 1:
+            return
+        row = self.watch_table.currentRow()
+        if row < 0:
+            return
+        item = self.watch_table.item(row, 0)
+        if not item:
+            return
+        wid = item.data(Qt.ItemDataRole.UserRole)
+        if wid:
+            self._remove_watch_by_id(wid)
+
+    def _backup_now_for_selected(self):
+        """Enter/Space shortcut: trigger Backup Now for the currently-selected watch."""
+        if self._watch_table_stack.currentIndex() != 1:
+            return
+        row = self.watch_table.currentRow()
+        if row < 0:
+            return
+        item = self.watch_table.item(row, 0)
+        if not item:
+            return
+        wid = item.data(Qt.ItemDataRole.UserRole)
+        watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
+        if not watch:
+            return
+        mw = self.parent()
+        if mw and hasattr(mw, "_backup_single"):
+            try:
+                mw._backup_single(watch)
+            except Exception:
+                pass
+
+    def _show_undo_snackbar(self, watch_name: str):
+        existing = getattr(self, "_undo_snackbar", None)
+        if existing is not None:
+            try:
+                existing.hide()
+                existing.deleteLater()
+            except Exception:
+                pass
+
+        snackbar = QWidget(self)
+        snackbar.setObjectName("undoSnackbar")
+        snackbar.setStyleSheet(
+            "QWidget#undoSnackbar { background:#1e3a5f; border-radius:8px; }"
+            "QLabel { color:#ffffff; font-size:13px; font-weight:600; background:transparent; }"
+            "QPushButton { background:#ffffff; color:#1e3a5f; font-weight:700; font-size:12px;"
+            "  border:none; border-radius:4px; padding:4px 14px; min-width:52px; }"
+            "QPushButton:hover { background:#dbeafe; }"
+        )
+        _row = QHBoxLayout(snackbar)
+        _row.setContentsMargins(16, 10, 16, 10)
+        _row.setSpacing(16)
+        _lbl = QLabel(f"Watch ‘{watch_name}’ removed.")
+        _row.addWidget(_lbl)
+        _undo_btn = QPushButton("Undo")
+        _undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _undo_btn.clicked.connect(self._undo_watch_removal)
+        _row.addWidget(_undo_btn)
+
+        snackbar.adjustSize()
+        cx = self.width() // 2 - snackbar.width() // 2
+        cy = self.height() - snackbar.height() - 20
+        snackbar.move(cx, cy)
+        snackbar.raise_()
+        snackbar.show()
+        self._undo_snackbar = snackbar
+
+    def _undo_watch_removal(self):
+        pr = getattr(self, "_pending_removal", None)
+        if pr is None:
+            return
+        try:
+            pr["timer"].stop()
+        except Exception:
+            pass
+        self._pending_removal = None
+
+        # Re-insert watch at its original position
+        watches = self.cfg.setdefault("watches", [])
+        idx = pr["index"]
+        if 0 <= idx <= len(watches):
+            watches.insert(idx, pr["watch"])
+        else:
+            watches.append(pr["watch"])
+
+        self._refresh_watch_table()
+        self._refresh_cloud_combo()
+        self.watches_changed.emit()
+
+        snackbar = getattr(self, "_undo_snackbar", None)
+        if snackbar is not None:
+            try:
+                snackbar.hide()
+                snackbar.deleteLater()
+            except Exception:
+                pass
+        self._undo_snackbar = None
+
+    def _commit_pending_removal(self):
+        pr = getattr(self, "_pending_removal", None)
+        if pr is None:
+            return
+        try:
+            pr["timer"].stop()
+        except Exception:
+            pass
+        self._pending_removal = None
+
+        snackbar = getattr(self, "_undo_snackbar", None)
+        if snackbar is not None:
+            try:
+                snackbar.hide()
+                snackbar.deleteLater()
+            except Exception:
+                pass
+        self._undo_snackbar = None
+
+        try:
+            config_manager.save(self.cfg)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self._commit_pending_removal()
+        super().closeEvent(event)
 
     def _edit_watch(self):
         btn = self.sender()
@@ -6592,23 +13603,8 @@ class AdminPanel(QDialog):
 
         # Pre-fill existing values
         dlg.name_input.setText(watch.get("name", ""))
-        is_smb = watch.get("type", "local") == "smb" or watch.get("path", "").startswith("\\\\") or watch.get("path", "").startswith("//")
-        if is_smb:
-            dlg.source_type.setCurrentIndex(1)
-            dlg.smb_path_input.setText(watch.get("path", ""))
-            smb_cfg = watch.get("smb_cfg", {})
-            dlg.smb_user.setText(smb_cfg.get("user", ""))
-            # Load password from credential store if available, else from config
-            try:
-                from credential_store import get_smb_password
-                _stored_pass = get_smb_password(watch.get("path", ""))
-                dlg.smb_pass.setText(_stored_pass or smb_cfg.get("pass", ""))
-            except Exception:
-                dlg.smb_pass.setText(smb_cfg.get("pass", ""))
-            dlg.smb_domain.setText(smb_cfg.get("domain", ""))
-        else:
-            dlg.source_type.setCurrentIndex(0)
-            dlg.path_input.setText(watch.get("path", ""))
+        dlg.source_type.setCurrentIndex(0)  # Local / Mapped Drive
+        dlg.path_input.setText(watch.get("path", ""))
         dlg.interval_spin.setValue(watch.get("interval_min", 0))
         # Pre-fill destination if set on this watch
         _watch_dest = watch.get("destination", "")
@@ -6624,6 +13620,12 @@ class AdminPanel(QDialog):
             dlg.compress_combo.setCurrentIndex(3)  # Best
         else:
             dlg.compress_combo.setCurrentIndex(0)  # Off
+        # Pre-fill SMB credentials if previously saved
+        _nas_cfg = watch.get("smb_audit_cfg", {})
+        if _nas_cfg.get("username"):
+            dlg.nas_user_input.setText(_nas_cfg.get("username", ""))
+            dlg.nas_pass_input.setText(_nas_cfg.get("password", ""))
+            # SMB credentials frame is always visible for local type — nothing to expand
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
             v = dlg.get_values()
@@ -6636,42 +13638,80 @@ class AdminPanel(QDialog):
                     sync_mode=v.get("sync_mode", False),
                     destination=v.get("destination", "") or None,
                 )
-                # Update path and SMB credentials directly (not in update_watch_meta)
+                # Update path directly (not in update_watch_meta)
                 for w in self.cfg.get("watches", []):
                     if w["id"] == wid:
                         w["path"] = v["path"]   # get_values() always returns "path" key
-                        w["type"] = "smb" if v["is_smb"] else "local"
-                        if v["is_smb"]:
-                            w["smb_cfg"] = {
-                                "user":   v["smb_user"],
-                                "pass":   v["smb_pass"],
-                                "domain": v["smb_domain"],
+                        w["type"] = "local"
+                        # Save SMB credentials
+                        if v.get("nas_user"):
+                            w["smb_audit_cfg"] = {
+                                "username": v.get("nas_user", ""),
+                                "password": v.get("nas_pass", ""),
+                                
                             }
+                        elif "smb_audit_cfg" in w and not v.get("nas_user"):
+                            # User cleared the credentials — remove them
+                            w.pop("smb_audit_cfg", None)
                         break
                 config_manager.save(self.cfg)
+                # ── Auto-configure SACL on remote Windows PC (edit path) ──
+                _sacl_path2 = v.get("path", "")
+                _sacl_host2 = None
+                import re as _ew_re
+                _unc_m2 = _ew_re.match(r"^\\\\([^\\]+)\\", _sacl_path2)
+                if _unc_m2:
+                    _sacl_host2 = _unc_m2.group(1)
+                _sacl_cfg2 = v.get("nas_user") and {
+                    "username": v.get("nas_user", ""),
+                    "password": v.get("nas_pass", ""),
+                }
+                if _sacl_host2 and _sacl_cfg2:
+                    import threading as _sacl_th2
+                    def _sacl_bg2(host=_sacl_host2, path=_sacl_path2, cfg=_sacl_cfg2):
+                        ok, msg = _apply_sacl_remote(host, path, cfg)
+                        import logging; logging.getLogger(__name__).info(
+                            f"[_edit_watch] SACL auto-config: ok={ok} msg={msg!r}")
+                    _sacl_th2.Thread(target=_sacl_bg2, daemon=True).start()
+                elif not _sacl_host2:
+                    # Local path on *this* PC — apply SACL without WinRM/SMB.
+                    # Uses the feedback helper so the user sees a dialog on UAC decline.
+                    self._apply_local_sacl_with_feedback(_sacl_path2)
                 self._refresh_watch_table()
                 self._refresh_cloud_combo()
                 self.watches_changed.emit()
-                # ── Success feedback ──────────────────────────────────────
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Saved")
-                msg.setText(f"✅  <b>{v['name']}</b> settings saved successfully.")
-                msg.setIcon(QMessageBox.Icon.Information)
-                msg.exec()
+                # ── Success toast on the main window ─────────────────────
+                _mw = self.parent()
+                if _mw and hasattr(_mw, "_show_toast"):
+                    _mw._show_toast("Watch settings saved.")
             except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+                _mw = self.parent()
+                if _mw and hasattr(_mw, "_show_toast"):
+                    _mw._show_toast("Failed to save watch settings.", success=False)
+                else:
+                    QMessageBox.critical(self, "Error", str(e))
 
     def _refresh_watch_table(self):
         self.watch_table.setRowCount(0)
         watches = self.cfg.get("watches", [])
         for row, w in enumerate(watches):
             self.watch_table.insertRow(row)
-            self.watch_table.setItem(row, 0, QTableWidgetItem(w.get("name", "")))
+            _name_item = QTableWidgetItem(w.get("name", ""))
+            _name_item.setData(Qt.ItemDataRole.UserRole, w["id"])
+            self.watch_table.setItem(row, 0, _name_item)
             self.watch_table.setItem(row, 1, QTableWidgetItem(w.get("path", "")))
             self.watch_table.setItem(row, 2, QTableWidgetItem(w.get("status", "")))
-            self.watch_table.setItem(row, 3, QTableWidgetItem(w.get("last_backup", "")))
+            _lb_display, _lb_tip = _fmt_past_ts(w.get("last_backup", ""))
+            _lb_item = QTableWidgetItem(_lb_display)
+            if _lb_tip:
+                _lb_item.setToolTip(_lb_tip)
+            self.watch_table.setItem(row, 3, _lb_item)
             self.watch_table.setItem(row, 4, QTableWidgetItem(str(w.get("duration", ""))))
-            self.watch_table.setItem(row, 5, QTableWidgetItem(w.get("next_backup", "")))
+            _nb_display, _nb_tip = _fmt_future_ts(w.get("next_backup", ""))
+            _nb_item = QTableWidgetItem(_nb_display)
+            if _nb_tip:
+                _nb_item.setToolTip(_nb_tip)
+            self.watch_table.setItem(row, 5, _nb_item)
             self.watch_table.setItem(row, 6, QTableWidgetItem(str(w.get("runs", ""))))
             self.watch_table.setItem(row, 7, QTableWidgetItem(str(w.get("failed", ""))))
             self.watch_table.setItem(row, 8, QTableWidgetItem(w.get("size", "")))
@@ -6693,6 +13733,69 @@ class AdminPanel(QDialog):
             del_btn.setProperty("watch_id", w["id"])
             del_btn.clicked.connect(self._remove_watch)
             self.watch_table.setCellWidget(row, 12, del_btn)
+
+        self._filter_watch_table()
+
+    def _filter_watch_table(self, text: str = None):
+        if text is None:
+            text = getattr(self, "_watch_search", None)
+            text = text.text() if text is not None else ""
+        q = text.strip().lower()
+        watches = self.cfg.get("watches", [])
+        if not watches:
+            self._watch_table_stack.setCurrentIndex(0)
+            return
+        visible = 0
+        for row in range(self.watch_table.rowCount()):
+            name = (self.watch_table.item(row, 0) or QTableWidgetItem()).text().lower()
+            path = (self.watch_table.item(row, 1) or QTableWidgetItem()).text().lower()
+            match = not q or q in name or q in path
+            self.watch_table.setRowHidden(row, not match)
+            if match:
+                visible += 1
+        if visible == 0:
+            self._watch_table_stack.setCurrentIndex(2)  # no matches
+        else:
+            self._watch_table_stack.setCurrentIndex(1)  # table
+
+    def _set_row_progress(self, wid: str, current: int, total: int, is_scanning: bool):
+        """Called from MainWindow._on_progress to show inline progress in the watch table row."""
+        for row in range(self.watch_table.rowCount()):
+            item = self.watch_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == wid:
+                existing = self.watch_table.cellWidget(row, 2)
+                if not isinstance(existing, QProgressBar):
+                    pb = QProgressBar()
+                    pb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    pb.setStyleSheet(
+                        "QProgressBar { font-size:10px; border:1px solid #475569; border-radius:3px;"
+                        " background:#1e293b; color:#f8fafc; text-align:center; }"
+                        "QProgressBar::chunk { background:#16a34a; border-radius:2px; }"
+                    )
+                    self.watch_table.setCellWidget(row, 2, pb)
+                    existing = pb
+                if is_scanning:
+                    existing.setMaximum(0)
+                    existing.setValue(0)
+                    existing.setFormat("Scanning…")
+                elif total > 0:
+                    existing.setMaximum(total)
+                    existing.setValue(current)
+                    existing.setFormat(f"{current}/{total} files")
+                else:
+                    existing.setMaximum(0)
+                    existing.setValue(0)
+                    existing.setFormat("Running…")
+                break
+
+    def _clear_row_progress(self, wid: str):
+        """Called from MainWindow._on_backup_done to remove the inline progress bar."""
+        for row in range(self.watch_table.rowCount()):
+            item = self.watch_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == wid:
+                self.watch_table.removeCellWidget(row, 2)
+                self.watch_table.setItem(row, 2, QTableWidgetItem(""))
+                break
 
     def _save_email_settings(self):
         ec = self.cfg.setdefault("email_config", {})
@@ -6972,26 +14075,55 @@ class AdminPanel(QDialog):
             cursor.movePosition(_end)
             self._log_viewer.setTextCursor(cursor)
 
-    def _clear_log_file(self):
-        """Prompt and then truncate the log file."""
-        reply = QMessageBox.question(
-            self, "Clear Log",
-            "This will permanently delete all log entries.\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+    def _export_log(self):
+        """Save the currently visible (filtered) log content to a file chosen by the user."""
+        content = self._log_viewer.toPlainText()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Log", "backupsys_log.txt",
+            "Text files (*.txt);;All files (*)"
         )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            _mw = self.parent()
+            if _mw and hasattr(_mw, "_show_toast"):
+                _mw._show_toast(f"Log exported to {path}")
+            else:
+                QMessageBox.information(self, "Export Log", f"Log saved to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Could not save log file:\n{e}")
+
+    def _clear_log_file(self):
+        """Confirm then truncate the log file."""
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Clear all logs?")
+        dlg.setText(
+            "This will permanently delete all log entries and cannot be undone.\n"
+            "Are you sure?"
+        )
+        dlg.setIcon(QMessageBox.Icon.Warning)
+        cancel_btn = dlg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        clear_btn  = dlg.addButton("Clear Logs", QMessageBox.ButtonRole.DestructiveRole)
+        clear_btn.setStyleSheet(
+            "QPushButton { background:#dc2626; color:#fff; font-weight:700;"
+            " border:none; border-radius:4px; padding:6px 16px; }"
+            "QPushButton:hover { background:#b91c1c; }"
+        )
+        dlg.setDefaultButton(cancel_btn)
+        dlg.exec()
+        if dlg.clickedButton() is not clear_btn:
             return
         try:
             self._log_file_path.write_text("", encoding="utf-8")
             self._log_raw_lines = []
             self._log_viewer.clear()
-            QMessageBox.information(self, "Cleared", "Log file cleared.")
+            mw = self.parent()
+            if mw and hasattr(mw, "_show_toast"):
+                mw._show_toast("Logs cleared.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not clear log file:\n{e}")
-
-
-        dlg = PasswordDialog(self, mode="set")
-        dlg.exec()
 
     def _apply_theme(self):
         """Apply the selected theme immediately and persist the choice."""
@@ -7107,19 +14239,6 @@ class AdminPanel(QDialog):
             QMessageBox.critical(self, "Import Failed", f"Could not merge config: {e}")
 
     def _save_general(self):
-        self.cfg["dest_smb"] = {
-            "path": self.dest_smb_path.text().strip(),
-            "user": self.dest_smb_user.text().strip(),
-            "pass": self.dest_smb_pass.text(),
-            "domain": self.dest_smb_domain.text().strip(),
-        }
-        # For SMB, the backup destination IS the UNC path — not the local dest_input.
-        # Using a local path when dest_type is smb causes WinError 21 (device not ready)
-        # because the engine tries to create the backup folder on a non-existent local drive.
-        if self.cfg["dest_type"] == "smb":
-            self.cfg["destination"] = self.cfg["dest_smb"]["path"]
-        else:
-            self.cfg["destination"] = self.dest_input.text().strip()
         self.cfg["dest_sftp"] = {
             "host": self.sftp_host.text().strip(),
             "port": self.sftp_port.value(),
@@ -7159,19 +14278,17 @@ class AdminPanel(QDialog):
         if BACKEND_AVAILABLE:
             credential_store.set_sftp_password(self.cfg["dest_sftp"], self.sftp_pass.text())
             credential_store.set_ftp_password(self.cfg["dest_ftp"], self.ftp_pass.text())
-            credential_store.set_smb_password(self.cfg["dest_smb"], self.dest_smb_pass.text())
             credential_store.set_webdav_password(self.cfg["dest_webdav"], self.webdav_pass.text())
         idx = self.dest_type_combo.currentIndex()
         dest_map = {
-            0: "local",
-            1: "smb",
-            2: "sftp",
-            3: "ftps",
-            4: "ftp",
-            5: "https",
-            6: "rclone",
-            7: "webdav",
-            8: "gdrive",
+            0: "local",   # Local / Mapped Drive
+            1: "sftp",
+            2: "ftps",
+            3: "ftp",
+            4: "https",
+            5: "rclone",
+            6: "webdav",
+            7: "gdrive",
         }
         self.cfg["dest_type"] = dest_map.get(idx, "local")
         self.cfg["auto_backup"] = self.auto_check.isChecked()
@@ -7194,6 +14311,7 @@ class AdminPanel(QDialog):
         self.cfg["integrity_check_interval_days"] = self.integrity_interval_spin.value()
         self.cfg["force_full_interval_days"]      = self.force_full_global_spin.value()
         self.cfg["auto_shutdown_on_complete"]     = self.shutdown_check.isChecked()
+        self.cfg["auto_sacl_owned_smb_shares"]    = self.auto_sacl_smb_check.isChecked()
         try:
             config_manager.save(self.cfg)
             QMessageBox.information(self, "Saved", "Settings saved.")
@@ -7326,10 +14444,6 @@ class StorageChartWidget(QWidget):
         try:
             dest = self.watch.get("destination", "")
             if not dest:
-                from config_manager import load_config
-                cfg = load_config()
-                dest = cfg.get("destination", "")
-            if not dest:
                 return
             dest_path = Path(dest)
             if not dest_path.exists():
@@ -7414,7 +14528,7 @@ class WatchCard(QFrame):
         # Using recent samples (last 8 s) avoids the "ETA explodes after a
         # throttle pause" problem caused by using total-elapsed as the divisor.
         self._speed_window: list = []
-        self._SPEED_WIN_SEC: int = 8
+        self._SPEED_WIN_SEC: int = 30
         self._build_ui()
 
     def _build_ui(self):
@@ -7529,6 +14643,35 @@ class WatchCard(QFrame):
         meta_row.addStretch()
         info_layout.addLayout(meta_row)
 
+        # ── Error banner (shown only when last backup failed) ─────────────
+        self._err_banner = QWidget()
+        self._err_banner.setVisible(False)
+        _eb_row = QHBoxLayout(self._err_banner)
+        _eb_row.setContentsMargins(0, 2, 0, 0)
+        _eb_row.setSpacing(6)
+        self._err_msg_lbl = QLabel("")
+        self._err_msg_lbl.setStyleSheet(
+            "color:#fca5a5; font-size:11px; font-weight:500;"
+        )
+        self._err_msg_lbl.setWordWrap(False)
+        _eb_row.addWidget(self._err_msg_lbl, stretch=1)
+        self._err_logs_btn = QPushButton("See Logs")
+        self._err_logs_btn.setObjectName("secondary")
+        self._err_logs_btn.setFixedHeight(18)
+        self._err_logs_btn.setStyleSheet(
+            "QPushButton { font-size:10px; padding:0 7px; border-radius:3px;"
+            " background:#3f1a1a; color:#fca5a5; border:1px solid #7f1d1d; }"
+            "QPushButton:hover { background:#7f1d1d; color:#fff; }"
+        )
+        self._err_logs_btn.clicked.connect(self._open_logs_tab)
+        _eb_row.addWidget(self._err_logs_btn)
+        info_layout.addWidget(self._err_banner)
+
+        # Populate banner from persisted last_error (visible on restart)
+        _le = self.watch.get("last_error", "")
+        if _le and self.watch.get("last_backup_status") == "failed":
+            self._show_error_banner(_le)
+
         self.next_lbl = QLabel("")
         self.next_lbl.setStyleSheet("color: #374151; font-size: 10px;")
         self.next_lbl.setVisible(True)
@@ -7555,7 +14698,7 @@ class WatchCard(QFrame):
         self.status_widget = QWidget()
         # Fix: lock the width so the indeterminate progress bar animation
         # cannot push or shift the buttons during scanning/backing up.
-        self.status_widget.setFixedWidth(170)
+        self.status_widget.setFixedWidth(185)
         status_layout = QVBoxLayout(self.status_widget)
         status_layout.setSpacing(4)
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -7566,8 +14709,10 @@ class WatchCard(QFrame):
         status_layout.addWidget(self.status_lbl)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(160)   # fixed — never resizes during marquee animation
+        self.progress_bar.setFixedWidth(175)   # fixed — never resizes during marquee animation
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setTextVisible(True)
         self.progress_bar.setVisible(False)
         status_layout.addWidget(self.progress_bar)
 
@@ -7593,14 +14738,14 @@ class WatchCard(QFrame):
         status_layout.addWidget(self.details_lbl)
 
         self.backup_btn = QPushButton("Backup Now")
-        self.backup_btn.setFixedWidth(160)
+        self.backup_btn.setFixedWidth(175)
         self.backup_btn.clicked.connect(lambda: self.backup_requested.emit(self.watch))
         status_layout.addWidget(self.backup_btn)
 
         # ── "More ▾" dropdown for secondary actions ────────────────────────
         self._more_btn = QToolButton()
         self._more_btn.setText("More ▾")
-        self._more_btn.setFixedWidth(160)
+        self._more_btn.setFixedWidth(175)
         self._more_btn.setObjectName("secondary")
         self._more_btn.setPopupMode(
             QToolButton.ToolButtonPopupMode.InstantPopup
@@ -7682,14 +14827,14 @@ class WatchCard(QFrame):
         # ── Pause/Resume and Cancel buttons (shown during backup) ─────
         self.pause_backup_btn = QPushButton("⏸ Pause")
         self.pause_backup_btn.setObjectName("secondary")
-        self.pause_backup_btn.setFixedWidth(160)
+        self.pause_backup_btn.setFixedWidth(175)
         self.pause_backup_btn.setVisible(False)
         self.pause_backup_btn.clicked.connect(self._on_pause_backup_clicked)
         status_layout.addWidget(self.pause_backup_btn)
 
         self.cancel_btn = QPushButton("▶ Cancel")
         self.cancel_btn.setObjectName("danger")
-        self.cancel_btn.setFixedWidth(160)
+        self.cancel_btn.setFixedWidth(175)
         self.cancel_btn.setVisible(False)
         self.cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self.watch["id"]))
         status_layout.addWidget(self.cancel_btn)
@@ -7744,7 +14889,7 @@ class WatchCard(QFrame):
         self.toggle_btn.setText(f"{'▴' if self._expanded else '▾'}  {count} change(s)")
 
         # Update changes list
-        icon_map = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗"}
+        icon_map = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗", "backed up": "📦"}
         lines = []
         for e in reversed(self._changes[-30:]):  # show last 30
             ts = e.get("timestamp", "")
@@ -7831,7 +14976,9 @@ class WatchCard(QFrame):
             self.file_lbl.setText("Scanning…")
             self.details_lbl.setText("")
         else:
-            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setRange(0, 10000)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("%p%")
             self.file_lbl.setText("")
             self.details_lbl.setText("")
             self.status_lbl.setText("▶ Watching")
@@ -7839,29 +14986,105 @@ class WatchCard(QFrame):
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
 
+    def set_queued(self, active: bool, position: int = 0):
+        """Show/hide a 'Queued' status when this watch is waiting in the Backup All queue."""
+        if active:
+            pos_str = f" (#{position})" if position > 1 else ""
+            self.status_lbl.setText(f"⏳ Queued{pos_str} — waiting…")
+            self.status_lbl.setObjectName("status_warn")
+            self.status_lbl.setToolTip(
+                "This backup is queued and will start automatically once the current backup finishes."
+            )
+            self.backup_btn.setEnabled(False)
+            self.backup_btn.setText("Queued…")
+            if hasattr(self, "_more_btn"):
+                self._more_btn.setEnabled(False)
+        else:
+            self.status_lbl.setToolTip("")
+            self.backup_btn.setEnabled(True)
+            self.backup_btn.setText("Backup Now")
+            if hasattr(self, "_more_btn"):
+                self._more_btn.setEnabled(True)
+            # Only reset status label if we're not already backing up
+            if "Backing up" not in self.status_lbl.text() and "Queued" in self.status_lbl.text():
+                self.status_lbl.setText("▶ Watching")
+                self.status_lbl.setObjectName("status_ok")
+        self.status_lbl.style().unpolish(self.status_lbl)
+        self.status_lbl.style().polish(self.status_lbl)
+
     def set_progress(self, current: int, total: int, fname: str = "", elapsed: float = 0.0, is_scanning: bool = False, bytes_done: int = 0, total_bytes: int = 0):
-        short_name = fname.replace("\\", "/").split("/")[-1] if fname else ""
+        import time as _t
+        _is_verify = fname.startswith("\x00verify\x00")
+        _fname_clean = fname[len("\x00verify\x00"):] if _is_verify else fname
+        short_name = _fname_clean.replace("\\", "/").split("/")[-1] if _fname_clean else ""
+
+        # ── Update speed window ─────────────────────────────────────────────────
+        if bytes_done > 0:
+            now = _t.monotonic()
+            self._speed_window.append((now, bytes_done))
+            cutoff = now - float(self._SPEED_WIN_SEC)
+            while len(self._speed_window) > 2 and self._speed_window[0][0] < cutoff:
+                self._speed_window.pop(0)
+
+            # the first few seconds at very high speed, then drops to the real
+            # SMB disk write speed once the cache fills.  If we keep those fast
+            # burst samples in the 30 s window, speed and ETA stay wrong for up
+            # to 30 s after the cliff — showing "ETA ~3 min" then "ETA ~2 h".
+            #
+            # Fix: compute the instantaneous rate from just the last 2 samples.
+            # If it is less than 20% of the window-average rate, the cliff just
+            # happened — purge all samples older than 3 s so the window resets
+            # to post-cliff reality immediately.
+            if len(self._speed_window) >= 4:
+                # Window-average rate (bytes/s over full window)
+                _w_dt = self._speed_window[-1][0] - self._speed_window[0][0]
+                _w_db = self._speed_window[-1][1] - self._speed_window[0][1]
+                _avg_rate = (_w_db / _w_dt) if _w_dt > 0 else 0.0
+
+                # Instantaneous rate from last 2 samples only
+                _i_dt = self._speed_window[-1][0] - self._speed_window[-2][0]
+                _i_db = self._speed_window[-1][1] - self._speed_window[-2][1]
+                _inst_rate = (_i_db / _i_dt) if _i_dt > 0 else 0.0
+
+                # Cliff detected: instant rate < 20% of window average
+                if _avg_rate > 0 and _inst_rate < _avg_rate * 0.20:
+                    _cliff_cutoff = now - 3.0   # keep only last 3 s of samples
+                    while len(self._speed_window) > 2 and self._speed_window[0][0] < _cliff_cutoff:
+                        self._speed_window.pop(0)
+
+        # ── Speed / ETA helpers ─────────────────────────────────────────────────
+        def _fmt_bytes(n: int) -> str:
+            if n >= 1_073_741_824: return f"{n / 1_073_741_824:.1f} GB"
+            if n >= 1_048_576:     return f"{n / 1_048_576:.1f} MB"
+            if n >= 1_024:         return f"{n / 1_024:.0f} KB"
+            return f"{n} B"
+
+        speed_bps = 0.0
+        if len(self._speed_window) >= 2:
+            dt = self._speed_window[-1][0] - self._speed_window[0][0]
+            db = self._speed_window[-1][1] - self._speed_window[0][1]
+            if dt > 0 and db > 0:
+                speed_bps = db / dt
 
         if is_scanning:
             # ── Scanning phase ────────────────────────────────────────────
             if self.progress_bar.maximum() != 0:
                 self.progress_bar.setRange(0, 0)   # ensure marquee during scan
 
+            # Clear any stale copy-phase details (e.g. "10.0 GB left · 1.0 MB/s")
+            self.details_lbl.setText("")
+            self.details_lbl.setVisible(False)
+
             if total > 0 and current > 0 and elapsed > 2.0:
                 # Repeat backup — use previous snapshot count as estimated total
                 pct = min(int(current / total * 100), 99)
                 self.progress_bar.setRange(0, 100)
                 self.progress_bar.setValue(pct)
-                rate = current / elapsed
-                eta_s = (total - current) / rate
-                eta_text = _fmt_eta(eta_s)
-                eta_part = f"  ·  ETA {eta_text}" if eta_text else ""
-                lbl = f"Scanning ({current}/{total}){eta_part}"
+                lbl = f"Scanning ({current}/{total})"
             elif elapsed > 1.0:
-                # First-time backup — no estimate, show elapsed + count
-                elapsed_text = _fmt_duration(elapsed)
+                # First-time backup — show count only
                 count_part = f"  {current} files" if current > 0 else ""
-                lbl = f"Scanning{count_part}  ·  {elapsed_text} elapsed"
+                lbl = f"Scanning{count_part}"
             else:
                 lbl = f"Scanning: {short_name}" if short_name else "Scanning…"
 
@@ -7873,94 +15096,205 @@ class WatchCard(QFrame):
             # Falls back to file-count progress for edge cases (0-byte files, etc.)
             # When current==1 and total==1 the signal is coming from the remote
             # upload leg (_upload_progress in backup_engine) — label as "Uploading".
-            _is_uploading = (current == 1 and total == 1 and bytes_done > 0 and total_bytes > 0)
+            _is_uploading = fname.startswith("\x00upload\x00")
+            if _is_uploading:
+                fname = fname[len("\x00upload\x00"):]
+                short_name = fname.split("\\")[-1].split("/")[-1]
             use_bytes = total_bytes > 0 and bytes_done >= 0
 
-            if total == 0 and not use_bytes:
-                self.progress_bar.setRange(0, 0)
-                self.file_lbl.setText(f"Copying: {short_name}" if short_name else "Copying…")
-            else:
-                if self.progress_bar.maximum() == 0:
-                    self.progress_bar.setRange(0, 100)
+            # Network sources often report total_bytes=0 (size not in snapshot).
+            # Detect this: bytes ARE flowing (speed_bps > 0 or bytes_done > 0)
+            # but we have no total to divide by — show marquee instead of "0%".
+            unknown_total = (total_bytes == 0 and bytes_done > 0)
 
-                if use_bytes:
-                    pct = int(min(bytes_done / total_bytes * 100, 99)) if bytes_done < total_bytes else 100
-                elif total > 0:
-                    pct = int(current / total * 100)
-                else:
-                    pct = 0
-                self.progress_bar.setValue(pct)
-
-                byte_rate  = 0.0
-                eta_part   = ""
-                speed_text = ""
-                if elapsed > 1.0:
-                    if use_bytes and bytes_done > 0 and bytes_done < total_bytes:
-                        # ── Rolling-window speed (last _SPEED_WIN_SEC seconds) ──
-                        # This stays accurate even after throttle pauses, because
-                        # we measure only recent activity — not total-since-start.
-                        import time as _t
-                        now = _t.time()
-                        self._speed_window.append((now, bytes_done))
-                        cutoff = now - self._SPEED_WIN_SEC
-                        while len(self._speed_window) > 2 and self._speed_window[0][0] < cutoff:
-                            self._speed_window.pop(0)
-
-                        if len(self._speed_window) >= 2:
-                            dt = self._speed_window[-1][0] - self._speed_window[0][0]
-                            db = self._speed_window[-1][1] - self._speed_window[0][1]
-                            if dt > 0.1 and db > 0:
-                                byte_rate = db / dt
-
-                        if byte_rate > 0:
-                            eta_s      = (total_bytes - bytes_done) / byte_rate
-                            mbps       = byte_rate / (1024 * 1024)
-                            eta_text   = _fmt_eta(eta_s)
-                            speed_text = f"{mbps:.1f} MB/s"
-                            if eta_text:
-                                eta_part = f"  ·  ETA {eta_text}  ·  {speed_text}"
-                            else:
-                                eta_part = f"  ·  {speed_text}"
-                    elif not use_bytes and current > 0 and total > 0 and current < total:
-                        # Fallback: file-count ETA
-                        rate     = current / elapsed
-                        eta_s    = (total - current) / rate
-                        eta_text = _fmt_eta(eta_s)
-                        if eta_text:
-                            eta_part = f"  ·  ETA {eta_text}"
-
-                # ── Windows-Explorer-style details row ────────────────────
-                # "8% complete  ·  70.1 GB left  ·  71,307 files left  ·  4.3 MB/s"
-                details_parts = []
-                if pct > 0:
-                    details_parts.append(f"{pct}% complete")
-                if use_bytes and total_bytes > 0 and bytes_done < total_bytes:
-                    bytes_left = total_bytes - bytes_done
-                    if bytes_left >= 1024 ** 3:
-                        details_parts.append(f"{bytes_left / (1024**3):.1f} GB left")
-                    elif bytes_left >= 1024 ** 2:
-                        details_parts.append(f"{bytes_left / (1024**2):.0f} MB left")
-                    else:
-                        details_parts.append(f"{bytes_left / 1024:.0f} KB left")
-                if not _is_uploading and total > 0 and current < total:
-                    files_left = total - current
-                    details_parts.append(f"{files_left:,} files left")
-                if speed_text:
-                    details_parts.append(speed_text)
-                self.details_lbl.setText("  ·  ".join(details_parts))
-
+            if (total == 0 and not use_bytes) or unknown_total:
+                # Indeterminate — we're copying but don't know total size
+                if self.progress_bar.maximum() != 0:
+                    self.progress_bar.setRange(0, 0)
+                verb = "Uploading" if _is_uploading else ("Verifying" if _is_verify else "Copying")
                 if short_name:
-                    # Truncate long filenames so the ETA is never clipped off
                     max_name     = 35
                     display_name = (short_name[:max_name] + "…") if len(short_name) > max_name else short_name
-                    verb         = "Uploading" if _is_uploading else "Copying"
-                    # Show ETA first so it's always visible even on narrow cards
-                    if eta_part:
-                        self.file_lbl.setText(f"{eta_part.strip()}  ·  {display_name}")
+                    self.file_lbl.setText(f"{verb}: {display_name}")
+                else:
+                    self.file_lbl.setText(f"{verb}…")
+                # Show how many bytes have been copied + speed even when total unknown
+                detail_parts = []
+                if bytes_done > 0:
+                    detail_parts.append(f"{_fmt_bytes(bytes_done)} copied")
+                if speed_bps > 0:
+                    detail_parts.append(f"{_fmt_bytes(int(speed_bps))}/s")
+                if detail_parts:
+                    self.details_lbl.setText("  ·  ".join(detail_parts))
+                    self.details_lbl.setVisible(True)
+                else:
+                    self.details_lbl.setText("")
+                    self.details_lbl.setVisible(False)
+            else:
+                # ── Preparing: bytes_done==0, copy not yet started ────────────
+                # When the copy loop is about to start the first chunk (or the
+                # first CopyFileEx/robocopy thread hasn't written anything yet),
+                # show an indeterminate bar + "Preparing…" label so the user
+                # knows something is happening rather than seeing a frozen "0%".
+                _is_robocopy  = fname.startswith("\x00robocopy\x00")
+                _is_uptodate  = fname.startswith("\x00uptodate\x00")
+                _is_nas_copy  = fname.startswith("\x00nas_copy\x00") or fname.startswith("\x00smb_copy\x00")
+                if _is_nas_copy:
+                    # CopyFileEx / FSCTL_SRV_COPYCHUNK: the PC copies data
+                    # internally so no byte-level progress is available until
+                    # the file is done.  Show a pulsing indeterminate bar so
+                    # the user can see work is happening instead of "0.00%".
+                    if bytes_done > 0:
+                        pass  # CopyFileEx did report progress — fall through to %
                     else:
-                        self.file_lbl.setText(f"{verb}: {display_name}")
+                        _nas_fname = fname[len("\x00smb_copy\x00"):] if fname.startswith("\x00smb_copy\x00") else fname[len("\x00nas_copy\x00"):]
+                        _short_nas = _nas_fname.split("\\")[-1].split("/")[-1]
+                        if self.progress_bar.maximum() != 0:
+                            self.progress_bar.setRange(0, 0)  # indeterminate / pulsing
+                        self.file_lbl.setText(f"Copying: {_short_nas}" if _short_nas else "Copying…")
+                        self.details_lbl.setText(
+                            f"{_fmt_bytes(total_bytes)} · server-side copy in progress…"
+                        )
+                        self.details_lbl.setVisible(True)
+                        return
+                if _is_uptodate:
+                    if self.progress_bar.maximum() != 0:
+                        self.progress_bar.setRange(0, 0)  # indeterminate
+                    self.file_lbl.setText("Up to date…")
+                    self.details_lbl.setText("Destination already matches source")
+                    self.details_lbl.setVisible(True)
+                    return
+                if _is_robocopy:
+                    # If robocopy percentage lines are already flowing we have
+                    # real bytes_done > 0 — fall through to the normal
+                    # byte-based rendering so the bar moves smoothly.
+                    # Only show the indeterminate "Copying…" placeholder for
+                    # the brief instant before the first percentage arrives.
+                    if bytes_done > 0:
+                        pass  # fall through to byte-based rendering below
+                    else:
+                        if self.progress_bar.maximum() != 0:
+                            self.progress_bar.setRange(0, 0)  # indeterminate
+                        self.file_lbl.setText("Copying…")
+                        self.details_lbl.setText(
+                            f"{_fmt_bytes(total_bytes)} · fast copy (robocopy)"
+                        )
+                        self.details_lbl.setVisible(True)
+                        return
+                if bytes_done == 0 and total_bytes > 0 and not _is_verify:
+                    if self.progress_bar.maximum() != 0:
+                        self.progress_bar.setRange(0, 0)  # indeterminate
+                    if current > 0:
+                        # Robocopy has processed at least one file but byte count
+                        # is still 0 (e.g. file sizes missing from snapshot for a
+                        # first/full backup).  Show "Copying…" so the UI doesn't
+                        # remain stuck on "Preparing…" while data is flowing.
+                        self.file_lbl.setText("Copying\u2026")
+                        self.details_lbl.setText(
+                            f"{current} file(s) copied \u00b7 {_fmt_bytes(total_bytes)} total"
+                        )
+                    else:
+                        self.file_lbl.setText("Preparing\u2026")
+                        self.details_lbl.setText(
+                            f"{_fmt_bytes(total_bytes)} to copy"
+                        )
+                    self.details_lbl.setVisible(True)
+                    return
 
-    def set_done(self, success: bool, duration_s: float = 0.0):
+                # Use 10 000-step scale so sub-1% progress still moves the bar fill
+                if self.progress_bar.maximum() != 10000:
+                    self.progress_bar.setRange(0, 10000)
+
+                if use_bytes:
+                    raw_pct = bytes_done / total_bytes * 100 if bytes_done < total_bytes else 100.0
+                    pct = int(min(raw_pct, 99)) if bytes_done < total_bytes else 100
+                elif total > 0:
+                    raw_pct = min(current / total * 100, 100.0)
+                    pct = int(raw_pct)
+                else:
+                    raw_pct = 0.0
+                    pct = 0
+
+                bar_val = int(min(raw_pct * 100, 9999)) if raw_pct < 100 else 10000
+                self.progress_bar.setValue(bar_val)
+
+                # Show decimal for sub-1% so large files don't appear frozen
+                if raw_pct > 0 and raw_pct < 1.0 and bytes_done > 0:
+                    self.progress_bar.setFormat(f"{raw_pct:.2f}%")
+                elif pct == 0 and bytes_done > 0 and speed_bps > 0:
+                    self.progress_bar.setFormat("< 0.01%")
+                else:
+                    self.progress_bar.setFormat(f"{pct}%")
+
+                if pct == 100:
+                    # All bytes transferred — engine is still finalising (MANIFEST, etc.)
+                    self.file_lbl.setText("Verifying…" if _is_verify else "Finalizing…")
+                elif short_name:
+                    max_name     = 35
+                    display_name = (short_name[:max_name] + "…") if len(short_name) > max_name else short_name
+                    verb         = "Uploading" if _is_uploading else ("Verifying" if _is_verify else "Copying")
+                    self.file_lbl.setText(f"{verb}: {display_name}")
+
+                # ── Details row: bytes left · files left · speed · ETA ────────
+                detail_parts = []
+                if use_bytes and total_bytes > 0:
+                    remaining_bytes = max(0, total_bytes - bytes_done)
+                    # The engine clamps bytes_done to (total_bytes - 1) to prevent
+                    # a premature "Finalizing…" flash mid-copy.  This means
+                    # remaining_bytes can be as small as 1 B even when 10 GB is
+                    # being copied — "1 B left" is confusing and wrong.
+                    # Suppress the "left" label when remaining is ≤ 1 MB AND
+                    # we're already at ≥ 99% — at that point the copy is
+                    # effectively done and the engine is just finalizing.
+                    _nearly_done = (remaining_bytes <= 1_048_576
+                                    and bytes_done / total_bytes >= 0.99)
+                    if remaining_bytes > 0 and not _nearly_done:
+                        detail_parts.append(f"{_fmt_bytes(remaining_bytes)} left")
+                if not use_bytes and total > 0 and current > 0:
+                    detail_parts.append(f"{current}/{total} files")
+                if speed_bps > 0:
+                    detail_parts.append(f"{_fmt_bytes(int(speed_bps))}/s")
+                    if use_bytes and total_bytes > bytes_done and speed_bps > 0:
+                        eta_s = (total_bytes - bytes_done) / speed_bps
+                        # Suppress ETA until we have at least 20 s of speed data
+                        # after any burst-flush cliff AND have copied at least 1%
+                        # burst from producing a wildly optimistic ETA that then
+                        # spikes to hours once the real disk speed kicks in.
+                        _speed_window_duration = (
+                            self._speed_window[-1][0] - self._speed_window[0][0]
+                            if len(self._speed_window) >= 2 else 0.0
+                        )
+                        _pct_done = bytes_done / total_bytes if total_bytes > 0 else 0.0
+                        _eta_ready = _speed_window_duration >= 5.0 and _pct_done >= 0.01
+                        eta_str = _fmt_eta(eta_s) if _eta_ready else ""
+                        if eta_str:
+                            detail_parts.append(f"ETA {eta_str}")
+                if detail_parts:
+                    self.details_lbl.setText("  ·  ".join(detail_parts))
+                    self.details_lbl.setVisible(True)
+                else:
+                    self.details_lbl.setText("")
+                    self.details_lbl.setVisible(pct == 100 and self.progress_bar.isVisible())
+
+    def _show_error_banner(self, msg: str):
+        if not hasattr(self, "_err_banner"):
+            return
+        truncated = (msg[:120] + "…") if len(msg) > 120 else msg
+        self._err_msg_lbl.setText(f"✘ {truncated}")
+        self._err_msg_lbl.setToolTip(msg)
+        self._err_banner.setVisible(True)
+
+    def _hide_error_banner(self):
+        if hasattr(self, "_err_banner"):
+            self._err_banner.setVisible(False)
+
+    def _open_logs_tab(self):
+        """Navigate to the Logs tab in Admin Settings via the parent MainWindow."""
+        mw = self.window()
+        if mw and hasattr(mw, "_shortcut_jump_logs"):
+            mw._shortcut_jump_logs()
+
+    def set_done(self, success: bool, duration_s: float = 0.0, error_msg: str = ""):
         self.set_backing_up(False)
         dur_str = _fmt_duration(duration_s)
         if success:
@@ -7968,9 +15302,11 @@ class WatchCard(QFrame):
             self.status_lbl.setText(done_text)
             self.status_lbl.setObjectName("status_ok")
             self.clear_changes()
+            self._hide_error_banner()
         else:
             self.status_lbl.setText("▶  Failed")
             self.status_lbl.setObjectName("status_err")
+            self._show_error_banner(error_msg)
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
 
@@ -8104,15 +15440,19 @@ class WatchCard(QFrame):
         if hasattr(self, "meta_lbl"):
             self.meta_lbl.setText(f"{lb_text}   ·   {count} backup(s){size_h}")
 
-        # Refresh the status dot
+        # Refresh the status dot and error banner
         if hasattr(self, "_status_dot"):
             _ls = watch.get("last_backup_status", "")
             if _ls == "success":
                 self._status_dot.setText("✔")
                 self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px; font-weight: 700;")
+                self._hide_error_banner()
             elif _ls == "failed":
                 self._status_dot.setText("✘")
                 self._status_dot.setStyleSheet("color: #ef4444; font-size: 13px; font-weight: 700;")
+                _le = watch.get("last_error", "")
+                if _le:
+                    self._show_error_banner(_le)
             else:
                 self._status_dot.setText("—")
                 self._status_dot.setStyleSheet("color: #6b7280; font-size: 13px; font-weight: 700;")
@@ -8156,20 +15496,149 @@ class WatchCard(QFrame):
             pass
 
 
+class _WelcomeDialog(QDialog):
+    """Styled first-launch welcome screen shown when no watches are configured."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.add_to_startup = False
+        self.setWindowTitle(f"Welcome to {APP_NAME}")
+        self.setMinimumWidth(460)
+        self.setMaximumWidth(520)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+        )
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(44, 40, 44, 36)
+        outer.setSpacing(0)
+
+        # ── Logo ─────────────────────────────────────────────────────────────
+        logo = QLabel("💾")
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setStyleSheet("font-size:56px; background:transparent;")
+        outer.addWidget(logo)
+        outer.addSpacing(16)
+
+        # ── Heading ───────────────────────────────────────────────────────────
+        heading = QLabel(f"Welcome to {APP_NAME}!")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        heading.setStyleSheet(
+            "font-size:22px; font-weight:700; color:#e8eaf0; background:transparent;"
+        )
+        outer.addWidget(heading)
+        outer.addSpacing(8)
+
+        subtitle = QLabel("Here's how to get started:")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setStyleSheet("font-size:13px; color:#9ca3af; background:transparent;")
+        outer.addWidget(subtitle)
+        outer.addSpacing(28)
+
+        # ── Steps ─────────────────────────────────────────────────────────────
+        _steps = [
+            ("📁", "Click <b>Add Watch</b> to choose a folder to back up"),
+            ("🎯", "Set your backup <b>destination</b> in Settings"),
+            ("⏰", "Enable <b>Auto-Backup</b> to run on a schedule"),
+        ]
+        steps_widget = QWidget()
+        steps_widget.setStyleSheet("background:transparent;")
+        steps_layout = QVBoxLayout(steps_widget)
+        steps_layout.setContentsMargins(0, 0, 0, 0)
+        steps_layout.setSpacing(14)
+
+        for icon, text in _steps:
+            row = QHBoxLayout()
+            row.setSpacing(14)
+
+            icon_lbl = QLabel(icon)
+            icon_lbl.setFixedSize(36, 36)
+            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon_lbl.setStyleSheet(
+                "font-size:20px; background:#22262f; border-radius:8px; color:#e8eaf0;"
+            )
+            row.addWidget(icon_lbl)
+
+            text_lbl = QLabel(text)
+            text_lbl.setTextFormat(Qt.TextFormat.RichText)
+            text_lbl.setWordWrap(True)
+            text_lbl.setStyleSheet("font-size:13px; color:#e8eaf0; background:transparent;")
+            row.addWidget(text_lbl, stretch=1)
+
+            steps_layout.addLayout(row)
+
+        outer.addWidget(steps_widget)
+        outer.addSpacing(32)
+
+        # ── Get Started button ────────────────────────────────────────────────
+        get_started = QPushButton("Get Started")
+        get_started.setObjectName("success")
+        get_started.setFixedHeight(44)
+        get_started.setStyleSheet(
+            "QPushButton { font-size:14px; font-weight:700; border-radius:8px; }"
+        )
+        get_started.clicked.connect(self.accept)
+        outer.addWidget(get_started)
+        outer.addSpacing(10)
+
+        # ── Add to Startup button ─────────────────────────────────────────────
+        startup_btn = QPushButton("Add to Startup")
+        startup_btn.setObjectName("secondary")
+        startup_btn.setFixedHeight(36)
+        def _on_startup():
+            self.add_to_startup = True
+            self.accept()
+        startup_btn.clicked.connect(_on_startup)
+        outer.addWidget(startup_btn)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Main Window ────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MainWindow(QMainWindow):
+    # Carries (result_dict, watch_id, watch_name) back to the main thread
+    # after a dry-run background thread completes.
+    _dry_run_result = pyqtSignal(dict, str, str)
+
+    # Carries watcher file-change events from the poll/watchdog background
+    # thread to the Qt main thread.  QTimer.singleShot() called from a plain
+    # threading.Thread has no Qt event loop and silently drops the callback —
+    # a queued signal is the only safe way to cross the thread boundary.
+    _file_change_signal = pyqtSignal(str, dict)   # watch_id, entry
+
+    # so _start_all_groups runs safely on the Qt main thread.
+    # QTimer.singleShot() is NOT safe to call from a background thread
+    # (the slot may silently never fire); a queued signal is the correct fix.
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(780, 620)
         self.resize(860, 680)
 
+        # Wire the dry-run signal so the background thread can safely show
+        # the result dialog on the Qt main thread.
+        self._dry_run_result.connect(self._show_dry_run_dialog)
+
+        # Wire the watcher file-change signal.  The watcher runs on a plain
+        # threading.Thread; this queued connection ensures _apply_file_change
+        # always executes on the Qt main thread regardless of which thread
+        # emits the signal.
+        self._file_change_signal.connect(self._apply_file_change)
+
         self._workers: dict          = {}   # watch_id >BackupWorker
         self._cards: dict            = {}   # watch_id >WatchCard
+        self._no_watches_placeholder = None  # placeholder label shown when no watches exist
         self._watcher_mgr            = WatcherManager() if BACKEND_AVAILABLE else None
+        if self._watcher_mgr is not None:
+            try:
+                register_watcher_manager(self._watcher_mgr)
+            except Exception:
+                pass
         self._change_counts: dict    = {}
         self._pending_entries: dict  = {}   # watch_id >[entries]
         self._last_notif_time: dict  = {}   # watch_id >timestamp
@@ -8178,7 +15647,43 @@ class MainWindow(QMainWindow):
         self._history_save_counter   = 0    # throttle disk saves
         self._history_window         = None
         self._user_cancelled_watches: set = set()  # watches cancelled by user — suppress auto-restart
+        self._source_queues: dict    = {}   # source_path -> [watches] for smart grouping
         self._skipped_notified: dict = {}   # watch_id > {'window': bool, 'idle': bool}
+        # Post-backup grace period: suppress dest-watcher noise for 60s after backup
+        # completes (robocopy tail-end writes fire modified events after worker exits)
+        self._post_backup_finish: dict = {}  # watch_id -> monotonic timestamp of completion
+        self._watcher_start_times: dict = {}  # watch_id -> monotonic timestamp when watcher started
+        _WATCHER_START_SUPPRESS_SECS = 60    # suppress non-delete/rename dest events for 60s after start
+        # 60s is needed for UNC/SMB watchers: the SMB2 CHANGE_NOTIFY buffer
+        # overflows on startup fire MODIFIED events for all pre-existing files
+        # repeatedly for ~20-30s after the watcher connects.  The old 10s
+        # window was too short and let the second/third overflow burst through.
+        self._WATCHER_START_SUPPRESS_SECS = _WATCHER_START_SUPPRESS_SECS
+        self._post_backup_filenames: dict = {}  # watch_id -> set of basenames copied by robocopy
+        self._post_backup_dest_fnames: dict = {}  # watch_id -> set of basenames already in dest before backup
+        _POST_BACKUP_SUPPRESS_SECS = 120     # 120s grace: covers mtime drift on slow/network volumes
+        self._POST_BACKUP_SUPPRESS_SECS = _POST_BACKUP_SUPPRESS_SECS
+        # Dedup cache: prevent watchdog + unc_poll double-reporting the same event
+        # Key: (watch_id, norm_path, event_type)  Value: monotonic time last seen
+        import threading as _threading_init
+        self._dest_event_seen: dict   = {}   # (watch_id, path, type) -> monotonic time
+        self._source_event_seen: dict = {}   # same structure for source-watcher events
+        self._dest_event_seen_lock    = _threading_init.Lock()
+        self._source_event_seen_lock  = _threading_init.Lock()
+        # Early-stamp for "added" events: stamped the instant an ADDED enters the
+        # dest block, BEFORE any suppressor/dedup logic runs.  This allows a
+        # near-simultaneous MODIFIED (which Windows always fires alongside a
+        # file-create over SMB) to find the ADDED stamp even when both events
+        # are processed concurrently on different threads.
+        self._dest_added_early: dict  = {}   # (watch_id, norm_path) -> monotonic time
+        self._dest_added_lock         = _threading_init.Lock()
+        # Pre-delete modified suppression:
+        # When Windows fires a MODIFIED immediately before a DELETED for the same
+        # file (SMB artifact), the MODIFIED is not a real edit.  We hold it briefly
+        # and cancel it if a DELETED for the same path arrives within the window.
+        # Key: (watch_id, norm_path)  Value: threading.Event (set when delete arrives)
+        self._pending_mod_before_del: dict = {}
+        self._pending_mod_lock             = _threading_init.Lock()
 
         # Load persisted history from previous sessions
         if BACKEND_AVAILABLE:
@@ -8193,6 +15698,7 @@ class MainWindow(QMainWindow):
 
         self._load_config()
         self._build_ui()
+        self._setup_shortcuts()
         self._start_watchers()
         self._start_auto_timer()
         # ── Integrity scheduler — weekly background validation ─────────────────
@@ -8206,11 +15712,45 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(5000, self._validate_cloud_tokens)
         QTimer.singleShot(10000, self._check_for_updates)
         QTimer.singleShot(4000, self._check_migration_notice)
+        QTimer.singleShot(8000, self._maybe_init_global_sacl)
         self._drive_monitor = DriveTriggerMonitor(self)
         self._drive_monitor.drive_connected.connect(self._on_drive_connected)
         self._drive_monitor.start()
 
+    def _setup_shortcuts(self):
+        """Wire all main-window keyboard shortcuts."""
+        # Ctrl+N: open Add Watch (opens Admin then immediately triggers _add_watch)
+        QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self._shortcut_add_watch)
+        # F5: refresh the watch cards
+        QShortcut(QKeySequence("F5"), self).activated.connect(self._refresh_watches)
+        # Ctrl+,: open Admin Settings
+        QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(self._open_admin)
+        # Ctrl+L: open Admin Settings and jump directly to the Logs tab
+        QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._shortcut_jump_logs)
+        # Ctrl+F: focus the main-window watch filter box
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(
+            lambda: (self.watch_search_input.setFocus(), self.watch_search_input.selectAll())
+        )
+        # Escape: clear the watch filter if it has text, otherwise unfocus
+        def _esc_clear():
+            if self.watch_search_input.text():
+                self.watch_search_input.clear()
+            else:
+                self.watch_search_input.clearFocus()
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(_esc_clear)
 
+    def _shortcut_add_watch(self):
+        """Ctrl+N: open Admin and immediately open the Add Watch dialog."""
+        self._open_admin(_after_show=lambda panel: panel._add_watch())
+
+    def _shortcut_jump_logs(self):
+        """Ctrl+L: open Admin and switch directly to the Logs tab."""
+        def _go(panel):
+            for i in range(panel._tabs.count()):
+                if panel._tabs.tabText(i) == "Logs":
+                    panel._tabs.setCurrentIndex(i)
+                    break
+        self._open_admin(_after_show=_go)
 
     def _maybe_run_setup_wizard(self):
         """
@@ -8239,27 +15779,10 @@ class MainWindow(QMainWindow):
                 pass   # wizard not present or failed — non-fatal
 
             # Welcome dialog: explain what to do next.
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Welcome to BackupSys!")
-            msg.setIcon(QMessageBox.Icon.Information)
-            msg.setText(
-                "<b>Welcome — BackupSys is set up and ready to go.</b><br><br>"
-                "To get started:<br>"
-                "1. Click <b>Add Watch</b> to choose a folder to back up.<br>"
-                "2. Open <b>Settings</b> to set your backup destination.<br>"
-                "3. Enable <b>Auto-Backup</b> to run on a schedule.<br><br>"
-                "You can also run <code>python setup_wizard.py</code> in a terminal "
-                "for a guided CLI walkthrough."
-            )
+            dlg = _WelcomeDialog(self)
+            dlg.exec()
 
-            # Offer startup-on-login (Windows / macOS / Linux).
-            startup_btn = msg.addButton(
-                "Add to Startup", QMessageBox.ButtonRole.ActionRole
-            )
-            msg.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
-            msg.exec()
-
-            if msg.clickedButton() == startup_btn:
+            if dlg.add_to_startup:
                 try:
                     import setup_wizard as _sw
                     ok = _sw.offer_startup_gui()
@@ -8283,6 +15806,262 @@ class MainWindow(QMainWindow):
 
         except Exception:
             pass   # wizard errors must never crash the app
+
+    def _maybe_init_global_sacl(self):
+        """One-time global audit-policy initialisation on first launch (Windows only).
+
+        Enables the 'File System' and 'Handle Manipulation' audit sub-categories
+        via auditpol and increases the Security event log to 500 MB via wevtutil.
+        These are machine-wide prerequisites — they must be done once before any
+        per-watch SACL rules can generate useful events.
+
+        The per-watch SACL (applying FileSystemAuditRule to a specific folder)
+        remains in _add_watch() as-is; this method only covers the global policy.
+
+        On success sets cfg["sacl_initialized"] = True so the check never runs again.
+        On failure increments cfg["sacl_declined_count"] and shows a warning dialog
+        with a Retry button.  Does NOT set sacl_initialized on failure so the next
+        launch will try again.
+        """
+        import sys as _sys
+        if _sys.platform != "win32":
+            return
+        if not BACKEND_AVAILABLE:
+            return
+        if self.cfg.get("sacl_initialized"):
+            return
+
+        import subprocess, tempfile, os, logging as _log, threading as _t
+        _logger = _log.getLogger(__name__)
+
+        _result = [False]           # [ok] — written by worker, read by poll callback
+        _done   = _t.Event()
+
+        def _worker():
+            script = (
+                "auditpol /set /subcategory:'File System' /success:enable /failure:enable; "
+                "auditpol /set /subcategory:'Handle Manipulation' /success:enable /failure:enable; "
+                "wevtutil sl Security /ms:524288000 /rt:false"
+            )
+
+            # Attempt 1: run in the current process (works if already elevated).
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=_WIN_NO_WINDOW,
+                )
+                if r.returncode == 0:
+                    _logger.info("[_maybe_init_global_sacl] Global audit policy configured (inline).")
+                    _result[0] = True
+                    _done.set()
+                    return
+                _logger.info(
+                    f"[_maybe_init_global_sacl] Attempt 1 failed (rc={r.returncode}): "
+                    f"{(r.stderr or r.stdout)[:300]!r}"
+                )
+            except Exception as _e1:
+                _logger.info(f"[_maybe_init_global_sacl] Attempt 1 exception: {_e1!r}")
+
+            # Attempt 2: re-launch elevated via UAC (Start-Process -Verb RunAs).
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+                ) as _tf:
+                    _tf.write(script)
+                    _tf_path = _tf.name
+
+                elevate_cmd = (
+                    f"Start-Process powershell "
+                    f"-ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                    f"-WindowStyle Hidden -File \"{_tf_path}\"' "
+                    f"-Verb RunAs -Wait -WindowStyle Hidden"
+                )
+                r2 = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", elevate_cmd],
+                    capture_output=True, text=True, timeout=60,
+                    creationflags=_WIN_NO_WINDOW,
+                )
+                try:
+                    os.unlink(_tf_path)
+                except Exception:
+                    pass
+
+                if r2.returncode == 0:
+                    _logger.info("[_maybe_init_global_sacl] Global audit policy configured (elevated UAC).")
+                    _result[0] = True
+                    _done.set()
+                    return
+
+                _logger.warning(
+                    f"[_maybe_init_global_sacl] Attempt 2 (elevated) failed "
+                    f"(rc={r2.returncode}): {(r2.stderr or r2.stdout)[:300]!r}"
+                )
+            except Exception as _e2:
+                _logger.warning(f"[_maybe_init_global_sacl] Attempt 2 exception: {_e2!r}")
+
+            _done.set()
+
+        _t.Thread(target=_worker, daemon=True).start()
+
+        def _poll():
+            if not _done.is_set():
+                QTimer.singleShot(500, _poll)
+                return
+            ok = _result[0]
+            if ok:
+                self.cfg["sacl_initialized"] = True
+                try:
+                    config_manager.save(self.cfg)
+                except Exception:
+                    pass
+                return
+
+            # ── Failure / declined path — BLOCK the app until the user allows ──
+            # The user clicked "No" on the UAC prompt (or it timed out).
+            # We show a modal dialog with no way to dismiss it other than
+            # clicking "Allow" (which retries) or "Quit" (which closes the app).
+            # This ensures file auditing is always active before the app is used.
+            try:
+                dlg = QDialog(self)
+                dlg.setWindowTitle("Administrator Permission Required")
+                dlg.setWindowFlags(
+                    dlg.windowFlags()
+                    | Qt.WindowType.WindowStaysOnTopHint
+                )
+                # Prevent closing via the X button or Alt+F4
+                dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+                dlg.setModal(True)
+                dlg.setMinimumWidth(460)
+
+                _layout = QVBoxLayout(dlg)
+                _layout.setSpacing(16)
+                _layout.setContentsMargins(24, 24, 24, 20)
+
+                # Icon + title row
+                _title_row = QHBoxLayout()
+                _icon_lbl = QLabel()
+                _icon_lbl.setPixmap(
+                    dlg.style().standardIcon(
+                        QStyle.StandardPixmap.SP_MessageBoxWarning
+                    ).pixmap(40, 40)
+                )
+                _title_row.addWidget(_icon_lbl)
+                _title_row.addSpacing(10)
+                _title_lbl = QLabel("<b style='font-size:14px'>Permission Required to Continue</b>")
+                _title_lbl.setTextFormat(Qt.TextFormat.RichText)
+                _title_row.addWidget(_title_lbl, 1)
+                _layout.addLayout(_title_row)
+
+                # Body text
+                _body = QLabel(
+                    "BackupSys needs <b>Administrator permission</b> to enable Windows file "
+                    "auditing on shared folders.<br><br>"
+                    "This is a one-time setup. Without it, the app <b>cannot track who "
+                    "adds, modifies, deletes, or renames files</b> in watched folders — "
+                    "Change History will show <i>Unknown</i> for every event.<br><br>"
+                    "Please click <b>Allow</b> below and then click <b>Yes</b> on the "
+                    "Windows <i>User Account Control</i> prompt that appears."
+                )
+                _body.setTextFormat(Qt.TextFormat.RichText)
+                _body.setWordWrap(True)
+                _layout.addWidget(_body)
+
+                # Buttons
+                _btn_row = QHBoxLayout()
+                _btn_row.addStretch()
+                _quit_btn  = QPushButton("Quit")
+                _quit_btn.setFixedWidth(90)
+                _quit_btn.setObjectName("secondary")
+                _allow_btn = QPushButton("Allow  ▶")
+                _allow_btn.setFixedWidth(110)
+                _allow_btn.setDefault(True)
+                _btn_row.addWidget(_quit_btn)
+                _btn_row.addSpacing(8)
+                _btn_row.addWidget(_allow_btn)
+                _layout.addLayout(_btn_row)
+
+                def _on_allow():
+                    dlg.accept()
+                    # Retry immediately — shows the UAC prompt again
+                    self._maybe_init_global_sacl()
+
+                def _on_quit():
+                    dlg.accept()
+                    import logging as _ql
+                    _ql.getLogger(__name__).warning(
+                        "[_maybe_init_global_sacl] User chose Quit after declining UAC — exiting."
+                    )
+                    # Stop watchers gracefully before exit
+                    try:
+                        if self._watcher_mgr:
+                            self._watcher_mgr.stop_all()
+                    except Exception:
+                        pass
+                    QApplication.instance().quit()
+
+                _allow_btn.clicked.connect(_on_allow)
+                _quit_btn.clicked.connect(_on_quit)
+                dlg.exec()
+
+            except Exception:
+                pass
+
+        QTimer.singleShot(500, _poll)
+
+    def _show_toast(self, message: str, success: bool = True, duration_ms: int = 3000):
+        """Show a brief non-blocking toast at the bottom-centre of the main window.
+
+        Auto-dismisses after *duration_ms* milliseconds.  Multiple calls replace
+        the previous toast rather than stacking.
+        """
+        # Remove any existing toast
+        existing = getattr(self, "_toast_label", None)
+        if existing is not None:
+            try:
+                existing.hide()
+                existing.deleteLater()
+            except Exception:
+                pass
+        if hasattr(self, "_toast_timer"):
+            try:
+                self._toast_timer.stop()
+            except Exception:
+                pass
+
+        bg    = "#16a34a" if success else "#dc2626"
+        toast = QLabel(message, self)
+        toast.setObjectName("toast")
+        toast.setStyleSheet(
+            f"QLabel {{ background:{bg}; color:#ffffff; "
+            f"font-size:13px; font-weight:600; padding:10px 22px; "
+            f"border-radius:8px; }}"
+        )
+        toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        toast.adjustSize()
+        toast.raise_()
+
+        def _reposition():
+            try:
+                mw = self.centralWidget() or self
+                cx = mw.width() // 2 - toast.width() // 2
+                cy = mw.height() - toast.height() - 28
+                toast.move(cx, cy)
+            except Exception:
+                pass
+
+        _reposition()
+        toast.show()
+        self._toast_label = toast
+
+        # Reposition if the window is resized before auto-dismiss
+        self._toast_reposition = _reposition
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: (toast.hide(), toast.deleteLater()))
+        timer.start(duration_ms)
+        self._toast_timer = timer
 
     def _check_for_updates(self):
         """Non-blocking background update check against GitHub releases API.
@@ -8487,6 +16266,7 @@ class MainWindow(QMainWindow):
 
         admin_btn = QPushButton("🔧 Admin")
         admin_btn.setObjectName("secondary")
+        admin_btn.setToolTip("Admin Settings (Ctrl+,)")
         admin_btn.clicked.connect(self._open_admin)
         tl.addWidget(admin_btn)
 
@@ -8530,9 +16310,6 @@ class MainWindow(QMainWindow):
         sl.addSpacing(16)
         sl.addWidget(self._sidebar_label("QUICK ACTIONS"))
 
-        backup_all_btn = QPushButton("⚡  Backup All Now")
-        backup_all_btn.clicked.connect(self._backup_all)
-        sl.addWidget(backup_all_btn)
 
         self._pause_all_btn = QPushButton("⏸  Pause All Backups")
         self._pause_all_btn.setObjectName("secondary")
@@ -8567,7 +16344,7 @@ class MainWindow(QMainWindow):
         self.watch_search_input = QLineEdit()
         self.watch_search_input.setPlaceholderText("🔍  Filter watches…")
         self.watch_search_input.setFixedWidth(200)
-        self.watch_search_input.setToolTip("Filter the watch list by name")
+        self.watch_search_input.setToolTip("Filter the watch list by name (Ctrl+F)")
         self.watch_search_input.textChanged.connect(self._filter_watch_cards)
         header_row.addWidget(self.watch_search_input)
         cl.addLayout(header_row)
@@ -8692,7 +16469,7 @@ class MainWindow(QMainWindow):
             self.auto_lbl.setText(
                 f"<span style='color:#22c55e; font-weight:700;'>▶ Auto Backup ON</span>"
                 f"  ·  Every <b>{interval} min</b>"
-                f"  ·  Destination: <code style='color:#9ca3af;'>{self.cfg.get('destination','Unknown')}</code>"
+                f"  ·  Per-watch destinations"
             )
         else:
             self.auto_lbl.setText(
@@ -8706,6 +16483,12 @@ class MainWindow(QMainWindow):
             self.watches_layout.removeWidget(card)
             card.deleteLater()
         self._cards.clear()
+
+        # Remove stale placeholder label if present
+        if hasattr(self, "_no_watches_placeholder") and self._no_watches_placeholder is not None:
+            self.watches_layout.removeWidget(self._no_watches_placeholder)
+            self._no_watches_placeholder.deleteLater()
+            self._no_watches_placeholder = None
 
         watches = self.cfg.get("watches", [])
         # Sync the Pause All button label to reflect persisted watch states
@@ -8726,6 +16509,7 @@ class MainWindow(QMainWindow):
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             placeholder.setStyleSheet("color:#374151; font-size:13px; padding:40px;")
             self.watches_layout.insertWidget(0, placeholder)
+            self._no_watches_placeholder = placeholder
         else:
             for w in watches:
                 dest_type = self.cfg.get("dest_type", "local")
@@ -8744,6 +16528,11 @@ class MainWindow(QMainWindow):
                 card.watch_settings_requested.connect(self._on_watch_settings_requested)
                 self._cards[w["id"]] = card
                 self.watches_layout.insertWidget(self.watches_layout.count() - 1, card)
+                # Restore active backup state so the progress bar stays visible
+                # when a new watch is added (or any other _refresh_watches call)
+                # while a backup for this watch is already in progress.
+                if w["id"] in self._workers:
+                    card.set_backing_up(True)
                 # Seed countdown label immediately so it shows on first load
                 try:
                     card.refresh_next_backup_lbl(self.cfg)
@@ -8770,26 +16559,34 @@ class MainWindow(QMainWindow):
         self._stat_cards["changes"]._value_label.setText(str(total_changes))
 
         if BACKEND_AVAILABLE:
-            dest = self.cfg.get("destination", "")
-            try:
-                all_backups = backup_engine.list_backups(dest)
-                self._stat_cards["backups"]._value_label.setText(str(len(all_backups)))
-            except Exception:
-                pass
+            # Total backup runs: sum backup_count across all watches.
+            # list_backups() only finds versioned (non-sync) backup folders so
+            # it always returns 0 for SYNC-mode watches — use the per-watch
+            # backup_count field that is incremented after every successful run.
+            total_backup_runs = sum(w.get("backup_count", 0) for w in watches)
+            self._stat_cards["backups"]._value_label.setText(str(total_backup_runs))
 
-            # Disk usage across all backups
+            # Backup storage: sum last_backup_size across all watches for
+            # sync-mode watches, and fall back to scanning versioned backup
+            # dirs for non-sync watches.
             try:
-                from pathlib import Path as _P
-                dest_path = _P(dest) if dest else None
-                if dest_path and dest_path.exists():
-                    total_bytes = sum(
-                        backup_engine._safe_size(b.get("backup_dir", ""))
-                        for b in backup_engine.list_backups(dest)
-                        if b.get("backup_dir")
-                    )
-                    self._stat_cards["disk"]._value_label.setText(
-                        backup_engine._human_size(total_bytes)
-                    )
+                total_bytes = 0
+                for w in watches:
+                    if w.get("sync_mode"):
+                        total_bytes += w.get("last_backup_size", 0) or 0
+                    else:
+                        w_dest = w.get("destination", "").strip()
+                        try:
+                            total_bytes += sum(
+                                backup_engine._safe_size(b.get("backup_dir", ""))
+                                for b in backup_engine.list_backups(w_dest)
+                                if b.get("backup_dir")
+                            )
+                        except Exception:
+                            pass
+                self._stat_cards["disk"]._value_label.setText(
+                    backup_engine._human_size(total_bytes) if total_bytes else "0 B"
+                )
             except Exception:
                 self._stat_cards["disk"]._value_label.setText("Error")
 
@@ -8819,11 +16616,11 @@ class MainWindow(QMainWindow):
             wid   = item.get("watch_id")
             watch = next((w for w in self.cfg.get("watches", []) if w["id"] == wid), None)
             if watch:
-                # Skip watches whose source is unreachable (e.g. SMB share not
+                # Skip watches whose source is unreachable (e.g. network share not
                 # yet authenticated after reboot) — log a warning instead of crashing.
                 src_type = watch.get("type", "local")
                 src_path = watch.get("path", "")
-                if src_type in ("local", "smb"):
+                if src_type == "local":
                     try:
                         accessible = Path(src_path).exists()
                     except OSError:
@@ -8832,7 +16629,7 @@ class MainWindow(QMainWindow):
                         self._append_log(
                             f"⚠ Skipping queued backup '{watch.get('name', wid)}' "
                             f"— source path not accessible at startup "
-                            f"(SMB share may need credentials). Will retry on next scheduled run."
+                            f"(network share may be inaccessible). Will retry on next scheduled run."
                         )
                         continue
                 self._append_log(f"⏳ Resuming queued backup: {watch.get('name', wid)}")
@@ -8843,53 +16640,2395 @@ class MainWindow(QMainWindow):
 
     # ── Watchers ───────────────────────────────────────────────────────────────
 
+    def _dest_event_suppressed(self, watch_id: str, event_type: str, path: str) -> bool:
+        """Suppression hook registered with watcher.py.
+
+        Returns True when the event should be completely dropped — not persisted
+        to history.json and not forwarded to on_change.
+
+        Covers these cases:
+
+        For __dest watchers (destination folder):
+          1. Backup actively running  (watch_id in _workers)
+          2. Post-backup grace period (60 s after completion)
+
+        For source watchers (no __dest suffix):
+          3. "modified" events during the post-backup grace period (60 s).
+             After a backup the poll thread resets its snapshot baseline; SMB
+             mtime drift (~2 s precision) can make files look "modified" in the
+             very first diff cycle even though nothing changed.  We suppress
+             only "modified" — never "deleted" or "renamed", because those
+             can't be caused by a backup and always represent real user actions.
+
+        deleted and renamed events are NEVER suppressed for any watcher.
+        """
+        # Never suppress deletions or renames — these can't be caused by a backup
+        if event_type in ("deleted", "renamed"):
+            return False
+
+        import time as _t
+        _now = _t.monotonic()
+
+        if watch_id.endswith("__dest"):
+            real_id = watch_id[:-len("__dest")]
+
+            # Helper: check whether the event's file is one actually being
+            # copied by the backup, OR one already present in the destination.
+            # If the basename is in neither set (e.g. IMG_0020.pdf added by a
+            # remote user while testfile_10gb.dat is being re-copied) the event
+            # is a genuine user action and must NOT be suppressed.
+            import os as _os_sup
+            _event_basename_sup = _os_sup.path.basename(path) if path else ""
+            _backed_fnames_sup  = self._post_backup_filenames.get(real_id, set())
+            _dest_fnames_sup    = self._post_backup_dest_fnames.get(real_id, set())
+            _is_backup_file_sup = (
+                (not _backed_fnames_sup)
+                or (_event_basename_sup in _backed_fnames_sup)
+                or (_event_basename_sup in _dest_fnames_sup)
+            )
+
+            if real_id in self._workers:
+                if not _is_backup_file_sup:
+                    return False   # new file unrelated to the running backup — let it through
+                return True
+            finish = self._post_backup_finish.get(real_id)
+            if finish is not None and (_now - finish) < self._POST_BACKUP_SUPPRESS_SECS:
+                if not _is_backup_file_sup:
+                    return False   # new file unrelated to the last backup — let it through
+                return True
+
+            # ── Startup grace window: suppress modified/added for 10s after dest watcher starts ──
+            # SACL Set-Acl on the destination folder at startup triggers watchdog "modified"
+            # events for all pre-existing files.  Suppress them during the first 10s.
+            if event_type not in ("deleted", "renamed"):
+                _dest_start = self._watcher_start_times.get(watch_id)
+                if _dest_start is not None and (_now - _dest_start) < self._WATCHER_START_SUPPRESS_SECS:
+                    return True
+
+            # ── Cross-watch suppression ──────────────────────────────────────
+            # Two watches can share the same destination folder (e.g. "test" and
+            # "test2" both backing up to \\host\share\test4).  When "test2" runs,
+            # its robocopy writes land inside test4 and trigger "test"'s __dest
+            # watcher with added/modified events.  Suppress if ANY other watch's
+            # backup is active or recently finished and its destination is a
+            # prefix of (or equal to) the path being reported.
+            _path_lower = path.replace("\\", "/").lower() if path else ""
+            for _wid, _worker in list(self._workers.items()):
+                if _wid == real_id:
+                    continue
+                _other_watch = next(
+                    (w for w in self.cfg.get("watches", []) if w.get("id") == _wid), None
+                )
+                if _other_watch:
+                    _odest = self._watch_dest(_other_watch)
+                    if _odest:
+                        _odest_lower = _odest.replace("\\", "/").lower().rstrip("/")
+                        if _path_lower.startswith(_odest_lower + "/") or _path_lower == _odest_lower:
+                            import logging as _sl
+                            _sl.getLogger(__name__).debug(
+                                f"[_dest_event_suppressed] CROSS-WATCH suppressed: "
+                                f"watch_id={watch_id!r} path={path!r} — "
+                                f"another watch '{_wid}' is actively backing up to {_odest!r}"
+                            )
+                            return True
+            for _wid, _finish_ts in list(self._post_backup_finish.items()):
+                if _wid == real_id:
+                    continue
+                if (_now - _finish_ts) >= self._POST_BACKUP_SUPPRESS_SECS:
+                    continue
+                _other_watch = next(
+                    (w for w in self.cfg.get("watches", []) if w.get("id") == _wid), None
+                )
+                if _other_watch:
+                    _odest = self._watch_dest(_other_watch)
+                    if _odest:
+                        _odest_lower = _odest.replace("\\", "/").lower().rstrip("/")
+                        if _path_lower.startswith(_odest_lower + "/") or _path_lower == _odest_lower:
+                            import logging as _sl
+                            _sl.getLogger(__name__).debug(
+                                f"[_dest_event_suppressed] CROSS-WATCH post-grace suppressed: "
+                                f"watch_id={watch_id!r} path={path!r} — "
+                                f"watch '{_wid}' finished backup {_now - _finish_ts:.1f}s ago "
+                                f"to same dest {_odest!r}"
+                            )
+                            return True
+
+            return False
+
+        # ── Source-watcher: suppress "modified" while backup is active or in grace window ──
+        # "added" on a source watch is always a real user action; only "modified"
+        # can be a false positive caused by:
+        #   • robocopy touching the source file during copy (mtime/metadata update)
+        #   • post-backup SMB mtime drift (~2 s precision on FAT/SMB shares)
+        # Suppress during BOTH the active backup AND the 60 s post-backup grace window.
+        if event_type == "modified":
+            if watch_id in self._workers:
+                return True
+            finish = self._post_backup_finish.get(watch_id)
+            if finish is not None and (_now - finish) < self._POST_BACKUP_SUPPRESS_SECS:
+                return True
+
+        # ── Startup grace window: suppress "modified" for source watcher on startup ──
+        # When the app starts (or a watch is saved/re-saved), auto-SACL (Set-Acl)
+        # fires watchdog "modified" events for all pre-existing files on the share.
+        # Suppress "modified" (and other non-delete/rename types EXCEPT "added")
+        # during the first _WATCHER_START_SUPPRESS_SECS seconds.
+        #
+        # IMPORTANT: "added" is intentionally NOT suppressed here.
+        # A coworker may have files open on the share before the watch is saved,
+        # and any file they add within the startup window is a genuine user action
+        # that must appear in Change History.  Only "modified" is a phantom event
+        # caused by SACL Set-Acl touching existing file metadata at startup.
+        if event_type not in ("deleted", "renamed", "added"):
+            start_ts = self._watcher_start_times.get(watch_id)
+            if start_ts is not None and (_now - start_ts) < self._WATCHER_START_SUPPRESS_SECS:
+                return True
+
+        return False
+
     def _start_watchers(self):
         if not BACKEND_AVAILABLE or not self._watcher_mgr:
             return
+        # Register the suppression hook so watcher.py can block dest-watcher
+        # noise (backup writes, unc_poll duplicates) before they hit history.json
+        if BACKEND_AVAILABLE:
+            try:
+                register_history_persist_suppressor(self._dest_event_suppressed)
+            except Exception:
+                pass
+            # FIX: tell watcher to skip its own save_history() calls — desktop_app
+            # saves history AFTER attribution so rows always have user/machine/IP.
+            try:
+                set_defer_history_to_app(True)
+            except Exception:
+                pass
         for w in self.cfg.get("watches", []):
             if w.get("active", True) and not w.get("paused", False):
+                # Watch the source path
+                _nas_cfg = w.get("smb_audit_cfg", {})
+                _src_path = w["path"]
+                _src_excl = list(w.get("exclude_patterns", []))
+
+                # If the destination is a subfolder of the source, auto-exclude it
+                # from the source watcher so backup writes do not appear as source changes.
+                dest = self._watch_dest(w)
+                if dest and dest.strip():
+                    import os as _os_sw
+                    _dest_norm = _os_sw.path.normcase(_os_sw.path.normpath(dest.strip()))
+                    _src_norm  = _os_sw.path.normcase(_os_sw.path.normpath(_src_path))
+                    if _dest_norm.startswith(_src_norm + _os_sw.sep) or _dest_norm == _src_norm:
+                        _dest_rel = _os_sw.path.relpath(_dest_norm, _src_norm)
+                        _dest_top = _dest_rel.split(_os_sw.sep)[0]
+                        if _dest_top and _dest_top not in _src_excl:
+                            _src_excl.append(_dest_top)
+                            logger.info(
+                                f"[desktop] Auto-excluding dest subfolder '{_dest_top}' "
+                                f"from source watcher (watch_id={w['id']!r}) to prevent "
+                                f"backup writes appearing as source changes."
+                            )
+
                 self._watcher_mgr.start(
-                    w["id"], w["path"],
+                    w["id"], _src_path,
                     on_change=self._on_file_change,
-                    exclude_patterns=w.get("exclude_patterns", []),
-                    interval_min=w.get("interval_min", 0) or self.cfg.get("interval_min", 30)
+                    exclude_patterns=_src_excl,
+                    interval_min=w.get("interval_min", 0) or self.cfg.get("interval_min", 30),
+                    smb_audit_cfg=_nas_cfg,
                 )
+                import time as _wst_time
+                self._watcher_start_times[w["id"]] = _wst_time.monotonic()
+                # Also watch the destination path so changes made there
+                # (e.g. a coworker deleting a file from the backup folder)
+                # are recorded in Change History under the same watch name.
+                if dest and dest.strip() and dest.strip() != w["path"].strip():
+                    dest_watch_id = w["id"] + "__dest"
+                    logger.info(
+                        f"[desktop] Starting destination watcher for "
+                        f"watch_id={w['id']!r} dest={dest!r} "
+                        f"dest_watch_id={dest_watch_id!r}"
+                    )
+                    self._watcher_mgr.start(
+                        dest_watch_id, dest.strip(),
+                        on_change=self._on_file_change,
+                        exclude_patterns=w.get("exclude_patterns", []),
+                        interval_min=w.get("interval_min", 0) or self.cfg.get("interval_min", 30),
+                        smb_audit_cfg=_nas_cfg,
+                    )
+                    import time as _wst_time2
+                    self._watcher_start_times[dest_watch_id] = _wst_time2.monotonic()
+                    # Proactively verify SACL propagation on the destination folder.
+                    # Warns in the log if InheritanceFlags=None (does not cover subfolders)
+                    # so the admin knows BEFORE a deletion happens that attribution will fail.
+                    try:
+                        import threading as _sacl_t
+                        _sacl_dest = dest.strip()
+                        _sacl_cfg  = dict(_nas_cfg)
+                        _sacl_host = _sacl_dest.replace("\\\\", "//").lstrip("/").split("/")[0]                                      if _sacl_dest.startswith("\\\\") or _sacl_dest.startswith("//") else ""
+                        if _sacl_host:
+                            _sacl_t.Thread(
+                                target=_verify_sacl_propagation,
+                                args=(_sacl_host, _sacl_dest, _sacl_cfg),
+                                daemon=True,
+                                name=f"sacl-check-{dest_watch_id}",
+                            ).start()
+                    except Exception:
+                        pass
+
+                # ── Auto-apply local SACL on the source folder at startup ──────
+                # Handled by the startup SMB-share batch (_enable_sacl_for_all_smb_shares)
+                # below, which covers ALL local share paths in a single UAC elevation.
+                # Running a separate per-watch _apply_sacl_local() here in parallel
+                # caused a second UAC popup because both threads raced to elevate before
+                # either saved the marker.  Removed — the batch already handles this.
+
+        # ── Auto-enable SACL on ALL locally-hosted SMB shares ─────────────────
+        # Problem this solves:
+        #   PC .106 owns a shared folder but never added it to their own watches.
+        #   PC .104 watches \\106\SharedDocs.
+        #   PC .109 modifies a file inside that folder.
+        #   Without a SACL on .106's machine, the Windows Security Event Log has
+        #   no audit entry → Change History on .104 shows "Unknown" actor.
+        #
+        # Fix: at startup, discover every SMB share this PC hosts and call
+        # _apply_sacl_local() on its local path.  _apply_sacl_local() already
+        # caches results in sacl_state.json so UAC is only prompted once per folder.
+        # The setting "auto_sacl_owned_smb_shares" (default True) lets the user opt out.
+        import sys as _sacl_sys
+        if _sacl_sys.platform == "win32" and self.cfg.get("auto_sacl_owned_smb_shares", True):
+            import threading as _sacl_smb_t
+            import subprocess as _sacl_smb_sub
+
+            def _enable_sacl_for_all_smb_shares():
+                import logging as _sacl_log
+                import json as _sacl_json
+                import tempfile as _sacl_tmp
+                import os as _sacl_os
+                _lg = _sacl_log.getLogger(__name__)
+                try:
+                    # Query all local SMB shares and get their real local paths.
+                    # We filter out special admin shares (C$, ADMIN$, IPC$) and
+                    # shares with no local path (e.g. DFS roots).
+                    ps_cmd = (
+                        "Get-SmbShare | "
+                        "Where-Object { $_.Path -ne '' -and $_.Name -notmatch '\\$$' } | "
+                        "Select-Object -ExpandProperty Path"
+                    )
+                    result = _sacl_smb_sub.run(
+                        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=_WIN_NO_WINDOW,
+                    )
+                    if result.returncode != 0:
+                        _lg.warning(
+                            f"[startup_sacl_smb] Get-SmbShare failed "
+                            f"(rc={result.returncode}): {result.stderr.strip()!r}"
+                        )
+                        return
+
+                    share_paths = [
+                        p.strip() for p in result.stdout.splitlines()
+                        if p.strip()
+                        # Skip UNC-style or empty lines that PowerShell may emit
+                        and not p.strip().startswith("\\")
+                    ]
+
+                    if not share_paths:
+                        _lg.info("[startup_sacl_smb] No local SMB shares found — nothing to do.")
+                        return
+
+                    _lg.info(
+                        f"[startup_sacl_smb] Discovered {len(share_paths)} local SMB "
+                        f"share path(s): {share_paths}"
+                    )
+
+                    # ── Idempotency: skip paths already configured ────────────
+                    _marker_path = config_manager._DATA_DIR / "sacl_state.json"
+                    try:
+                        _marker_data = _sacl_json.loads(
+                            _marker_path.read_text(encoding="utf-8")
+                        ) if _marker_path.exists() else {}
+                    except Exception:
+                        _marker_data = {}
+
+                    needs_sacl = []
+                    for sp in share_paths:
+                        _key = sp.strip().lower()
+                        if _marker_data.get(_key, {}).get("configured"):
+                            _lg.info(
+                                f"[startup_sacl_smb] SKIPPING {sp!r} — "
+                                f"already configured (cached in sacl_state.json)"
+                            )
+                        else:
+                            needs_sacl.append(sp)
+
+                    if not needs_sacl:
+                        _lg.info(
+                            "[startup_sacl_smb] All shares already configured — "
+                            "no UAC prompt needed."
+                        )
+                        return
+
+                    _lg.info(
+                        f"[startup_sacl_smb] {len(needs_sacl)} share(s) need SACL "
+                        f"configuration (single UAC prompt for all): {needs_sacl}"
+                    )
+
+                    # ── Build ONE PowerShell script covering all shares ────────
+                    # This triggers a single UAC elevation instead of one per folder.
+                    def _ps_sacl_block(p: str) -> str:
+                        escaped = p.replace("'", "''")
+                        return (
+                            f"$acl = Get-Acl -Audit '{escaped}'; "
+                            f"$rule = New-Object System.Security.AccessControl.FileSystemAuditRule("
+                            f"'Everyone',"
+                            f"'Delete,DeleteSubdirectoriesAndFiles,WriteData,AppendData,"
+                            f"WriteAttributes,WriteExtendedAttributes',"
+                            f"'ContainerInherit,ObjectInherit','None','Success'); "
+                            f"$acl.AddAuditRule($rule); Set-Acl '{escaped}' $acl;"
+                        )
+
+                    import os as _os_batch
+                    script_lines = []
+                    for sp in needs_sacl:
+                        script_lines.append(_ps_sacl_block(sp))
+                        parent = _os_batch.path.dirname(sp)
+                        if parent and parent.lower() != sp.lower():
+                            script_lines.append(_ps_sacl_block(parent))
+
+                    script_lines.append(
+                        "auditpol /set /subcategory:'File System' /success:enable /failure:enable"
+                    )
+                    script_lines.append(
+                        "wevtutil sl Security /ms:524288000 /rt:false"
+                    )
+                    batch_script = " ".join(script_lines)
+
+                    # ── Attempt 1: run non-elevated ───────────────────────────
+                    _batch_ok = False
+                    try:
+                        r1 = _sacl_smb_sub.run(
+                            ["powershell", "-NoProfile", "-NonInteractive",
+                             "-Command", batch_script],
+                            capture_output=True, text=True, timeout=30,
+                            creationflags=_WIN_NO_WINDOW,
+                        )
+                        if r1.returncode == 0:
+                            _batch_ok = True
+                            _lg.info(
+                                "[startup_sacl_smb] Batch SACL configured "
+                                "(non-elevated) for all shares."
+                            )
+                    except Exception as _b1e:
+                        _lg.info(f"[startup_sacl_smb] Batch attempt 1 exception: {_b1e!r}")
+
+                    # ── Attempt 2: single UAC elevation for ALL shares ────────
+                    if not _batch_ok:
+                        _elevate_timeout = 150
+                        try:
+                            with _sacl_tmp.NamedTemporaryFile(
+                                mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+                            ) as _tf:
+                                _tf.write(batch_script)
+                                _tf_path = _tf.name
+
+                            elevate_cmd = (
+                                f"Start-Process powershell "
+                                f"-ArgumentList '-NoProfile -NonInteractive "
+                                f"-ExecutionPolicy Bypass -WindowStyle Hidden "
+                                f"-File \"{_tf_path}\"' "
+                                f"-Verb RunAs -Wait -WindowStyle Hidden"
+                            )
+                            _lg.info(
+                                f"[startup_sacl_smb] Requesting ONE UAC elevation "
+                                f"for ALL {len(needs_sacl)} share(s) "
+                                f"(timeout={_elevate_timeout}s) — "
+                                f"click Yes on the User Account Control prompt."
+                            )
+                            r2 = _sacl_smb_sub.run(
+                                ["powershell", "-NoProfile", "-NonInteractive",
+                                 "-Command", elevate_cmd],
+                                capture_output=True, text=True,
+                                timeout=_elevate_timeout,
+                                creationflags=_WIN_NO_WINDOW,
+                            )
+                            try:
+                                _sacl_os.unlink(_tf_path)
+                            except Exception:
+                                pass
+
+                            if r2.returncode == 0:
+                                _batch_ok = True
+                                _lg.info(
+                                    "[startup_sacl_smb] Batch SACL configured "
+                                    "(elevated UAC) for all shares."
+                                )
+                            else:
+                                _lg.warning(
+                                    f"[startup_sacl_smb] Batch elevated attempt "
+                                    f"failed (rc={r2.returncode}): "
+                                    f"{(r2.stderr or r2.stdout)[:300]!r}"
+                                )
+                        except _sacl_smb_sub.TimeoutExpired:
+                            _lg.warning(
+                                "[startup_sacl_smb] Batch UAC elevation timed out "
+                                f"after {_elevate_timeout}s — user did not click Yes."
+                            )
+                        except Exception as _b2e:
+                            _lg.warning(
+                                f"[startup_sacl_smb] Batch attempt 2 exception: {_b2e!r}"
+                            )
+
+                    # ── Save marker for all successfully configured paths ──────
+                    if _batch_ok:
+                        import datetime as _sacl_dt
+                        try:
+                            _marker_data2 = _sacl_json.loads(
+                                _marker_path.read_text(encoding="utf-8")
+                            ) if _marker_path.exists() else {}
+                        except Exception:
+                            _marker_data2 = {}
+                        for sp in needs_sacl:
+                            _marker_data2[sp.strip().lower()] = {
+                                "configured": True,
+                                "timestamp": _sacl_dt.datetime.utcnow().isoformat() + "Z",
+                            }
+                        try:
+                            _marker_path.parent.mkdir(parents=True, exist_ok=True)
+                            _marker_path.write_text(
+                                _sacl_json.dumps(_marker_data2, indent=2),
+                                encoding="utf-8",
+                            )
+                            _lg.info(
+                                f"[startup_sacl_smb] Saved SACL markers for "
+                                f"{len(needs_sacl)} share(s) → {_marker_path!s}"
+                            )
+                        except Exception as _mk_err:
+                            _lg.warning(
+                                f"[startup_sacl_smb] Could not save markers: {_mk_err!r}"
+                            )
+                    for sp in needs_sacl:
+                        _lg.info(
+                            f"[startup_sacl_smb] SACL for {sp!r}: "
+                            f"ok={_batch_ok} (batched)"
+                        )
+
+                except Exception as _outer_err:
+                    _sacl_log.getLogger(__name__).warning(
+                        f"[startup_sacl_smb] Unexpected error during auto-SACL "
+                        f"for SMB shares: {_outer_err!r}"
+                    )
+
+            _sacl_smb_t.Thread(
+                target=_enable_sacl_for_all_smb_shares,
+                daemon=True,
+                name="sacl-auto-smb-shares",
+            ).start()
+            logger.info(
+                "[startup_sacl_smb] Launched background thread to auto-enable "
+                "SACL on all locally-hosted SMB shares."
+            )
 
     def _on_file_change(self, watch_id: str, entry: dict):
         """Called from watcher thread when a file changes."""
+        import logging as _logging
+        import time as _ofc_time
+        _dbg = _logging.getLogger(__name__)
+        # ── Silently ignore internal BackupSys metadata writes ───────────────────
+        _ofc_path_early = entry.get("path", "")
+        if ".backupsys_meta" in _ofc_path_early.replace("\\", "/"):
+            return
+        _dbg.info(
+            f"[desktop._on_file_change] watch_id={watch_id!r} "
+            f"type={entry.get('type')!r} "
+            f"path={entry.get('path')!r} "
+            f"detection_source={entry.get('detection_source')!r}"
+        )
+
+        # ── PRE-STAMP: set the early-stamp for ADDED events HERE, before any
+        # attribution work begins.  Windows SMB fires ADDED + MODIFIED almost
+        # simultaneously on separate threads; the MODIFIED thread must be able
+        # to find the ADDED stamp even while the ADDED thread is still blocked
+        # inside _get_editor_info (wevtutil / NetSessionEnum can take 2-3 s).
+        # Doing the stamp in _on_file_change_inner is too late — by the time
+        # attribution completes the MODIFIED has already passed the suppression
+        # check and been recorded as a genuine edit.
+        _ofc_etype = entry.get("type", "")
+        _ofc_path  = entry.get("path", "").lower()
+        _ofc_now   = _ofc_time.monotonic()
+        _ofc_is_dest = watch_id.endswith("__dest")
+        _ofc_real_wid = watch_id[:-len("__dest")] if _ofc_is_dest else watch_id
+
+        if _ofc_etype == "added":
+            # NOTE: key must use the original watch_id (including __dest suffix for
+            # destination watchers) so it matches the key used by:
+            #   • the suppression check  → (watch_id, path)
+            #   • the inner-refresh      → (watch_id, path)
+            # Using _ofc_real_wid here was a bug: it stored ("w_xxx", path) but
+            # suppression looked up ("w_xxx__dest", path) → key never matched →
+            # spurious "modified" events were never suppressed.
+            _ofc_key = (watch_id, _ofc_path)
+            if _ofc_is_dest:
+                # Destination early-stamp (lock already initialised in __init__)
+                with self._dest_added_lock:
+                    self._dest_added_early[_ofc_key] = _ofc_now
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-STAMP dest added: "
+                    f"path={entry.get('path')!r} mono={_ofc_now:.3f} "
+                    f"watch_id={watch_id!r} (key uses full watch_id incl __dest) "
+                    f"— early-stamp set before attribution"
+                )
+            else:
+                # Source early-stamp (lazily initialised for back-compat)
+                import threading as _ofc_threading
+                if not hasattr(self, "_source_added_early"):
+                    self._source_added_early = {}
+                    self._source_added_lock  = _ofc_threading.Lock()
+                with self._source_added_lock:
+                    self._source_added_early[_ofc_key] = _ofc_now
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-STAMP source added: "
+                    f"path={entry.get('path')!r} mono={_ofc_now:.3f} "
+                    f"watch_id={watch_id!r} — early-stamp set before attribution"
+                )
+
+        try:
+            self._on_file_change_inner(watch_id, entry)
+        except Exception as _exc:
+            _dbg.error(
+                f"[desktop._on_file_change] UNHANDLED EXCEPTION — event dropped: "
+                f"watch_id={watch_id!r} type={entry.get('type')!r} "
+                f"path={entry.get('path')!r} error={_exc!r}",
+                exc_info=True,
+            )
+
+    def _on_file_change_inner(self, watch_id: str, entry: dict):
+        import logging as _logging
+        _dbg = _logging.getLogger(__name__)
+        # ── Silently ignore internal BackupSys metadata writes ───────────────────
+        # The backup engine writes a MANIFEST.json into a .backupsys_meta subfolder
+        # inside every destination directory.  These are internal housekeeping files
+        # and must never appear in the user-visible Change History.
+        _event_path_meta = entry.get("path", "")
+        if ".backupsys_meta" in _event_path_meta.replace("\\", "/"):
+            _dbg.debug(
+                f"[desktop._on_file_change_inner] SKIPPED internal metadata event: "
+                f"path={_event_path_meta!r} watch_id={watch_id!r}"
+            )
+            return
+        # ── Suppress noisy Office / temporary file artifacts ──────────────────
+        # Excel and other Office apps create transient files during save:
+        #   • lockfile:    ~$<name> (e.g. ~$test sheet.xlsx)
+        #   • temp write:  ~tmp<digits>.TMP
+        #   • temp sibling: name~XXXX.tmp (e.g. test sheet~6D88E7.tmp)
+        # Windows also auto-generates Thumbs.db (thumbnail cache) in folders
+        # viewed in Explorer — these are OS housekeeping writes, not user actions.
+        # Desktop.ini is similarly a system-managed metadata file.
+        # These produce Added/Renamed/Deleted events that are not user actions
+        # and should not appear in the Change History.  Drop them early.
+        try:
+            import os as _os_tmp
+            import re as _re_tmp
+            _tmp_basename = _os_tmp.path.basename(_event_path_meta)
+            _tmp_lower = _tmp_basename.lower()
+            _tmp_stem_lower = _os_tmp.path.splitext(_tmp_lower)[0]
+            # Windows system-generated files that should never appear in Change History
+            _WINDOWS_SYSTEM_FILES = frozenset({"thumbs.db", "desktop.ini", "folder.ini"})
+            if _tmp_lower in _WINDOWS_SYSTEM_FILES:
+                _dbg.debug(
+                    f"[desktop._on_file_change_inner] SKIPPED Windows system file: "
+                    f"path={_event_path_meta!r} watch_id={watch_id!r}"
+                )
+                return
+            def _check_office_temp(basename):
+                low  = basename.lower()
+                stem = _os_tmp.path.splitext(low)[0]
+                return (
+                    basename.startswith("~$")
+                    or low.startswith("~tmp")
+                    or (low.endswith('.tmp') and '~' in stem)
+                    or bool(_re_tmp.fullmatch(r'[0-9a-f]{5,16}', stem) and low.endswith('.tmp'))
+                    or bool(_re_tmp.fullmatch(r'[0-9a-f]{5,16}', low))
+                )
+            _is_office_temp = _check_office_temp(_tmp_basename)
+            # For 'renamed' events also check the destination name.
+            # Excel atomic-save step 1: renames the original file to a temp
+            # backup (e.g. test sheet.xlsx → test sheet~6D88E7.tmp).  The
+            # source is the real file so the src-only check above misses it;
+            # checking the dest catches this intermediate backup step.
+            if not _is_office_temp and entry.get("type") == "renamed":
+                _dest_meta = entry.get("dest") or ""
+                _dest_bn   = _os_tmp.path.basename(_dest_meta)
+                if _dest_bn and _check_office_temp(_dest_bn):
+                    _is_office_temp = True
+            # For 'renamed' events where src IS temp but dest is NOT temp:
+            # This is Excel's finalize step (e.g. ~B435291F.tmp → test sheet.xlsx).
+            # Instead of suppressing it, convert to 'modified' on the dest file
+            # so the user sees their save reflected in Change History.
+            if _is_office_temp and entry.get("type") == "renamed":
+                _dest_fin    = entry.get("dest") or ""
+                _dest_fin_bn = _os_tmp.path.basename(_dest_fin)
+                if _dest_fin_bn and not _check_office_temp(_dest_fin_bn):
+                    _dbg.info(
+                        f"[desktop._on_file_change_inner] COALESCE temp→real rename "
+                        f"as 'modified': src={_event_path_meta!r} dest={_dest_fin!r} "
+                        f"watch_id={watch_id!r}"
+                    )
+                    entry["type"] = "modified"
+                    entry["path"] = _dest_fin
+                    entry.pop("dest", None)
+                    _is_office_temp = False
+            if _is_office_temp:
+                # When the ~$ owner lock file is DELETED, the Office save
+                # sequence has completed.  If the watchdog rename events were
+                # lost (SMB CHANGE_NOTIFY buffer overflow) AND the poll diff
+                # also missed the change (same size/mtime across two cycles),
+                # the user's save would silently disappear from Change History.
+                # Guard against this by scheduling a forced snapshot-reset
+                # poll wakeup on the source watcher: the next poll cycle will
+                # re-read the file from scratch, and if the mtime or size
+                # changed, the diff will catch it this time.  This is a
+                # belt-and-suspenders safeguard — in the normal path the
+                # watchdog COALESCE temp→real rename path handles it first.
+                import os as _os_lf
+                if (
+                    entry.get("type") == "deleted"
+                    and _tmp_basename.startswith("~$")
+                    and not watch_id.endswith("__dest")
+                ):
+                    _lf_parent_dir = _os_lf.path.dirname(_event_path_meta)
+                    _lf_real_name  = _tmp_basename[2:]   # strip leading ~$
+                    _lf_real_path  = _os_lf.path.join(_lf_parent_dir, _lf_real_name)
+                    _dbg.info(
+                        f"[desktop._on_file_change_inner] ~$ lock-file deleted — "
+                        f"scheduling forced snap-reset poll wakeup for parent file "
+                        f"{_lf_real_path!r} watch_id={watch_id!r} "
+                        f"(guards against missed saves when watchdog renames were lost "
+                        f"due to SMB CHANGE_NOTIFY overflow)"
+                    )
+                    # Trigger a snap-reset on the source watcher after 1 s
+                    # (enough time for the OS to flush the file to the share).
+                    import threading as _lf_threading
+                    def _lf_reset_snap(wid=watch_id, rpath=_lf_real_path):
+                        import time as _lf_time
+                        _lf_time.sleep(1.0)
+                        try:
+                            from watcher import reset_watch_snapshot
+                            reset_watch_snapshot(wid)
+                            _dbg.info(
+                                f"[desktop._on_file_change_inner] ~$ snap-reset triggered "
+                                f"for watch_id={wid!r} (real path={rpath!r})"
+                            )
+                        except Exception as _lf_ex:
+                            _dbg.debug(
+                                f"[desktop._on_file_change_inner] ~$ snap-reset failed: {_lf_ex!r}"
+                            )
+                    _lf_threading.Thread(target=_lf_reset_snap, daemon=True).start()
+                _dbg.info(
+                    f"[desktop._on_file_change_inner] SKIPPED Office-temp artifact: "
+                    f"basename={_tmp_basename!r} path={_event_path_meta!r} "
+                    f"dest={entry.get('dest')!r} watch_id={watch_id!r}"
+                )
+                return
+        except Exception:
+            # Non-fatal — if this check fails, continue normal processing
+            pass
+        # Map __dest watcher events back to the real watch_id so the card
+        # badge, change counts, and history all associate correctly.
+        _is_dest = watch_id.endswith("__dest")
+        if _is_dest:
+            watch_id = watch_id[:-len("__dest")]
+            entry["from_destination"] = True
+        _dbg.info(
+            f"[desktop._on_file_change_inner] ENTER watch_id={watch_id!r} "
+            f"is_dest={_is_dest} type={entry.get('type')!r} "
+            f"path={entry.get('path')!r} "
+            f"detection_source={entry.get('detection_source')!r}"
+        )
+        # Look up SMB credentials for this watch early so all code paths can use them
+        _real_watch_id = watch_id
+        _watch_cfg_early = next(
+            (w for w in self.cfg.get("watches", []) if w.get("id") == _real_watch_id),
+            {}
+        )
+        _smb_audit_cfg = _watch_cfg_early.get("smb_audit_cfg", {})
+
+        # ── Detect local-path-as-SMB-share scenario ──────────────────────────
+        # If the watched source path is a local drive path (e.g. D:\testshare)
+        # but changes arrive from remote SMB clients (coworkers), win32security
+        # will always show the folder *owner* (this machine's account) instead of
+        # the coworker who actually wrote the file.
+        # Fix: detect when the watch path is local (not UNC) and compute this
+        # machine's IP so _get_editor_info can use NetSessionEnum / Event Log
+        # to find the real remote actor.
+        _local_smb_host = ""
+        _watch_src_path = _watch_cfg_early.get("path", "")
+        _is_local_path  = bool(_watch_src_path) and not _watch_src_path.startswith("\\\\")
+        if _is_local_path and not _is_dest:
+            try:
+                import socket as _lsh_sock
+                _lsh_hostname = _lsh_sock.gethostname()
+                _local_smb_host = _lsh_sock.gethostbyname(_lsh_hostname)
+            except Exception:
+                _local_smb_host = ""
+
+            # ── Suppress destination events caused by the backup itself ─────────
+            # Two suppression layers:
+            #
+            # 1. ACTIVE BACKUP: suppress while robocopy is running (worker present).
+            # 2. POST-BACKUP GRACE PERIOD (60 s): suppress after worker exits because
+            #    robocopy tail-end writes and the unc_poll safety-net cycle both fire
+            #    add/modified events on the destination after the backup completes.
+            #
+            # IMPORTANT: deleted and renamed events are NEVER suppressed by either
+            # layer.  A backup copy cannot delete or rename files, so those event
+            # types always represent a real user action (e.g. a coworker removing a
+            # file from the destination folder).
+            import time as _time
+            _now_mono = _time.monotonic()
+            _etype    = entry.get("type", "")
+            _is_destructive = _etype in ("deleted", "renamed")
+
+            # ── Early-stamp ADDED events for spurious-modified suppression ───────
+            # NOTE: The primary early-stamp is now set in _on_file_change (the
+            # outer wrapper) BEFORE attribution begins, so a concurrent MODIFIED
+            # thread can always find it even while this thread is blocked inside
+            # wevtutil / NetSessionEnum.  The update below is kept to:
+            #   a) refresh the timestamp with the post-attribution monotonic value
+            #   b) periodically prune the dict
+            _EARLY_STAMP_WINDOW = 10  # seconds
+            if _etype == "added":
+                _early_path = entry.get("path", "").lower()
+                _early_key  = (watch_id, _early_path)
+                with self._dest_added_lock:
+                    self._dest_added_early[_early_key] = _now_mono
+                    # Prune old entries
+                    if len(self._dest_added_early) > 500:
+                        _cutoff_e = _now_mono - _EARLY_STAMP_WINDOW
+                        self._dest_added_early = {
+                            k: v for k, v in self._dest_added_early.items()
+                            if v > _cutoff_e
+                        }
+                _dbg.info(
+                    f"[desktop._on_file_change] EARLY-STAMP added (inner refresh): "
+                    f"path={entry.get('path')!r} at mono={_now_mono:.3f} "
+                    f"watch_id={watch_id!r} — stamp already set pre-attribution; refreshed here"
+                )
+
+            if not _is_destructive:
+                # ── Helper: quick attribution probe ──────────────────────────────
+                # Before suppressing an added/modified event whose filename matches
+                # the last backup set, do a fast SMB audit.  If the audit resolves
+                # to a machine OTHER than our own backup machine, a coworker (not
+                # robocopy) added the file and the event must NOT be suppressed.
+                def _suppressor_probe_third_party(event_path: str, event_type_p: str) -> bool:
+                    """Return True if SMB audit identifies a third-party (non-own) actor.
+                    Returns False when audit is inconclusive or resolves to own machine."""
+                    import socket as _sp_sock
+                    import logging as _sp_log
+                    _sp = _sp_log.getLogger(__name__)
+                    try:
+                        _own_ip_sp = _sp_sock.gethostbyname(_sp_sock.gethostname())
+                        _own_host_sp = _sp_sock.gethostname().lower()
+                    except Exception:
+                        _own_ip_sp = ""
+                        _own_host_sp = ""
+                    _sp.debug(
+                        f"[desktop._on_file_change] SUPPRESSOR_PROBE: checking third-party "
+                        f"attribution for '{event_path}' type={event_type_p!r} "
+                        f"own_ip={_own_ip_sp!r} own_host={_own_host_sp!r}"
+                    )
+                    try:
+                        _probe_editor = _get_editor_info(
+                            event_path,
+                            entry.get("detection_source", ""),
+                            timestamp_iso=entry.get("timestamp", ""),
+                            event_type=event_type_p,
+                            smb_audit_cfg=_smb_audit_cfg,
+                            smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
+                        )
+                        _probe_ip   = _probe_editor.get("ip", "")
+                        _probe_mach = _probe_editor.get("machine", "").lower()
+                        _probe_user = _probe_editor.get("user", "")
+                        _sp.info(
+                            f"[desktop._on_file_change] SUPPRESSOR_PROBE result: "
+                            f"user={_probe_user!r} machine={_probe_mach!r} ip={_probe_ip!r} "
+                            f"own_ip={_own_ip_sp!r} own_host={_own_host_sp!r} "
+                            f"path={event_path!r}"
+                        )
+                        if not _probe_ip and not _probe_mach:
+                            _sp.debug(
+                                f"[desktop._on_file_change] SUPPRESSOR_PROBE: inconclusive "
+                                f"(no ip/machine returned) — treating as backup-engine event"
+                            )
+                            return False
+                        _is_own = (
+                            (_own_ip_sp and _probe_ip == _own_ip_sp)
+                            or (_own_host_sp and _probe_mach == _own_host_sp)
+                        )
+                        if _is_own:
+                            _sp.debug(
+                                f"[desktop._on_file_change] SUPPRESSOR_PROBE: resolved to OWN "
+                                f"machine — this is a backup-engine write, suppressing"
+                            )
+                            return False
+                        # Resolved to a different machine → real coworker action
+                        _sp.info(
+                            f"[desktop._on_file_change] SUPPRESSOR_PROBE: THIRD-PARTY ACTOR "
+                            f"detected — user={_probe_user!r} machine={_probe_mach!r} "
+                            f"ip={_probe_ip!r} is NOT own machine ({_own_ip_sp!r}). "
+                            f"Event will NOT be suppressed."
+                        )
+                        # Pre-fill attribution into the entry so downstream enrichment
+                        # doesn't double-query SMB (saves a round-trip)
+                        entry["_probe_editor"] = _probe_editor
+                        return True
+                    except Exception as _sp_err:
+                        _sp.warning(
+                            f"[desktop._on_file_change] SUPPRESSOR_PROBE: exception during "
+                            f"attribution probe — {_sp_err!r}. Treating as backup-engine event."
+                        )
+                        return False
+                # ─────────────────────────────────────────────────────────────────
+
+                if watch_id in self._workers:
+                    # Suppress MODIFIED events for files being copied by the running
+                    # backup AND for files already present in the destination.
+                    # Robocopy can touch pre-existing dest files' timestamps while
+                    # copying new files into the same directory, causing Windows to
+                    # fire MODIFIED on those unchanged files.  Without suppressing
+                    # them here they would appear in History as genuine edits.
+                    # A file added by a truly remote user appears in neither set and
+                    # correctly passes through.
+                    import os as _os_ab
+                    _event_basename_ab = _os_ab.path.basename(entry.get("path", ""))
+                    _backed_fnames_ab  = self._post_backup_filenames.get(watch_id, set())
+                    _dest_fnames_ab    = self._post_backup_dest_fnames.get(watch_id, set())
+                    _is_backup_file_ab = (
+                        (not _backed_fnames_ab)
+                        or (_event_basename_ab in _backed_fnames_ab)
+                        or (_event_basename_ab in _dest_fnames_ab)
+                    )
+                    if _is_backup_file_ab:
+                        # Before suppressing, probe SMB to detect a coworker adding
+                        # a file with the same name as the currently-backed-up file.
+                        logger.info(
+                            f"[desktop._on_file_change] SUPPRESSOR: candidate for suppression "
+                            f"during active backup — basename={_event_basename_ab!r} "
+                            f"backed_set={_backed_fnames_ab!r} "
+                            f"watch_id={watch_id!r} type={_etype!r} "
+                            f"path={entry.get('path')!r} — probing SMB attribution ..."
+                        )
+                        if _suppressor_probe_third_party(entry.get("path", ""), _etype):
+                            logger.info(
+                                f"[desktop._on_file_change] SUPPRESSOR: OVERRIDE — third-party "
+                                f"actor confirmed during active backup; NOT suppressing "
+                                f"watch_id={watch_id!r} type={_etype!r} path={entry.get('path')!r}"
+                            )
+                            # Fall through to normal processing below
+                        else:
+                            logger.debug(
+                                f"[desktop._on_file_change] SUPPRESSED dest event during backup "
+                                f"(backup-engine write confirmed or inconclusive): "
+                                f"watch_id={watch_id!r} type={_etype!r} "
+                                f"path={entry.get('path')!r}"
+                            )
+                            return
+                    else:
+                        logger.debug(
+                            f"[desktop._on_file_change] ALLOWED dest event during backup — "
+                            f"filename not in backup set or dest snapshot: "
+                            f"watch_id={watch_id!r} type={_etype!r} "
+                            f"path={entry.get('path')!r} basename={_event_basename_ab!r}"
+                        )
+
+                _finish_mono = self._post_backup_finish.get(watch_id)
+                if _finish_mono is not None:
+                    _elapsed = _now_mono - _finish_mono
+                    if _elapsed < self._POST_BACKUP_SUPPRESS_SECS:
+                        # Suppress MODIFIED events for:
+                        #   (a) files that were actually copied by this backup, AND
+                        #   (b) files that were already present in the destination.
+                        # Robocopy touching pre-existing dest files (e.g. updating
+                        # directory timestamps) causes Windows to fire MODIFIED on those
+                        # files even though this backup didn't copy them.  Without (b),
+                        # pre-existing dest files like "test sheet.xlsx" would leak into
+                        # History as genuine edits every time any backup runs.
+                        # New files added by a truly remote user still pass through
+                        # because they appear in neither _backed_fnames nor _dest_fnames.
+                        import os as _os_gs
+                        _event_basename = _os_gs.path.basename(entry.get("path", ""))
+                        _backed_fnames  = self._post_backup_filenames.get(watch_id, set())
+                        _dest_fnames    = self._post_backup_dest_fnames.get(watch_id, set())
+                        _is_backup_file = (
+                            (not _backed_fnames)                     # no file list → suppress all
+                            or (_event_basename in _backed_fnames)   # file was newly copied this run
+                            or (_event_basename in _dest_fnames)     # file was already in dest (robocopy touched mtime)
+                        )
+                        if _is_backup_file:
+                            # Before suppressing, probe SMB attribution to detect a
+                            # coworker adding a same-named file during the grace window.
+                            logger.info(
+                                f"[desktop._on_file_change] SUPPRESSOR: candidate for suppression "
+                                f"in post-backup grace window ({_elapsed:.1f}s / "
+                                f"{self._POST_BACKUP_SUPPRESS_SECS}s) — "
+                                f"basename={_event_basename!r} backed_set={_backed_fnames!r} "
+                                f"watch_id={watch_id!r} type={_etype!r} "
+                                f"path={entry.get('path')!r} "
+                                f"detection_source={entry.get('detection_source')!r} "
+                                f"— probing SMB attribution ..."
+                            )
+                            if _suppressor_probe_third_party(entry.get("path", ""), _etype):
+                                logger.info(
+                                    f"[desktop._on_file_change] SUPPRESSOR: OVERRIDE — third-party "
+                                    f"actor confirmed in post-backup grace window; NOT suppressing "
+                                    f"watch_id={watch_id!r} type={_etype!r} path={entry.get('path')!r}"
+                                )
+                                # Fall through to normal processing below
+                            else:
+                                logger.debug(
+                                    f"[desktop._on_file_change] SUPPRESSED dest event in post-backup "
+                                    f"grace window ({_elapsed:.1f}s < {self._POST_BACKUP_SUPPRESS_SECS}s): "
+                                    f"watch_id={watch_id!r} type={_etype!r} "
+                                    f"path={entry.get('path')!r} "
+                                    f"detection_source={entry.get('detection_source')!r}"
+                                )
+                                return
+                        else:
+                            logger.debug(
+                                f"[desktop._on_file_change] ALLOWED dest event in post-backup "
+                                f"grace window — filename not in backup set or dest snapshot: "
+                                f"watch_id={watch_id!r} type={_etype!r} "
+                                f"path={entry.get('path')!r} basename={_event_basename!r}"
+                            )
+                    else:
+                        # Grace period expired — clean up so the dict doesn't grow
+                        self._post_backup_finish.pop(watch_id, None)
+                        self._post_backup_filenames.pop(watch_id, None)
+                        self._post_backup_dest_fnames.pop(watch_id, None)
+
+            # ── Spurious-modified suppression ────────────────────────────────────
+            # When a file is created over SMB, Windows always fires both an
+            # ADDED event and a MODIFIED event for the same path within ~1 s.
+            # The MODIFIED is not a real user edit — it is an SMB/NTFS write
+            # notification that piggybacks on the file-create.  Suppress it if:
+            #   • event type is "modified", AND
+            #   • an "added" event for the same path was early-stamped OR recorded
+            #     in _dest_event_seen within the last _SPURIOUS_MOD_WINDOW seconds.
+            # Two sources are checked because:
+            #   - _dest_added_early: stamped the instant ADDED enters this block,
+            #     catches the race where ADDED and MODIFIED arrive simultaneously
+            #     on separate threads (MODIFIED may arrive before ADDED is done).
+            #   - _dest_event_seen: catches the case where MODIFIED arrives a few
+            #     seconds after ADDED has already fully processed.
+            _SPURIOUS_MOD_WINDOW = 10  # seconds — generous to cover slow SMB links
+            if _etype == "modified":
+                import time as _suppress_time
+                _mod_path = entry.get("path", "").lower()
+                # The pre-stamp in _on_file_change is stored with the ORIGINAL watch_id
+                # (including the "__dest" suffix) because that outer wrapper runs before
+                # this inner function strips the suffix.  We must therefore also check
+                # the __dest-suffixed key, otherwise spurious-modified events on the
+                # destination are never suppressed (key mismatch → early_hit=False).
+                _early_stamp_key      = (watch_id, _mod_path)
+                _early_stamp_key_dest = (watch_id + "__dest", _mod_path) if _is_dest else None
+                _seen_added_key = (watch_id, _mod_path, "added")
+
+                # ── Race-condition retry loop ──────────────────────────────────
+                # Windows SMB fires ADDED and MODIFIED simultaneously on separate
+                # watchdog threads.  With per-(path,type) debouncing both fire
+                # independently after DEBOUNCE_DELAY (2s), nearly simultaneously
+                # on separate Timer threads.  The MODIFIED thread can reach this
+                # check before the ADDED thread has written the PRE-STAMP.
+                # We retry for up to _RETRY_MAX seconds to catch this race.
+                #
+                # 500ms is sufficient when both come from watchdog (same Timer
+                # delay → fire within ms of each other).  We use 3s to also
+                # cover edge cases where the ADDED timer fires slightly late
+                # (e.g. system load delay).  The unc_poll ADDED (~15s later)
+                # is NOT waited for here — if MODIFIED arrives from watchdog and
+                # no watchdog ADDED stamp is found within 3s, it's treated as a
+                # genuine edit (the unc_poll ADDED will set its own event later).
+                _RETRY_INTERVAL = 0.10   # 100 ms per poll
+                _RETRY_MAX      = 3.0    # give up after 3s (covers 2s debounce + margin)
+                _retry_elapsed  = 0.0
+                _early_added_at = None
+                _seen_added_at  = None
+                _early_dict_keys = []
+
+                while True:
+                    with self._dest_added_lock:
+                        _early_added_at  = self._dest_added_early.get(_early_stamp_key)
+                        # Also check the __dest-suffixed key: the outer _on_file_change
+                        # stores the pre-stamp with the original watch_id (before this
+                        # inner function strips "__dest"), so for destination events both
+                        # keys must be checked to correctly detect the pre-stamp.
+                        if _early_added_at is None and _early_stamp_key_dest is not None:
+                            _early_added_at = self._dest_added_early.get(_early_stamp_key_dest)
+                        _early_dict_keys = list(self._dest_added_early.keys())
+                    _seen_added_at = self._dest_event_seen.get(_seen_added_key)
+
+                    if _early_added_at is not None or _seen_added_at is not None:
+                        break  # stamp found — no need to wait further
+                    if _retry_elapsed >= _RETRY_MAX:
+                        break  # gave up — stamp never appeared within _RETRY_MAX
+                    _suppress_time.sleep(_RETRY_INTERVAL)
+                    _retry_elapsed += _RETRY_INTERVAL
+
+                _dbg.info(
+                    f"[desktop._on_file_change] MODIFIED-SUPPRESS-CHECK: "
+                    f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                    f"early_stamp_key={_early_stamp_key!r} "
+                    f"early_stamp_key_dest={_early_stamp_key_dest!r} "
+                    f"early_hit={_early_added_at is not None} "
+                    f"seen_added_key={_seen_added_key!r} seen_hit={_seen_added_at is not None} "
+                    f"retry_elapsed={_retry_elapsed:.3f}s "
+                    f"early_dict_size={len(_early_dict_keys)} "
+                    f"early_dict_keys={_early_dict_keys!r}"
+                )
+                # Use the most recent of the two timestamps
+                _added_at = None
+                if _early_added_at is not None and _seen_added_at is not None:
+                    _added_at = max(_early_added_at, _seen_added_at)
+                elif _early_added_at is not None:
+                    _added_at = _early_added_at
+                elif _seen_added_at is not None:
+                    _added_at = _seen_added_at
+                if _added_at is not None and (_now_mono - _added_at) < _SPURIOUS_MOD_WINDOW:
+                    _dbg.info(
+                        f"[desktop._on_file_change] SPURIOUS-MODIFIED suppressed: "
+                        f"'modified' arrived {_now_mono - _added_at:.3f}s after 'added' "
+                        f"for the same path — Windows SMB write-notification artifact, not a real edit. "
+                        f"early_stamp={_early_added_at is not None} "
+                        f"seen_stamp={_seen_added_at is not None} "
+                        f"retry_elapsed={_retry_elapsed:.3f}s "
+                        f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                        f"detection_source={entry.get('detection_source')!r}"
+                    )
+                    return
+                else:
+                    _dbg.info(
+                        f"[desktop._on_file_change] MODIFIED not suppressed: "
+                        f"no recent 'added' stamp found within {_SPURIOUS_MOD_WINDOW}s "
+                        f"(retried {_retry_elapsed:.3f}s) — treating as genuine edit. "
+                        f"early_stamp_age={f'{_now_mono - _early_added_at:.3f}s' if _early_added_at else 'none'} "
+                        f"seen_stamp_age={f'{_now_mono - _seen_added_at:.3f}s' if _seen_added_at else 'none'} "
+                        f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                    )
+
+            # ── Pre-delete modified suppression ───────────────────────────────────
+            # Windows SMB fires a MODIFIED event immediately before a DELETED event
+            # when a remote client deletes a file.  The MODIFIED is not a real user
+            # edit — it is an SMB/NTFS notification artifact.  We suppress it if a
+            # DELETED for the same path arrives within _PRE_DEL_MOD_WINDOW seconds.
+            #
+            # Mechanism:
+            #   1. When a dest MODIFIED arrives (and was not suppressed above),
+            #      register a threading.Event in _pending_mod_before_del and block
+            #      this thread for up to _PRE_DEL_MOD_WINDOW seconds waiting for it.
+            #   2. When a dest DELETED arrives, set the Event for the same key so
+            #      any waiting MODIFIED thread wakes and suppresses itself.
+            #   3. If the window expires without a DELETED, fall through and treat
+            #      the MODIFIED as a genuine edit.
+            #
+            # Only applies to destination-watch modified events (source-side
+            # modified events from other machines are handled separately).
+            _PRE_DEL_MOD_WINDOW = 3.0  # seconds to wait for a following delete
+            if _etype == "modified" and _is_dest:
+                import threading as _pdm_threading
+                import time as _pdm_time
+                _pdm_key = (watch_id, entry.get("path", "").lower())
+                _pdm_event = _pdm_threading.Event()
+                with self._pending_mod_lock:
+                    self._pending_mod_before_del[_pdm_key] = _pdm_event
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-DELETE-MOD-HOLD: holding 'modified' for "
+                    f"up to {_PRE_DEL_MOD_WINDOW}s to detect following delete. "
+                    f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                )
+                _pdm_deleted = _pdm_event.wait(timeout=_PRE_DEL_MOD_WINDOW)
+                with self._pending_mod_lock:
+                    self._pending_mod_before_del.pop(_pdm_key, None)
+                if _pdm_deleted:
+                    _dbg.info(
+                        f"[desktop._on_file_change] PRE-DELETE-MOD suppressed: "
+                        f"'modified' cancelled because 'deleted' arrived within "
+                        f"{_PRE_DEL_MOD_WINDOW}s for same path — Windows SMB pre-delete "
+                        f"notification artifact, not a real edit. "
+                        f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                        f"detection_source={entry.get('detection_source')!r}"
+                    )
+                    return
+                else:
+                    _dbg.info(
+                        f"[desktop._on_file_change] PRE-DELETE-MOD not suppressed: "
+                        f"no 'deleted' arrived within {_PRE_DEL_MOD_WINDOW}s — "
+                        f"treating as genuine edit. "
+                        f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                    )
+
+            # ── Signal a pending MODIFIED to suppress itself when a DELETE arrives ─
+            # If a MODIFIED for this path is currently held in the pre-delete window,
+            # wake it so it can suppress itself.
+            if _etype == "deleted" and _is_dest:
+                _pdm_key = (watch_id, entry.get("path", "").lower())
+                with self._pending_mod_lock:
+                    _pdm_ev = self._pending_mod_before_del.get(_pdm_key)
+                if _pdm_ev is not None:
+                    _dbg.info(
+                        f"[desktop._on_file_change] PRE-DELETE-MOD signal: 'deleted' waking "
+                        f"held 'modified' for suppression. "
+                        f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                    )
+                    _pdm_ev.set()
+
+            # ── Dedup: watchdog + unc_poll can both fire for the same event ──────
+            # If the same (watch_id, path, type) was already recorded within 25 s,
+            # drop the duplicate regardless of which detection source fires second.
+            # 25s covers the max watchdog→unc_poll gap (15s poll + processing).
+            # deleted/renamed are also deduped — two detectors seeing the same
+            # deletion is still just one deletion.
+            _dedup_key = (watch_id, entry.get("path", "").lower(), _etype)
+            _DEDUP_WINDOW = 25  # seconds — covers watchdog+unc_poll overlap (max ~15s gap)
+            # Atomic check-and-claim: prevents two concurrent threads from both
+            # passing "key not found" before either writes the key.
+            if not hasattr(self, '_dest_event_seen_lock'):
+                import threading as _dee_init
+                self._dest_event_seen_lock = _dee_init.Lock()
+            with self._dest_event_seen_lock:
+                _last_seen = self._dest_event_seen.get(_dedup_key)
+                _dest_is_dupe = _last_seen is not None and (_now_mono - _last_seen) < _DEDUP_WINDOW
+                if not _dest_is_dupe:
+                    self._dest_event_seen[_dedup_key] = _now_mono  # claim slot
+            if _dest_is_dupe:
+                # For deleted events: whichever detector fires second gets a chance
+                # to improve attribution on the already-stored entry.
+                #
+                # Two race-condition scenarios:
+                #
+                #  A) watchdog first, unc_poll second (previous fix):
+                #     watchdog fires while file is already gone → win32security fails
+                #     → last-resort SMB host stored as machine, user=''.
+                #     unc_poll arrives later with detection_source='unc_poll' and can
+                #     try NetSessionEnum which may still find the open session.
+                #
+                #  B) unc_poll first, watchdog second (this fix):
+                #     unc_poll wins the race → same last-resort SMB host result.
+                #     watchdog arrives with detection_source='watchdog' ~1s later;
+                #     win32security may still succeed if the file handle is cached.
+                #
+                # Retry condition: editor_user is empty AND (editor_machine is also
+                # empty OR editor_machine equals the SMB host IP, which is only the
+                # last-resort fallback, not a real user attribution).
+                if _etype == "deleted":
+                    _path_lower = entry.get("path", "").lower()
+                    # Extract the SMB host from the UNC path for last-resort detection
+                    def _unc_host_of(p):
+                        # Use single-backslash replace so \\host → //host (two slashes)
+                        # Double-backslash replace produces /host (one slash) which
+                        # fails the startswith("//") check and returns "" — Bug #1 fix.
+                        n = p.replace("\\", "/")
+                        if n.startswith("//"):
+                            parts = n.lstrip("/").split("/")
+                            return parts[0] if parts else ""
+                        return ""
+                    _nas_host = _unc_host_of(entry.get("path", ""))
+                    logger.info(
+                        f"[desktop._on_file_change] DEDUP retry scan: "
+                        f"path_lower={_path_lower!r} nas_host={_nas_host!r} "
+                        f"history_len={len(self._history_log)} "
+                        f"incoming_source={entry.get('detection_source')!r}"
+                    )
+                    _dedup_matched_stored = False
+                    for _stored in reversed(self._history_log):
+                        _smach = _stored.get("editor_machine", "")
+                        _suser = _stored.get("editor_user", "")
+                        _stype = _stored.get("type", "")
+                        _spath = _stored.get("path", "").lower()
+                        _is_nas_fallback = (
+                            _smach == _nas_host or
+                            _smach == _stored.get("editor_ip", "NOMATCH")
+                        )
+                        _path_match  = (_spath == _path_lower)
+                        _type_match  = (_stype == "deleted")
+                        # Treat 'Unknown' the same as empty — it means all
+                        # attribution strategies failed on the first attempt.
+                        # A second detector (e.g. watchdog arriving ~1 s after
+                        # unc_poll, carrying a fresh smb_sessions_snapshot from
+                        # NetSessionEnum) must still be allowed to upgrade the
+                        # stored entry to a real user identity.
+                        _user_empty  = (not _suser) or (_suser == "Unknown")
+                        _mach_ok     = (not _smach or _is_nas_fallback)
+                        logger.info(
+                            f"[desktop._on_file_change] DEDUP retry candidate: "
+                            f"path_match={_path_match} type_match={_type_match} "
+                            f"user_empty={_user_empty} mach_ok={_mach_ok} "
+                            f"stored_user={_suser!r} stored_machine={_smach!r} "
+                            f"stored_ip={_stored.get('editor_ip', '')!r} "
+                            f"nas_host={_nas_host!r} is_nas_fallback={_is_nas_fallback} "
+                            f"attribution_unknown={_stored.get('attribution_unknown', False)}"
+                        )
+                        if not (_path_match and _type_match):
+                            # This entry doesn't correspond to our deletion — keep scanning
+                            continue
+                        # Found a stored deletion for the same path.
+                        # Before treating it as a duplicate, check whether the stored
+                        # entry already has a *real* attributed user from a *different*
+                        # machine.  If so this is a genuinely new deletion by a different
+                        # actor (e.g. the folder owner deleting the file again after the
+                        # backup user already deleted it once) and must NOT be deduped.
+                        _stored_has_real_user = (
+                            bool(_suser)
+                            and _suser != "Unknown"
+                            and not _stored.get("attribution_unknown", False)
+                        )
+                        _stored_from_different_machine = (
+                            _smach
+                            and _smach.lower() != _nas_host.lower()
+                            and not _is_nas_fallback
+                        )
+                        if _stored_has_real_user and _stored_from_different_machine:
+                            # This is a real second deletion by a different actor.
+                            # Do NOT mark as dedup-matched; fall through to append
+                            # a fresh row after the loop.
+                            logger.info(
+                                f"[desktop._on_file_change] DEDUP: stored deletion has real "
+                                f"user {_suser!r} from different machine {_smach!r} — "
+                                f"treating incoming event as a NEW deletion (not a duplicate). "
+                                f"nas_host={_nas_host!r} is_nas_fallback={_is_nas_fallback}"
+                            )
+                            # Clear the dedup key so this new event is registered
+                            self._dest_event_seen.pop(_dedup_key, None)
+                            _last_seen = None
+                            break
+                        # Same actor (or unresolved) — normal dedup upgrade path
+                        _dedup_matched_stored = True
+                        if _user_empty and _mach_ok:
+                            _has_snap = bool(entry.get("smb_sessions_snapshot"))
+                            logger.info(
+                                f"[desktop._on_file_change] DEDUP retry: matched stored entry — "
+                                f"calling _get_editor_info with "
+                                f"detection_source={entry.get('detection_source')!r} "
+                                f"has_smb_sessions_snapshot={_has_snap} "
+                                f"(snapshot carries live NetSessionEnum data taken at watchdog fire time)"
+                            )
+                            _retry_editor = _get_editor_info(
+                                entry.get("path", ""),
+                                entry.get("detection_source", ""),
+                                timestamp_iso=entry.get("timestamp", ""),
+                                event_type="deleted",
+                                smb_audit_cfg=_smb_audit_cfg,
+                                smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
+                                is_dest_watch=_is_dest,
+                            )
+                            logger.info(
+                                f"[desktop._on_file_change] DEDUP retry _get_editor_info result: "
+                                f"user={_retry_editor.get('user')!r} "
+                                f"machine={_retry_editor.get('machine')!r} "
+                                f"ip={_retry_editor.get('ip')!r}"
+                            )
+                            # Only upgrade if we got a REAL user identity —
+                            # "Unknown" and "" both mean attribution failed;
+                            # overwriting with "Unknown" is not an improvement.
+                            # Bug #2 fix: previously `if _retry_editor.get("user")`
+                            # was True for "Unknown" (non-empty string).
+                            _retry_user = _retry_editor.get("user", "")
+                            if _retry_user and _retry_user != "Unknown":
+                                _stored["editor_user"]        = _retry_editor["user"]
+                                _stored["editor_machine"]     = _retry_editor["machine"]
+                                _stored["editor_ip"]          = _retry_editor["ip"]
+                                # Clear the "attribution_unknown" flag that was set
+                                # during the first (failed) attribution attempt so
+                                # the UI stops showing the "Unknown" badge.
+                                _stored["attribution_unknown"] = False
+                                logger.info(
+                                    f"[desktop._on_file_change] DEDUP enrichment retry succeeded "
+                                    f"for deleted event: path={entry.get('path')!r} "
+                                    f"user={_retry_editor['user']!r} "
+                                    f"machine={_retry_editor['machine']!r} "
+                                    f"detection_source={entry.get('detection_source')!r}"
+                                )
+                                # Patch the existing row in-place (don't insert a new one)
+                                if self._history_window and self._history_window.isVisible():
+                                    self._history_window.update_entry(_stored)
+                            else:
+                                # Detect same-host SMB: if the SMB host is the same as the
+                                # destination host, Win32 session enum cannot distinguish
+                                # the backup machine from a coworker. Call this out explicitly.
+                                _path_unc_host = _nas_host  # already extracted above
+                                logger.info(
+                                    f"[desktop._on_file_change] DEDUP retry: enrichment still "
+                                    f"could not resolve user — stored entry unchanged. "
+                                    f"user={_retry_editor.get('user')!r} "
+                                    f"machine={_retry_editor.get('machine')!r} "
+                                    f"ip={_retry_editor.get('ip')!r}. "
+                                    f"To fix: "
+                                    f"(1) add SMB credentials in watch settings (same admin account used to access the share), "
+                                    f"(2) enable object auditing (SACL) on the Windows shared folder — "
+                                    f""
+                                    f""
+                                    f"Windows: Security event log 4663. "
+                                    + (
+                                    f"(3) SAME-HOST DETECTED (dest={_path_unc_host!r}): "
+                                    f"Win32 session enumeration (NetSessionEnum/NetFileEnum) cannot "
+                                    f"identify a coworker when both the backup machine and the coworker "
+                                    f"connect to the same Windows host. Security Event Log (step 2 above) is the "
+                                    f"ONLY reliable fix for this scenario. "
+                                    if _path_unc_host else ""
+                                    )
+                                )
+                        break  # matched — stop scanning
+                    if not _dedup_matched_stored:
+                        # The first detector (watchdog/poll) hasn't appended the entry
+                        # yet — it's still blocked in _get_editor_info (network call,
+                        # typically 0.5–3 s).  The dedup key is set but the history
+                        # entry isn't there yet.
+                        #
+                        # Strategy: wait up to 5 s in 200 ms increments for the first
+                        # detector's entry to appear, then attempt the DEDUP upgrade as
+                        # normal.  This eliminates the race that previously caused both
+                        # detectors to append separate rows.
+                        import time as _dedup_wait_time
+                        _wait_deadline = _dedup_wait_time.monotonic() + 40.0
+                        _dedup_found_late = False
+                        logger.info(
+                            f"[desktop._on_file_change] DEDUP retry: no stored deletion yet for "
+                            f"path={_path_lower!r} — first detector still in-flight; "
+                            f"waiting up to 40s for it to append "
+                            f"(source={entry.get('detection_source')!r})"
+                        )
+                        while _dedup_wait_time.monotonic() < _wait_deadline:
+                            _dedup_wait_time.sleep(0.2)
+                            for _stored_late in reversed(self._history_log):
+                                _sl_path  = _stored_late.get("path", "").lower()
+                                _sl_type  = _stored_late.get("type", "")
+                                _sl_user  = _stored_late.get("editor_user", "")
+                                _sl_mach  = _stored_late.get("editor_machine", "")
+                                _sl_ip    = _stored_late.get("editor_ip", "")
+                                _sl_is_nas = (_sl_mach == _nas_host or _sl_mach == _sl_ip)
+                                _sl_user_empty = (not _sl_user) or (_sl_user == "Unknown")
+                                _sl_mach_ok    = (not _sl_mach or _sl_is_nas)
+                                if _sl_path == _path_lower and _sl_type == "deleted":
+                                    _dedup_found_late = True
+                                    logger.info(
+                                        f"[desktop._on_file_change] DEDUP late-match: "
+                                        f"first-detector entry now present — "
+                                        f"stored_user={_sl_user!r} stored_machine={_sl_mach!r} "
+                                        f"user_empty={_sl_user_empty} mach_ok={_sl_mach_ok} "
+                                        f"(source={entry.get('detection_source')!r})"
+                                    )
+                                    if _sl_user_empty and _sl_mach_ok:
+                                        # Try to upgrade attribution with this detector's data
+                                        _has_snap2 = bool(entry.get("smb_sessions_snapshot"))
+                                        _retry2 = _get_editor_info(
+                                            entry.get("path", ""),
+                                            entry.get("detection_source", ""),
+                                            timestamp_iso=entry.get("timestamp", ""),
+                                            event_type="deleted",
+                                            smb_audit_cfg=_smb_audit_cfg,
+                                            smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
+                                            is_dest_watch=_is_dest,
+                                        )
+                                        logger.info(
+                                            f"[desktop._on_file_change] DEDUP late-retry _get_editor_info: "
+                                            f"user={_retry2.get('user')!r} "
+                                            f"machine={_retry2.get('machine')!r} "
+                                            f"ip={_retry2.get('ip')!r} "
+                                            f"has_snap={_has_snap2}"
+                                        )
+                                        _r2_user = _retry2.get("user", "")
+                                        if _r2_user and _r2_user != "Unknown":
+                                            _stored_late["editor_user"]        = _retry2["user"]
+                                            _stored_late["editor_machine"]     = _retry2["machine"]
+                                            _stored_late["editor_ip"]          = _retry2["ip"]
+                                            _stored_late["attribution_unknown"] = False
+                                            logger.info(
+                                                f"[desktop._on_file_change] DEDUP late-retry UPGRADED: "
+                                                f"user={_retry2['user']!r} machine={_retry2['machine']!r}"
+                                            )
+                                            if self._history_window and self._history_window.isVisible():
+                                                self._history_window.update_entry(_stored_late)
+                                        else:
+                                            logger.info(
+                                                f"[desktop._on_file_change] DEDUP late-retry: "
+                                                f"still unresolved — stored entry unchanged"
+                                            )
+                                    break  # matched — stop scanning
+                            if _dedup_found_late:
+                                break  # stop waiting
+
+                        if _dedup_found_late:
+                            # Successfully deduped — do NOT append a second row
+                            logger.info(
+                                f"[desktop._on_file_change] DEDUP late-match: "
+                                f"suppressing duplicate append for "
+                                f"path={_path_lower!r} source={entry.get('detection_source')!r}"
+                            )
+                            return
+                        else:
+                            # Waited 5 s and still no matching entry — the first
+                            # detector must have genuinely failed to append (exception,
+                            # suppression, etc.).  Fall through so this detector appends.
+                            logger.info(
+                                f"[desktop._on_file_change] DEDUP late-match: "
+                                f"timed out after 40s — first-detector entry never appeared; "
+                                f"falling through to append "
+                                f"(source={entry.get('detection_source')!r})"
+                            )
+                            self._dest_event_seen.pop(_dedup_key, None)
+                            _last_seen = None
+
+                # ── If enrichment still returned no user, mark honestly ──────
+                # Never borrow attribution from another machine/event — that
+                # would show the wrong person (e.g. the backup machine .106)
+                # as the actor when it was really a coworker (.101).
+                # Instead label the entry clearly as unattributable.
+                _path_lower_ls = entry.get("path", "").lower()
+                for _stored2 in reversed(self._history_log):
+                    if (_stored2.get("path", "").lower() == _path_lower_ls
+                            and _stored2.get("type") == "deleted"
+                            and not _stored2.get("editor_user")
+                            and not _stored2.get("attribution_unknown")):
+                        _nas_ip = (_stored2.get("editor_ip", "")
+                                   or _stored2.get("editor_machine", ""))
+                        _stored2["editor_user"]         = "Unknown"
+                        # Don't show the share-server's own hostname as the
+                        # machine — it's misleading (e.g. DESKTOP-KGG55PU is
+                        # the host of the share, not the actor's PC).
+                        # Leave machine blank so the UI shows nothing in that
+                        # column rather than pointing at the wrong machine.
+                        _stored2["editor_machine"]      = ""
+                        _stored2["editor_ip"]           = ""
+                        _stored2["attribution_unknown"] = True
+                        logger.info(
+                            f"[desktop._on_file_change] Attribution unresolvable — "
+                            f"marked as Unknown (SMB host {_nas_ip!r}) for "
+                            f"path={entry.get('path')!r}. "
+                            f"Tip: enter SMB credentials in watch settings (same account used to access the share) "
+                            f"and enable object auditing (SACL) on the shared folder."
+                        )
+                        if self._history_window and self._history_window.isVisible():
+                            self._history_window.update_entry(_stored2)
+                        break
+                if _last_seen is None:
+                    # Fall-through path: first detector crashed before appending,
+                    # _last_seen was cleared so this event should be appended normally.
+                    pass
+                else:
+                    logger.debug(
+                        f"[desktop._on_file_change] DEDUP dropped dest event "
+                        f"(already seen {_now_mono - _last_seen:.1f}s ago): "
+                        f"watch_id={watch_id!r} type={_etype!r} "
+                        f"path={entry.get('path')!r} "
+                        f"detection_source={entry.get('detection_source')!r}"
+                    )
+                    return
+            self._dest_event_seen[_dedup_key] = _now_mono
+            # Prune old dedup entries to avoid unbounded growth
+            if len(self._dest_event_seen) > 500:
+                _cutoff = _now_mono - _DEDUP_WINDOW
+                self._dest_event_seen = {
+                    k: v for k, v in self._dest_event_seen.items() if v > _cutoff
+                }
+        # ── Source-watcher: spurious-modified suppression ────────────────────
+        # Same Windows SMB artifact as on the destination: a remote file-create
+        # fires both ADDED and MODIFIED nearly simultaneously on separate threads.
+        # Primary stamp is set in _on_file_change (outer wrapper) BEFORE attribution
+        # starts.  The inner block below refreshes the timestamp and prunes the dict.
+        if not _is_dest:
+            import time as _src_time
+            import threading as _src_threading
+            _src_now   = _src_time.monotonic()
+            _src_etype = entry.get("type", "")
+            _src_path  = entry.get("path", "").lower()
+
+            # ── Source-watch dedup: prevent watchdog + unc_poll double-row ──
+            # The destination watch has _dest_event_seen for this; source needs
+            # the same guard.  Both detectors fire for the same file event and
+            # both reach this point independently.  Without dedup, two rows appear
+            # in Change History for a single user action.
+            #
+            # For "added" events: if the first detector already recorded a row,
+            # the second detector should attempt an attribution upgrade (in case
+            # the first landed as Unknown) and then return — never append a new row.
+            # For other event types: simply drop the duplicate.
+            _SRC_DEDUP_WINDOW = 25  # seconds — covers watchdog+unc_poll overlap (max ~15s gap)
+            # Strip __unc_poll/__unc_notify suffix: watchdog uses 'w_xxx', unc_poll
+            # uses 'w_xxx__unc_poll' — same logical watch must share the same dedup slot.
+            _src_wid_norm   = watch_id.partition("__")[0]
+            _src_dedup_key  = (_src_wid_norm, _src_path, _src_etype)
+            # ── Atomic check-and-claim under lock ────────────────────────────
+            # Without this lock, watchdog and unc_poll threads can BOTH read
+            # "key not found" before either writes the key, causing both to
+            # proceed past the dedup check and append duplicate history rows.
+            # The lock is held only for the tiny check+set; attribution and
+            # history-append run outside it.
+            if not hasattr(self, '_source_event_seen_lock'):
+                import threading as _see_init
+                self._source_event_seen_lock = _see_init.Lock()
+            with self._source_event_seen_lock:
+                _src_last_seen = self._source_event_seen.get(_src_dedup_key)
+                _src_is_dupe = (
+                    _src_last_seen is not None
+                    and (_src_now - _src_last_seen) < _SRC_DEDUP_WINDOW
+                )
+                if not _src_is_dupe:
+                    # Claim the slot NOW so a racing thread sees it immediately
+                    self._source_event_seen[_src_dedup_key] = _src_now
+                    if _src_etype == "added":
+                        _stale_del_key = (_src_wid_norm, _src_path, "deleted")
+                        if _stale_del_key in self._source_event_seen:
+                            self._source_event_seen.pop(_stale_del_key)
+                            _src_stale_del_cleared = True
+                        else:
+                            _src_stale_del_cleared = False
+                    else:
+                        _src_stale_del_cleared = False
+                    if len(self._source_event_seen) > 500:
+                        _src_cutoff_dd = _src_now - _SRC_DEDUP_WINDOW
+                        self._source_event_seen = {
+                            k: v for k, v in self._source_event_seen.items()
+                            if v > _src_cutoff_dd
+                        }
+
+            if _src_is_dupe:
+                if _src_etype == "added":
+                    # Second detector arrived — try to upgrade Unknown attribution
+                    # on the already-stored row (same logic as dest-watch dedup).
+                    import time as _sdd_time
+                    _sdd_deadline = _sdd_time.monotonic() + 5.0
+                    _sdd_upgraded = False
+                    while _sdd_time.monotonic() < _sdd_deadline:
+                        for _sdd_stored in reversed(self._history_log):
+                            if (_sdd_stored.get("path", "").lower() == _src_path
+                                    and _sdd_stored.get("type") == "added"):
+                                _sdd_user = _sdd_stored.get("editor_user", "")
+                                if _sdd_user and _sdd_user != "Unknown":
+                                    # Already well-attributed — nothing to do
+                                    logger.info(
+                                        f"[desktop._on_file_change] SOURCE DEDUP: "
+                                        f"second detector suppressed (already attributed to "
+                                        f"{_sdd_user!r}). "
+                                        f"path={entry.get('path')!r} "
+                                        f"detection_source={entry.get('detection_source')!r}"
+                                    )
+                                    _sdd_upgraded = True
+                                else:
+                                    pass
+                                break
+                        if _sdd_upgraded:
+                            return
+                        _sdd_time.sleep(0.2)
+                    _src_is_dedup_upgrade = True
+                else:
+                    logger.info(
+                        f"[desktop._on_file_change] SOURCE DEDUP dropped "
+                        f"(seen {_src_now - _src_last_seen:.1f}s ago): "
+                        f"watch_id={watch_id!r} type={_src_etype!r} "
+                        f"path={entry.get('path')!r} "
+                        f"detection_source={entry.get('detection_source')!r}"
+                    )
+                    return
+            else:
+                _src_is_dedup_upgrade = False
+                if _src_stale_del_cleared:
+                    import logging as _gen_log
+                    _gen_log.getLogger(__name__).info(
+                        f"[desktop._on_file_change] SOURCE DEDUP: cleared stale "
+                        f"'deleted' dedup key on re-add so future deletions are "
+                        f"not suppressed. "
+                        f"path={entry.get('path')!r} watch_id={watch_id!r}"
+                    )
+            _SRC_SPURIOUS_WINDOW = 300  # seconds — Windows SMB can re-fire a modified notification
+            # well after the initial added+modified burst when the write flushes
+            # through the SMB client cache.  120 s was too short: logs showed
+            # spurious "modified" events arriving ~150 s after the "added" event
+            # for files that were only ever added by a coworker (never edited).
+            # 300 s (5 min) comfortably covers the longest observed re-fire delay
+            # while still allowing genuine edits made minutes after the add to
+            # show up correctly (unc_poll snapshot-diff is never suppressed and
+            # will catch real size changes regardless of this window).
+            # Lazily create source early-stamp structures if not present
+            if not hasattr(self, "_source_added_early"):
+                self._source_added_early = {}
+                self._source_added_lock  = _src_threading.Lock()
+            if _src_etype == "added":
+                # Refresh stamp (primary stamp was set pre-attribution in outer wrapper)
+                _src_early_key = (watch_id, _src_path)
+                with self._source_added_lock:
+                    self._source_added_early[_src_early_key] = _src_now
+                    if len(self._source_added_early) > 500:
+                        _src_cutoff_e = _src_now - _SRC_SPURIOUS_WINDOW
+                        self._source_added_early = {
+                            k: v for k, v in self._source_added_early.items()
+                            if v > _src_cutoff_e
+                        }
+                _dbg.info(
+                    f"[desktop._on_file_change] SOURCE EARLY-STAMP added (inner refresh): "
+                    f"path={entry.get('path')!r} at mono={_src_now:.3f} "
+                    f"watch_id={watch_id!r} — stamp already set pre-attribution; refreshed here"
+                )
+                # Also record in _source_event_seen for the post-processing path
+                _src_add_key = (watch_id, _src_path, "added")
+                self._source_event_seen[_src_add_key] = _src_now
+                if len(self._source_event_seen) > 500:
+                    _src_cutoff = _src_now - _SRC_SPURIOUS_WINDOW
+                    self._source_event_seen = {
+                        k: v for k, v in self._source_event_seen.items()
+                        if v > _src_cutoff
+                    }
+            elif _src_etype == "modified":
+                _src_early_key = (watch_id, _src_path)
+                _src_seen_key  = (watch_id, _src_path, "added")
+
+                # Retry loop — same race as destination: MODIFIED thread can arrive
+                # before the ADDED thread has written the PRE-STAMP (500 ms max).
+                _src_retry_elapsed = 0.0
+                _src_retry_max     = 0.50
+                _src_retry_step    = 0.05
+                _src_early_at = None
+                _src_seen_at  = None
+                while True:
+                    with self._source_added_lock if hasattr(self, "_source_added_lock") else _src_threading.Lock():
+                        _src_early_at = self._source_added_early.get(_src_early_key) if hasattr(self, "_source_added_early") else None
+                    _src_seen_at = self._source_event_seen.get(_src_seen_key)
+                    if _src_early_at is not None or _src_seen_at is not None:
+                        break
+                    if _src_retry_elapsed >= _src_retry_max:
+                        break
+                    _src_time.sleep(_src_retry_step)
+                    _src_retry_elapsed += _src_retry_step
+
+                _src_added_at = None
+                if _src_early_at is not None and _src_seen_at is not None:
+                    _src_added_at = max(_src_early_at, _src_seen_at)
+                elif _src_early_at is not None:
+                    _src_added_at = _src_early_at
+                elif _src_seen_at is not None:
+                    _src_added_at = _src_seen_at
+                # Spurious-modified suppression applies to both watchdog AND
+                # unc_notify.  unc_notify uses ReadDirectoryChangesW (same as
+                # watchdog) and fires raw OS events — it is NOT a snapshot diff.
+                # On every SMB2 CHANGE_NOTIFY buffer overflow + handle reopen,
+                # Windows re-delivers a "modified" event for EVERY file currently
+                # open on the share, even though nothing changed.
+                # unc_poll (snapshot diff) is the only detector that is truly
+                # "never spurious" — it only reports genuine size changes.
+                # Both watchdog and unc_notify "modified" events must go through
+                # spurious-suppression.
+                _src_det_src = entry.get("detection_source", "")
+                # unc_poll uses snapshot diff → only real size changes → never suppress
+                _src_is_poll = _src_det_src in ("unc_poll", "poll_reset_recovery")
+                if _src_added_at is not None and (_src_now - _src_added_at) < _SRC_SPURIOUS_WINDOW and not _src_is_poll:
+                    _dbg.info(
+                        f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED suppressed: "
+                        f"'modified' arrived {_src_now - _src_added_at:.3f}s after 'added' "
+                        f"for same path — Windows SMB write-notification artifact, not a real edit. "
+                        f"early_stamp={_src_early_at is not None} seen_stamp={_src_seen_at is not None} "
+                        f"retry_elapsed={_src_retry_elapsed:.3f}s "
+                        f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                        f"detection_source={_src_det_src!r}"
+                    )
+                    # Release the dedup slot so that a later unc_poll-sourced
+                    # "modified" for this file is not dropped as a duplicate.
+                    # Without this, watchdog claims the slot at T1, gets spuriously
+                    # blocked, but the slot stays set — unc_poll's detection 15s later
+                    # sees T1 as recent (< 25s) and is silently dropped as a dupe.
+                    with self._source_event_seen_lock:
+                        if self._source_event_seen.get(_src_dedup_key) == _src_now:
+                            self._source_event_seen.pop(_src_dedup_key, None)
+                            _dbg.info(
+                                f"[desktop._on_file_change] SOURCE SPURIOUS dedup-slot RELEASED: "
+                                f"key={_src_dedup_key!r} — unc_poll detection can still reach history"
+                            )
+                    return
+
+                # ── unc_notify overflow-reopen storm suppression ─────────────
+                # When the SMB2 CHANGE_NOTIFY buffer overflows (during robocopy or
+                # heavy IO), unc_notify closes and reopens the handle.  On each
+                # reopen Windows re-fires "modified" for every file currently open
+                # on the share — even files that nobody touched.  These repeating
+                # modified events are pure noise for EXISTING files (no "added"
+                # stamp).  Suppress them when:
+                #   • detection_source is "unc_notify"
+                #   • no "added" stamp exists (existing file, not a new one)
+                #   • a "modified" for the same file was already accepted within
+                #     the last _SRC_NOTIFY_REOPEN_WINDOW seconds
+                # This covers the 30s exponential-backoff reopen cycle seen in logs.
+                if _src_det_src == "unc_notify" and _src_added_at is None:
+                    import threading as _srn_th
+                    _SRC_NOTIFY_REOPEN_WINDOW = 60  # seconds — covers 30s reopen backoff
+                    if not hasattr(self, "_source_notify_mod_seen"):
+                        self._source_notify_mod_seen = {}
+                        self._source_notify_mod_lock = _srn_th.Lock()
+                    _srn_key = (_src_wid_norm, _src_path)
+                    with self._source_notify_mod_lock:
+                        _srn_last = self._source_notify_mod_seen.get(_srn_key)
+                        _srn_is_repeat = (
+                            _srn_last is not None
+                            and (_src_now - _srn_last) < _SRC_NOTIFY_REOPEN_WINDOW
+                        )
+                        if not _srn_is_repeat:
+                            self._source_notify_mod_seen[_srn_key] = _src_now
+                            if len(self._source_notify_mod_seen) > 1000:
+                                _srn_cutoff = _src_now - _SRC_NOTIFY_REOPEN_WINDOW
+                                self._source_notify_mod_seen = {
+                                    k: v for k, v in self._source_notify_mod_seen.items()
+                                    if v > _srn_cutoff
+                                }
+                    if _srn_is_repeat:
+                        _dbg.info(
+                            f"[desktop._on_file_change] SOURCE UNC_NOTIFY REOPEN-STORM suppressed: "
+                            f"'modified' via unc_notify for existing file seen "
+                            f"{_src_now - _srn_last:.1f}s ago (< {_SRC_NOTIFY_REOPEN_WINDOW}s) — "
+                            f"likely SMB2 CHANGE_NOTIFY buffer-overflow reopen re-delivery, not a real edit. "
+                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                        )
+                        with self._source_event_seen_lock:
+                            if self._source_event_seen.get(_src_dedup_key) == _src_now:
+                                self._source_event_seen.pop(_src_dedup_key, None)
+                        return
+
+                _dbg.info(
+                    f"[desktop._on_file_change] SOURCE MODIFIED not suppressed: "
+                    f"{'poll-sourced (never spurious)' if _src_is_poll else f'no recent added stamp within {_SRC_SPURIOUS_WINDOW}s'} "
+                    f"(retried {_src_retry_elapsed:.3f}s) — treating as genuine edit. "
+                    f"early_stamp_age={f'{_src_now - _src_early_at:.3f}s' if _src_early_at else 'none'} "
+                    f"seen_stamp_age={f'{_src_now - _src_seen_at:.3f}s' if _src_seen_at else 'none'} "
+                    f"detection_source={_src_det_src!r} "
+                    f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                )
+
         self._change_counts[watch_id] = self._change_counts.get(watch_id, 0) + 1
 
-        # Attach who/where info
-        editor = _get_editor_info(entry.get("path", ""))
+        # Attach who/where info.
+        # If the suppressor probe already resolved attribution (and confirmed
+        # a third-party actor so we fell through), reuse it to avoid a second
+        # round-trip to the SMB Security Event Log.
+        _pre_probed = entry.pop("_probe_editor", None)
+        if _pre_probed:
+            import logging as _ruse_log
+            _ruse_log.getLogger(__name__).info(
+                f"[desktop._on_file_change] Reusing suppressor-probe attribution "
+                f"(skipping duplicate SMB query): "
+                f"user={_pre_probed.get('user')!r} "
+                f"machine={_pre_probed.get('machine')!r} "
+                f"ip={_pre_probed.get('ip')!r}"
+            )
+            editor = _pre_probed
+        else:
+            # FIX: unc_poll "added" events have no smb_sessions_snapshot because
+            # unc_poll uses snapshot-diff and never calls NetSessionEnum.  But
+            # watchdog fires for the same file at nearly the same time and DOES
+            # capture a live NetSessionEnum snapshot.  If unc_poll fires first
+            # (which it often does — it runs on the 15s cycle and can beat the
+            # 2s debounce on watchdog), the watchdog entry is sitting in
+            # _pending with a valid snapshot.  We steal it here so attribution
+            # uses the real coworker IP/username instead of falling back to the
+            # local machine owner.
+            _snap_for_gei = entry.get("smb_sessions_snapshot")
+            if not _snap_for_gei and entry.get("detection_source") == "unc_poll":
+                import logging as _snap_log
+                try:
+                    from watcher import _pending as _watcher_pending, _lock as _watcher_lock
+                    _epath_lower = (entry.get("path") or "").lower()
+                    with _watcher_lock:
+                        _peer_entries = list(_watcher_pending.get(watch_id, []))
+                    for _pe in reversed(_peer_entries):
+                        if (_pe.get("path") or "").lower() == _epath_lower and                                 _pe.get("smb_sessions_snapshot"):
+                            _snap_for_gei = _pe["smb_sessions_snapshot"]
+                            _snap_log.getLogger(__name__).info(
+                                f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
+                                f"unc_poll 'added' for {entry.get('path')!r} has no SMB snapshot; "
+                                f"found watchdog snapshot in _pending: {_snap_for_gei!r} — "
+                                f"using it for attribution so coworker is identified correctly "
+                                f"instead of falling back to the local machine owner."
+                            )
+                            break
+                    else:
+                        _snap_log.getLogger(__name__).info(
+                            f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
+                            f"no watchdog snapshot found in _pending for {entry.get('path')!r} — "
+                            f"will rely on session cache / audit log for attribution."
+                        )
+                except Exception as _snap_err:
+                    pass
+            editor = _get_editor_info(
+                entry.get("path", ""),
+                entry.get("detection_source", ""),
+                timestamp_iso=entry.get("timestamp", ""),
+                event_type=entry.get("type", ""),
+                smb_audit_cfg=_smb_audit_cfg,
+                smb_sessions_snapshot=_snap_for_gei,
+                is_dest_watch=_is_dest,
+                local_smb_host=_local_smb_host,
+            )
         entry["editor_user"]    = editor["user"]
         entry["editor_machine"] = editor["machine"]
         entry["editor_ip"]      = editor["ip"]
 
+        # FIX: If editor_machine looks like a bare IP address, try a reverse-DNS
+        # lookup to get the actual hostname.  NetSessionEnum returns client_name
+        # as an IP (e.g. \192.168.254.105) when the remote PC connected using
+        # its IP rather than its NetBIOS/DNS name — common in small networks
+        # without proper DNS.  gethostbyaddr() asks the OS's resolver (mDNS,
+        # WINS, hosts file, DNS) for the canonical name, which is what should
+        # appear in the MACHINE column.
+        import re as _re_mach, socket as _sock_mach, logging as _log_mach
+        _mach_val = entry.get("editor_machine", "")
+        _ip_pat = r"^(?:\d{1,3}\.){3}\d{1,3}$"
+        if _mach_val and _re_mach.match(_ip_pat, _mach_val.strip()):
+            try:
+                _resolved_host = _sock_mach.gethostbyaddr(_mach_val.strip())[0]
+                if _resolved_host and _resolved_host != _mach_val.strip():
+                    _log_mach.getLogger(__name__).info(
+                        f"[desktop._on_file_change] MACHINE RESOLVE: "
+                        f"editor_machine was IP {_mach_val!r} — "
+                        f"resolved to hostname {_resolved_host!r} via gethostbyaddr"
+                    )
+                    entry["editor_machine"] = _resolved_host.upper()
+            except Exception as _mach_err:
+                _log_mach.getLogger(__name__).info(
+                    f"[desktop._on_file_change] MACHINE RESOLVE: "
+                    f"gethostbyaddr({_mach_val!r}) failed: {_mach_err!r} — "
+                    f"keeping IP as machine name"
+                )
+        # Propagate attribution_unknown flag so the UI can show the amber badge
+        if editor.get("attribution_unknown"):
+            entry["attribution_unknown"] = True
+
         # Attach watch name for history display
         entry["watch_name"] = self._watch_name_for(watch_id)
 
-        # Store in global history log (capped to avoid unbounded memory growth)
-        self._history_log.append(entry)
-        if len(self._history_log) > 5000:
-            self._history_log = self._history_log[-2500:]
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            f"[desktop._on_file_change] After enrichment: "
+            f"editor_user={entry['editor_user']!r} "
+            f"editor_machine={entry['editor_machine']!r} "
+            f"editor_ip={entry['editor_ip']!r} "
+            f"watch_name={entry['watch_name']!r}"
+        )
 
-        # Persist history to disk every 25 new entries
-        self._history_save_counter += 1
-        if BACKEND_AVAILABLE and self._history_save_counter % 25 == 0:
+        # ── Conservative rename→modified coalescing for Office finalization ──
+        # Office save sequences often produce a transient temp file that is
+        # later renamed to the final filename.  This final 'renamed' event is
+        # not a user-initiated rename and should be shown as a 'modified'.
+        # Safely coalesce when a recent 'added' or 'modified' burst exists for
+        # the same UNC host — this avoids treating Office-finalize as a rename.
+        try:
+            if entry.get("type") == "renamed":
+                _host_try = ""
+                try:
+                    _p = entry.get("path", "").replace("\\", "/")
+                    if _p.startswith("//"):
+                        _host_try = _p.lstrip("/").split("/")[0].lower()
+                except Exception:
+                    _host_try = ""
+                if _host_try:
+                    # Check for any recent 'added' or 'modified' burst for this host
+                    _bc_added = _burst_cache_any_for_host(_host_try, event_type="added")
+                    _bc_mod   = _burst_cache_any_for_host(_host_try, event_type="modified")
+                    if _bc_added or _bc_mod:
+                        import logging as _rl
+                        _rl.getLogger(__name__).info(
+                            f"[desktop._on_file_change] COALESCE: treating 'renamed' as 'modified' "
+                            f"because recent added/modified burst exists for host={_host_try!r} "
+                            f"path={entry.get('path')!r}"
+                        )
+                        entry["type"] = "modified"
+        except Exception:
+            # Non-fatal — leave event type unchanged on error
+            pass
+
+        # ── Debug: explain Unknown attribution for Windows PC targets ────────────
+        _unknown_user = entry.get("editor_user") in ("Unknown", "")
+        if _unknown_user and (entry.get("from_destination") or not _is_dest):
+            _epath = entry.get("path", "")
+            _ehost = ""
             try:
-                config_manager.save_history(self._history_log)
+                _n = _epath.replace("\\", "/")
+                if _n.startswith("//"):
+                    _ehost = _n.lstrip("/").split("/")[0]
             except Exception:
                 pass
+            if _ehost:
+                _own_ip_dbg = ""
+                try:
+                    import socket as _dbgsock
+                    _own_ip_dbg = _dbgsock.gethostbyname(_dbgsock.gethostname())
+                except Exception:
+                    pass
+                _same_host = (_ehost == _own_ip_dbg)
+                _watch_label = "dest" if _is_dest else "source"
+                _logging.getLogger(__name__).warning(
+                    f"[desktop._on_file_change] ATTRIBUTION=Unknown for {_watch_label} event "
+                    f"on {'same-host ' if _same_host else ''}Windows PC {_ehost!r}. "
+                    + (
+                    f"This PC ({_own_ip_dbg}) is the backup machine; {_ehost!r} hosts "
+                    f"both source and destination. "
+                    if _same_host else
+                    f"Remote PC {_ehost!r} — "
+                    ) +
+                    f"Win32 session-enum (NetSessionEnum/NetFileEnum) can only see "
+                    f"NETWORK sessions — a user acting LOCALLY on {_ehost!r} will "
+                    f"never appear in session lists. "
+                    f"TO FIX: "
+                    f"(A) Add Windows admin credentials for {_ehost!r} in watch Settings → Edit Watch → SMB credentials. "
+                    f"(B) On {_ehost!r}: right-click the shared folder → Properties → Security → "
+                    f"Advanced → Auditing → Add → Everyone / All / Delete+Delete subfolders. "
+                    f"(C) On {_ehost!r}: open Windows Defender Firewall → Allow 'Remote Event Log Management'. "
+                    f"With steps A+B+C, BackupSys will read Security Event Log 4663 to identify the actor."
+                )
 
-        # Store entry per watch for the card
-        if watch_id not in self._pending_entries:
-            self._pending_entries[watch_id] = []
-        self._pending_entries[watch_id].append(entry)
-        # Schedule UI update on main thread
-        QTimer.singleShot(300, lambda: self._apply_file_change(watch_id, entry))
+        # Store in global history log (capped to avoid unbounded memory growth)
+        # For source-watch dedup upgrades: patch the existing Unknown row instead
+        # of appending a duplicate.
+        _src_dedup_upgrade_done = False
+        if not _is_dest and locals().get('_src_is_dedup_upgrade', False):
+            # Use editor dict directly — entry['editor_user'] is set AFTER this block,
+            # so entry.get('editor_user') would always be empty here.
+            _upg_editor_dict = editor if 'editor' in dir() else {}
+            _upg_user = _upg_editor_dict.get('user', '')
+            _upg_path = entry.get('path', '').lower()
+            if _upg_user and _upg_user != 'Unknown':
+                # The first detector (watchdog) may still be blocked in _get_editor_info
+                # (e.g. RPC timeout took 39s).  Wait up to 90s for its row to appear,
+                # then patch it in-place.  This covers long wevtutil / OpenEventLog delays.
+                import time as _upg_time
+                _upg_deadline = _upg_time.monotonic() + 90.0
+                while _upg_time.monotonic() < _upg_deadline:
+                    for _upg_stored in reversed(self._history_log):
+                        if (_upg_stored.get('path', '').lower() == _upg_path
+                                and _upg_stored.get('type') == entry.get('type')):
+                            _already_attributed = (
+                                _upg_stored.get('editor_user', '')
+                                and _upg_stored.get('editor_user') != 'Unknown'
+                            )
+                            if _already_attributed:
+                                # Stored row already has a real attribution — do NOT
+                                # overwrite it.  The first detector (e.g. unc_poll)
+                                # resolved the actor correctly (e.g. LOCAL .105 user via
+                                # loopback 4624).  The second detector (watchdog) often
+                                # sees fresh SMB sessions from the backup-app machine
+                                # (.106) that opened handles after the event and would
+                                # wrongly replace the correct local attribution.
+                                import logging as _logging
+                                _logging.getLogger(__name__).info(
+                                    f"[desktop._on_file_change] SOURCE DEDUP upgrade: "
+                                    f"stored row already attributed to "
+                                    f"{_upg_stored.get('editor_user')!r} — "
+                                    f"second detector result {_upg_user!r} discarded "
+                                    f"(no overwrite). "
+                                    f"path={entry.get('path')!r} "
+                                    f"detection_source={entry.get('detection_source')!r}"
+                                )
+                                _src_dedup_upgrade_done = True
+                                break
+                            _upg_stored['editor_user']         = _upg_editor_dict.get('user', _upg_user)
+                            _upg_stored['editor_machine']      = _upg_editor_dict.get('machine', '')
+                            _upg_stored['editor_ip']           = _upg_editor_dict.get('ip', '')
+                            _upg_stored['attribution_unknown'] = False
+                            import logging as _logging
+                            _logging.getLogger(__name__).info(
+                                f"[desktop._on_file_change] SOURCE DEDUP upgrade: "
+                                f"patched existing Unknown row -> user={_upg_stored['editor_user']!r} "
+                                f"machine={_upg_stored['editor_machine']!r} "
+                                f"path={entry.get('path')!r} "
+                                f"detection_source={entry.get('detection_source')!r}"
+                            )
+                            if self._history_window and self._history_window.isVisible():
+                                self._history_window.update_entry(_upg_stored)
+                            _src_dedup_upgrade_done = True
+                            break
+                    if _src_dedup_upgrade_done:
+                        break
+                    # Row not yet appended — first detector still running. Wait and retry.
+                    _upg_time.sleep(0.25)
+                if not _src_dedup_upgrade_done:
+                    import logging as _logging
+                    _logging.getLogger(__name__).info(
+                        f"[desktop._on_file_change] SOURCE DEDUP upgrade: "
+                        f"first-detector row never appeared after 90s — appending new row. "
+                        f"path={entry.get('path')!r} "
+                        f"detection_source={entry.get('detection_source')!r}"
+                    )
+                    # Fall through to normal append below
+            else:
+                # Second detector also returned Unknown — suppress duplicate row.
+                # But first: check if the burst cache now has a result for this
+                # host (the sibling file may have resolved while this detector
+                # was running).  If so, patch the existing stored row in-place.
+                import logging as _sdl2
+                _sdl2_log = _sdl2.getLogger(__name__)
+                _sd_host = ""
+                try:
+                    _sd_p = entry.get("path", "").replace("\\", "/")
+                    if _sd_p.startswith("//"):
+                        _sd_host = _sd_p.lstrip("/").split("/")[0].lower()
+                except Exception:
+                    pass
+                _sdl2_log.info(
+                    f"[desktop._on_file_change] DEDUP-BURST-PATCH check: "
+                    f"second detector Unknown — scanning burst cache for host={_sd_host!r} "
+                    f"path={entry.get('path')!r} "
+                    f"detection_source={entry.get('detection_source')!r}"
+                )
+                _sd_patched = False
+                if _sd_host:
+                    _sd_etype = entry.get("type", "")
+                    _sd_bc = _burst_cache_any_for_host(_sd_host, event_type=_sd_etype)
+                    _sdl2_log.info(
+                        f"[desktop._on_file_change] DEDUP-BURST-PATCH: "
+                        f"_burst_cache_any_for_host({_sd_host!r} event_type={_sd_etype!r}) -> "
+                        f"{'HIT machine=' + repr(_sd_bc[0]) + ' user=' + repr(_sd_bc[2]) if _sd_bc else 'MISS (no matching burst cache entry for this host+event_type)'}"
+                    )
+                    if _sd_bc:
+                        _sd_m, _sd_i, _sd_u = _sd_bc
+                        _sd_path_lower = entry.get("path", "").lower()
+                        _sd_type = entry.get("type", "")
+                        _sd_scan_count = 0
+                        for _sd_stored in reversed(self._history_log):
+                            _sd_scan_count += 1
+                            _sd_stored_path  = _sd_stored.get("path", "").lower()
+                            _sd_stored_type  = _sd_stored.get("type", "")
+                            _sd_stored_user  = _sd_stored.get("editor_user", "")
+                            _sd_path_match   = (_sd_stored_path == _sd_path_lower)
+                            _sd_type_match   = (_sd_stored_type == _sd_type)
+                            _sd_user_unknown = (_sd_stored_user in ("Unknown", ""))
+                            if _sd_path_match and _sd_type_match:
+                                _sdl2_log.info(
+                                    f"[desktop._on_file_change] DEDUP-BURST-PATCH: "
+                                    f"scan #{_sd_scan_count} — path+type match: "
+                                    f"stored_user={_sd_stored_user!r} user_unknown={_sd_user_unknown} "
+                                    f"-> {'PATCHING' if _sd_user_unknown else 'SKIP (already attributed)'}"
+                                )
+                            if (_sd_path_match and _sd_type_match and _sd_user_unknown):
+                                _sd_stored["editor_user"]         = _sd_u
+                                _sd_stored["editor_machine"]      = _sd_m
+                                _sd_stored["editor_ip"]           = _sd_i
+                                _sd_stored["attribution_unknown"] = False
+                                _sdl2_log.info(
+                                    f"[desktop._on_file_change] DEDUP-BURST-PATCH: "
+                                    f"second detector Unknown but burst cache HIT — "
+                                    f"patched existing row for path={entry.get('path')!r} "
+                                    f"-> user={_sd_u!r} machine={_sd_m!r} ip={_sd_i!r}"
+                                )
+                                if self._history_window and self._history_window.isVisible():
+                                    self._history_window.update_entry(_sd_stored)
+                                _sd_patched = True
+                                break
+                        if not _sd_patched:
+                            _sdl2_log.info(
+                                f"[desktop._on_file_change] DEDUP-BURST-PATCH: "
+                                f"burst cache HIT but no matching Unknown row found in history_log "
+                                f"(scanned {_sd_scan_count} entries). "
+                                f"Row may not be appended yet — delayed retry will run after suppress. "
+                                f"path={entry.get('path')!r} type={_sd_type!r}"
+                            )
+                            # ── Delayed retry: the first detector's row may not be in
+                            # history_log yet (its _query_smb_audit is still running).
+                            # Spawn a short-lived thread to retry the patch up to 10 times
+                            # over 5 seconds so we don't miss the window.
+                            import threading as _sd_threading
+                            import time as _sd_time
+                            _sd_entry_path_lower = _sd_path_lower
+                            _sd_entry_type       = _sd_type
+                            _sd_patch_user       = _sd_u
+                            _sd_patch_machine    = _sd_m
+                            _sd_patch_ip         = _sd_i
+                            _sd_history_ref      = self._history_log
+                            _sd_hw_ref           = self._history_window
+                            def _sd_delayed_patch():
+                                import logging as _sdp_log
+                                _sdp = _sdp_log.getLogger(__name__)
+                                for _sd_attempt in range(10):
+                                    _sd_time.sleep(0.5)
+                                    for _sd_r in reversed(_sd_history_ref):
+                                        if (_sd_r.get("path", "").lower() == _sd_entry_path_lower
+                                                and _sd_r.get("type") == _sd_entry_type
+                                                and _sd_r.get("editor_user") in ("Unknown", "")):
+                                            _sd_r["editor_user"]         = _sd_patch_user
+                                            _sd_r["editor_machine"]      = _sd_patch_machine
+                                            _sd_r["editor_ip"]           = _sd_patch_ip
+                                            _sd_r["attribution_unknown"] = False
+                                            _sdp.info(
+                                                f"[desktop._on_file_change] DEDUP-BURST-PATCH delayed: "
+                                                f"patched Unknown row on attempt #{_sd_attempt + 1} "
+                                                f"path={_sd_entry_path_lower!r} "
+                                                f"-> user={_sd_patch_user!r} machine={_sd_patch_machine!r}"
+                                            )
+                                            try:
+                                                if _sd_hw_ref and _sd_hw_ref.isVisible():
+                                                    _sd_hw_ref.update_entry(_sd_r)
+                                            except Exception:
+                                                pass
+                                            return
+                                _sdp.info(
+                                    f"[desktop._on_file_change] DEDUP-BURST-PATCH delayed: "
+                                    f"gave up after 10 attempts — row never appeared in history_log. "
+                                    f"path={_sd_entry_path_lower!r}"
+                                )
+                            _sd_threading.Thread(
+                                target=_sd_delayed_patch, daemon=True,
+                                name=f"dedup-burst-patch-{_sd_entry_path_lower[-20:]}"
+                            ).start()
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"[desktop._on_file_change] SOURCE DEDUP: second detector also "
+                    f"returned Unknown -- suppressing duplicate row"
+                    f"{' (DEDUP-BURST-PATCH applied or delayed)' if _sd_patched or (_sd_host and _sd_bc) else ''}. "
+                    f"path={entry.get('path')!r} "
+                    f"detection_source={entry.get('detection_source')!r}"
+                )
+                return
+
+        if not _src_dedup_upgrade_done:
+            # ── Forward burst-patch: if THIS entry is Unknown, check if a sibling
+            # already resolved and populated the burst cache while this entry's
+            # _query_smb_audit was running.  Patch before appending so the UI
+            # never shows Unknown at all for this row.
+            if entry.get("editor_user") in ("Unknown", ""):
+                _fwd_host = ""
+                try:
+                    _fwd_p = entry.get("path", "").replace("\\", "/")
+                    if _fwd_p.startswith("//"):
+                        _fwd_host = _fwd_p.lstrip("/").split("/")[0].lower()
+                except Exception:
+                    pass
+                if _fwd_host:
+                    _fwd_etype = entry.get("type", "")
+                    _fwd_bc = _burst_cache_any_for_host(_fwd_host, event_type=_fwd_etype)
+                    if _fwd_bc:
+                        _fwd_m, _fwd_i, _fwd_u = _fwd_bc
+                        import logging as _fwdl
+                        _fwdl.getLogger(__name__).info(
+                            f"[desktop._on_file_change] FORWARD-BURST-PATCH: "
+                            f"Unknown entry patched BEFORE append using burst cache "
+                            f"for host={_fwd_host!r} event_type={_fwd_etype!r} path={entry.get('path')!r} "
+                            f"-> user={_fwd_u!r} machine={_fwd_m!r} ip={_fwd_i!r}"
+                        )
+                        entry["editor_user"]         = _fwd_u
+                        entry["editor_machine"]      = _fwd_m
+                        entry["editor_ip"]           = _fwd_i
+                        entry["attribution_unknown"] = False
+                    else:
+                        import logging as _fwdl2
+                        _fwdl2.getLogger(__name__).info(
+                            f"[desktop._on_file_change] FORWARD-BURST-PATCH: "
+                            f"MISS — no burst cache entry for host={_fwd_host!r} event_type={_fwd_etype!r} "
+                            f"path={entry.get('path')!r} — entry stays Unknown"
+                        )
+
+            self._history_log.append(entry)
+            if len(self._history_log) > 5000:
+                self._history_log = self._history_log[-2500:]
+
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                f"[desktop._on_file_change] Appended to in-memory history_log. "
+                f"Total in-memory entries: {len(self._history_log)}"
+            )
+
+            # Persist history to disk every 25 new entries
+            self._history_save_counter += 1
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                f"[desktop._on_file_change] _history_save_counter={self._history_save_counter} "
+                f"(saves every 25 entries)"
+            )
+            if BACKEND_AVAILABLE and self._history_save_counter % 25 == 0:
+                try:
+                    config_manager.save_history(self._history_log)
+                except Exception:
+                    pass
+
+            # Store entry per watch for the card
+            if watch_id not in self._pending_entries:
+                self._pending_entries[watch_id] = []
+            self._pending_entries[watch_id].append(entry)
+            # Dispatch to the Qt main thread via a queued signal.
+            # QTimer.singleShot() called from a plain threading.Thread (no Qt
+            # event loop) silently drops the callback — the UI never updates.
+            # Emitting a pyqtSignal with a queued connection is the correct fix.
+            self._file_change_signal.emit(watch_id, entry)
+
+            # ── Retroactive burst-patch: fix Unknown siblings ──────────────────────
+            # When multiple files are added in the same burst from one SMB session,
+            # the FIRST file's attribution query may complete before the SECOND
+            # file's query populates the burst cache, leaving the first as Unknown.
+            # NOW that the burst cache has been populated by this successful
+            # attribution, scan back through recent history_log entries for the
+            # same UNC host that are still Unknown and patch them in-place.
+            #
+            # This runs on the background thread that called _on_file_change, so
+            # it is safe to mutate _history_log entries (dicts are reference types
+            # and the UI reads them via update_entry, not copies).
+            _burst_new_user    = entry.get("editor_user", "")
+            _burst_new_machine = entry.get("editor_machine", "")
+            _burst_new_ip      = entry.get("editor_ip", "")
+            if _burst_new_user and _burst_new_user != "Unknown":
+                # Extract UNC host from the successfully attributed entry
+                _burst_patch_host = ""
+                try:
+                    _bpn = entry.get("path", "").replace("\\", "/")
+                    if _bpn.startswith("//"):
+                        _burst_patch_host = _bpn.lstrip("/").split("/")[0].lower()
+                except Exception:
+                    pass
+                if _burst_patch_host:
+                    _burst_patched_count = 0
+                    for _burst_older in reversed(self._history_log):
+                        if _burst_older is entry:
+                            continue
+                        if _burst_older.get("editor_user") not in ("Unknown", ""):
+                            # Only patch Unknown entries
+                            continue
+                        # Check the host matches
+                        _burst_op = _burst_older.get("path", "").replace("\\", "/")
+                        _burst_oh = ""
+                        try:
+                            if _burst_op.startswith("//"):
+                                _burst_oh = _burst_op.lstrip("/").split("/")[0].lower()
+                        except Exception:
+                            pass
+                        if _burst_oh != _burst_patch_host:
+                            continue
+                        # Only patch entries of the same event type
+                        if _burst_older.get("type") != entry.get("type"):
+                            continue
+                        # Try burst cache for the most precise matching result,
+                        # otherwise use the just-resolved attribution directly.
+                        # CRITICAL: pass event_type so the burst cache does NOT reuse
+                        # attributions from a different event type (e.g. 'added' by .106
+                        # must never patch 'deleted' entries that may have been done by .105).
+                        _burst_patch_etype = entry.get("type", "")
+                        _burst_bc_hit = _burst_cache_any_for_host(_burst_patch_host, event_type=_burst_patch_etype)
+                        _burst_pu = (_burst_bc_hit[2] if _burst_bc_hit else _burst_new_user)    or _burst_new_user
+                        _burst_pm = (_burst_bc_hit[0] if _burst_bc_hit else _burst_new_machine) or _burst_new_machine
+                        _burst_pi = (_burst_bc_hit[1] if _burst_bc_hit else _burst_new_ip)      or _burst_new_ip
+                        _burst_older["editor_user"]         = _burst_pu
+                        _burst_older["editor_machine"]      = _burst_pm
+                        _burst_older["editor_ip"]           = _burst_pi
+                        _burst_older["attribution_unknown"] = False
+                        _burst_patched_count += 1
+                        import logging as _rbl
+                        _rbl.getLogger(__name__).info(
+                            f"[desktop._on_file_change] BURST-PATCH: retroactively resolved "
+                            f"Unknown entry for path={_burst_older.get('path')!r} "
+                            f"event_type={_burst_patch_etype!r} "
+                            f"-> user={_burst_pu!r} machine={_burst_pm!r} ip={_burst_pi!r} "
+                            f"(sibling {entry.get('path')!r} resolved first, "
+                            f"burst_cache_hit={_burst_bc_hit is not None})"
+                        )
+                        if self._history_window and self._history_window.isVisible():
+                            self._history_window.update_entry(_burst_older)
+                    if _burst_patched_count:
+                        import logging as _rbl
+                        _rbl.getLogger(__name__).info(
+                            f"[desktop._on_file_change] BURST-PATCH: patched "
+                            f"{_burst_patched_count} Unknown entry(s) for "
+                            f"host={_burst_patch_host!r} event_type={entry.get('type', '')!r} after sibling resolved."
+                        )
+                    else:
+                        # No Unknown siblings found yet — they may still be running
+                        # _query_smb_audit and haven't been appended to history_log.
+                        # Spawn a delayed retry that re-scans for up to 3 seconds.
+                        import logging as _rbl2
+                        _rbl2.getLogger(__name__).info(
+                            f"[desktop._on_file_change] BURST-PATCH: 0 Unknown entries "
+                            f"found in history_log for host={_burst_patch_host!r} "
+                            f"(siblings may still be in _query_smb_audit). "
+                            f"Spawning delayed retry thread (6 × 0.5s)."
+                        )
+                        import threading as _bp_threading
+                        import time    as _bp_time
+                        _bp_host_cap    = _burst_patch_host
+                        _bp_etype_cap   = entry.get("type", "")
+                        _bp_user_cap    = _burst_new_user
+                        _bp_machine_cap = _burst_new_machine
+                        _bp_ip_cap      = _burst_new_ip
+                        _bp_history_ref = self._history_log
+                        _bp_hw_ref      = self._history_window
+                        def _bp_delayed_patch():
+                            import logging as _bpd
+                            _bpdl = _bpd.getLogger(__name__)
+                            for _bp_attempt in range(20):
+                                _bp_time.sleep(0.5)
+                                _bp_count = 0
+                                for _bp_r in reversed(_bp_history_ref):
+                                    if _bp_r.get("editor_user") not in ("Unknown", ""):
+                                        continue
+                                    if _bp_r.get("type") != _bp_etype_cap:
+                                        continue
+                                    _bp_rp = _bp_r.get("path", "").replace("\\", "/")
+                                    _bp_rh = ""
+                                    try:
+                                        if _bp_rp.startswith("//"):
+                                            _bp_rh = _bp_rp.lstrip("/").split("/")[0].lower()
+                                    except Exception:
+                                        pass
+                                    if _bp_rh != _bp_host_cap:
+                                        continue
+                                    # Use burst cache for the freshest attribution,
+                                    # fall back to the values captured at append time.
+                                    # CRITICAL: pass event_type so the burst cache does NOT
+                                    # reuse attributions from a different event type.
+                                    _bp_bc = _burst_cache_any_for_host(_bp_host_cap, event_type=_bp_etype_cap)
+                                    _bp_pu = (_bp_bc[2] if _bp_bc else _bp_user_cap)    or _bp_user_cap
+                                    _bp_pm = (_bp_bc[0] if _bp_bc else _bp_machine_cap) or _bp_machine_cap
+                                    _bp_pi = (_bp_bc[1] if _bp_bc else _bp_ip_cap)      or _bp_ip_cap
+                                    _bp_r["editor_user"]         = _bp_pu
+                                    _bp_r["editor_machine"]      = _bp_pm
+                                    _bp_r["editor_ip"]           = _bp_pi
+                                    _bp_r["attribution_unknown"] = False
+                                    _bp_count += 1
+                                    _bpdl.info(
+                                        f"[desktop._on_file_change] BURST-PATCH delayed "
+                                        f"(attempt #{_bp_attempt + 1}): resolved "
+                                        f"Unknown entry path={_bp_r.get('path')!r} "
+                                        f"event_type={_bp_etype_cap!r} "
+                                        f"-> user={_bp_pu!r} machine={_bp_pm!r} "
+                                        f"burst_cache_hit={_bp_bc is not None}"
+                                    )
+                                    try:
+                                        if _bp_hw_ref and _bp_hw_ref.isVisible():
+                                            _bp_hw_ref.update_entry(_bp_r)
+                                    except Exception:
+                                        pass
+                                if _bp_count:
+                                    _bpdl.info(
+                                        f"[desktop._on_file_change] BURST-PATCH delayed: "
+                                        f"patched {_bp_count} entry(s) on attempt #{_bp_attempt + 1} "
+                                        f"for host={_bp_host_cap!r}."
+                                    )
+                                    return
+                            _bpdl.info(
+                                f"[desktop._on_file_change] BURST-PATCH delayed: "
+                                f"gave up after 20 attempts — no Unknown sibling appeared "
+                                f"for host={_bp_host_cap!r}."
+                            )
+                        _bp_threading.Thread(
+                            target=_bp_delayed_patch, daemon=True,
+                            name=f"burst-patch-retry-{_bp_host_cap}"
+                        ).start()
+        else:
+            # Dedup-upgrade path: the stored row was already patched in-place above.
+            # We do NOT emit a new signal (which would call append_entry and produce
+            # a phantom duplicate row in the UI).  The update_entry call inside the
+            # upgrade loop already refreshed the UI row with the corrected attribution.
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                f"[desktop._on_file_change] Dedup-upgrade complete — "
+                f"no new row emitted to UI. "
+                f"Total in-memory entries: {len(self._history_log)}"
+            )
 
     def _apply_file_change(self, watch_id: str, entry: dict):
         """Update card badge + tray toast on main thread."""
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            f"[desktop._apply_file_change] MAIN THREAD: watch_id={watch_id!r} "
+            f"type={entry.get('type')!r} path={entry.get('path')!r} "
+            f"detection_source={entry.get('detection_source')!r}"
+        )
         # Update card
         if watch_id in self._cards:
             self._cards[watch_id].add_change(entry)
@@ -8908,11 +19047,19 @@ class MainWindow(QMainWindow):
             etype = entry.get("type", "changed")
             path  = entry.get("path", "")
             name  = self._watch_name_for(watch_id)
-            icon_map = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗"}
+            icon_map = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗", "backed up": "📦"}
             icon = icon_map.get(etype, "·")
             user    = entry.get("editor_user", "")
             machine = entry.get("editor_machine", "")
-            who     = f" by {user}" if user else (f" on {machine}" if machine else "")
+            _unknown = entry.get("attribution_unknown", False)
+            if _unknown:
+                who = f" — actor unknown (SMB host: {machine})"
+            elif user:
+                who = f" by {user}"
+            elif machine:
+                who = f" on {machine}"
+            else:
+                who = ""
             self._tray.showMessage(
                 f"Change detected  · {name}",
                 f"{icon}  {etype.capitalize()}: {path}{who}",
@@ -8920,23 +19067,20 @@ class MainWindow(QMainWindow):
             )
 
     def _watch_name_for(self, watch_id: str) -> str:
+        # Strip __dest suffix so destination-watcher events are labelled
+        # with the same watch name as the source watcher.
+        _lookup_id = watch_id[:-len("__dest")] if watch_id.endswith("__dest") else watch_id
         for w in self.cfg.get("watches", []):
-            if w["id"] == watch_id:
-                return w.get("name", watch_id)
+            if w["id"] == _lookup_id:
+                name = w.get("name", _lookup_id)
+                if watch_id.endswith("__dest"):
+                    return name + " (destination)"
+                return name
         return watch_id
 
     def _watch_dest(self, watch: dict) -> str:
-        """Return the effective destination for a watch.
-        Per-watch destination takes priority over the global cfg destination.
-        Falls back to global cfg[destination] if not set on the watch.
-        """
-        dest_type = self.cfg.get("dest_type", "local")
-        per_watch = watch.get("destination", "").strip()
-        if per_watch:
-            return per_watch
-        if dest_type == "smb":
-            return self.cfg.get("dest_smb", {}).get("path", "").strip()
-        return self.cfg.get("destination", "")
+        """Return the effective destination for a watch (per-watch only)."""
+        return watch.get("destination", "").strip()
 
 
     # ── Auto Timer ─────────────────────────────────────────────────────────────
@@ -8967,8 +19111,19 @@ class MainWindow(QMainWindow):
     def _auto_backup_tick(self):
         if not BACKEND_AVAILABLE:
             return
-        cfg = config_manager.load()
-        self.cfg = cfg
+        # FIX: wrap in try/except — if _on_backup_done is mid-way through
+        # save(cfg) on the worker thread, a concurrent load() here can get a
+        # partially-written file → JSONDecodeError.  Keep stale self.cfg rather
+        # than crashing the main-thread timer.
+        try:
+            cfg = config_manager.load()
+            self.cfg = cfg
+        except Exception as _tick_err:
+            import logging as _tick_log
+            _tick_log.getLogger(__name__).debug(
+                f"[_auto_backup_tick] config load failed (retrying next tick): {_tick_err!r}"
+            )
+            cfg = self.cfg  # use last-known-good config
 
         # ── Watcher health check: restart any dead observers ───────────────────
         # Runs every tick (every 5s) so network shares that drop and come back
@@ -9177,6 +19332,16 @@ class MainWindow(QMainWindow):
             watch_interval_min = w.get("interval_min", 0)
             watch_secs = (watch_interval_min * 60) if watch_interval_min else global_secs
             lb = w.get("last_backup")
+
+            # Brand-new watch (never backed up) — never auto-fire the first backup.
+            # The user must click "Backup Now" to establish the initial baseline.
+            # Without this guard, a newly added watch with no last_backup and
+            # backup_count=0 falls straight through to _backup_single on the very
+            # first auto-tick (within 5 s of being added), silently copying
+            # gigabytes to the destination without any user action.
+            if not lb and w.get("backup_count", 0) == 0:
+                continue
+
             if lb:
                 try:
                     last       = datetime.fromisoformat(lb)
@@ -9214,7 +19379,7 @@ class MainWindow(QMainWindow):
         _max_bytes = watch.get("max_backup_bytes", 0)
         if _max_bytes and _max_bytes > 0 and BACKEND_AVAILABLE:
             _dest_type_for_quota = self.cfg.get("dest_type", "local")
-            _non_local_dests = {"sftp", "ftp", "ftps", "smb", "webdav", "rclone", "cloud", "https", "gdrive"}
+            _non_local_dests = {"sftp", "ftp", "ftps", "webdav", "rclone", "cloud", "https", "gdrive"}
             if _dest_type_for_quota in _non_local_dests:
                 # Storage quota cannot be enforced for remote destinations because
                 # get_watch_disk_usage scans the local backup_dir path which does
@@ -9228,7 +19393,7 @@ class MainWindow(QMainWindow):
             else:
                 try:
                     _used = backup_engine._backup_index.get_watch_disk_usage(
-                        self.cfg.get("destination", ""), wid
+                        watch.get("destination", "").strip(), wid
                     )
                     # Add warning thresholds before hard refusal
                     _usage_pct = (_used / _max_bytes) * 100
@@ -9259,10 +19424,12 @@ class MainWindow(QMainWindow):
                     pass  # quota check failure is non-fatal; proceed with backup
 
         # Collect watcher-tracked changed paths for the fast-scan optimisation.
-        # Only use for incremental (non-manual-full) triggers; for "force full"
-        # changed_paths is left None so build_snapshot does a complete rglob.
+        # Only use for auto-triggered backups; manual/queue/full triggers always
+        # do a complete rglob so the comprehensive sync-mode self-heal runs and
+        # any files the watcher missed (added from another machine, SMB cache
+        # miss, etc.) are correctly detected as missing from the destination.
         _changed_paths = None
-        if self._watcher_mgr and triggered_by != "full":
+        if self._watcher_mgr and triggered_by == "auto":
             try:
                 _pending = self._watcher_mgr.get_pending(wid)
                 if _pending:
@@ -9271,10 +19438,26 @@ class MainWindow(QMainWindow):
                 pass
 
         worker = BackupWorker(watch, self.cfg, triggered_by=triggered_by, changed_paths=_changed_paths)
+        # Register pre-emit callback so _post_backup_finish is set on the worker thread,
+        # before the finished signal reaches the main thread (closes the race window).
+        import time as _wtime
+        def _pre_emit_cb(_wid=wid):
+            self._post_backup_finish[_wid] = _wtime.monotonic()
+        worker.on_complete_cb = _pre_emit_cb
         worker.progress.connect(lambda c, t, f, e, s, bd, tb, _wid=wid: self._on_progress(_wid, c, t, f, e, s, bd, tb))
         worker.finished.connect(lambda r, _wid=wid: self._on_backup_done(_wid, r))
+        worker.ui_status.connect(
+            lambda status, _wid=wid: self._on_ui_status(_wid, status),
+            Qt.ConnectionType.BlockingQueuedConnection,   # worker blocks until UI has painted the update
+        )
         worker.log_message.connect(self._append_log)
         self._workers[wid] = worker
+        _ap = getattr(self, "_admin_panel", None)
+        if _ap is not None:
+            try:
+                _ap._set_row_progress(wid, 0, 0, True)
+            except Exception:
+                pass
         # Track how many backups have started this session (used by auto-shutdown)
         self._backups_started_this_session = getattr(self, "_backups_started_this_session", 0) + 1
 
@@ -9323,6 +19506,7 @@ class MainWindow(QMainWindow):
                 pass
 
         if wid in self._cards:
+            self._cards[wid].set_queued(False)   # clear any "Queued" state before starting
             self._cards[wid].set_backing_up(True)
 
         self.status_dot.setText("● Backing up…")
@@ -9364,20 +19548,101 @@ class MainWindow(QMainWindow):
                     pass
         self._backup_single(watch, triggered_by="manual")
 
-    def _backup_all(self):
-        for w in self.cfg.get("watches", []):
-            if w.get("active", True) and not w.get("paused", False) and not w.get("skip_auto_backup", False):
-                self._backup_single(w)
+    @staticmethod
+    def _source_group_key(path: str) -> str:
+        """Return a serialization key for *path* so that all watches that share
+        the same Windows host / server are grouped together and run sequentially.
+
+        Rules:
+        - UNC paths  (``\\\\host\\share`` or ``//host/share``) → ``host`` (lowercased)
+        - SFTP / FTP config strings that embed a host already handled upstream;
+          fall back to the raw normalized path for everything else (local drives,
+          mapped letters, etc.).
+        """
+        import re as _re
+        p = path.strip()
+        # Normalise forward-slashes to back-slashes for UNC detection
+        p_norm = p.replace("/", "\\")
+        unc_match = _re.match(r"^\\\\([^\\]+)", p_norm)
+        if unc_match:
+            return unc_match.group(1).lower()  # just the host/IP
+        return p.lower()
+
+    def _backup_group_key(self, watch: dict) -> str:
+        """Return a serialization key for *watch* so that watches sharing the
+        same SOURCE host are queued sequentially.
+
+        Uses the normalised source host/IP so that \\\\host\\shareA and
+        \\\\host\\shareB both serialise against the same Windows host.  This prevents
+        two watches that read from the same SMB source from hammering it in
+        parallel — concurrent reads from the same share split the available
+        bandwidth and can throttle one watch to 2-3 MB/s while the other
+        gets the full ~94 MB/s.
+
+        Destination is intentionally NOT part of the key: what matters for
+        serialisation is the SOURCE I/O path, not where the data lands.
+        """
+        return self._source_group_key(watch.get("path", ""))
 
     def _on_progress(self, wid: str, current: int, total: int, fname: str = "", elapsed: float = 0.0, is_scanning: bool = False, bytes_done: int = 0, total_bytes: int = 0):
         if wid in self._cards:
             self._cards[wid].set_progress(current, total, fname, elapsed, is_scanning, bytes_done, total_bytes)
+        _ap = getattr(self, "_admin_panel", None)
+        if _ap is not None:
+            try:
+                _ap._set_row_progress(wid, current, total, is_scanning)
+            except Exception:
+                pass
+
+    def _on_ui_status(self, wid: str, status: str):
+        """Handle guaranteed one-shot UI status updates from the backup worker.
+
+        Called via BlockingQueuedConnection so the worker thread is blocked
+        until this method returns — guaranteeing the UI updates before the
+        engine continues (e.g. before robocopy starts copying).
+        """
+        if wid not in self._cards:
+            return
+        card = self._cards[wid]
+        if status.startswith("\x00robocopy\x00"):
+            card.set_progress(0, 1, status, 0.0, False, 0, 0)  # bytes_done=0 → indeterminate "Copying…" (not "Finalizing 100%")
+        elif status.startswith("\x00uptodate\x00"):
+            card.set_progress(0, 0, status, 0.0, False, 0, 0)
 
     def _on_backup_done(self, wid: str, result: dict):
+        # _post_backup_finish[wid] was already set on the worker thread by
+        # on_complete_cb before finished.emit() — this ensures the suppressor
+        # grace window is active before ANY post-backup events can arrive.
+        # We still do a safety set here in case on_complete_cb didn't fire
+        # (e.g. old worker without the callback), and remove from _workers.
+        import time as _time
+        if wid not in self._post_backup_finish:
+            self._post_backup_finish[wid] = _time.monotonic()
         if wid in self._workers:
             del self._workers[wid]
 
-        # ── Remove from persistent queue now that this backup is done ───────
+        _ap = getattr(self, "_admin_panel", None)
+        if _ap is not None:
+            try:
+                _ap._clear_row_progress(wid)
+            except Exception:
+                pass
+
+        # ── Smart queue: when a watch finishes, start next in its group ──────
+        finished_watch = next(
+            (w for w in self.cfg.get("watches", []) if w["id"] == wid), None
+        )
+        if finished_watch:
+            src_key = self._backup_group_key(finished_watch)
+            group   = self._source_queues.get(src_key, [])
+            if group:
+                next_watch = group.pop(0)
+                remaining  = len(group)
+                self._append_log(
+                    f"▶ Starting '{next_watch.get('name', next_watch['id'])}'"
+                    + (f" — {remaining} more in this group" if remaining else " — last in group")
+                )
+                self._backup_single(next_watch, triggered_by="manual")
         if BACKEND_AVAILABLE:
             try:
                 queue = config_manager.load_backup_queue()
@@ -9389,7 +19654,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        success = result.get("status") == "success"
+        success = result.get("status") in ("success", "partial_failure")
+        partial = result.get("status") == "partial_failure"
 
         # Record backup history for export
         started_at = result.get("timestamp", datetime.now().isoformat())
@@ -9400,6 +19666,7 @@ class MainWindow(QMainWindow):
         except Exception:
             finished_at = datetime.now().isoformat()
 
+        _bytes_copied = int(result.get("bytes_copied", 0) or result.get("total_size_bytes", 0) or 0)
         history_entry = {
             "watch_name": self._watch_name_for(wid),
             "watch_id": wid,
@@ -9408,7 +19675,8 @@ class MainWindow(QMainWindow):
             "started_at": started_at,
             "finished_at": finished_at,
             "file_count": int(result.get("files_copied", 0) or 0),
-            "size_bytes": int(result.get("total_size_bytes", 0) or 0),
+            "size_bytes": _bytes_copied,
+            "bytes_copied": _bytes_copied,
             "destination": result.get("destination", ""),
             "error": result.get("error", "") or "",
         }
@@ -9422,7 +19690,11 @@ class MainWindow(QMainWindow):
                 pass
 
         if wid in self._cards:
-            self._cards[wid].set_done(success, result.get("duration_s", 0.0))
+            self._cards[wid].set_done(
+                success,
+                result.get("duration_s", 0.0),
+                error_msg=result.get("error", "") or "",
+            )
 
         # Reset change count for this watch
         if success:
@@ -9432,9 +19704,30 @@ class MainWindow(QMainWindow):
                 self._watcher_mgr.clear_pending(wid)
 
             # ── Inject backup-diff changes into history ─────────────────
-            # Works for ALL source types (local, SMB, network) because it
+            # Works for ALL source types (local, network) because it
             # uses snapshot diffing, not live file system events.
             diff_changes = result.get("changes", [])
+            # Track which filenames were actually copied so the grace-period
+            # suppressor can let NEW files (not in this backup) through.
+            import os as _os_bpf
+            self._post_backup_filenames[wid] = {
+                _os_bpf.path.basename(ch.get("path", ""))
+                for ch in diff_changes if ch.get("path")
+            }
+            # Also track ALL basenames present in the destination after this backup
+            # (= all files in the source snapshot, since sync mode mirrors dest to source).
+            # Robocopy firing MODIFIED on pre-existing dest files (e.g. test sheet.xlsx)
+            # must be suppressed too — not just files that were newly copied this run.
+            _snapshot = result.get("snapshot", {})
+            self._post_backup_dest_fnames[wid] = {
+                _os_bpf.path.basename(k) for k in _snapshot if k
+            }
+            import logging as _bdl
+            _bdlog = _bdl.getLogger(__name__)
+            _bdlog.info(
+                f"[_on_backup_done] backup_diff injection: wid={wid!r} "
+                f"diff_changes={len(diff_changes)} success={success}"
+            )
             if diff_changes:
                 watch_name = self._watch_name_for(wid)
                 ts_iso     = result.get("timestamp", datetime.now().isoformat())
@@ -9443,11 +19736,26 @@ class MainWindow(QMainWindow):
                 _watch_src  = result.get("source", "")
                 _first_path = diff_changes[0].get("path", "") if diff_changes else ""
                 _sample_fp  = str(Path(_watch_src) / _first_path) if _watch_src and _first_path else ""
-                editor      = _get_editor_info(_sample_fp)
+                # Backup-diff changes are always triggered by THIS machine
+                # running the backup job, so always report the local machine.
+                # force_local=True bypasses UNC/SMB audit (which would return
+                # "Unknown" for network sources) and reads local identity directly.
+                editor      = _get_editor_info(_sample_fp, detection_source="watchdog",
+                                               force_local=True)
+                _bdlog.info(
+                    f"[_on_backup_done] backup_diff editor resolved: "
+                    f"user={editor['user']!r} machine={editor['machine']!r} "
+                    f"ip={editor['ip']!r} sample_fp={_sample_fp!r}"
+                )
+                _injected = []
                 for ch in diff_changes:
+                    # Build the full source path for the history row so it matches
+                    # the format used by dest-watcher events (full UNC or local path).
+                    _rel  = ch.get("path", "")
+                    _full_path = str(Path(_watch_src) / _rel) if _watch_src and _rel else _rel
                     hist_entry = {
-                        "type":           ch.get("type", "modified"),
-                        "path":           ch.get("path", ""),
+                        "type":           "backed up",
+                        "path":           _full_path,
                         "timestamp":      ts_iso,
                         "watch_name":     watch_name,
                         "watch_id":       wid,
@@ -9457,29 +19765,25 @@ class MainWindow(QMainWindow):
                         "source":         "backup_diff",
                     }
                     self._history_log.append(hist_entry)
+                    _injected.append(hist_entry)
                 if len(self._history_log) > 5000:
                     self._history_log = self._history_log[-2500:]
                 # Persist immediately after backup (don't wait for 25-entry threshold)
                 if BACKEND_AVAILABLE:
                     try:
                         config_manager.save_history(self._history_log)
-                    except Exception:
-                        pass
+                        _bdlog.info(
+                            f"[_on_backup_done] backup_diff history persisted: "
+                            f"{len(_injected)} entries saved (total history={len(self._history_log)})"
+                        )
+                    except Exception as _save_err:
+                        _bdlog.warning(
+                            f"[_on_backup_done] backup_diff history SAVE FAILED: {_save_err!r}"
+                        )
                 # Live-update history window if open
                 if self._history_window and self._history_window.isVisible():
-                    for ch in diff_changes:
-                        hist_entry = {
-                            "type":           ch.get("type", "modified"),
-                            "path":           ch.get("path", ""),
-                            "timestamp":      ts_iso,
-                            "watch_name":     watch_name,
-                            "watch_id":       wid,
-                            "editor_user":    editor["user"],
-                            "editor_machine": editor["machine"],
-                            "editor_ip":      editor["ip"],
-                            "source":         "backup_diff",
-                        }
-                        self._history_window.append_entry(hist_entry)
+                    for _he in _injected:
+                        self._history_window.append_entry(_he)
             # Clear needs_full_backup flag now that full backup is done
             if BACKEND_AVAILABLE:
                 try:
@@ -9490,7 +19794,28 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Save extra stats BEFORE reloading config so they persist correctly
+        # Reload config FIRST so we pick up the worker's updates (last_backup,
+        # backup_count, snapshot) that were saved to disk on the worker thread.
+        # Previously this save happened AFTER _load_config, which caused a race:
+        # the worker saved backup_count=1 to disk, but then _on_backup_done
+        # saved self.cfg (which still had backup_count=0) on top of it, wiping
+        # the worker's update.  The result was the second watch in a "Backup All
+        # Now" sequential group always showing "Never backed up · 0 backup(s)".
+        # FIX: wrap _load_config in try/except — a JSONDecodeError or I/O race
+        # (5-second auto-backup tick also calls config_manager.load() concurrently)
+        # was propagating unhandled to Qt's main-thread event loop →
+        # _excepthook → sys.exit(1) → app appeared to "suddenly close".
+        try:
+            self._load_config()
+        except Exception as _lce:
+            import logging as _lcl
+            _lcl.getLogger(__name__).warning(
+                f"[_on_backup_done] _load_config failed (non-fatal): {_lce!r} "
+                f"— keeping existing self.cfg to avoid losing watch cards"
+            )
+
+        # Now apply the extra per-run stats (status, duration, failed count) to
+        # the freshly-reloaded config and save once — no stale overwrites.
         if BACKEND_AVAILABLE:
             try:
                 for w in self.cfg.get("watches", []):
@@ -9498,19 +19823,33 @@ class MainWindow(QMainWindow):
                         w["last_backup_status"]   = "success" if success else "failed"
                         w["last_backup_duration"] = round(result.get("duration_s", 0), 1)
                         w["last_failed_files"]    = len(result.get("failed_files", []))
+                        if success:
+                            w.pop("last_error", None)
+                        else:
+                            w["last_error"] = result.get("error", "") or ""
                 config_manager.save(self.cfg)
             except Exception:
                 pass
 
-        # Reload config to get updated last_backup time
-        self._load_config()
-        for w in self.cfg.get("watches", []):
-            if w["id"] == wid and wid in self._cards:
-                self._cards[wid].update_watch(w)
-                self._cards[wid].refresh_next_backup_lbl(self.cfg)
+        try:
+            for w in self.cfg.get("watches", []):
+                if w["id"] == wid and wid in self._cards:
+                    self._cards[wid].update_watch(w)
+                    self._cards[wid].refresh_next_backup_lbl(self.cfg)
+        except Exception as _uce:
+            import logging as _ucl
+            _ucl.getLogger(__name__).warning(
+                f"[_on_backup_done] card update failed (non-fatal): {_uce!r}"
+            )
 
-        self._update_stats()
-        self._update_auto_label()
+        try:
+            self._update_stats()
+        except Exception:
+            pass
+        try:
+            self._update_auto_label()
+        except Exception:
+            pass
 
         if not self._workers:
             self.status_dot.setText("● Active")
@@ -9539,12 +19878,20 @@ class MainWindow(QMainWindow):
                 watch.pop("_quota_warning_80", None)
                 watch.pop("_quota_warning_90", None)
 
-            if success:
+            if success and not partial:
                 dur_str  = _fmt_duration(result.get("duration_s", 0.0))
                 dur_part = f"  ·  {dur_str}" if dur_str else ""
                 sz_part  = f"  ·  {result.get('total_size','')}" if result.get("total_size") else ""
                 msg = f"✅ Backup complete: {result.get('files_copied',0)} file(s){sz_part}{dur_part}"
                 _icon = QSystemTrayIcon.MessageIcon.Information
+            elif partial:
+                _nfailed = len(result.get("failed_files", []))
+                msg = (
+                    f"⚠ Partial backup: {self._watch_name_for(wid)} — "
+                    f"{result.get('files_copied', 0)} file(s) OK, {_nfailed} failed. "
+                    f"Check activity log for details."
+                )
+                _icon = QSystemTrayIcon.MessageIcon.Warning
             elif result.get("status") == "cancelled":
                 msg   = f"⏹ Backup cancelled: {result.get('watch_name', self._watch_name_for(wid))}"
                 _icon = QSystemTrayIcon.MessageIcon.Information
@@ -9556,6 +19903,25 @@ class MainWindow(QMainWindow):
                     self.gdrive_banner.show()
                 _icon = QSystemTrayIcon.MessageIcon.Warning
             self._tray.showMessage(APP_NAME, msg, _icon, 5000 if not success else 3000)
+
+        # Always append the result to the activity log regardless of tray
+        # availability — the tray balloon is easy to miss and disappears after
+        # a few seconds, whereas the activity log persists for the session.
+        if success and not partial:
+            dur_str  = _fmt_duration(result.get("duration_s", 0.0))
+            dur_part = f"  ·  {dur_str}" if dur_str else ""
+            sz_part  = f"  ·  {result.get('total_size', '')}" if result.get("total_size") else ""
+            self._append_log(f"✅ Backup complete: {self._watch_name_for(wid)} — {result.get('files_copied', 0)} file(s){sz_part}{dur_part}")
+        elif partial:
+            _nfailed = len(result.get("failed_files", []))
+            self._append_log(
+                f"⚠ Partial backup: {self._watch_name_for(wid)} — "
+                f"{result.get('files_copied', 0)} file(s) OK, {_nfailed} failed"
+            )
+        elif result.get("status") == "cancelled":
+            self._append_log(f"⏹ Backup cancelled: {self._watch_name_for(wid)}")
+        else:
+            self._append_log(f"❌ Backup FAILED: {self._watch_name_for(wid)} — {result.get('error', 'unknown error')}")
 
         # ── Auto-shutdown: trigger only when ALL backups are done ────────────
         # _workers is empty → no backups running.  Check the config flag and
@@ -9579,7 +19945,7 @@ class MainWindow(QMainWindow):
         import platform, subprocess
         try:
             if platform.system() == "Windows":
-                subprocess.run(["shutdown", "/s", "/t", "0"], check=True)
+                subprocess.run(["shutdown", "/s", "/t", "0"], check=True, creationflags=_WIN_NO_WINDOW)
             elif platform.system() == "Darwin":
                 subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'], check=True)
             else:  # Linux / BSD
@@ -9638,6 +20004,7 @@ class MainWindow(QMainWindow):
                     text=True,
                     timeout=120,
                     cwd=_app_dir,
+                    creationflags=_WIN_NO_WINDOW,
                 )
                 return {
                     "status": "ok" if result.returncode == 0 else "error",
@@ -9653,7 +20020,7 @@ class MainWindow(QMainWindow):
             """In-process path — used when running as a frozen PyInstaller .exe."""
             try:
                 cfg      = config_manager.load()
-                dest     = watch.get("destination", "").strip() or cfg.get("destination", "")
+                dest     = watch.get("destination", "").strip()
                 dest_type = cfg.get("dest_type", "local")
                 snapshot = config_manager.load_snapshot(watch_id, dest_type)
                 result   = backup_engine.run_backup(
@@ -9696,95 +20063,143 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 return {"status": "error", "stdout": "", "stderr": str(e)}
         
-        def _show_dialog(result):
-            """Display the preview output in a modal dialog."""
-            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout
-            from PyQt6.QtCore import Qt
-            
-            dlg = QDialog(self)
-            dlg.setWindowTitle(f"Backup Preview — {watch_name}")
-            dlg.setGeometry(100, 100, 700, 500)
-            
-            layout = QVBoxLayout(dlg)
-            
-            # Read-only text edit for output
-            text_edit = QTextEdit()
-            text_edit.setReadOnly(True)
-            text_edit.setStyleSheet(
-                "background:#141720; color:#e5e7eb; font-family:'Courier New'; font-size:10px;"
-            )
-            
-            # Combine stdout and stderr for display
-            output = result.get("stdout", "")
-            if result.get("stderr"):
-                if output:
-                    output += "\n\n--- STDERR ---\n"
-                output += result.get("stderr", "")
-            
-            if result.get("status") == "error" and not output:
-                output = f"Error running preview: {result.get('stderr', 'Unknown error')}"
-            
-            text_edit.setPlainText(output if output else "(No output)")
-            text_edit.moveCursor(text_edit.textCursor().__class__.Start)
-            layout.addWidget(text_edit)
-            
-            # Close button
-            btn_layout = QHBoxLayout()
-            btn_layout.addStretch()
-            close_btn = QPushButton("Close")
-            close_btn.clicked.connect(dlg.accept)
-            btn_layout.addWidget(close_btn)
-            layout.addLayout(btn_layout)
-            
-            dlg.exec()
-            
-            # Re-enable the dry run button after dialog closes
-            if watch_id in self._cards:
-                self._cards[watch_id].dry_run_btn.setEnabled(True)
-            
-            # Log summary
-            if result.get("status") == "ok":
-                self._append_log(f"✔ Backup preview for '{watch_name}' completed")
-            else:
-                self._append_log(f"❌ Backup preview for '{watch_name}' failed")
-        
         # Run in background thread.
         # In frozen (.exe) mode backupsys_cli.py does not exist on disk, so
         # we call backup_engine directly.  In script mode we spawn the CLI
         # subprocess so the output is identical to the terminal command.
+        #
+        # FIX: emit a pyqtSignal to deliver the result to the Qt main thread.
+        # The previous QTimer.singleShot approach was called from a plain
+        # threading.Thread (which has no Qt event loop), so the timer callback
+        # never fired and the dialog never appeared.
         import threading
         _is_frozen = getattr(sys, "frozen", False)
         def _thread():
             result = _run_inprocess() if _is_frozen else _run_cli()
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(0, lambda: _show_dialog(result))
+            self._dry_run_result.emit(result, watch_id, watch_name)
 
         threading.Thread(target=_thread, daemon=True).start()
+
+    def _show_dry_run_dialog(self, result: dict, watch_id: str, watch_name: str):
+        """Display dry-run preview results in a modal dialog (always called on the main thread via signal)."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout, QLabel
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QTextCursor as _QTC
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Backup Preview — {watch_name}")
+        dlg.setMinimumSize(720, 520)
+        dlg.resize(720, 520)
+
+        # Centre the dialog over the main window
+        geo = self.geometry()
+        dlg.move(
+            geo.x() + (geo.width()  - dlg.width())  // 2,
+            geo.y() + (geo.height() - dlg.height()) // 2,
+        )
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # Status banner
+        ok = result.get("status") == "ok"
+        banner = QLabel("✅  Preview completed successfully" if ok else "❌  Preview encountered an error")
+        banner.setStyleSheet(
+            "color:#4ade80; font-weight:600; font-size:13px; padding:4px 0;" if ok
+            else "color:#f87171; font-weight:600; font-size:13px; padding:4px 0;"
+        )
+        layout.addWidget(banner)
+
+        # Read-only output pane
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setStyleSheet(
+            "background:#141720; color:#e5e7eb; font-family:'Courier New'; font-size:13px;"
+            "border:1px solid #374151; border-radius:4px;"
+        )
+
+        output = result.get("stdout", "")
+        if result.get("stderr"):
+            if output:
+                output += "\n\n--- STDERR ---\n"
+            output += result.get("stderr", "")
+        if result.get("status") == "error" and not output:
+            output = f"Error running preview: {result.get('stderr', 'Unknown error')}"
+        text_edit.setPlainText(output if output else "(No output)")
+        text_edit.moveCursor(_QTC.MoveOperation.Start)
+        layout.addWidget(text_edit)
+
+        # Close button
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setMinimumWidth(80)
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        dlg.exec()
+
+        # Re-enable the dry run button after dialog closes
+        if watch_id in self._cards:
+            self._cards[watch_id].dry_run_btn.setEnabled(True)
+
+        # Log summary
+        if ok:
+            self._append_log(f"✔ Backup preview for '{watch_name}' completed")
+        else:
+            self._append_log(f"❌ Backup preview for '{watch_name}' failed")
 
     def _validate_watch(self, watch: dict):
         if not BACKEND_AVAILABLE:
             return
 
         # Sync mode: validate the destination folder directly.
+        # NOTE: backup_engine.validate_backup() looks for BACKUP.sha256, which
+        # is intentionally never written in sync mode (it would pollute the live
+        # destination).  We do a simple folder-accessibility check instead —
+        # a full hash-manifest validation is not meaningful on a live sync folder.
         if watch.get("sync_mode", False):
             folder = self._watch_dest(watch)
             if not folder:
                 QMessageBox.warning(self, "Validate", "No destination path configured.")
                 return
             self._append_log(f"Validating sync destination: {watch['name']} …")
+            import os
             try:
-                result = backup_engine.validate_backup(folder)
-            except Exception as e:
-                QMessageBox.critical(self, "Validate Error", str(e))
+                exists      = os.path.isdir(folder)
+                file_count  = sum(1 for _ in os.scandir(folder)) if exists else 0
+                accessible  = True
+            except PermissionError as exc:
+                accessible  = False
+                exists      = False
+                file_count  = 0
+                _acc_err    = str(exc)
+            except Exception as exc:
+                QMessageBox.critical(self, "Validate Error", str(exc))
                 return
-            if result.get("valid"):
-                QMessageBox.information(self, "Validate  · Passed",
-                    f"▶  Destination is valid\n\nWatch:  {watch['name']}\nFolder: {folder}")
+
+            if exists and accessible:
+                QMessageBox.information(
+                    self, "Validate  · Passed",
+                    f"▶  Sync destination is accessible\n\n"
+                    f"Watch:   {watch['name']}\n"
+                    f"Folder:  {folder}\n"
+                    f"Items:   {file_count} file(s) / folder(s) present\n\n"
+                    f"Note: sync folders do not store a checksum file — "
+                    f"file integrity is maintained by the sync process itself."
+                )
                 self._append_log(f"▶ Validate passed: {watch['name']}")
             else:
-                err = result.get("error", "Unknown error")
-                QMessageBox.critical(self, "Validate  · Failed",
-                    f"⚠  Validation failed\n\nWatch: {watch['name']}\nError: {err}")
+                reason = _acc_err if not accessible else f"Folder not found: {folder}"
+                QMessageBox.critical(
+                    self, "Validate  · Failed",
+                    f"⚠  Sync destination is not accessible\n\n"
+                    f"Watch:  {watch['name']}\n"
+                    f"Folder: {folder}\n"
+                    f"Error:  {reason}"
+                )
                 self._append_log(f"⚠ Validate failed: {watch['name']}")
             return
 
@@ -9859,7 +20274,7 @@ class MainWindow(QMainWindow):
         # ── Global non-local destination ──────────────────────────────────────
         # "gdrive" is the canonical dest_type saved by the Settings dialog;
         # "cloud" is kept as a legacy alias for configs saved by older versions.
-        _REMOTE_TYPES = {"sftp", "ftps", "ftp", "smb", "webdav", "https", "rclone", "cloud", "gdrive"}
+        _REMOTE_TYPES = {"sftp", "ftps", "ftp", "webdav", "https", "rclone", "cloud", "gdrive"}
         if global_dest_type in _REMOTE_TYPES:
             local_path = self._download_for_restore(
                 self._watch_dest(watch), global_dest_type, watch)
@@ -9934,7 +20349,7 @@ class MainWindow(QMainWindow):
 
         label_map = {
             "sftp": "SFTP", "ftps": "SFTP/TLS", "ftp": "FTP",
-            "smb": "SMB", "webdav": "WebDAV", "https": "HTTPS",
+            "webdav": "WebDAV", "https": "HTTPS",
             "rclone": "rclone", "cloud": "Google Drive", "gdrive": "Google Drive",
         }
         label = label_map.get(dest_type, dest_type.upper())
@@ -9955,7 +20370,7 @@ class MainWindow(QMainWindow):
 
         try:
             from transport_utils import (
-                download_from_sftp, download_from_ftp, download_from_smb,
+                download_from_sftp, download_from_ftp,
                 download_from_webdav, download_from_https, download_from_rclone,
             )
 
@@ -9968,8 +20383,6 @@ class MainWindow(QMainWindow):
                 result = download_from_sftp(dest, temp_dir, _cfg("dest_sftp"), progress_cb=_prog)
             elif dest_type == "ftp":
                 result = download_from_ftp(dest, temp_dir, _cfg("dest_ftp"), progress_cb=_prog)
-            elif dest_type == "smb":
-                result = download_from_smb(dest, temp_dir, _cfg("dest_smb"), progress_cb=_prog)
             elif dest_type == "webdav":
                 result = download_from_webdav(dest, temp_dir, _cfg("dest_webdav"), progress_cb=_prog)
             elif dest_type == "https":
@@ -10531,7 +20944,9 @@ class MainWindow(QMainWindow):
             panel = AdminPanel(self.cfg, self)
             panel.watches_changed.connect(self._on_watches_changed)
             panel._tabs.setCurrentIndex(2)  # Cloud tab (0=General, 1=Watches, 2=Cloud)
+            self._admin_panel = panel
             panel.exec()
+            self._admin_panel = None
             self._load_config()
             self._update_auto_label()
             self._update_stats()
@@ -10544,7 +20959,7 @@ class MainWindow(QMainWindow):
                 f"Open Settings → Cloud tab → click Reconnect next to Google Drive.\n\n({e})"
             )
 
-    def _open_admin(self):
+    def _open_admin(self, *, _after_show=None):
         if not PasswordDialog.has_password():
             # First time  · prompt to set password
             reply = QMessageBox.question(self, "Set Admin Password",
@@ -10555,16 +20970,31 @@ class MainWindow(QMainWindow):
                 dlg = PasswordDialog(self, mode="set")
                 if dlg.exec() != QDialog.DialogCode.Accepted:
                     return
-
-        dlg = PasswordDialog(self, mode="verify")
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+            # Password was just set (or the user chose to skip) — proceed
+            # straight into Admin. Asking them to re-enter the password they
+            # *just* typed in a second dialog was confusing and made it look
+            # like the app refused to let them in.
+        else:
+            dlg = PasswordDialog(self, mode="verify")
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                if getattr(dlg, "_forgot_clicked", False):
+                    # User reset the password via "Forgot password?" — let
+                    # them set a new one now, then continue into Admin.
+                    reset_dlg = PasswordDialog(self, mode="set")
+                    if reset_dlg.exec() != QDialog.DialogCode.Accepted:
+                        return
+                else:
+                    return
 
         panel = AdminPanel(self.cfg, self)
         panel.watches_changed.connect(self._on_watches_changed)
+        self._admin_panel = panel
         # Validate cloud tokens when opening admin panel so user sees warning immediately
         self._validate_cloud_tokens()
+        if _after_show is not None:
+            QTimer.singleShot(0, lambda: _after_show(panel))
         panel.exec()
+        self._admin_panel = None
 
         self._load_config()
         self._update_auto_label()
@@ -10605,13 +21035,40 @@ class MainWindow(QMainWindow):
         worker = self._workers.get(watch_id)
         if worker:
             worker.request_stop()
+            # BUG FIX: if the backup was paused, the worker thread is parked
+            # inside pause_event.wait() and won't re-check _stop_event on its
+            # own — cancelling while paused used to hang forever ("stuck
+            # Cancelling…"). resume() wakes the wait immediately so the
+            # cancel takes effect right away.
+            worker.resume()
             self._append_log(f"⏹ Cancel requested for: {self._watch_name_for(watch_id)}")
         # Remember this was a deliberate user cancel so the auto-timer does
         # not immediately re-trigger a new backup for the same watch.
         self._user_cancelled_watches.add(watch_id)
         if watch_id in self._cards:
-            self._cards[watch_id].cancel_btn.setEnabled(False)
-            self._cards[watch_id].cancel_btn.setText("Cancelling…")
+            card = self._cards[watch_id]
+            card.cancel_btn.setEnabled(False)
+            card.cancel_btn.setText("Cancelling…")
+            # Give immediate visual feedback so the UI doesn't look frozen
+            # while robocopy winds down (can take a few seconds on SMB).
+            card.file_lbl.setText("Cancelling…")
+            card.status_lbl.setText("▶ Cancelling…")
+            card.status_lbl.setObjectName("status_warn")
+
+        # Also remove this watch's remaining group from the queue and clear
+        # "Queued" badges on any watches that were waiting behind it.
+        cancelled_watch = next(
+            (w for w in self.cfg.get("watches", []) if w["id"] == watch_id), None
+        )
+        if cancelled_watch:
+            src_key = self._backup_group_key(cancelled_watch)
+            remaining = self._source_queues.pop(src_key, [])
+            for _qi, _qw in enumerate(remaining, start=1):
+                if _qw["id"] in self._cards:
+                    self._cards[_qw["id"]].set_queued(False)
+                    self._append_log(
+                        f"⏹ '{_qw.get('name', _qw['id'])}' removed from queue (parent cancelled)"
+                    )
 
     def _on_open_backup_folder(self, watch_id: str):
         """Open the backup destination folder in the system file explorer.
@@ -10677,6 +21134,18 @@ class MainWindow(QMainWindow):
                     pre_backup_cmd=v.get("pre_backup_cmd", ""),
                     post_backup_cmd=v.get("post_backup_cmd", ""),
                 )
+                # Save SMB credentials
+                for w in self.cfg.get("watches", []):
+                    if w["id"] == wid:
+                        if v.get("nas_user"):
+                            w["smb_audit_cfg"] = {
+                                "username": v.get("nas_user", ""),
+                                "password": v.get("nas_pass", ""),
+                                
+                            }
+                        else:
+                            w.pop("smb_audit_cfg", None)
+                        break
                 config_manager.save(self.cfg)
             except Exception as e:
                 QMessageBox.critical(self, "Save Error", f"Could not save watch settings:\n{e}")
@@ -10694,15 +21163,27 @@ class MainWindow(QMainWindow):
         if self._watcher_mgr:
             if paused:
                 self._watcher_mgr.stop(watch_id)
+                self._watcher_mgr.stop(watch_id + "__dest")
             else:
                 watch = next((w for w in self.cfg.get("watches", []) if w["id"] == watch_id), None)
                 if watch:
+                    _nas_cfg_resume = watch.get("smb_audit_cfg", {})
                     self._watcher_mgr.start(
                         watch_id, watch["path"],
                         on_change=self._on_file_change,
                         exclude_patterns=watch.get("exclude_patterns", []),
                         interval_min=watch.get("interval_min", 0) or self.cfg.get("interval_min", 30),
+                        smb_audit_cfg=_nas_cfg_resume,
                     )
+                    dest = self._watch_dest(watch)
+                    if dest and dest.strip() and dest.strip() != watch["path"].strip():
+                        self._watcher_mgr.start(
+                            watch_id + "__dest", dest.strip(),
+                            on_change=self._on_file_change,
+                            exclude_patterns=watch.get("exclude_patterns", []),
+                            interval_min=watch.get("interval_min", 0) or self.cfg.get("interval_min", 30),
+                            smb_audit_cfg=_nas_cfg_resume,
+                        )
         self._append_log(f"{'⏸ Paused' if paused else '▶ Resumed'} watch: {self._watch_name_for(watch_id)}")
 
     def _toggle_pause_all(self):
@@ -10742,8 +21223,12 @@ class MainWindow(QMainWindow):
     def _on_watches_changed(self):
         self._load_config()
         if self._watcher_mgr:
-            self._watcher_mgr.stop_all()
+            # Stop watchers in a background thread — observer.join(timeout=2)
+            # per watcher blocks the main thread (= UI freeze) if done inline.
+            old_mgr = self._watcher_mgr
             self._watcher_mgr = WatcherManager()
+            import threading as _thr
+            _thr.Thread(target=old_mgr.stop_all, daemon=True).start()
         self._refresh_watches()
         self._start_watchers()
         self._update_stats()
@@ -11003,7 +21488,7 @@ class GlobalTrendDialog(QDialog):
                 success += 1
             elif st == "failure":
                 failure += 1
-            bc = entry.get("bytes_copied") or 0
+            bc = entry.get("bytes_copied") or entry.get("size_bytes") or 0
             total_bytes += bc
 
             ts = entry.get("timestamp") or entry.get("time") or ""
@@ -11036,7 +21521,7 @@ class GlobalTrendDialog(QDialog):
                 rec["success"] += 1
             elif st == "failure":
                 rec["failure"] += 1
-            rec["bytes"] += entry.get("bytes_copied") or 0
+            rec["bytes"] += entry.get("bytes_copied") or entry.get("size_bytes") or 0
 
         return total, success, failure, total_bytes, daily_series, watch_stats
 
@@ -11236,7 +21721,7 @@ class HistoryWindow(QDialog):
         fl.addWidget(self.filter_input)
 
         self.type_filter = QComboBox()
-        self.type_filter.addItems(["All Types", "modified", "added", "deleted", "renamed"])
+        self.type_filter.addItems(["All Types", "modified", "added", "deleted", "renamed", "backed up"])
         self.type_filter.setFixedWidth(120)
         self.type_filter.currentTextChanged.connect(self._filter_changes)
         fl.addWidget(self.type_filter)
@@ -11514,14 +21999,11 @@ class HistoryWindow(QDialog):
         if not query:
             return
 
-        global_dest = self._cfg.get("destination", "")
         filter_wid  = self._fs_watch_combo.currentData()
 
         # Build a watch-id → name lookup and collect all distinct destinations
         watch_names = {}
         dest_set: set = set()
-        if global_dest:
-            dest_set.add(global_dest)
         for w in self._cfg.get("watches", []):
             watch_names[w["id"]] = w.get("name", w["id"])
             wd = w.get("destination", "").strip()
@@ -11701,12 +22183,13 @@ class HistoryWindow(QDialog):
         self.backup_table.resizeRowsToContents()
 
     def _populate_changes(self, entries: list):
-        icon_map  = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗"}
+        icon_map  = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗", "backed up": "📦"}
         color_map = {
-            "modified": "#f59e0b",
-            "added":    "#22c55e",
-            "deleted":  "#ef4444",
-            "renamed":  "#3b82f6",
+            "modified":  "#f59e0b",
+            "added":     "#22c55e",
+            "deleted":   "#ef4444",
+            "renamed":   "#3b82f6",
+            "backed up": "#a78bfa",
         }
 
         self.table.setRowCount(len(entries))
@@ -11725,6 +22208,7 @@ class HistoryWindow(QDialog):
             user    = e.get("editor_user", "")
             machine = e.get("editor_machine", "")
             ip      = e.get("editor_ip", "")
+            _unknown = e.get("attribution_unknown", False)
 
             def _item(text, clr=None):
                 item = QTableWidgetItem(str(text))
@@ -11739,9 +22223,45 @@ class HistoryWindow(QDialog):
             type_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
             self.table.setItem(i, 2, type_item)
             self.table.setItem(i, 3, _item(path))
-            self.table.setItem(i, 4, _item(user,    "#60a5fa"))
-            self.table.setItem(i, 5, _item(machine, "#a78bfa"))
-            self.table.setItem(i, 6, _item(ip,      "#34d399"))
+            # Use amber for Unknown, orange for Local user, blue for identified
+            _is_local_pop   = (user == "Local user")
+            _is_unknown_pop = _unknown and not _is_local_pop
+            _user_color    = "#f59e0b" if _is_unknown_pop else ("#fb923c" if _is_local_pop else "#60a5fa")
+            _machine_color = "#9ca3af" if (_is_unknown_pop or _is_local_pop) else "#a78bfa"
+            _ip_color      = "#9ca3af" if (_is_unknown_pop or _is_local_pop) else "#34d399"
+            _user_display    = (f"⚠ {user}" if _is_unknown_pop else
+                                (f"🖥 {user}" if _is_local_pop else user))
+            _machine_display = machine
+            _user_item = _item(_user_display, _user_color)
+            if _is_local_pop:
+                _user_item.setToolTip(
+                    "Local user on the Windows PC — deleted directly via Explorer\n"
+                    "or a local app, not over a network connection.\n\n"
+                    "To identify the exact account:\n"
+                    "  1. Right-click shared folder → Properties → Security\n"
+                    "     → Advanced → Auditing → Add Everyone/Delete\n"
+                    "  2. Enable 'Remote Event Log Management' in Windows Firewall\n"
+                    "  3. Add Windows admin credentials in watch Settings"
+                )
+            elif _is_unknown_pop:
+                _user_item.setToolTip(
+                    "Identity could not be determined.\n"
+                    "The file was deleted locally on the Windows PC that hosts the share,\n"
+                    "so no SMB network session was visible to identify the actor.\n\n"
+                    "To identify who deleted it in future:\n"
+                    "  1. On the Windows PC hosting the share: right-click the shared folder\n"
+                    "     → Properties → Security → Advanced → Auditing\n"
+                    "     → Add → Principal: Everyone, Type: Success, Access: Delete\n"
+                    "  2. On the same PC: Windows Defender Firewall\n"
+                    "     → Allow an app → enable 'Remote Event Log Management'\n"
+                    "  3. In watch Settings → Edit Watch → add Windows admin credentials\n"
+                    "     for the PC hosting the share\n\n"
+                    "With all three steps done, BackupSys will read the Security Event Log\n"
+                    "and show the exact user account that deleted the file."
+                )
+            self.table.setItem(i, 4, _user_item)
+            self.table.setItem(i, 5, _item(_machine_display, _machine_color))
+            self.table.setItem(i, 6, _item(ip,               _ip_color))
 
         self.table.resizeRowsToContents()
         self._update_stats(entries)
@@ -11878,6 +22398,13 @@ class HistoryWindow(QDialog):
         on *every* incoming file-change event, which caused visible UI freezes
         on busy watches.  Now we insert a single row at position 0.
         """
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            f"[HistoryWindow.append_entry] type={entry.get('type')!r} "
+            f"path={entry.get('path')!r} "
+            f"detection_source={entry.get('detection_source')!r} "
+            f"watch_name={entry.get('watch_name')!r}"
+        )
         self._all_history.append(entry)
 
         # If a filter is active, check whether this entry passes before inserting
@@ -11896,12 +22423,13 @@ class HistoryWindow(QDialog):
             if text not in searchable:
                 return
 
-        icon_map  = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗"}
+        icon_map  = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗", "backed up": "📦"}
         color_map = {
-            "modified": "#f59e0b",
-            "added":    "#22c55e",
-            "deleted":  "#ef4444",
-            "renamed":  "#3b82f6",
+            "modified":  "#f59e0b",
+            "added":     "#22c55e",
+            "deleted":   "#ef4444",
+            "renamed":   "#3b82f6",
+            "backed up": "#a78bfa",
         }
 
         ts = entry.get("timestamp", "")
@@ -11928,14 +22456,94 @@ class HistoryWindow(QDialog):
         type_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.table.setItem(0, 2, type_item)
         self.table.setItem(0, 3, _item(entry.get("path", "")))
-        self.table.setItem(0, 4, _item(entry.get("editor_user",    ""), "#60a5fa"))
-        self.table.setItem(0, 5, _item(entry.get("editor_machine", ""), "#a78bfa"))
+
+        # ── Attribution column: colour Unknown/Local user distinctly and add tooltip ────
+        _user_text    = entry.get("editor_user", "")
+        _is_local     = _user_text == "Local user"
+        _is_unknown   = (entry.get("attribution_unknown", False) or _user_text == "Unknown") and not _is_local
+        _user_clr     = "#f59e0b" if _is_unknown else ("#fb923c" if _is_local else "#60a5fa")  # amber=unknown, orange=local, blue=identified
+        user_item     = _item(_user_text, _user_clr)
+        if _is_local:
+            _machine = entry.get("editor_machine", "")
+            _tip = (
+                "Local user on the Windows PC — the file was deleted directly on\n"
+                "the PC (via Explorer or a local app), not over a network connection.\n\n"
+                "Win32 NetSessionEnum only sees SMB/network sessions — local actors\n"
+                "are invisible to it. To identify the specific user account:\n"
+                "  1. Open the shared folder on the Windows PC\n"
+                "  2. Right-click → Properties → Security → Advanced → Auditing\n"
+                "  3. Add: Principal=Everyone, Type=All, Access=Delete/Write\n"
+                "  4. Enable 'Remote Event Log Management' in Windows Firewall\n"
+                "  5. Add Windows admin credentials in watch Settings\n\n"
+                "With steps 1-5, BackupSys will read Security Event Log 4663\n"
+                "to show the exact Windows account that deleted the file."
+            )
+            if _machine and _machine not in ("Local user", ""):
+                _tip = f"PC: {_machine}\n\n" + _tip
+            user_item.setToolTip(_tip)
+        elif _is_unknown:
+            _machine = entry.get("editor_machine", "")
+            _tip = (
+                "Attribution unknown — the file was changed directly on the Windows PC\n"
+                "(locally via Explorer/app), not via a remote SMB connection.\n\n"
+                "Win32 NetSessionEnum only sees network sessions — local actors are\n"
+                "invisible to it. To identify who did it:\n"
+                "  1. Open the shared folder on the Windows PC\n"
+                "  2. Right-click \u2192 Properties \u2192 Security \u2192 Advanced \u2192 Auditing\n"
+                "  3. Add: Principal=Everyone, Type=All, Access=Delete/Write\n"
+                "  4. Enable 'Remote Event Log Management' in Windows Firewall\n"
+                "  5. Add Windows admin credentials in watch Settings"
+            )
+            if _machine and _machine not in ("Unknown", ""):
+                _tip = f"PC: {_machine}\n\n" + _tip
+            user_item.setToolTip(_tip)
+        self.table.setItem(0, 4, user_item)
+
+        _machine_item = _item(entry.get("editor_machine", ""), "#a78bfa")
+        if _is_unknown or _is_local:
+            _machine_item.setForeground(QColor("#9ca3af"))  # grey out machine too
+        self.table.setItem(0, 5, _machine_item)
         self.table.setItem(0, 6, _item(entry.get("editor_ip",      ""), "#34d399"))
 
         # Update counters without rebuilding the whole stats bar
         self._update_stats([e for e in self._all_history
                             if not type_sel or type_sel == "All Types"
                             or e.get("type") == type_sel])
+
+    def update_entry(self, entry: dict):
+        """Patch user/machine/IP cells for an already-displayed row in-place.
+
+        Called when the dedup retry enrichment succeeds for a deleted event
+        that initially had no attribution.  The entry dict has already been
+        mutated, so _all_history is already up-to-date; we only need to
+        refresh the matching table row(s).
+        """
+        path_lower = entry.get("path", "").lower()
+        etype      = entry.get("type", "")
+        for row in range(self.table.rowCount()):
+            path_item = self.table.item(row, 3)
+            type_item = self.table.item(row, 2)
+            if path_item is None or type_item is None:
+                continue
+            if (path_item.text().lower() == path_lower
+                    and etype in type_item.text()):
+                _new_user = entry.get("editor_user", "")
+                _is_local_upd   = _new_user == "Local user"
+                _is_unknown_upd = (entry.get("attribution_unknown", False) or _new_user == "Unknown") and not _is_local_upd
+                _user_clr_upd   = "#f59e0b" if _is_unknown_upd else ("#fb923c" if _is_local_upd else "#60a5fa")
+                user_cell = self.table.item(row, 4)
+                mach_cell = self.table.item(row, 5)
+                if user_cell:
+                    user_cell.setText(_new_user)
+                    user_cell.setForeground(QColor(_user_clr_upd))
+                if mach_cell:
+                    mach_cell.setText(entry.get("editor_machine", ""))
+                    mach_cell.setForeground(QColor("#9ca3af" if (_is_unknown_upd or _is_local_upd) else "#a78bfa"))
+                ip_cell = self.table.item(row, 6)
+                if ip_cell:
+                    ip_cell.setText(entry.get("editor_ip", ""))
+                break
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -11958,9 +22566,6 @@ class TrayApp:
             open_action = QAction("Open Dashboard", menu)
             open_action.triggered.connect(self._show_window)
 
-            backup_action = QAction("⚡  Backup All Now", menu)
-            backup_action.triggered.connect(self.window._backup_all)
-
             integrity_action = QAction("🔍  Run Integrity Check Now", menu)
             integrity_action.triggered.connect(self.window._trigger_integrity_check_now)
 
@@ -11972,7 +22577,6 @@ class TrayApp:
 
             menu.addAction(open_action)
             menu.addSeparator()
-            menu.addAction(backup_action)
             menu.addAction(integrity_action)
             menu.addAction(admin_action)
             menu.addAction(history_action)
@@ -12074,32 +22678,6 @@ def main():
         import traceback
         tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         logger.critical(f"Unhandled exception:\n{tb_str}")
-
-        # ── SMB authentication errors are non-fatal — show a friendly warning
-        # instead of crashing the app. WinError 1326 = wrong username/password.
-        err_str = str(exc_value)
-        is_smb_auth = (
-            isinstance(exc_value, OSError) and
-            ("1326" in err_str or "1219" in err_str or
-             "ユーザー名またはパスワード" in err_str or
-             "wrong password" in err_str.lower() or
-             "logon failure" in err_str.lower())
-        )
-        if is_smb_auth:
-            logger.warning(f"[smb] Authentication error (non-fatal): {exc_value}")
-            try:
-                _tmp_app = QApplication.instance() or QApplication(sys.argv)
-                QMessageBox.warning(
-                    None,
-                    f"{APP_NAME} — Network Share Unavailable",
-                    f"A watched network share could not be accessed.\n\n"
-                    f"Path: {err_str}\n\n"
-                    f"The app will continue running. To fix this permanently, save your\n"
-                    f"NAS credentials in Windows Credential Manager so they survive reboots."
-                )
-            except Exception:
-                pass
-            return  # don't exit — app continues normally
 
         # ── Crash notification — attempt email + webhook ───────────────────
         try:

@@ -84,9 +84,9 @@ class TestDeletePassword:
         assert cs.delete_password("ftp", "nope") is False
 
     def test_delete_returns_true_on_success(self):
-        cs.set_password("smb", "nas", "pw")
-        assert cs.delete_password("smb", "nas") is True
 
+        cs.set_password("ftp", "host", "pw")
+        assert cs.delete_password("ftp", "host") is True
 
 # ─── Convenience helpers ──────────────────────────────────────────────────────
 class TestConvenienceHelpers:
@@ -100,10 +100,6 @@ class TestConvenienceHelpers:
         cfg = {"host": "ftp.example.com", "password": "config-pw"}
         assert cs.get_ftp_password(cfg) == "config-pw"
 
-    def test_smb_helper_roundtrip(self):
-        cfg = {"server": "nas", "password": "nas-pw"}
-        cs.set_smb_password(cfg, "keyring-smb")
-        assert cs.get_smb_password(cfg) == "keyring-smb"
 
     def test_smtp_env_var_priority(self, monkeypatch):
         monkeypatch.setenv("BACKUPSYS_EMAIL_PASSWORD", "env-pw")

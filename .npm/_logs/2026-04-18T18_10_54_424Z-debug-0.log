@@ -1,0 +1,18 @@
+0 verbose cli /usr/bin/node /usr/bin/npm
+1 info using npm@10.9.7
+2 info using node@v22.22.2
+3 silly config load:file:/usr/lib/node_modules/npm/npmrc
+4 silly config load:file:/home/claude/.npmrc
+5 silly config load:file:/usr/etc/npmrc
+6 verbose title npm config set prefix /home/claude/.npm-global
+7 verbose argv "config" "set" "prefix" "/home/claude/.npm-global" "--global"
+8 verbose logfile logs-max:10 dir:/home/claude/.npm/_logs/2026-04-18T18_10_54_424Z-
+9 verbose logfile /home/claude/.npm/_logs/2026-04-18T18_10_54_424Z-debug-0.log
+10 info config set "prefix" "/home/claude/.npm-global"
+11 silly logfile done cleaning log files
+12 verbose cwd /home/claude
+13 verbose os Linux 6.12.55-74.119.amzn2023.x86_64
+14 verbose node v22.22.2
+15 verbose npm  v10.9.7
+16 verbose exit 0
+17 info ok

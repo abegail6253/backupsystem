@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BackupSys — Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f172a;
+      --surface:   #1e293b;
+      --border:    #334155;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --subtle:    #94a3b8;
+      --accent:    #3b82f6;
+      --green:     #22c55e;
+      --red:       #ef4444;
+      --yellow:    #f59e0b;
+      --radius:    10px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* ── Nav ───────────────────────────────────────────────────────────────── */
+    nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 54px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 15px;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .nav-brand span { font-size: 20px; }
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .nav-ts {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .btn-logout {
+      padding: 5px 14px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--subtle);
+      font-size: 12px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .btn-logout:hover { border-color: var(--subtle); color: var(--text); }
+
+    /* ── Layout ────────────────────────────────────────────────────────────── */
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 28px 24px 60px;
+    }
+
+    h2 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+
+    /* ── Stat cards ────────────────────────────────────────────────────────── */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 14px;
+      margin-bottom: 32px;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+    }
+    .stat-label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .stat-value.green { color: var(--green); }
+    .stat-value.red   { color: var(--red);   }
+    .stat-value.blue  { color: var(--accent); }
+    .stat-value.white { color: var(--text);   }
+
+    /* ── Machine cards ─────────────────────────────────────────────────────── */
+    .machines {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 12px;
+      margin-bottom: 36px;
+    }
+    .machine {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+    }
+    .machine .name {
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 6px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .machine .detail {
+      font-size: 12px;
+      color: var(--subtle);
+    }
+    .machine .detail.ts { color: var(--muted); margin-top: 4px; }
+
+    /* ── Events table ──────────────────────────────────────────────────────── */
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .table-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .table-header h2 { margin: 0; }
+    .table-count {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .table-scroll { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead th {
+      padding: 9px 14px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      background: rgba(255,255,255,0.02);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody tr {
+      border-bottom: 1px solid rgba(51,65,85,0.5);
+      transition: background 0.1s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(255,255,255,0.03); }
+    tbody td {
+      padding: 9px 14px;
+      color: var(--text);
+      vertical-align: middle;
+    }
+    td.ts      { color: var(--muted); white-space: nowrap; font-family: monospace; font-size: 12px; }
+    td.error-cell {
+      color: #fca5a5;
+      font-size: 12px;
+      max-width: 260px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      cursor: help;
+    }
+
+    /* ── Status pills ──────────────────────────────────────────────────────── */
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .pill.ok  { background: rgba(34,197,94,0.15);  color: #86efac; }
+    .pill.err { background: rgba(239,68,68,0.15);   color: #fca5a5; }
+    .pill.can { background: rgba(245,158,11,0.15);  color: #fde68a; }
+
+    /* ── Refresh hint ──────────────────────────────────────────────────────── */
+    .footer {
+      text-align: center;
+      margin-top: 28px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .footer a { color: var(--accent); text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <a class="nav-brand" href="/dashboard">
+    <span>🛡️</span> BackupSys
+  </a>
+  <div class="nav-right">
+    <span class="nav-ts">Last updated: {{ ts[:19] }}</span>
+    <a class="btn-logout" href="/dashboard/logout">Sign out</a>
+  </div>
+</nav>
+
+<main>
+
+  <!-- Stat cards -->
+  <h2>Overview</h2>
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">Total Events</div>
+      <div class="stat-value white">{{ total }}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Successful</div>
+      <div class="stat-value green">{{ successes }}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Failed</div>
+      <div class="stat-value red">{{ failures }}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Machines</div>
+      <div class="stat-value blue">{{ machine_count }}</div>
+    </div>
+  </div>
+
+  <!-- Machine cards -->
+  <h2>Machines</h2>
+  <div class="machines">
+    {{ machine_rows | safe }}
+  </div>
+
+  <!-- Events table -->
+  <div class="table-wrap">
+    <div class="table-header">
+      <h2>Recent Events</h2>
+      <span class="table-count">showing up to {{ event_count }}</span>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Machine</th>
+            <th>Watch</th>
+            <th>Status</th>
+            <th>Files</th>
+            <th>Size</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ event_rows | safe }}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">
+    <a href="?limit=500">Show 500</a> &nbsp;·&nbsp;
+    <a href="?limit=1000">Show 1000</a> &nbsp;·&nbsp;
+    <a href="/dashboard">Refresh</a>
+  </div>
+
+</main>
+
+</body>
+</html>

@@ -1,0 +1,37 @@
+# BackupSys API Server — requirements
+# Install with: pip install -r requirements_api.txt
+#
+# This file is for the optional server-side component (backupsys_api.py).
+# It is NOT needed for the desktop app — use requirements_desktop.txt for that.
+#
+# All versions are pinned to a known-good range so that a fresh `pip install`
+# on Railway / Render / any future CI run produces the same environment.
+# When upgrading, test locally first, then widen the upper bound deliberately.
+
+# ── Web framework ──────────────────────────────────────────────────────────────
+flask>=3.0.3,<4.0
+
+# ── CORS support ──────────────────────────────────────────────────────────────────────────────────
+# Enables cross-origin requests so browser dashboards and third-party
+# integrations can call the API without opaque CORS errors.
+flask-cors>=4.0.0,<5.0
+
+# ── Production WSGI server ─────────────────────────────────────────────────────
+# Used by the Procfile: gunicorn backupsys_api:app
+# Do NOT use Flask's built-in dev server (app.run()) in production.
+gunicorn>=21.2.0,<24.0
+
+# ── WSGI / HTTP utilities (Flask transitive deps — pin for reproducibility) ────
+werkzeug>=3.0.3,<4.0
+click>=8.1.7,<9.0
+itsdangerous>=2.2.0,<3.0
+jinja2>=3.1.4,<4.0
+markupsafe>=2.1.5,<3.0
+
+# ── Standard-library modules used (no install needed, listed for clarity) ──────
+# hashlib, hmac, json, logging, os, sqlite3, secrets, string, time, datetime
+
+# ── .env auto-load ─────────────────────────────────────────────────────────────
+# backupsys_api.py calls load_dotenv() at import time so operators can put their
+# configuration in a .env file instead of sourcing it manually before gunicorn.
+python-dotenv>=1.0.0,<2.0

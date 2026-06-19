@@ -8,6 +8,7 @@
   "compression_enabled": false,
   "auto_retry": true,
   "retry_delay_min": 5,
+  "auto_sacl_owned_smb_shares": true,
   "max_backup_mbps": 0,
   "webhook_url": "",
   "webhook_on_success": false,
@@ -51,13 +52,6 @@
     "username": "",
     "__password_note": "Store via Settings UI (OS keyring) or use an environment variable \u2014 never paste passwords here",
     "use_tls": true
-  },
-  "dest_smb": {
-    "server": "",
-    "share": "",
-    "username": "",
-    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable \u2014 never paste passwords here",
-    "remote_path": ""
   },
   "pause_on_metered": false,
   "force_full_interval_days": 0,

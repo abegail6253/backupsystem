@@ -1,24 +1,22 @@
 """
 transport_utils.py — Remote destination upload helpers for BackupSys.
 
-Provides upload_to_sftp(), upload_to_ftp(), upload_to_smb(), upload_to_https().
+Provides upload_to_sftp(), upload_to_ftp(), upload_to_https().
 Each function accepts a local_dir path and a destination-specific config dict,
 and returns { ok: bool, uploaded: int, path: str, error: str }.
 
 Integration — add to backup_engine.py run_backup() after the cloud block:
 
     from transport_utils import (
-        upload_to_sftp, upload_to_ftp, upload_to_smb, upload_to_https
+        upload_to_sftp, upload_to_ftp, upload_to_https
     )
 
-    # ── SFTP / FTP / SMB / HTTPS upload (dest_type from global config) ─────
+    # ── SFTP / FTP / HTTPS upload (dest_type from global config) ─────
     dest_type = cfg.get("dest_type", "local") if cfg else storage_type
     if dest_type == "sftp" and cfg.get("dest_sftp"):
         upload_result = upload_to_sftp(str(backup_dir), cfg["dest_sftp"])
     elif dest_type == "ftp" and cfg.get("dest_ftp"):
         upload_result = upload_to_ftp(str(backup_dir), cfg["dest_ftp"])
-    elif dest_type == "smb" and cfg.get("dest_smb"):
-        upload_result = upload_to_smb(str(backup_dir), cfg["dest_smb"])
     elif dest_type == "https" and cfg.get("dest_https"):
         upload_result = upload_to_https(str(backup_dir), cfg["dest_https"])
 
@@ -26,7 +24,6 @@ Config shapes expected (mirrors config.json):
 
     dest_sftp:  { host, port(=22), username, password, key_path, remote_path }
     dest_ftp:   { host, port(=21), username, password, remote_path, use_tls(=true) }
-    dest_smb:   { server, share, username, password, remote_path, domain(="") }
     dest_https: { url, token, headers, verify_ssl(=true) }
 """
 
@@ -38,6 +35,9 @@ from pathlib import Path
 from typing import Optional
 import hashlib
 import io
+
+# Suppress console-window pop-ups on Windows for every subprocess call.
+_NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,6 @@ try:
     from credential_store import (
         get_sftp_password as _cred_sftp,
         get_ftp_password  as _cred_ftp,
-        get_smb_password  as _cred_smb,
         get_webdav_password as _cred_webdav,
     )
     _CRED_STORE = True
@@ -485,196 +484,6 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None, verify=Fal
             pass
 
 
-# ─── SMB / CIFS ───────────────────────────────────────────────────────────────
-
-def upload_to_smb(local_dir: str, smb_config: dict, progress_cb=None,
-                  max_retries: int = 3) -> dict:
-    """
-    Upload a backup folder to an SMB/CIFS network share.
-
-    On Windows:  Uses UNC paths directly (\\\\server\\share\\...) — no extra lib needed.
-    On Linux/Mac: Falls back to smbprotocol (must be installed: pip install smbprotocol).
-
-    smb_config: { server, share, username, password, domain, remote_path }
-    progress_cb(bytes_done, total_bytes, filename) — optional, called per chunk.
-    """
-    server      = smb_config.get("server", "").strip()
-    share       = smb_config.get("share", "").strip()
-    username    = smb_config.get("username", "").strip()
-    password    = _cred_smb(smb_config) if _CRED_STORE else smb_config.get("password", "")
-    domain      = smb_config.get("domain", "")
-    remote_base = smb_config.get("remote_path", "backups").strip().strip("/\\")
-
-    if not server:
-        return {"ok": False, "error": "SMB server not configured"}
-    if not share:
-        return {"ok": False, "error": "SMB share not configured"}
-
-    ld = Path(local_dir)
-
-    # ── Windows: native UNC copy ───────────────────────────────────────────
-    if os.name == "nt":
-        import subprocess, shutil as _sh
-
-        unc_root = f"\\\\{server}\\{share}"
-
-        # Try net use to authenticate if credentials provided
-        if username:
-            net_user = f"{domain}\\{username}" if domain else username
-            try:
-                subprocess.run(
-                    ["net", "use", unc_root, f"/user:{net_user}", password],
-                    capture_output=True, timeout=15, check=False
-                )
-            except Exception:
-                pass  # May already be connected — proceed anyway
-
-        remote_dir = Path(unc_root) / remote_base / ld.name
-        try:
-            remote_dir.mkdir(parents=True, exist_ok=True)
-            _SKIP        = {"MANIFEST.json", "BACKUP.sha256"}
-            uploaded     = 0
-            _SMB_BUF     = 16 * 1024 * 1024   # 16 MB — minimise SMB round-trips
-            _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
-            _total_bytes = sum(fp.stat().st_size for fp in _all_files)
-            _bytes_done  = 0
-            for _smb_fp in _all_files:
-                _smb_rel  = _smb_fp.relative_to(ld)
-                _smb_dest = remote_dir / _smb_rel
-                _smb_dest.parent.mkdir(parents=True, exist_ok=True)
-                def _do_smb_copy(_src=_smb_fp, _dst=_smb_dest):
-                    with open(str(_src), "rb") as _src_f, open(str(_dst), "wb") as _dst_f:
-                        while True:
-                            _buf = _src_f.read(_SMB_BUF)
-                            if not _buf:
-                                break
-                            _dst_f.write(_buf)
-                            if progress_cb:
-                                nonlocal _bytes_done
-                                _bytes_done += len(_buf)
-                                try:
-                                    progress_cb(_bytes_done, _total_bytes, _src.name)
-                                except Exception:
-                                    pass
-                    _sh.copystat(str(_src), str(_dst))
-                _retry_with_backoff(
-                    _do_smb_copy,
-                    max_retries=max_retries,
-                    label=f"smb:{_smb_rel}",
-                )
-                if not progress_cb:
-                    _bytes_done += _smb_fp.stat().st_size
-                uploaded += 1
-            logger.info(f"[smb] Copied {uploaded} file(s) to {remote_dir}")
-            return {"ok": True, "uploaded": uploaded, "path": str(remote_dir)}
-        except Exception as e:
-            return {"ok": False, "error": f"SMB copy failed: {e}"}
-
-    # ── Linux/Mac: smbprotocol ─────────────────────────────────────────────
-    try:
-        import smbprotocol.connection
-        import smbprotocol.session
-        import smbprotocol.tree
-        import smbprotocol.open as smb_open
-        from smbprotocol.connection import Connection
-        from smbprotocol.session import Session
-        from smbprotocol.tree import TreeConnect
-        from smbprotocol.open import Open, CreateDisposition, FileAttributes, ImpersonationLevel, ShareAccess, CreateOptions, FilePipePrinterAccessMask
-        import uuid as _uuid
-    except ImportError:
-        return {"ok": False, "error": "smbprotocol not installed — run: pip install smbprotocol"}
-
-    try:
-        conn_id  = _uuid.uuid4()
-        conn     = Connection(conn_id, server, 445)
-        conn.connect(timeout=30)
-
-        session = Session(conn, username=username, password=password,
-                         require_encryption=False)
-        session.connect()
-
-        unc   = f"\\\\{server}\\{share}"
-        tree  = TreeConnect(session, unc)
-        tree.connect()
-
-        uploaded = 0
-
-        SMB_CHUNK = 16 * 1024 * 1024  # 16 MB chunks — minimise SMB round-trips
-
-        _SKIP        = {"MANIFEST.json", "BACKUP.sha256"}
-        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
-        _total_bytes = sum(fp.stat().st_size for fp in _all_files)
-        _bytes_done  = 0
-
-        def _smb_write_tracked(rel_path: str, local_fp: Path):
-            nonlocal _bytes_done
-            rel_win     = rel_path.replace('/', '\\')
-            remote_path = f"{remote_base}\\{ld.name}\\{rel_win}".lstrip("\\")
-            parts = remote_path.replace("/", "\\").split("\\")
-            for i in range(1, len(parts)):
-                dir_path = "\\".join(parts[:i])
-                try:
-                    d = Open(tree, dir_path)
-                    d.create(
-                        ImpersonationLevel.Impersonation,
-                        FilePipePrinterAccessMask.MAXIMUM_ALLOWED,
-                        FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
-                        ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE,
-                        CreateDisposition.FILE_OPEN_IF,
-                        CreateOptions.FILE_DIRECTORY_FILE,
-                    )
-                    d.close(False)
-                except Exception:
-                    pass
-            f_handle = Open(tree, remote_path)
-            f_handle.create(
-                ImpersonationLevel.Impersonation,
-                FilePipePrinterAccessMask.FILE_WRITE_DATA,
-                FileAttributes.FILE_ATTRIBUTE_NORMAL,
-                0,
-                CreateDisposition.FILE_OVERWRITE_IF,
-                CreateOptions.FILE_NON_DIRECTORY_FILE,
-            )
-            offset = 0
-            with open(local_fp, "rb") as raw:
-                while True:
-                    chunk = raw.read(SMB_CHUNK)
-                    if not chunk:
-                        break
-                    f_handle.write(chunk, offset)
-                    offset += len(chunk)
-                    _bytes_done += len(chunk)
-                    if progress_cb:
-                        try:
-                            progress_cb(_bytes_done, _total_bytes, local_fp.name)
-                        except Exception:
-                            pass
-            f_handle.close(False)
-
-        for fp in _all_files:
-            rel = str(fp.relative_to(ld))
-            try:
-                def _do_smb_write(_fp=fp, _rel=rel):
-                    _smb_write_tracked(_rel, _fp)
-                _retry_with_backoff(
-                    _do_smb_write,
-                    max_retries=max_retries,
-                    label=f"smb:{rel}",
-                )
-                uploaded += 1
-            except Exception as e:
-                logger.warning(f"[smb] Failed to upload {rel}: {e}")
-
-        tree.disconnect()
-        session.disconnect()
-        conn.disconnect()
-
-        logger.info(f"[smb] Uploaded {uploaded} file(s) to \\\\{server}\\{share}\\{remote_base}\\{ld.name}")
-        return {"ok": True, "uploaded": uploaded, "path": f"\\\\{server}\\{share}\\{remote_base}\\{ld.name}"}
-
-    except Exception as e:
-        return {"ok": False, "error": f"SMB error: {e}"}
-
 
 # ─── HTTPS (webhook / REST upload endpoint) ───────────────────────────────────
 
@@ -838,7 +647,7 @@ def upload_to_rclone(local_dir: str, rclone_config: dict, progress_cb=None,
         return {"ok": False, "error": "Rclone remote name not configured"}
 
     try:
-        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15)
+        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15, **_NO_WINDOW)
         if check.returncode != 0:
             return {"ok": False, "error": "rclone not installed or not available in PATH"}
     except FileNotFoundError:
@@ -857,7 +666,7 @@ def upload_to_rclone(local_dir: str, rclone_config: dict, progress_cb=None,
         nonlocal stderr_lines
         stderr_lines = []
         try:
-            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1, **_NO_WINDOW)
         except FileNotFoundError:
             raise RuntimeError("rclone not installed or not available in PATH")
         if proc.stderr:
@@ -895,7 +704,7 @@ def check_remote_free_space(dest_type: str, cfg: dict, needed_bytes: int) -> dic
     """Check free space on a remote backup destination before uploading.
 
     Args:
-        dest_type:    One of: sftp, ftp, ftps, smb, webdav, rclone, cloud, https
+        dest_type:    One of: sftp, ftp, ftps, webdav, rclone, cloud, https
         cfg:          Full config dict (same structure as the watch/global config).
         needed_bytes: Estimated bytes the backup will consume on the remote.
 
@@ -1015,96 +824,6 @@ def check_remote_free_space(dest_type: str, cfg: dict, needed_bytes: int) -> dic
             logger.warning("[space-check] FTP AVBL check failed (non-fatal): %s", e)
             return _OK
 
-    # ── SMB — UNC disk_usage on Windows; skipped on Linux ────────────────────
-    if dest_type == "smb":
-        smb_cfg     = cfg.get("dest_smb", {})
-        server      = smb_cfg.get("server", "").strip()
-        share       = smb_cfg.get("share", "").strip()
-        username    = smb_cfg.get("username", "").strip()
-        password    = smb_cfg.get("password", "")
-        domain      = smb_cfg.get("domain", "")
-
-        if not server or not share:
-            return _OK
-
-        if os.name == "nt":
-            import subprocess, shutil as _sh
-            unc_root = f"\\\\{server}\\{share}"
-            if username:
-                net_user = f"{domain}\\{username}" if domain else username
-                try:
-                    subprocess.run(
-                        ["net", "use", unc_root, f"/user:{net_user}", password],
-                        capture_output=True, timeout=15, check=False,
-                    )
-                except Exception:
-                    pass
-            try:
-                usage = _sh.disk_usage(unc_root)
-                free  = usage.free
-                if free < _needed:
-                    return {
-                        "ok":      False,
-                        "free":    free,
-                        "error":   (
-                            f"SMB share has insufficient space. "
-                            f"Need ~{_human_size(_needed)}, only {_human_size(free)} free on "
-                            f"\\\\{server}\\{share}."
-                        ),
-                        "skipped": False,
-                    }
-                return {"ok": True, "free": free, "error": "", "skipped": False}
-            except Exception as e:
-                logger.warning("[space-check] SMB disk_usage failed (non-fatal): %s", e)
-                return _OK
-        # Linux SMB space query via smbprotocol QueryFSSize
-        try:
-            import smbprotocol.connection, smbprotocol.session, smbprotocol.tree
-            import smbprotocol.query_info as smb_qi
-            import uuid as _uuid
-            conn_id = _uuid.uuid4()
-            conn    = smbprotocol.connection.Connection(conn_id, server, 445)
-            conn.connect(timeout=15)
-            session = smbprotocol.session.Session(
-                conn, username=username, password=password, require_encryption=False
-            )
-            session.connect()
-            unc  = f"\\\\{server}\\{share}"
-            tree = smbprotocol.tree.TreeConnect(session, unc)
-            tree.connect()
-            # FILE_FS_SIZE_INFORMATION = InfoClass 3
-            try:
-                raw = tree.query_info(
-                    smbprotocol.query_info.InfoType.SMB2_0_INFO_FILESYSTEM,
-                    smbprotocol.query_info.FileSystemInformationClass.FileFsSizeInformation,
-                    output_buffer_length=24,
-                )
-                # Structure: total_allocation_units(8) + available_units(8) + sectors_per_unit(4) + bytes_per_sector(4)
-                import struct as _struct
-                _ta, _aa, _spu, _bps = _struct.unpack_from("<QQII", raw)
-                free = _aa * _spu * _bps
-                tree.disconnect(); session.disconnect(); conn.disconnect()
-                if free < _needed:
-                    return {
-                        "ok":      False,
-                        "free":    free,
-                        "error":   (
-                            f"SMB share has insufficient space. "
-                            f"Need ~{_human_size(_needed)}, only {_human_size(free)} free on "
-                            f"\\\\{server}\\{share}."
-                        ),
-                        "skipped": False,
-                    }
-                return {"ok": True, "free": free, "error": "", "skipped": False}
-            except Exception:
-                tree.disconnect(); session.disconnect(); conn.disconnect()
-                return _OK
-        except ImportError:
-            return _OK
-        except Exception as e:
-            logger.warning("[space-check] SMB FileFsSizeInformation failed (non-fatal): %s", e)
-            return _OK
-
     # ── WebDAV — DAV:quota-available-bytes PROPFIND ───────────────────────────
     if dest_type == "webdav":
         webdav_cfg  = cfg.get("dest_webdav", {})
@@ -1180,7 +899,7 @@ def check_remote_free_space(dest_type: str, cfg: dict, needed_bytes: int) -> dic
             import subprocess, json as _json
             result = subprocess.run(
                 ["rclone", "about", f"{remote_name}:", "--json"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=30, **_NO_WINDOW,
             )
             if result.returncode != 0:
                 return _OK  # rclone about not supported for this remote
@@ -1460,67 +1179,6 @@ def test_ftp_connection(ftp_config: dict) -> dict:
             pass
 
 
-def test_smb_connection(smb_config: dict) -> dict:
-    """
-    Verify SMB/CIFS share connectivity.
-    On Windows uses UNC paths directly; on Linux/macOS uses smbprotocol.
-    Returns { ok: bool, message: str }.
-    """
-    server   = smb_config.get("server", "").strip()
-    share    = smb_config.get("share", "").strip()
-    username = smb_config.get("username", "").strip()
-    password = smb_config.get("password", "")
-    domain   = smb_config.get("domain", "")
-    rpath    = smb_config.get("remote_path", "").strip().strip("/\\")
-
-    # Also accept a single UNC path string (desktop_app passes dest_smb_path directly)
-    unc_path = smb_config.get("unc_path", "").strip()
-    if unc_path and (not server or not share):
-        import re
-        m = re.match(r"[/\\]{2}([^/\\]+)[/\\]([^/\\]+)", unc_path)
-        if m:
-            server, share = m.group(1), m.group(2)
-
-    if not server:
-        return {"ok": False, "message": "SMB server not configured"}
-    if not share:
-        return {"ok": False, "message": "SMB share not configured"}
-
-    unc = f"\\\\{server}\\{share}"
-    test_dir = f"{unc}\\{rpath}" if rpath else unc
-
-    if os.name == "nt":
-        import subprocess as _sp
-        if username:
-            user_arg = f"{domain}\\{username}" if domain else username
-            cmd = ["net", "use", unc, f"/user:{user_arg}"]
-            if password:
-                cmd.insert(3, password)
-            cmd += ["/persistent:no"]
-            try:
-                res = _sp.run(cmd, capture_output=True, text=True, timeout=15)
-                stderr = (res.stdout + res.stderr).lower()
-                if res.returncode != 0 and "already" not in stderr and "local device" not in stderr:
-                    return {"ok": False, "message": f"net use failed: {(res.stderr or res.stdout).strip()}"}
-            except Exception as e:
-                return {"ok": False, "message": str(e)}
-        try:
-            entries = list(Path(test_dir).iterdir())
-            return {"ok": True, "message": f"✅ Connected to {unc}  |  {len(entries)} item(s) visible"}
-        except Exception as e:
-            return {"ok": False, "message": str(e)}
-    else:
-        try:
-            import smbclient
-            smbclient.register_session(server, username=username, password=password,
-                                       connection_timeout=10)
-            entries = smbclient.listdir(test_dir)
-            return {"ok": True, "message": f"✅ Connected to {unc}  |  {len(entries)} item(s) visible"}
-        except ImportError:
-            return {"ok": False, "message": "smbprotocol not installed — run: pip install smbprotocol"}
-        except Exception as e:
-            return {"ok": False, "message": str(e)}
-
 
 def test_https_connection(https_config: dict) -> dict:
     """
@@ -1572,7 +1230,7 @@ def test_rclone_connection(rclone_config: dict) -> dict:
         return {"ok": False, "message": "Rclone remote name not configured"}
 
     try:
-        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15)
+        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15, **_NO_WINDOW)
         if check.returncode != 0:
             return {"ok": False, "message": "rclone not installed or not available in PATH"}
     except FileNotFoundError:
@@ -1582,12 +1240,111 @@ def test_rclone_connection(rclone_config: dict) -> dict:
 
     dest = f"{remote_name}:{remote_path}" if remote_path else f"{remote_name}:"
     try:
-        proc = subprocess.run(["rclone", "lsd", dest], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(["rclone", "lsd", dest], capture_output=True, text=True, timeout=30, **_NO_WINDOW)
         if proc.returncode == 0:
             return {"ok": True, "message": f"✅ rclone can access {dest}"}
         return {"ok": False, "message": proc.stderr.strip() or proc.stdout.strip() or f"Failed to list {dest}"}
     except Exception as e:
         return {"ok": False, "message": str(e)}
+
+
+def cleanup_rclone_backups(rclone_cfg: dict, retention_days: int, watch_id: str = None) -> dict:
+    """
+    Remove expired backup folders from an rclone remote using `rclone lsd` + `rclone purge`.
+
+    rclone_cfg: { remote | remote_name, path | remote_path }
+    retention_days: integer days of retention (<=0 = noop)
+    watch_id: optional prefix filter — only folders starting with this prefix are considered
+    """
+    import datetime
+
+    remote_name = (rclone_cfg.get("remote") or rclone_cfg.get("remote_name", "")).strip()
+    remote_path = (rclone_cfg.get("path") or rclone_cfg.get("remote_path", "/backups")).strip()
+    if not remote_name:
+        return {"ok": False, "error": "Rclone remote name not configured"}
+
+    if retention_days <= 0:
+        return {"ok": True, "deleted": 0, "freed_bytes": 0, "remote_count": 0}
+
+    # Ensure rclone exists
+    try:
+        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15, **_NO_WINDOW)
+        if check.returncode != 0:
+            return {"ok": False, "error": "rclone not installed or not available in PATH"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "rclone not installed or not available in PATH"}
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to run rclone: {e}"}
+
+    dest = f"{remote_name}:{remote_path}" if remote_path else f"{remote_name}:"
+
+    try:
+        proc = subprocess.run(["rclone", "lsd", dest], capture_output=True, text=True, timeout=30, **_NO_WINDOW)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    if proc.returncode != 0:
+        return {"ok": False, "error": f"lsd failed: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}"}
+
+    now = datetime.datetime.utcnow()
+    deleted = 0
+    remote_count = 0
+    errors = []
+
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # rclone lsd output ends with the folder name
+        parts = line.split()
+        folder = parts[-1]
+        remote_count += 1
+        # Expect BackupSys folders to start with YYYYMMDD_HHMMSS
+        try:
+            ts = datetime.datetime.strptime(folder[:15], "%Y%m%d_%H%M%S")
+        except Exception:
+            # skip non-BackupSys folders
+            continue
+
+        age_days = (now - ts).days
+        if age_days <= retention_days:
+            continue
+
+        if watch_id and not folder.startswith(watch_id):
+            continue
+
+        # Attempt purge — non-fatal if one folder fails
+        target = f"{remote_name}:{remote_path.rstrip('/')}/{folder}" if remote_path else f"{remote_name}:{folder}"
+        try:
+            pur = subprocess.run(["rclone", "purge", target], capture_output=True, text=True, timeout=60, **_NO_WINDOW)
+            if pur.returncode == 0:
+                deleted += 1
+            else:
+                errors.append(f"purge failed for {folder}: {pur.stderr.strip() or pur.stdout.strip()}")
+        except Exception as e:
+            errors.append(f"purge error for {folder}: {e}")
+
+    result = {"ok": True, "deleted": deleted, "freed_bytes": 0, "remote_count": remote_count}
+    if errors:
+        result["error"] = "; ".join(errors[:5])
+    return result
+
+
+def cleanup_remote_backups(cfg: dict, retention_days: int, watch_id: str = None) -> dict:
+    """
+    Generic remote cleanup dispatcher. For transports that don't support remote
+    retention (https, cloud) this is a noop and returns ok=True deleted=0.
+    """
+    dest_type = (cfg.get("dest_type") or "local").lower()
+    if dest_type == "local":
+        return {"ok": True, "deleted": 0}
+    if dest_type in ("https", "cloud"):
+        return {"ok": True, "deleted": 0}
+    if dest_type == "rclone":
+        rclone_cfg = cfg.get("dest_rclone") or cfg
+        return cleanup_rclone_backups(rclone_cfg, retention_days, watch_id=watch_id)
+    # Other remote transports: not supported — noop
+    return {"ok": True, "deleted": 0}
 
 
 def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None,
@@ -2160,126 +1917,6 @@ def _unc_already_accessible(unc_path: str) -> bool:
         return False
 
 
-def download_from_smb(remote_dir: str, local_dest: str, smb_config: dict,
-                       progress_cb=None) -> dict:
-    """
-    Download a backup folder recursively from SMB/CIFS to local_dest.
-
-    On Windows, if the UNC path is already accessible (user authenticated via
-    Explorer or net use), copies files directly using os.walk — no credentials
-    needed.  Falls back to smbprotocol with explicit credentials otherwise.
-
-    Returns { status: "ok"|"error", downloaded: int, error: str|None }
-    progress_cb(downloaded: int, filename: str) — called after each file is saved.
-    """
-    server    = smb_config.get("server", "").strip()
-    share     = smb_config.get("share", "").strip()
-    username  = (smb_config.get("username") or smb_config.get("user", "")).strip()
-    password  = _cred_smb(smb_config) if _CRED_STORE else (smb_config.get("password") or smb_config.get("pass", ""))
-    domain    = smb_config.get("domain", "")
-    remote_base = (smb_config.get("remote_path") or "").lstrip("/\\")
-
-    # Auto-parse server and share from UNC path (\\server\share\...) if not set in config
-    if (not server or not share) and remote_dir:
-        _unc = remote_dir.replace("/", "\\").lstrip("\\")
-        _parts = _unc.split("\\", 2)
-        if len(_parts) >= 2:
-            if not server:
-                server = _parts[0].strip()
-            if not share:
-                share = _parts[1].strip()
-            if len(_parts) == 3 and not remote_base:
-                remote_base = _parts[2].strip("\\")
-
-    if not server or not share:
-        return {"status": "error", "downloaded": 0, "error": "SMB server/share not configured"}
-
-    # ── Strategy 1: Use existing Windows session (no credentials needed) ──────
-    # If the UNC path is already mounted/accessible (e.g. user opened it in
-    # Explorer or ran net use), copy files directly without smbprotocol.
-    _unc_source = f"\\\\{server}\\{share}"
-    if remote_base:
-        _unc_source = f"{_unc_source}\\{remote_base}"
-
-    if _unc_already_accessible(_unc_source):
-        logger.info(f"[smb] UNC path accessible via Windows session, copying directly: {_unc_source}")
-        downloaded = 0
-        try:
-            import shutil
-            Path(local_dest).mkdir(parents=True, exist_ok=True)
-            for root, dirs, files in os.walk(_unc_source):
-                rel_root = os.path.relpath(root, _unc_source)
-                local_root = os.path.join(local_dest, rel_root) if rel_root != "." else local_dest
-                os.makedirs(local_root, exist_ok=True)
-                for fname in files:
-                    src_file = os.path.join(root, fname)
-                    dst_file = os.path.join(local_root, fname)
-                    try:
-                        shutil.copy2(src_file, dst_file)
-                        downloaded += 1
-                        if progress_cb:
-                            try:
-                                progress_cb(downloaded, fname)
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        logger.warning(f"[smb] Failed to copy {src_file}: {e}")
-            return {"status": "ok", "downloaded": downloaded, "error": None}
-        except Exception as e:
-            logger.warning(f"[smb] Direct UNC copy failed ({e}), falling back to smbprotocol")
-
-    # ── Strategy 2: smbprotocol with explicit credentials ────────────────────
-    try:
-        from smbclient import walk, open_file
-        import smbclient
-    except ImportError:
-        return {"status": "error", "downloaded": 0, "error": "smbprotocol not installed"}
-
-    if not username:
-        username = "guest"
-
-    downloaded = 0
-
-    try:
-        smbclient.register_session(server, username=username, password=password)
-        Path(local_dest).mkdir(parents=True, exist_ok=True)
-
-        def _download_dir(remote_path, local_path):
-            nonlocal downloaded
-            Path(local_path).mkdir(parents=True, exist_ok=True)
-            try:
-                for root, dirs, files in walk(f"\\\\{server}\\{share}\\{remote_path}"):
-                    for fname in files:
-                        remote_file = os.path.join(root, fname)
-                        rel = os.path.relpath(remote_file, f"\\\\{server}\\{share}\\{remote_path}")
-                        local_file = os.path.join(local_path, rel)
-                        os.makedirs(os.path.dirname(local_file), exist_ok=True)
-                        try:
-                            with open_file(remote_file, mode="rb") as remote_fh:
-                                with open(local_file, "wb") as local_fh:
-                                    CHUNK = 16 * 1024 * 1024
-                                    while True:
-                                        chunk = remote_fh.read(CHUNK)
-                                        if not chunk:
-                                            break
-                                        local_fh.write(chunk)
-                            downloaded += 1
-                            if progress_cb:
-                                try:
-                                    progress_cb(downloaded, fname)
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            logger.warning(f"[smb] Failed to download {remote_file}: {e}")
-            except Exception as e:
-                logger.warning(f"[smb] Failed to walk {remote_path}: {e}")
-
-        _download_dir(remote_base, local_dest)
-        return {"status": "ok", "downloaded": downloaded, "error": None}
-
-    except Exception as e:
-        return {"status": "error", "downloaded": 0, "error": f"SMB error: {e}"}
-
 
 def download_from_rclone(remote_dir: str, local_dest: str, rclone_config: dict, progress_cb=None) -> dict:
     """
@@ -2293,7 +1930,7 @@ def download_from_rclone(remote_dir: str, local_dest: str, rclone_config: dict, 
         return {"status": "error", "downloaded": 0, "error": "Rclone remote name not configured"}
 
     try:
-        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15)
+        check = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=15, **_NO_WINDOW)
         if check.returncode != 0:
             return {"status": "error", "downloaded": 0, "error": "rclone not installed or not available in PATH"}
     except FileNotFoundError:
@@ -2310,7 +1947,7 @@ def download_from_rclone(remote_dir: str, local_dest: str, rclone_config: dict, 
 
     stderr_lines = []
     try:
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1, **_NO_WINDOW)
     except FileNotFoundError:
         return {"status": "error", "downloaded": 0, "error": "rclone not installed or not available in PATH"}
     except Exception as e:

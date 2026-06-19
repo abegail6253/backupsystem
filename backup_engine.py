@@ -2,6 +2,7 @@ def _is_gdrive_ready(config):
     """Return True if config is for Google Drive and has an access token."""
     return config and config.get("provider") == "gdrive" and bool(config.get("access_token"))
 import os
+import io
 import uuid
 import shutil
 import hashlib
@@ -11,8 +12,12 @@ import threading
 import difflib
 import fnmatch
 import subprocess
+import sys
 import logging
 logger = logging.getLogger(__name__)
+
+# Suppress console/PowerShell pop-up windows on Windows
+_WIN_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -37,7 +42,7 @@ except Exception:
 # Optional transport/notification helpers
 try:
     from transport_utils import (
-        upload_to_sftp, upload_to_ftp, upload_to_smb, upload_to_https, upload_to_rclone,
+        upload_to_sftp, upload_to_ftp, upload_to_https, upload_to_rclone,
         download_from_sftp, download_from_ftp,
         check_remote_free_space,
     )
@@ -55,6 +60,791 @@ except ImportError:
 
 MAX_EDIT_BYTES   = 5 * 1024 * 1024   # 5 MB – files larger than this refuse to open in editor
 # FERNET_MAX_BYTES: 200 MB was the old Fernet limit. AES-GCM streaming has no file size limit.
+
+
+def _ensure_writable(path) -> None:
+    """Remove read-only flag from *path* if it exists.
+
+    On Windows, network sources often have the read-only attribute set, and
+    shutil.copystat() faithfully mirrors it onto the destination.  A
+    subsequent backup run then fails with [Errno 13] Permission denied
+    when trying to open that file for writing.  Clearing the flag before
+    opening for write prevents this without altering the source.
+    """
+    try:
+        p = os.fspath(path)
+        if os.path.exists(p):
+            current = os.stat(p).st_mode
+            import stat as _stat
+            if not (current & _stat.S_IWRITE):
+                os.chmod(p, current | _stat.S_IWRITE)
+    except (OSError, AttributeError):
+        pass  # Non-fatal — let the open() below surface the real error
+
+
+def _unc_host(path: str) -> str:
+    """Return the lowercase hostname from a UNC path, or '' if not UNC.
+
+    Examples:
+        '\\\\192.168.254.108\\share\\dir' → '192.168.254.108'
+        'C:\\foo'                         → ''
+    """
+    p = path.replace("/", "\\")
+    if not p.startswith("\\\\"):
+        return ""
+    parts = p.lstrip("\\").split("\\")
+    return parts[0].lower() if parts else ""
+
+
+def _server_side_copy(src: str, dst: str, progress_cb=None) -> bool:
+    """Attempt a server-side (offloaded) copy using the Windows CopyFileEx API.
+
+    When source and destination are on the same Windows host the OS can issue
+    an FSCTL_SRV_COPYCHUNK request so the PC copies the data server-side —
+    the bytes never travel over the network to the PC.  This can be 10-100×
+    faster than the Python read→write loop for large files on a LAN.
+
+    progress_cb, if given, is called as progress_cb(bytes_transferred, total_bytes)
+    from the CopyFileEx native callback so the UI gets real byte-level progress
+    even during server-side offload (no Python chunk loop → no per-chunk cb).
+
+    Returns True if the offloaded copy succeeded, False if it is unavailable
+    or failed (caller should fall back to the normal chunked copy).
+
+    Tries ctypes first (no external deps), then pywin32 as fallback.
+    Safe to call when neither is available — returns False immediately.
+    """
+    if os.name != "nt":
+        return False
+
+    # ── Attempt 1: ctypes (built into Python — no pywin32 required) ──────────
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        COPY_FILE_NO_BUFFERING = 0x00001000
+        PROGRESS_CONTINUE = 0
+
+        # Define the native callback type for CopyFileExW
+        _PROGRESS_ROUTINE = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.DWORD,   # return DWORD (PROGRESS_CONTINUE=0)
+            ctypes.c_int64,          # TotalFileSize      (LARGE_INTEGER)
+            ctypes.c_int64,          # TotalBytesTransferred
+            ctypes.c_int64,          # StreamSize
+            ctypes.c_int64,          # StreamBytesTransferred
+            ctypes.wintypes.DWORD,   # dwStreamNumber
+            ctypes.wintypes.DWORD,   # dwCallbackReason
+            ctypes.wintypes.HANDLE,  # hSourceFile
+            ctypes.wintypes.HANDLE,  # hDestinationFile
+            ctypes.c_void_p,         # lpData
+        )
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CopyFileExW.restype  = ctypes.wintypes.BOOL
+        kernel32.CopyFileExW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_void_p,                       # progress routine (nullable)
+            ctypes.c_void_p,                       # lpData
+            ctypes.POINTER(ctypes.wintypes.BOOL),  # pbCancel
+            ctypes.wintypes.DWORD,                 # dwCopyFlags
+        ]
+
+        _cb_func = None
+        if progress_cb is not None:
+            def _raw_cb(total_size, total_transferred, stream_size,
+                        stream_transferred, stream_num, reason,
+                        h_src, h_dst, data):
+                try:
+                    progress_cb(int(total_transferred), int(total_size))
+                except Exception:
+                    pass
+                return PROGRESS_CONTINUE
+
+            _cb_func = _PROGRESS_ROUTINE(_raw_cb)
+
+        pb_cancel = ctypes.wintypes.BOOL(False)
+        ret = kernel32.CopyFileExW(
+            src, dst,
+            _cb_func,
+            None,
+            ctypes.byref(pb_cancel),
+            COPY_FILE_NO_BUFFERING,
+        )
+        if ret:
+            return True
+        # Non-zero means success; zero means failure — fall through to pywin32
+        err = ctypes.get_last_error()
+        logger.debug(f"[server-copy] CopyFileExW via ctypes failed (err={err}) — trying pywin32")
+    except Exception as _ct_err:
+        logger.debug(f"[server-copy] ctypes CopyFileExW unavailable ({_ct_err}) — trying pywin32")
+
+    # ── Attempt 2: pywin32 (optional install) ─────────────────────────────────
+    try:
+        import win32file
+        COPY_FILE_NO_BUFFERING = 0x00001000
+
+        _routine = None
+        if progress_cb is not None:
+            def _routine(total_size, total_transferred, stream_size,
+                         stream_transferred, stream_num, reason,
+                         h_src, h_dst, data):
+                try:
+                    progress_cb(int(total_transferred), int(total_size))
+                except Exception:
+                    pass
+                return 0  # PROGRESS_CONTINUE
+
+        win32file.CopyFileEx(src, dst, _routine, None, False, COPY_FILE_NO_BUFFERING)
+        return True
+    except ImportError:
+        logger.debug("[server-copy] pywin32 not installed — server-side copy unavailable")
+        return False
+    except Exception as _w32_err:
+        logger.debug(f"[server-copy] win32file.CopyFileEx failed ({_w32_err})")
+        return False
+
+
+def _parallel_copy_files(
+    entries: list,
+    src_root,
+    dst_root,
+    cancel_event=None,
+    progress_cb=None,
+    total_files: int = 0,
+    total_bytes: int = 0,
+    chunk_size: int = 16 * 1024 * 1024,
+    max_workers: int = 4,
+) -> tuple:
+    """Copy a list of file entries in parallel using a thread pool.
+
+    Used as the fast fallback when robocopy is unavailable for UNC→UNC
+    copies where the Python serial loop is the bottleneck.  4 concurrent
+    streams typically 3-4× the throughput of a single-threaded loop on a
+    Gigabit LAN because read latency is hidden by overlapping I/O.
+
+    Skips files that already exist in the destination with a matching size
+    (seed-skip) — avoids re-copying when the user pre-populated the dest
+    or a previous backup already wrote the file.
+
+    Returns (files_copied, bytes_skipped_seed, bytes_copied, failed_entries).
+    Thread-safe progress reporting via a lock-protected counter.
+    """
+    import concurrent.futures as _cf
+    import threading as _th
+
+    _lock        = _th.Lock()
+    _copied      = [0]
+    _bytes_done  = [0]
+    _skipped     = [0]
+    _failed      = []
+
+    def _copy_one(entry):
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        src_file  = src_root / entry["path"]
+        dest_file = dst_root / entry["path"]
+        src_size  = entry.get("size", 0)
+        try:
+            # ── Seed-skip: if dest already has same-size file, skip copy ──────
+            if dest_file.exists():
+                try:
+                    _dst_st = dest_file.stat()
+                    if _dst_st.st_size == src_size and src_size > 0:
+                        logger.debug(
+                            f"[parallel-copy] seed-skip '{entry['path']}' "
+                            f"— dest already has matching size ({src_size:,} bytes)"
+                        )
+                        with _lock:
+                            _skipped[0] += 1
+                            _bytes_done[0] += src_size
+                            if progress_cb:
+                                try:
+                                    progress_cb(
+                                        _copied[0] + _skipped[0], total_files or 1,
+                                        "\x00verify\x00" + entry["path"],
+                                        _bytes_done[0], total_bytes,
+                                    )
+                                except Exception:
+                                    pass
+                        return
+                except OSError:
+                    pass  # can't stat dest → fall through to copy
+
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(str(src_file), "rb", buffering=chunk_size) as f_in, \
+                 open(str(dest_file), "wb", buffering=chunk_size) as f_out:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    chunk = f_in.read(chunk_size)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+                    with _lock:
+                        _bytes_done[0] += len(chunk)
+                        if progress_cb:
+                            try:
+                                progress_cb(
+                                    _copied[0] + _skipped[0], total_files or 1,
+                                    entry["path"],
+                                    _bytes_done[0], total_bytes,
+                                )
+                            except Exception:
+                                pass
+            with _lock:
+                _copied[0] += 1
+                if progress_cb:
+                    try:
+                        progress_cb(
+                            _copied[0] + _skipped[0], total_files or 1,
+                            entry["path"],
+                            _bytes_done[0], total_bytes,
+                        )
+                    except Exception:
+                        pass
+        except Exception as _e:
+            logger.warning(f"[parallel-copy] failed for {entry['path']}: {_e}")
+            with _lock:
+                _failed.append(entry)
+
+    with _cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        list(pool.map(_copy_one, entries))
+
+    if _skipped[0]:
+        logger.info(
+            f"[parallel-copy] {_skipped[0]} file(s) already in destination — skipped "
+            f"({_skipped[0]} of {total_files} total)"
+        )
+
+    return _copied[0], _bytes_done[0], _failed
+
+
+def _robocopy_file(
+    src: str,
+    dst: str,
+    cancel_event=None,
+    progress_cb=None,
+    copied_files: int = 0,
+    total_files: int = 0,
+    bytes_done_offset: int = 0,
+    total_bytes: int = 0,
+) -> bool:
+    """Copy a single file using robocopy (built into every modern Windows).
+
+    robocopy uses native Windows I/O, unbuffered large-file mode (/J), and
+    can trigger server-side copy on Windows PCs that support it — often
+    significantly faster than Python's read/write loop for large files.
+
+    Returns True on success, False if robocopy is unavailable or failed.
+    Progress is polled by watching the destination file size grow.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        src_p = Path(src)
+        dst_p = Path(dst)
+
+        proc = subprocess.Popen(
+            [
+                "robocopy",
+                str(src_p.parent),
+                str(dst_p.parent),
+                src_p.name,
+                "/J",       # unbuffered I/O — faster for large files
+                "/COPY:DAT",# copy Data, Attributes, Timestamps
+                "/R:0",     # no retries on failure
+                "/W:0",     # no wait between retries
+                "/NP",      # no progress % in stdout
+                "/NFL",     # no file list
+                "/NDL",     # no dir list
+                "/NJH",     # no job header
+                "/NJS",     # no job summary
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_WIN_NO_WINDOW,
+        )
+
+        # Poll dest size for progress while robocopy runs
+        while proc.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                return False
+            if progress_cb is not None:
+                try:
+                    written = dst_p.stat().st_size if dst_p.exists() else 0
+                    progress_cb(
+                        copied_files, total_files or 1, src_p.name,
+                        bytes_done_offset + written, total_bytes,
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.25)
+
+        rc = proc.returncode if proc.returncode is not None else proc.wait()
+        # robocopy exit codes: 0=nothing to copy (match), 1=copied OK,
+        # 2=extra files in dest (not an error for us), 3=0+2 combo.
+        # Codes >= 8 mean at least one file failed.
+        return rc is not None and rc < 8
+    except FileNotFoundError:
+        # robocopy not found (very old Windows or stripped image)
+        return False
+    except Exception as _rb_err:
+        logger.debug(f"[robocopy] failed ({_rb_err})")
+        return False
+
+
+def _robocopy_dir(
+    src: str,
+    dst: str,
+    cancel_event=None,
+    progress_cb=None,
+    total_files: int = 0,
+    total_bytes: int = 0,
+    files_to_copy: list = None,
+    size_hints: list = None,
+) -> tuple:
+    """Copy an entire directory tree using robocopy.
+
+    When both *src* and *dst* are UNC paths on the same Windows host robocopy
+    can negotiate server-side copy so the data stays on the same machine —
+    order-of-magnitude faster than Python's read→write loop for UNC→UNC.
+
+    If *files_to_copy* is provided (incremental mode), only those specific
+    files are copied — robocopy is called once per unique subdirectory that
+    contains changed files, passing explicit filenames so unchanged files
+    are left untouched.
+
+    If *files_to_copy* is None or empty (full backup), robocopy copies the
+    entire tree in one shot with /E /MT:8.
+
+    Progress is driven by parsing robocopy's stdout line-by-line so the UI
+    updates in real time as each file is copied — no polling lag.
+
+    Returns (success: bool, files_copied: int, bytes_copied: int).
+    files_copied/bytes_copied reflect what robocopy actually processed,
+    which may exceed the pre-computed total when the scan was incomplete.
+    """
+    if os.name != "nt":
+        return False, 0, 0
+
+    dst_path = Path(dst)
+
+    # Build a size lookup from files_to_copy for byte-accurate progress.
+    # Keys are normalised relative paths (backslash, no leading slash).
+    # For full-backup mode files_to_copy is None but size_hints carries the
+    # same data — populate the map from whichever is available so the UI
+    # shows real byte progress instead of staying on "Preparing...".
+    _size_map: dict = {}
+    _basename_map: dict = {}   # filename-only lookup for full-backup robocopy output
+    _hint_source = files_to_copy or size_hints or []
+    for e in _hint_source:
+        _k = e["path"].replace("/", "\\").lstrip("\\")
+        _sz = e.get("size", 0)
+        _size_map[_k] = _sz
+        # Robocopy's /E full-tree run prints only the bare filename, not the
+        # relative path.  Index by basename so _read_stdout can still look up
+        # the size even for files nested inside subdirectories.
+        _bn = _k.split("\\")[-1]
+        _basename_map[_bn] = _basename_map.get(_bn, 0) + _sz
+
+    # Shared counters — accumulated across all _run_robocopy calls so the
+    # caller gets the true count even when total_files/total_bytes were 0
+    # (e.g. scan timed out or returned an incomplete snapshot).
+    _rc_files = [0]
+    _rc_bytes = [0]
+
+    def _run_robocopy(cmd: list, dir_prefix: str = "") -> bool:
+        """Run a robocopy command, parse stdout for real-time progress.
+
+        dir_prefix: relative subdir prefix for incremental multi-dir runs,
+                    used to look up sizes in _size_map.
+        """
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=_WIN_NO_WINDOW,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,          # line-buffered
+            )
+        except FileNotFoundError:
+            return False
+
+        def _read_stdout():
+            """Read robocopy stdout lines and update progress counters.
+
+            Robocopy emits two kinds of output lines (when /NP is absent):
+
+            1. Intra-file percentage lines:
+                   "        0%"   "       16%"  ...  "      100%"
+               These arrive BEFORE the filename line and give real-time
+               byte-level progress inside a large file.
+
+            2. Completion lines (one per copied file):
+                   "\t    10485760\ttestfile"
+               The middle tab-separated field is the file size in bytes
+               as reported by robocopy itself — more reliable than our
+               pre-scan _size_map lookup.
+
+            Strategy: on a percentage line credit fractional bytes so the
+            bar moves smoothly; on a completion line parse robocopy's own
+            size and add the remaining bytes not yet credited.
+            """
+            import re as _re
+            _pct_re = _re.compile(r'^(\d+(?:\.\d+)?)%$')
+
+            # Per-file running state
+            _cur_size      = [0]   # size of file currently being transferred
+            _cur_credited  = [0]   # bytes already emitted via % lines this file
+            _cur_fname     = [""]  # best-known filename (for progress label)
+            _in_pct_block  = [False]
+
+            # Size queue: ordered list of expected file sizes so percentage
+            # lines can be attributed before the filename is printed.
+            # For incremental runs we know the exact order; for full-backup
+            # it is approximate but still far better than zero.
+            _hint_source = files_to_copy or size_hints or []
+            if dir_prefix and dir_prefix != ".":
+                _q = [
+                    e.get("size", 0)
+                    for e in _hint_source
+                    if str(Path(e["path"].replace("/", "\\")).parent) == dir_prefix
+                ]
+            else:
+                _q = [e.get("size", 0) for e in _hint_source]
+            _size_queue = list(_q)
+
+            def _start_next_file():
+                _cur_size[0]    = _size_queue.pop(0) if _size_queue else 0
+                _cur_credited[0] = 0
+
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                _skip_prefixes = (
+                    "----------", "ROBOCOPY", "Started", "Source",
+                    "Dest", "Files", "Dirs", "Options", "Waiting",
+                    "ERROR", "WARNING", "New Dir", "*EXTRA",
+                    "Newer", "Older", "same", "Tweaked",
+                    "Existing Dir", "Lonely", "Changed", "Junction",
+                )
+                if any(line.startswith(p) for p in _skip_prefixes):
+                    continue
+
+                m = _pct_re.match(line)
+                if m:
+                    # ── Robocopy intra-file percentage line ─────────────
+                    pct = float(m.group(1)) / 100.0
+                    if not _in_pct_block[0]:
+                        _in_pct_block[0] = True
+                        _start_next_file()
+                    if _cur_size[0] > 0:
+                        target = int(_cur_size[0] * pct)
+                        delta  = target - _cur_credited[0]
+                        if delta > 0:
+                            _rc_bytes[0]     += delta
+                            _cur_credited[0] += delta
+                            if progress_cb is not None:
+                                try:
+                                    progress_cb(
+                                        _rc_files[0],
+                                        total_files or 1,
+                                        _cur_fname[0],
+                                        _rc_bytes[0],
+                                        total_bytes,
+                                    )
+                                except Exception:
+                                    pass
+                    continue
+
+                # ── Completion / filename line ───────────────────────────
+                _in_pct_block[0] = False
+
+                parts = line.split("\t")
+                fname = parts[-1].strip() if parts else line
+                if not fname:
+                    continue
+
+                # Skip directory summary lines — robocopy prints these to
+                # report how many files it processed per directory, e.g.:
+                #   "\t                   2\tD:\test\"
+                # After strip()+split("\t"), fname becomes "D:\test\" (ends
+                # with backslash).  These are NOT copied files and must not
+                # increment _rc_files.  Same applies to forward-slash paths.
+                if fname.endswith("\\") or fname.endswith("/"):
+                    logger.debug(f"[robocopy-stdout] SKIPPED dir-summary line: {line!r}")
+                    continue
+
+                _cur_fname[0] = fname
+
+                # Parse robocopy's own reported byte count (middle field).
+                # Format: "\t    SIZE\tFILENAME"
+                _reported_size = 0
+                if len(parts) >= 3:
+                    try:
+                        _reported_size = int(parts[-2].strip().replace(",", ""))
+                    except (ValueError, IndexError):
+                        pass
+
+                # Fall back to pre-scan map only when robocopy didn't print size
+                if _reported_size > 0:
+                    _fsz = _reported_size
+                else:
+                    _rel_key = (dir_prefix + "\\" + fname).lstrip("\\") if dir_prefix and dir_prefix != "." else fname
+                    _fsz = _size_map.get(_rel_key, _size_map.get(fname, _basename_map.get(fname, 0)))
+
+                # Credit remaining bytes (those not yet emitted via % lines)
+                remaining = _fsz - _cur_credited[0]
+                if remaining > 0:
+                    _rc_bytes[0] += remaining
+
+                _cur_size[0]    = _fsz
+                _cur_credited[0] = 0
+                _rc_files[0]   += 1
+
+                if progress_cb is not None:
+                    try:
+                        progress_cb(
+                            _rc_files[0],
+                            total_files or 1,
+                            fname,
+                            _rc_bytes[0],
+                            total_bytes,
+                        )
+                    except Exception:
+                        pass
+
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.terminate()
+                    raise InterruptedError("Backup cancelled by user")
+        _reader = threading.Thread(target=_read_stdout, daemon=True)
+        _reader.start()
+
+        # Wait for process, checking cancel every 0.25s.
+        # Also poll destination file sizes to emit real progress for the UI —
+        # robocopy with /MT:8 suppresses per-file percentage lines entirely
+        # (they only appear in single-threaded mode), so the _read_stdout thread
+        # gets no data until each file finishes.  For a single 10 GB file that
+        # means the UI shows "Copying…" with zero progress for 20+ minutes.
+        #
+        # Fix: every 0.25 s, walk the destination and sum file sizes.  The delta
+        # from the last poll is the bytes robocopy wrote in that interval — emit
+        # it as a progress callback so the bar, speed, and ETA stay live.
+        _last_polled_bytes = [0]
+        _last_poll_time    = [time.time()]
+        _poll_fname        = [files_to_copy[0]["path"] if files_to_copy else ""]
+
+        def _poll_dest_progress():
+            """Sum sizes of all files currently in dst_path and emit progress.
+
+            The poll gives approximate real-time byte progress while robocopy is
+            running, but it MUST NOT push bytes_done to >= total_bytes.  Only
+            _read_stdout (which parses robocopy's actual completion lines) should
+            be allowed to declare a file "done".  If the poll reports full size
+            prematurely (robocopy pre-allocates the destination file before
+            writing data, or the scan under-counted total_bytes), the UI would
+            flash "100% Finalizing…" and then jump backward when _read_stdout
+            emits the real in-progress value — causing the visible oscillation.
+            Fix: clamp the emitted bytes_done to at most (total_bytes - 1).
+            """
+            if progress_cb is None or not dst_path.exists():
+                return
+            try:
+                total_written = 0
+                for _fp in dst_path.rglob("*"):
+                    if _fp.is_file():
+                        try:
+                            total_written += _fp.stat().st_size
+                        except OSError:
+                            pass
+                now = time.time()
+                _last_poll_time[0] = now
+                # Only emit if bytes actually grew — skip spurious 0-delta calls.
+                if total_written <= _last_polled_bytes[0]:
+                    return
+                _last_polled_bytes[0] = total_written
+                # Cap at (total_bytes - 1) so the poll never triggers "Finalizing…".
+                # _read_stdout is the authoritative source for the 100% transition.
+                _capped = min(total_written, max(0, total_bytes - 1)) if total_bytes > 0 else total_written
+                try:
+                    progress_cb(
+                        _rc_files[0],
+                        total_files or 1,
+                        _poll_fname[0],
+                        _capped,
+                        total_bytes,
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        while proc.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                _reader.join(timeout=2)
+                return False
+            time.sleep(0.25)
+            # Emit dest-size progress so UI shows live MB/s + ETA even with /MT
+            _poll_dest_progress()
+
+        _reader.join(timeout=5)
+        rc = proc.returncode if proc.returncode is not None else proc.wait()
+        # robocopy exit codes: 0=no-op/match, 1=copied OK, 2=extra in dest,
+        # 3=0+2 combo, 4=mismatched, 8+=failure.  <8 is success for our purposes.
+        _rc_ok = rc is not None and rc < 8
+        if not _rc_ok:
+            logger.warning(
+                f"[robocopy] exited with code {rc} "
+                f"(>=8 means at least one file failed; check Windows Event Log "
+                f"or re-run manually: robocopy \"{src}\" \"{dst}\" /E /LOG:rc_debug.txt). "
+                f"Common SMB causes: code 8=permission/ACL error (try /COPY:D), "
+                f"code 16=serious error (SMB session dropped), "
+                f"code 32=share access violation."
+            )
+        return _rc_ok
+
+    try:
+        dst_path.mkdir(parents=True, exist_ok=True)
+
+        # ── Incremental mode: only copy specific changed files ─────────────
+        if files_to_copy:
+            # Group changed files by their parent directory (relative to src root)
+            # so we can call robocopy once per directory rather than once per file.
+            from collections import defaultdict
+            _dir_files: dict = defaultdict(list)
+            for entry in files_to_copy:
+                rel = entry["path"].replace("/", "\\")
+                rel_dir  = str(Path(rel).parent)   # e.g. "subdir" or "."
+                filename = Path(rel).name
+                _dir_files[rel_dir].append(filename)
+
+            for rel_dir, filenames in _dir_files.items():
+                src_dir = src if rel_dir == "." else str(Path(src) / rel_dir)
+                dst_dir = dst if rel_dir == "." else str(dst_path / rel_dir)
+                cmd = [
+                    "robocopy", src_dir, dst_dir,
+                    *filenames,
+                    "/J",
+                    "/COPY:DAT",
+                    "/R:2", "/W:3",
+                    "/NJH", "/NJS",   # keep /NFL removed so filenames appear in stdout
+                ]
+                if not _run_robocopy(cmd, dir_prefix=rel_dir):
+                    return False, _rc_files[0], _rc_bytes[0]
+            return True, _rc_files[0], _rc_bytes[0]
+
+        # ── Full backup mode: copy entire tree in one shot ──────────────────
+        cmd = [
+            "robocopy",
+            src,
+            dst,
+            "/E",        # copy subdirectories including empty ones
+            "/J",        # unbuffered I/O — faster for large files on SMB
+            "/COPY:DAT", # copy Data, Attributes, Timestamps
+            "/MT:4",     # 4 threads — /MT:8 suppresses per-file % progress lines;
+                         # /MT:4 balances throughput with progress visibility.
+                         # Dest-size polling in the wait loop provides live progress
+                         # regardless, but fewer threads = more % lines on older Windows.
+            "/R:2",      # 2 retries on failure
+            "/W:3",      # 3-second wait between retries
+            "/NJH",      # no job header
+            "/NJS",      # no job summary
+            # intentionally no /NP and no /NFL so filenames appear in stdout
+        ]
+        ok = _run_robocopy(cmd)
+        # ── Cancel check: if user pressed Cancel during robocopy, stop immediately.
+        # _run_robocopy returns False for both failure AND cancel — distinguish here
+        # so we don't start the next retry after a deliberate user cancellation.
+        if not ok and cancel_event is not None and cancel_event.is_set():
+            return False, _rc_files[0], _rc_bytes[0]
+        if not ok:
+            # ── Retry 1: without /MT:4 and /J — some SMB server configurations
+            # WD) rejects concurrent writes or unbuffered I/O via robocopy.
+            # Single-threaded + buffered is slower but far more compatible.
+            # NOTE: counters are NOT reset so the UI progress bar does not jump
+            # back to 0% — it continues from where the previous attempt left off.
+            logger.warning(
+                "[robocopy_dir] full-tree copy failed with /MT:4 /J — retrying "
+                "without multi-threading and unbuffered I/O (SMB compatibility mode)"
+            )
+            cmd_compat = [
+                "robocopy",
+                src,
+                dst,
+                "/E",
+                "/COPY:DAT",
+                "/R:2",
+                "/W:3",
+                "/NJH",
+                "/NJS",
+                # /J and /MT omitted — broadest SMB compatibility
+            ]
+            ok = _run_robocopy(cmd_compat)
+            # Cancel check before Retry 2
+            if not ok and cancel_event is not None and cancel_event.is_set():
+                return False, _rc_files[0], _rc_bytes[0]
+            if ok:
+                logger.info("[robocopy_dir] retry (compat mode) succeeded")
+            else:
+                # ── Retry 2: data-only copy, no attributes/timestamps ────────────
+                # Some SMB server configurations (especially SMB1/2) reject
+                # NTFS attribute/timestamp propagation via robocopy — exit code 8+.
+                # /COPY:D copies data only (no ACLs, no attributes, no timestamps).
+                # /XO skips files that are the same age or older in the destination
+                # so already-correct files aren't re-copied.
+                # /IPG:1 adds a 1ms inter-packet gap to reduce SMB congestion.
+                # NOTE: counters are NOT reset — progress bar continues from current
+                # position instead of resetting to 0% for a third time.
+                logger.warning(
+                    "[robocopy_dir] compat-mode retry also failed — trying data-only "
+                    "copy (/COPY:D /XO) for maximum SMB compatibility"
+                )
+                cmd_dataonly = [
+                    "robocopy",
+                    src,
+                    dst,
+                    "/E",
+                    "/COPY:D",   # data only — no attrs/timestamps (widest SMB compat)
+                    "/XO",       # exclude older files in destination (skip already-copied)
+                    "/R:3",
+                    "/W:5",
+                    "/IPG:1",    # 1 ms inter-packet gap — reduces SMB2 congestion
+                    "/NJH",
+                    "/NJS",
+                ]
+                ok = _run_robocopy(cmd_dataonly)
+                if ok:
+                    logger.info("[robocopy_dir] data-only retry succeeded")
+                else:
+                    logger.warning(
+                        "[robocopy_dir] all robocopy modes failed — "
+                        "falling back to Python per-file copy loop. "
+                        "Check Logs for robocopy exit codes. "
+                        "Tip: run 'robocopy \"" + src + "\" \"" + dst + "\" /E /LOG:rc_debug.txt' "
+                        "manually to see the full error."
+                    )
+        return ok, _rc_files[0], _rc_bytes[0]
+
+    except FileNotFoundError:
+        return False, 0, 0
+    except Exception as _rb_err:
+        logger.debug(f"[robocopy_dir] failed ({_rb_err})")
+        return False, 0, 0
 
 
 def _resolve_compress_level(compress) -> int:
@@ -159,7 +949,7 @@ def _fix_path(path: str) -> str:
         drive = m2.group(1).upper()
         rest  = m2.group(2).replace("/", "\\")
         return f"{drive}:\\{rest}"
-    # Preserve UNC/SMB network paths (\\server\\share or //server/share).
+    # Preserve UNC network paths (\\server\\share or //server/share).
     if path.startswith('\\\\') or path.startswith('//'):
         return path.replace('/', '\\')
     # Normalize double-backslashes that may come from JS string escaping
@@ -267,7 +1057,7 @@ def _dest_already_identical(src_file: Path, dest_file: Path) -> bool:
     """Return True if *dest_file* already exists and has the same size as
     *src_file*.
 
-    Size-only comparison (no mtime) is intentional: NAS/SMB shares sometimes
+    Size-only comparison (no mtime) is intentional: SMB shares sometimes
     report timestamps with timezone offsets or precision differences that make
     mtime checks unreliable even when files are identical.  For the seeding
     use-case (user pre-populated the backup destination before adding the
@@ -313,8 +1103,15 @@ class _HashingWriter:
     def hexdigest(self) -> str:
         return self._h.hexdigest()
 
+    def fileno(self):
+        # Explicitly raise UnsupportedOperation so callers (e.g. gzip.open)
+        # that probe for a real file descriptor fall back to the write() path
+        # instead of trying to use the underlying fd directly, which causes
+        # [Errno 22] Invalid argument on Windows.
+        raise io.UnsupportedOperation("fileno")
+
     # Forward every other attribute access to the underlying file object so
-    # gzip.open() (and anything else) can call flush(), tell(), etc. normally.
+    # gzip.GzipFile (and anything else) can call flush(), tell(), etc. normally.
     def __getattr__(self, name):
         return getattr(self._f, name)
 
@@ -348,6 +1145,183 @@ def hash_directory(path: str) -> str:
 
 
 # ─── Snapshot ─────────────────────────────────────────────────────────────────
+
+def _flush_smb_dir_cache(path: str) -> None:
+    """Force Windows SMB client to flush its directory-listing cache for *path*.
+
+    Background: the Windows SMB2 client caches FIND_FIRST2 (directory listing)
+    responses for several seconds.  When a remote machine deletes a file, the
+    local SMB client may continue to serve the stale cached listing for up to
+    ~10-30 s, depending on the SMB negotiation parameters.
+    os.scandir() reads from this cache, so build_snapshot() sees the file as
+    still present and diff_snapshots() reports no deletion.
+
+    Strategy (three-layer approach, most aggressive first):
+
+    Layer 1 — NtQueryDirectoryFile with RestartScan=True:
+        Opens a directory handle and calls NtQueryDirectoryFile with the
+        RestartScan flag set. This forces the SMB2 client to send a fresh
+        QUERY_DIRECTORY request to the SMB server, bypassing any client-side
+        directory cache. The server must respond with live data.
+        This is the most reliable method for defeating both client-side AND
+        some server-side caches on Windows/SMB hosts.
+
+    Layer 2 — FindFirstFileExW with FIND_FIRST_EX_NO_BUFFERING:
+        Uses the no-buffering flag which tells Windows to bypass its internal
+        directory cache and go directly to the filesystem/network.
+
+    Layer 3 — FindFirstFileW (original fallback):
+        The original approach. Forces a FIND_FIRST2 SMB request but may still
+        hit Windows client-side cache on some configurations.
+
+    This is a no-op on non-Windows platforms and on local (non-UNC) paths.
+    """
+    if os.name != "nt":
+        return
+    norm = path.replace("/", "\\")
+    if not norm.startswith("\\\\"):
+        return  # local path — SMB cache not involved
+
+    _flushed_via = "none"
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        kernel32 = ctypes.windll.kernel32
+        ntdll    = ctypes.windll.ntdll
+
+        # ── Layer 1: NtQueryDirectoryFile with RestartScan ────────────────
+        # Open directory handle, then call NtQueryDirectoryFile with
+        # RestartScan=True to force server to re-enumerate from scratch.
+        try:
+            FILE_LIST_DIRECTORY        = 0x0001
+            FILE_SHARE_READ            = 0x00000001
+            FILE_SHARE_WRITE           = 0x00000002
+            FILE_SHARE_DELETE          = 0x00000004
+            OPEN_EXISTING              = 3
+            FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+            INVALID_HANDLE_VALUE       = ctypes.c_void_p(-1).value
+
+            hDir = kernel32.CreateFileW(
+                norm.rstrip("\\"),
+                FILE_LIST_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+            if hDir != INVALID_HANDLE_VALUE:
+                try:
+                    # FILE_DIRECTORY_INFORMATION class = 1
+                    buf_size = 65536
+                    buf = ctypes.create_string_buffer(buf_size)
+
+                    class IO_STATUS_BLOCK(ctypes.Structure):
+                        _fields_ = [("Status", ctypes.c_long),
+                                    ("Information", ctypes.c_size_t)]
+
+                    io_status = IO_STATUS_BLOCK()
+
+                    # Call with RestartScan=True — forces SMB QUERY_DIRECTORY
+                    # with SL_RESTART_SCAN flag, bypassing all caches.
+                    status = ntdll.NtQueryDirectoryFile(
+                        hDir,           # FileHandle
+                        None,           # Event
+                        None,           # ApcRoutine
+                        None,           # ApcContext
+                        ctypes.byref(io_status),  # IoStatusBlock
+                        buf,            # FileInformation
+                        buf_size,       # Length
+                        1,              # FileInformationClass = FileDirectoryInformation
+                        False,          # ReturnSingleEntry
+                        None,           # FileName filter (None = all)
+                        True,           # RestartScan — KEY FLAG
+                    )
+                    if status == 0 or status == 0x80000006:  # STATUS_NO_MORE_FILES is also ok
+                        _flushed_via = "NtQueryDirectoryFile_RestartScan"
+                finally:
+                    kernel32.CloseHandle(hDir)
+        except Exception:
+            pass
+
+        # ── Layer 2: FindFirstFileExW with FIND_FIRST_EX_NO_BUFFERING ────
+        if _flushed_via == "none":
+            try:
+                class _WIN32_FIND_DATAW(ctypes.Structure):
+                    _fields_ = [
+                        ("dwFileAttributes",    wt.DWORD),
+                        ("ftCreationTime",      ctypes.c_ulonglong),
+                        ("ftLastAccessTime",    ctypes.c_ulonglong),
+                        ("ftLastWriteTime",     ctypes.c_ulonglong),
+                        ("nFileSizeHigh",       wt.DWORD),
+                        ("nFileSizeLow",        wt.DWORD),
+                        ("dwReserved0",         wt.DWORD),
+                        ("dwReserved1",         wt.DWORD),
+                        ("cFileName",           ctypes.c_wchar * 260),
+                        ("cAlternateFileName",  ctypes.c_wchar * 14),
+                    ]
+
+                find_data = _WIN32_FIND_DATAW()
+                pattern   = norm.rstrip("\\") + "\\*"
+                # FIND_FIRST_EX_NO_BUFFERING = 0x2 — bypass client-side cache
+                FIND_FIRST_EX_NO_BUFFERING = 0x2
+                FindExInfoBasic = 1
+                FindExSearchNameMatch = 0
+                handle = kernel32.FindFirstFileExW(
+                    pattern,
+                    FindExInfoBasic,
+                    ctypes.byref(find_data),
+                    FindExSearchNameMatch,
+                    None,
+                    FIND_FIRST_EX_NO_BUFFERING,
+                )
+                INVALID = ctypes.c_void_p(-1).value
+                if handle != INVALID:
+                    kernel32.FindClose(handle)
+                    _flushed_via = "FindFirstFileExW_NO_BUFFERING"
+            except Exception:
+                pass
+
+        # ── Layer 3: FindFirstFileW (original fallback) ───────────────────
+        if _flushed_via == "none":
+            try:
+                class _WIN32_FIND_DATAW2(ctypes.Structure):
+                    _fields_ = [
+                        ("dwFileAttributes",    wt.DWORD),
+                        ("ftCreationTime",      ctypes.c_ulonglong),
+                        ("ftLastAccessTime",    ctypes.c_ulonglong),
+                        ("ftLastWriteTime",     ctypes.c_ulonglong),
+                        ("nFileSizeHigh",       wt.DWORD),
+                        ("nFileSizeLow",        wt.DWORD),
+                        ("dwReserved0",         wt.DWORD),
+                        ("dwReserved1",         wt.DWORD),
+                        ("cFileName",           ctypes.c_wchar * 260),
+                        ("cAlternateFileName",  ctypes.c_wchar * 14),
+                    ]
+                find_data2 = _WIN32_FIND_DATAW2()
+                pattern2   = norm.rstrip("\\") + "\\*"
+                handle2    = kernel32.FindFirstFileW(pattern2, ctypes.byref(find_data2))
+                INVALID2   = ctypes.c_void_p(-1).value
+                if handle2 != INVALID2:
+                    kernel32.FindClose(handle2)
+                    _flushed_via = "FindFirstFileW"
+            except Exception:
+                pass
+
+        logger.info(
+            f"[flush_smb_dir_cache] path={path!r} method_used={_flushed_via!r} "
+            f"— NtQueryDirectoryFile RestartScan forces server re-enumeration"
+        )
+
+    except Exception:
+        pass  # never let a cache-flush failure break the poll loop
+
+# Public alias — watcher.py references this without the leading underscore.
+# The private _flush_smb_dir_cache name is kept for internal use; this alias
+# ensures the AttributeError (and silent swallow) bug is fixed without
+# renaming the private function throughout the codebase.
+flush_smb_dir_cache = _flush_smb_dir_cache
+
 
 def build_snapshot(
     path: str,
@@ -386,7 +1360,7 @@ def build_snapshot(
         return {}
 
     # Network/UNC paths are slow to enumerate — give them much more time.
-    # 300s (5 min) is too short for large SMB shares.
+    # 300s (5 min) is too short for large network shares.
     _norm = path.replace("/", "\\")
     if _norm.startswith("\\\\") and timeout_sec <= 300:
         timeout_sec = 7200  # 2 hours for network paths
@@ -411,6 +1385,18 @@ def build_snapshot(
         # sources and cuts first-backup scan time to a fast directory walk only.
         _first_backup = not previous
 
+        # For UNC/SMB sources, flush the Windows SMB client directory cache
+        # before scanning so we pick up files added from other machines that
+        # the local SMB client may still be caching as absent.  The flush is
+        # a lightweight NtQueryDirectoryFile RestartScan call on the root; each
+        # os.scandir() in _walk below opens its own enumeration handle which
+        # also bypasses the per-directory cache at the OS level.
+        if not changed_paths and str(path).startswith("\\\\"):
+            try:
+                _flush_smb_dir_cache(str(path))
+            except Exception:
+                pass
+
         # ── Watcher fast-path ─────────────────────────────────────────────
         # When the watcher has tracked exactly which files changed, skip the
         # expensive rglob and instead patch the previous snapshot in-place:
@@ -423,7 +1409,20 @@ def build_snapshot(
         # backup) or if changed_paths is None/empty (scheduled full-scan).
         if changed_paths and previous and not root.is_file():
             snapshot.update(previous)  # inherit all unchanged entries
-            changed_set = set(changed_paths)
+            # Normalise changed_paths: the watcher emits absolute paths but
+            # build_snapshot works in relative paths (relative to root).
+            # Convert any absolute path that starts with root to a relative path;
+            # leave already-relative paths unchanged so callers that pass relative
+            # paths continue to work correctly.
+            _root_str = str(root).rstrip("/\\")
+            _norm_changed = []
+            for _cp in changed_paths:
+                _cp_norm = _cp.replace("/", os.sep)
+                _root_norm = _root_str.replace("/", os.sep)
+                if _cp_norm.lower().startswith(_root_norm.lower() + os.sep):
+                    _cp_norm = _cp_norm[len(_root_norm) + 1:]
+                _norm_changed.append(_cp_norm)
+            changed_set = set(_norm_changed)
             for rel in changed_set:
                 if cancel_event is not None and cancel_event.is_set():
                     raise InterruptedError("Backup cancelled by user")
@@ -470,76 +1469,71 @@ def build_snapshot(
             return snapshot
 
         # -------------------------
-        # Directory Walk
+        # Directory Walk (os.scandir-based for speed)
         # -------------------------
-        for fp in root.rglob("*"):
-
-            # Check cancel on every file entry, before any I/O.
-            # This ensures cancellation is responsive even on slow/network
-            # sources where each rglob step can stall for seconds.
-            if cancel_event is not None and cancel_event.is_set():
-                raise InterruptedError("Backup cancelled by user")
-
-            if fp.is_symlink():
-                rel_sym = str(fp.relative_to(root))
-                try:
-                    target = os.readlink(str(fp))
-                    sym_detail = f" → {target}"
-                except OSError:
-                    sym_detail = " (broken symlink)"
-                logger.warning(
-                    f"[snapshot] Symlink skipped (not backed up): {rel_sym}{sym_detail}"
-                )
-                if skipped_symlinks is not None:
-                    skipped_symlinks.append(rel_sym)
-                continue
-
-            if not fp.is_file():
-                continue
-
-            rel = str(fp.relative_to(root))
-
-            if exclude_patterns and _is_excluded(rel, fp, exclude_patterns):
-                continue
-
+        # os.scandir returns DirEntry objects whose .stat() is cached from the
+        # directory listing — on Windows/UNC this means ONE network request per
+        # directory instead of one per file (as rglob + fp.stat() would do).
+        # This dramatically speeds up the scan phase on network shares.
+        def _walk(dir_path: Path, rel_prefix: str):
             try:
-                stat = fp.stat()
-                if scan_cb:
-                    try:
-                        scan_cb(rel)
-                    except InterruptedError:
-                        raise  # let cancel propagate — do NOT swallow
-                    except Exception:
-                        logger.debug("[suppressed] Exception ignored near: try: |                         scan_cb(rel) |                     except Interru", exc_info=True)
-                        pass
-
-                # Reuse previous entry if mtime+size unchanged (incremental fast path)
-                if (
-                    previous
-                    and rel in previous
-                    and previous[rel].get("mtime") == stat.st_mtime
-                    and previous[rel].get("size") == stat.st_size
-                ):
-                    snapshot[rel] = previous[rel]
+                entries = list(os.scandir(str(dir_path)))
+            except (OSError, PermissionError):
+                return
+            logger.info(
+                f"[snapshot] os.scandir({str(dir_path)!r}) returned "
+                f"{len(entries)} raw entries: "
+                f"{[e.name for e in entries]}"
+            )
+            for entry in entries:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Backup cancelled by user")
+                rel = rel_prefix + entry.name if rel_prefix else entry.name
+                try:
+                    if entry.is_symlink():
+                        try:
+                            target = os.readlink(entry.path)
+                            sym_detail = f" → {target}"
+                        except OSError:
+                            sym_detail = " (broken symlink)"
+                        logger.warning(
+                            f"[snapshot] Symlink skipped (not backed up): {rel}{sym_detail}"
+                        )
+                        if skipped_symlinks is not None:
+                            skipped_symlinks.append(rel)
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        _walk(Path(entry.path), rel + os.sep)
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if exclude_patterns and _is_excluded(rel, Path(entry.path), exclude_patterns):
+                        continue
+                    # Use cached stat from scandir — no extra network round-trip
+                    st = entry.stat(follow_symlinks=False)
+                    if scan_cb:
+                        try:
+                            scan_cb(rel)
+                        except InterruptedError:
+                            raise
+                        except Exception:
+                            pass
+                    # Reuse previous entry if mtime+size unchanged (incremental fast path)
+                    if (
+                        previous
+                        and rel in previous
+                        and previous[rel].get("mtime") == st.st_mtime
+                        and previous[rel].get("size") == st.st_size
+                    ):
+                        snapshot[rel] = previous[rel]
+                        continue
+                    snapshot[rel] = {"hash": "", "size": st.st_size, "mtime": st.st_mtime}
+                except InterruptedError:
+                    raise
+                except (IOError, OSError, PermissionError):
                     continue
 
-                snapshot[rel] = {
-                    # Always leave hash empty during scan — run_backup fills it in
-                    # while copying so each file is read only once (not twice).
-                    # Previously, incremental backups hashed changed files here,
-                    # causing the UI to freeze on "Scanning: <filename>" while a
-                    # large file was being hashed. The copy phase already backfills
-                    # hashes into new_snapshot, so hashing here was redundant.
-                    "hash": "",
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                }
-
-            except InterruptedError:
-                raise  # cancel must not be swallowed by the I/O except below
-            except (IOError, OSError, PermissionError):
-                continue
-
+        _walk(root, "")
         return snapshot
 
     # -------------------------------------------------
@@ -607,13 +1601,19 @@ def build_snapshot(
                     signal.signal(signal.SIGALRM, old_handler)
 
 
-def diff_snapshots(old: Dict, new: Dict, max_deletes: int = 500) -> List[dict]:
+def diff_snapshots(old: Dict, new: Dict, max_deletes: int = 500, size_only: bool = False) -> List[dict]:
     """Compare two snapshots and return a list of change records.
 
     max_deletes: cap the number of "deleted" entries recorded. When a stale
     snapshot has thousands of old paths (e.g. user emptied the watched folder),
     iterating all of them is slow and produces a huge changeset that is never
     actually used for copying. We record up to max_deletes deletions and stop.
+
+    size_only: when True and both hashes are empty, treat a file as modified
+    only when its *size* differs — mtime is ignored entirely.  Use this for
+    destination-folder poll watches where robocopy may preserve the source
+    file's original mtime, causing spurious "modified" events on every poll
+    cycle even though the file has not actually changed.
     """
 
     changes = []
@@ -628,7 +1628,31 @@ def diff_snapshots(old: Dict, new: Dict, max_deletes: int = 500) -> List[dict]:
                 "new_hash": meta["hash"],
                 "size": meta["size"],
             })
-        elif old[rel]["hash"] != meta["hash"]:
+        elif old[rel]["hash"] != meta["hash"] or (
+            # Fix: when both hashes are "" (file was seed-skipped on a previous
+            # first backup and its hash was never backfilled), fall back to
+            # mtime+size comparison so changed files are not silently missed.
+            # Without this, diff_snapshots would compare "" == "" → not modified,
+            # and incremental backups would never copy changed files again.
+            #
+            # Note: FAT-based SMB shares have ~2-second mtime precision
+            # and Python's stat().st_mtime can return slightly different float
+            # values for the same unchanged file across network calls.  Use a 2-second
+            # tolerance so a file whose mtime shifts by <2 s (but size stays the
+            # same) is NOT treated as modified.  This prevents the 10 GB re-copy
+            # loop seen with robocopy-backed sync-mode watches on SMB sources.
+            #
+            # size_only=True: destination-folder poll watches use robocopy which
+            # preserves the source mtime; each os.stat() over SMB can return a
+            # slightly different float for the same file, making mtime unreliable.
+            # When size_only is set we ignore mtime entirely and only flag genuine
+            # size differences, eliminating the perpetual "modified" spam on dest
+            # watches when the actual file content has not changed.
+            old[rel]["hash"] == "" and meta["hash"] == "" and (
+                old[rel].get("size") != meta.get("size") or
+                (not size_only and abs((old[rel].get("mtime") or 0.0) - (meta.get("mtime") or 0.0)) > 2.0)
+            )
+        ):
             changes.append({
                 "type": "modified",
                 "path": rel,
@@ -638,12 +1662,13 @@ def diff_snapshots(old: Dict, new: Dict, max_deletes: int = 500) -> List[dict]:
             })
 
     # Deleted — cap at max_deletes to avoid blocking on stale snapshots
+    deleted_changes = []
     delete_count = 0
     for rel, meta in old.items():
         if rel not in new:
             if delete_count >= max_deletes:
                 break
-            changes.append({
+            deleted_changes.append({
                 "type": "deleted",
                 "path": rel,
                 "old_hash": meta["hash"],
@@ -652,7 +1677,11 @@ def diff_snapshots(old: Dict, new: Dict, max_deletes: int = 500) -> List[dict]:
             })
             delete_count += 1
 
-    return changes
+    # Return deletions FIRST so the history timeline is correct when both a
+    # deletion and an addition are detected in the same poll cycle.
+    # (e.g. a coworker deletes testfile_10gb.dat and adds IMG_0019.pdf — the
+    # deletion happened first and should appear first in the history log.)
+    return deleted_changes + changes
 
 
 # ─── BackupIndex ──────────────────────────────────────────────────────────────
@@ -709,9 +1738,23 @@ class BackupIndex:
         dest = Path(destination)
         backups = []
         if dest.exists():
-            for d in sorted(dest.iterdir(), reverse=True):
+            # Collect all directories to scan: top-level versioned dirs +
+            # sync-mode metadata dirs inside .backupsys_meta subfolders.
+            _scan_dirs = []
+            for d in dest.iterdir():
                 if not d.is_dir():
                     continue
+                if d.name == ".backupsys_meta":
+                    # Sync-mode metadata: each sub-subfolder is one backup run
+                    try:
+                        for _sd in d.iterdir():
+                            if _sd.is_dir():
+                                _scan_dirs.append(_sd)
+                    except Exception:
+                        pass
+                else:
+                    _scan_dirs.append(d)
+            for d in sorted(_scan_dirs, key=lambda p: p.name, reverse=True):
                 manifest_p = d / "MANIFEST.json"
                 if not manifest_p.exists():
                     continue
@@ -1360,6 +2403,7 @@ def _vss_create_snapshot(volume: str) -> tuple:
         r = subprocess.run(
             ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=30,
+            creationflags=_WIN_NO_WINDOW,
         )
         out = r.stdout.strip()
         if r.returncode == 0 and "|" in out:
@@ -1391,6 +2435,7 @@ def _vss_delete_snapshot(shadow_id: str) -> None:
         subprocess.run(
             ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, timeout=15,
+            creationflags=_WIN_NO_WINDOW,
         )
         logger.debug(f"[vss] Shadow copy deleted: {shadow_id}")
     except Exception as e:
@@ -1419,7 +2464,6 @@ def _download_remote_source(
     remote_path: str,
     sftp_cfg:   Optional[dict] = None,
     ftp_cfg:    Optional[dict] = None,
-    smb_cfg:    Optional[dict] = None,
     webdav_cfg: Optional[dict] = None,
     progress_cb=None,
 ) -> dict:
@@ -1427,9 +2471,9 @@ def _download_remote_source(
     Download a remote source directory to a local temp directory so the backup
     engine can treat it as a plain local path.
 
-    source_type: "sftp" | "ftp" | "ftps" | "smb" | "webdav"
+    source_type: "sftp" | "ftp" | "ftps" | "webdav"
     remote_path: path on the remote server (e.g. "/home/user/docs")
-    sftp_cfg / ftp_cfg / smb_cfg / webdav_cfg: connection credentials dict.
+    sftp_cfg / ftp_cfg / webdav_cfg: connection credentials dict.
 
     Returns:
         {
@@ -1444,7 +2488,7 @@ def _download_remote_source(
 
     if not TRANSPORT_AVAILABLE:
         return {"ok": False, "temp_dir": None,
-                "error": "transport_utils not available (install paramiko / ftplib / smbprotocol / webdavclient3 dependencies)"}
+                "error": "transport_utils not available (install paramiko / ftplib / webdavclient3 dependencies)"}
 
     temp_dir = tempfile.mkdtemp(prefix="backupsys_src_")
     try:
@@ -1452,9 +2496,6 @@ def _download_remote_source(
             result = download_from_sftp(remote_path, temp_dir, sftp_cfg or {}, progress_cb=progress_cb)
         elif source_type in ("ftp", "ftps"):
             result = download_from_ftp(remote_path, temp_dir, ftp_cfg or {}, progress_cb=progress_cb)
-        elif source_type == "smb":
-            from transport_utils import download_from_smb
-            result = download_from_smb(remote_path, temp_dir, smb_cfg or {}, progress_cb=progress_cb)
         elif source_type == "webdav":
             from transport_utils import download_from_webdav
             result = download_from_webdav(remote_path, temp_dir, webdav_cfg or {}, progress_cb=progress_cb)
@@ -1504,11 +2545,11 @@ def run_backup(
     verify_after: bool = False,
     changed_paths: Optional[List[str]] = None,
     verify_remote_upload: bool = False,
-    source_type: str = "local",             # "local" | "sftp" | "ftp" | "smb" | "webdav"
+    source_type: str = "local",             # "local" | "sftp" | "ftp" | "webdav"
     source_sftp_cfg:   Optional[Dict] = None,  # SFTP credentials when source_type="sftp"
     source_ftp_cfg:    Optional[Dict] = None,  # FTP  credentials when source_type="ftp"
-    source_smb_cfg:    Optional[Dict] = None,  # SMB  credentials when source_type="smb"
     source_webdav_cfg: Optional[Dict] = None,  # WebDAV credentials when source_type="webdav"
+    force_robocopy: bool = False,  # override same-host UNC detection and always use robocopy
 ) -> dict:
     """
     Execute a backup from source → destination.
@@ -1586,47 +2627,33 @@ def run_backup(
     _resume_path   = dest_root / f"_resume_{watch_id}.json"
 
     # ── Remote source: download to a temp dir before processing ───────────────
-    # When source_type is "sftp", "ftp", "smb", or "webdav" we fetch the remote
+    # When source_type is "sftp", "ftp", or "webdav" we fetch the remote
     # directory into a
     # local temp dir and then treat that temp dir as the backup source.  This
     # allows the rest of the engine (snapshot diffing, compression, encryption,
     # VSS, incremental logic) to work without any changes.
     _remote_source_temp: Optional[str] = None
-    if source_type in ("sftp", "ftp", "ftps", "smb", "webdav"):
-        # ── SMB shortcut: if the UNC path is already accessible via Windows
-        # session (authenticated via Explorer/net use), treat as a plain local
-        # path — no download step needed. Much faster for LAN-to-LAN backups.
-        _smb_direct = (
-            source_type == "smb"
-            and os.name == "nt"
-            and (source.startswith("\\\\") or source.startswith("//"))
-            and Path(source).exists()
+    if source_type in ("sftp", "ftp", "ftps", "webdav"):
+        logger.info(f"[remote-src] Downloading {source_type.upper()} source: {source}")
+        _dl = _download_remote_source(
+            source_type=source_type,
+            remote_path=source,
+            sftp_cfg=source_sftp_cfg,
+            ftp_cfg=source_ftp_cfg,
+            webdav_cfg=source_webdav_cfg,
+            progress_cb=scan_cb,
         )
-        if _smb_direct:
-            logger.info(f"[smb] UNC path directly accessible, skipping download: {source}")
-            src_path = Path(source)
-        else:
-            logger.info(f"[remote-src] Downloading {source_type.upper()} source: {source}")
-            _dl = _download_remote_source(
-                source_type=source_type,
-                remote_path=source,
-                sftp_cfg=source_sftp_cfg,
-                ftp_cfg=source_ftp_cfg,
-                smb_cfg=source_smb_cfg,
-                webdav_cfg=source_webdav_cfg,
-                progress_cb=scan_cb,
-            )
-            if not _dl["ok"]:
-                result["error"] = f"Failed to download {source_type.upper()} source: {_dl['error']}"
-                return result
-            _remote_source_temp = _dl["temp_dir"]
-            logger.info(f"[remote-src] Downloaded {_dl['downloaded']} file(s) to {_remote_source_temp}")
-            source   = _remote_source_temp
-            src_path = Path(source)
+        if not _dl["ok"]:
+            result["error"] = f"Failed to download {source_type.upper()} source: {_dl['error']}"
+            return result
+        _remote_source_temp = _dl["temp_dir"]
+        logger.info(f"[remote-src] Downloaded {_dl['downloaded']} file(s) to {_remote_source_temp}")
+        source   = _remote_source_temp
+        src_path = Path(source)
 
     # ── Pre-backup hook ────────────────────────────────────────────────────────
     if pre_backup_cmd:
-        _pre_cmd = subprocess.run(pre_backup_cmd, shell=True, capture_output=True, text=True)
+        _pre_cmd = subprocess.run(pre_backup_cmd, shell=True, capture_output=True, text=True, creationflags=_WIN_NO_WINDOW)
         if _pre_cmd.returncode != 0:
             return {"ok": False, "error": f"Pre-backup command failed (exit {_pre_cmd.returncode}): {_pre_cmd.stderr}"}
 
@@ -1639,10 +2666,17 @@ def run_backup(
         # and only for directory sources (not single-file watches).
         # Fails gracefully: if VSS is unavailable the backup continues on live files.
         _effective_source = source
+        # VSS shadow copy: local drives only (C:\, D:\ etc.)
+        # Path.drive returns the UNC prefix for network paths (e.g. \\server\share),
+        # so we must explicitly exclude network sources — VSS only applies to local
+        # NTFS volumes and attempting it on a network path wastes time and emits a
+        # misleading "shadow copy unavailable" warning.
+        _is_unc_source = str(source).startswith("\\\\") or str(source).startswith("//")
         if (os.name == "nt"
                 and src_path.is_dir()
                 and not str(source).startswith("\\\\?\\")  # not already a shadow path
-                and Path(source).drive):                    # has a drive letter (local disk)
+                and not _is_unc_source                          # skip UNC / SMB sources
+                and Path(source).drive):                        # has a local drive letter
             _volume = str(Path(source).drive) + "\\"
             _sid, _sdevice = _vss_create_snapshot(_volume)
             if _sid and _sdevice:
@@ -1683,10 +2717,12 @@ def run_backup(
         if backup_dir is None:
             if sync_mode:
                 backup_dir = dest_root
-                backup_dir.mkdir(parents=True, exist_ok=True)
+                if not dry_run:
+                    backup_dir.mkdir(parents=True, exist_ok=True)
             else:
                 backup_dir = dest_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}__{safe_name}"
-                backup_dir.mkdir(parents=True, exist_ok=True)
+                if not dry_run:
+                    backup_dir.mkdir(parents=True, exist_ok=True)
 
         # ── Auto-exclude backup output folders inside the source ────────────
         # Prevents scanning backup output dirs (e.g. 20240101_123456__name)
@@ -1741,37 +2777,89 @@ def run_backup(
         )
 
         if incremental and previous_snapshot:
-            changes       = diff_snapshots(previous_snapshot, new_snapshot)
+            # Use size_only=True for UNC/SMB sources: robocopy fast-path stores
+            # hash="" for all files, so diff falls back to mtime comparison.
+            # SMB mtime can drift by more than the 2 s tolerance on every stat()
+            # call — this causes every file to appear "modified" on each
+            # incremental run, triggering a full re-copy of the entire source.
+            # size_only=True ignores mtime entirely and only flags genuine size
+            # differences (actual content changes), which is both correct and fast.
+            _unc_src = str(source).startswith("\\\\") or str(source).startswith("//")
+            changes       = diff_snapshots(previous_snapshot, new_snapshot, size_only=_unc_src)
             files_to_copy = [c for c in changes if c["type"] in ("added", "modified")]
 
             # ── Sync-mode destination check ───────────────────────────────────
             # diff_snapshots only compares source→source snapshots, so it cannot
             # detect files that were deleted from the *destination* while the
             # source remained unchanged.  In sync mode we want the destination to
-            # mirror the source exactly, so we do a single rglob pass over the
-            # destination to build a {rel: size} index (same pattern as the
-            # source scan — scan_cb fires per file so the UI stays responsive
-            # and cancel is supported), then find any source files absent from it.
+            # mirror the source exactly, so we build a {rel: size} index of the
+            # destination and find any source files absent from it.
+            #
+            # Optimisation: when source and destination are on the same Windows host,
+            # skip the expensive rglob and instead stat() only the files we know
+            # about (from new_snapshot).  One stat() per file vs. a full directory
+            # traversal — much faster on large SMB shares.
+            #
+            # IMPORTANT — watcher fast-path runs (changed_paths is set):
+            # build_snapshot()'s changed_paths fast-path returns new_snapshot
+            # pre-populated with EVERY previously-known file (inherited unchanged)
+            # plus the handful that actually changed — it is NOT limited to just
+            # the changed files. Looping over new_snapshot here would therefore
+            # stat() every file in the whole share (one network round-trip each)
+            # on every small incremental run, turning a 2-file change into a scan
+            # of the entire destination — slower than the original full directory
+            # walk, and with no UI feedback during it (scan_cb is intentionally
+            # not called in this loop), which makes the app look stuck.
+            # On these fast runs we only need to check the few files that are
+            # actually about to be copied; the comprehensive missing-file
+            # self-heal below is skipped here and instead relies on scheduled/
+            # full/manual scans (where changed_paths is None) to catch files
+            # that were deleted directly from the destination.
             if sync_mode:
+                _fast_incremental = bool(changed_paths)
                 _dest_index_inc: Dict[str, int] = {}
+                _dest_host_inc = _unc_host(str(dest_root))
+                _src_host_inc  = _unc_host(str(src_path))
+                _same_host_inc = bool(_dest_host_inc and _dest_host_inc == _src_host_inc)
                 try:
-                    for _dp in dest_root.rglob("*"):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise InterruptedError("Backup cancelled by user")
-                        if not _dp.is_file() or _dp.is_symlink():
-                            continue
-                        try:
-                            _rel = str(_dp.relative_to(dest_root))
-                            _dest_index_inc[_rel] = _dp.stat().st_size
-                            if scan_cb:
-                                try:
-                                    scan_cb(_rel)
-                                except InterruptedError:
-                                    raise
-                                except Exception:
-                                    pass
-                        except (OSError, ValueError):
-                            pass
+                    if _fast_incremental:
+                        # Only stat() the small set of files this run actually
+                        # intends to copy — never the whole destination.
+                        for _c in files_to_copy:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise InterruptedError("Backup cancelled by user")
+                            _dp = dest_root / _c["path"]
+                            try:
+                                _dest_index_inc[_c["path"]] = _dp.stat().st_size
+                            except OSError:
+                                pass  # file absent from dest — will be queued for copy
+                    elif _same_host_inc:
+                        # Fast path: stat only files we care about, no full rglob
+                        for _rel_key in new_snapshot:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise InterruptedError("Backup cancelled by user")
+                            _dp = dest_root / _rel_key
+                            try:
+                                _dest_index_inc[_rel_key] = _dp.stat().st_size
+                            except OSError:
+                                pass  # file absent from dest — will be queued for copy
+                    else:
+                        for _dp in dest_root.rglob("*"):
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise InterruptedError("Backup cancelled by user")
+                            if not _dp.is_file() or _dp.is_symlink():
+                                continue
+                            try:
+                                _rel = str(_dp.relative_to(dest_root))
+                                _dest_index_inc[_rel] = _dp.stat().st_size
+                                # NOTE: scan_cb is intentionally NOT called here.
+                                # This is an internal destination scan (sync-mode
+                                # missing-file detection), not a source file discovery
+                                # scan.  Calling scan_cb here would make the UI show
+                                # "Scanning: <backup file>" during a preparation step,
+                                # hiding the real copy-phase progress from the user.
+                            except (OSError, ValueError):
+                                pass
                 except InterruptedError:
                     raise
                 except Exception as _de:
@@ -1782,81 +2870,199 @@ def run_backup(
                     _dest_index_inc = None
 
                 if _dest_index_inc is not None:
-                    _already_queued = {c["path"] for c in files_to_copy}
-                    _dest_missing = [
-                        {
-                            "type":     "added",
-                            "path":     _rel,
-                            "new_hash": _meta["hash"],
-                            "size":     _meta["size"],
-                            "old_hash": None,
-                        }
-                        for _rel, _meta in new_snapshot.items()
-                        if _rel not in _already_queued
-                        and (
-                            _rel not in _dest_index_inc
-                            or _dest_index_inc[_rel] != _meta["size"]
-                        )
+                    # ── Filter: remove files already correct in destination ──────
+                    # diff_snapshots can produce false "modified" entries when the
+                    # SMB mtime fluctuates slightly (2-second precision) and the
+                    # saved snapshot has hash="" (robocopy fast-path skips hashing).
+                    # In sync mode the goal is destination == source; if the dest
+                    # already has the file at the right size it is already correct —
+                    # no need to re-copy 10 GB just because the mtime drifted 1 s.
+                    _before_filter = len(files_to_copy)
+                    files_to_copy = [
+                        c for c in files_to_copy
+                        if c["path"] not in _dest_index_inc
+                        or _dest_index_inc.get(c["path"], -1) != new_snapshot.get(c["path"], {}).get("size", -2)
                     ]
-                    if _dest_missing:
+                    _filtered = _before_filter - len(files_to_copy)
+                    if _filtered > 0:
                         logger.info(
-                            f"[sync] '{watch_name}': {len(_dest_missing)} file(s) missing "
-                            f"from destination — queuing for re-copy"
+                            f"[sync] '{watch_name}': {_filtered} file(s) skipped — "
+                            f"destination already has the correct size (SMB mtime drift suppressed)"
                         )
-                        files_to_copy = files_to_copy + _dest_missing
-                        changes       = changes + _dest_missing
+
+                    # The comprehensive "anything else missing from the
+                    # destination" self-heal requires knowing the destination
+                    # state for EVERY file, which _dest_index_inc only has on
+                    # full scans (not on the fast-path above) — running it here
+                    # on a fast incremental run would wrongly treat every
+                    # uninspected file as missing and re-queue the entire share.
+                    if not _fast_incremental:
+                        _already_queued = {c["path"] for c in files_to_copy}
+                        _dest_missing = [
+                            {
+                                "type":     "added",
+                                "path":     _rel,
+                                "new_hash": _meta["hash"],
+                                "size":     _meta["size"],
+                                "old_hash": None,
+                            }
+                            for _rel, _meta in new_snapshot.items()
+                            if _rel not in _already_queued
+                            and (
+                                _rel not in _dest_index_inc
+                                or _dest_index_inc[_rel] != _meta["size"]
+                            )
+                        ]
+                        if _dest_missing:
+                            logger.info(
+                                f"[sync] '{watch_name}': {len(_dest_missing)} file(s) missing "
+                                f"from destination — queuing for re-copy"
+                            )
+                            files_to_copy = files_to_copy + _dest_missing
+                            changes       = changes + _dest_missing
         else:
             # ── Sync-mode first-backup fast path ─────────────────────────────
             # In sync mode the destination may already be pre-populated (e.g.
             # user seeded the drive or re-added the watch after a reinstall).
             # Instead of queuing all source files and then seed-skipping them
             # one by one in the copy loop (O(n) individual stat calls over the
-            # network), we do a single rglob pass over the destination — the
-            # same way the source is scanned — to build a {rel: size} index,
-            # then diff that against new_snapshot.  This keeps the UI
-            # responsive (scan_cb fires per file), supports cancellation, and
-            # produces a minimal files_to_copy list up-front.
+            # network), we build a {rel: size} index of the destination and diff
+            # it against new_snapshot.  Optimisation: when source and destination
+            # are on the same Windows host, skip the rglob and stat only the files
+            # we know about — order-of-magnitude faster on large shares.
             if sync_mode and not encrypt_key and compress_level == 0:
-                _dest_index: Dict[str, int] = {}   # rel_path → file size
+                _dest_index: Dict[str, tuple] = {}   # rel_path → (size, mtime)
+                _dest_host_fb = _unc_host(str(dest_root))
+                _src_host_fb  = _unc_host(str(src_path))
+                _same_host_fb = bool(_dest_host_fb and _dest_host_fb == _src_host_fb)
                 try:
-                    for _dp in dest_root.rglob("*"):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise InterruptedError("Backup cancelled by user")
-                        if not _dp.is_file() or _dp.is_symlink():
-                            continue
-                        try:
-                            _rel = str(_dp.relative_to(dest_root))
-                            _dest_index[_rel] = _dp.stat().st_size
-                            if scan_cb:
-                                try:
-                                    scan_cb(_rel)
-                                except InterruptedError:
-                                    raise
-                                except Exception:
-                                    pass
-                        except (OSError, ValueError):
-                            pass
+                    if _same_host_fb:
+                        # Fast path: stat only the files in the snapshot, no rglob
+                        for _rel_key in new_snapshot:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise InterruptedError("Backup cancelled by user")
+                            _dp = dest_root / _rel_key
+                            try:
+                                _st = _dp.stat()
+                                _dest_index[_rel_key] = (_st.st_size, _st.st_mtime)
+                                logger.debug(
+                                    f"[sync] '{watch_name}': dest pre-scan found '{_rel_key}' "
+                                    f"({_st.st_size:,} bytes)"
+                                )
+                            except OSError as _oserr:
+                                logger.debug(
+                                    f"[sync] '{watch_name}': dest pre-scan: '{_rel_key}' "
+                                    f"not found or not accessible ({_oserr}) — will copy"
+                                )
+                    else:
+                        for _dp in dest_root.rglob("*"):
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise InterruptedError("Backup cancelled by user")
+                            if not _dp.is_file() or _dp.is_symlink():
+                                continue
+                            try:
+                                _rel = str(_dp.relative_to(dest_root))
+                                _st = _dp.stat()
+                                _dest_index[_rel] = (_st.st_size, _st.st_mtime)
+                                # NOTE: scan_cb intentionally omitted here — this is
+                                # an internal destination pre-scan for sync-mode
+                                # first-backup, not source file discovery.
+                            except (OSError, ValueError):
+                                pass
                 except InterruptedError:
                     raise
                 except Exception as _de:
                     logger.warning(f"[sync] '{watch_name}': destination pre-scan failed ({_de}) — falling back to full copy")
                     _dest_index = {}   # safe fallback: treat dest as empty → copy everything
 
+                if _dest_index:
+                    logger.info(
+                        f"[sync] '{watch_name}': destination pre-scan found "
+                        f"{len(_dest_index)} file(s) — checking which need copying..."
+                    )
+                elif new_snapshot:
+                    logger.warning(
+                        f"[sync] '{watch_name}': destination pre-scan found 0 files "
+                        f"(dest may be empty, inaccessible, or all stats failed) — "
+                        f"all {len(new_snapshot)} source file(s) will be queued for copy. "
+                        f"Check Logs (debug) for per-file stat errors."
+                    )
+
                 changes = []
+                _skipped_seed = []
                 for k, v in new_snapshot.items():
-                    if k not in _dest_index or _dest_index[k] != v["size"]:
+                    _src_size = v["size"]
+                    _dest_entry = _dest_index.get(k)
+                    if _dest_entry is None:
+                        # Not found in destination at all
+                        logger.debug(f"[sync] '{watch_name}': queuing '{k}' — not found in destination")
                         changes.append({
                             "type":     "added",
                             "path":     k,
                             "new_hash": v["hash"],
-                            "size":     v["size"],
+                            "size":     _src_size,
                             "old_hash": None,
                         })
-                if len(changes) < len(new_snapshot):
+                    else:
+                        _dest_size, _dest_mtime = _dest_entry
+                        # Primary check: size must match exactly.
+                        # Secondary check: if sizes differ but mtime matches within
+                        # 5 seconds (SMB timestamp precision — bumped from 2s for
+                        # UNC-to-UNC where clocks may drift slightly), treat as
+                        # identical — catches SMB rounding/timezone quirks.
+                        # Edge case: if snapshot returned size=0 for this file
+                        # (partial SMB scan / timeout), don't force a re-copy of
+                        # a large file that is clearly already present at the
+                        # destination — fall back to mtime-only for size=0 entries.
+                        _size_ok  = (_src_size > 0 and _dest_size == _src_size)
+                        _src_meta = new_snapshot[k]
+                        _src_mtime = _src_meta.get("mtime", 0)
+                        _mtime_ok = _src_mtime and abs(_dest_mtime - _src_mtime) <= 5
+                        _size_unknown = (_src_size == 0 and _dest_size > 0)
+                        if _size_ok or _mtime_ok or _size_unknown:
+                            _reason = (
+                                "size matches" if _size_ok
+                                else f"mtime matches within 5s (src={_src_mtime:.0f} dest={_dest_mtime:.0f}, size src={_src_size} dest={_dest_size})"
+                                if _mtime_ok
+                                else f"snapshot size=0 (partial SMB scan) — dest has {_dest_size:,} bytes, trusting mtime"
+                            )
+                            logger.debug(f"[sync] '{watch_name}': skipping '{k}' — already in destination ({_reason})")
+                            _skipped_seed.append(k)
+                            # Fix: stamp the snapshot with the *destination* mtime so
+                            # diff_snapshots on the next incremental run compares a stable
+                            # value.  Robocopy preserves the source mtime on the dest file,
+                            # but os.stat() over a local/UNC path can return a slightly
+                            # different float on each call (FAT/SMB 2-second precision).
+                            # Without this, both old and new snapshot entries have hash=""
+                            # and the mtime fallback in diff_snapshots may detect a spurious
+                            # change, re-queuing these already-present files as "modified"
+                            # on the very next backup even though nothing actually changed.
+                            if k in new_snapshot and _dest_mtime:
+                                new_snapshot[k]["mtime"] = _dest_mtime
+                        else:
+                            logger.info(
+                                f"[sync] '{watch_name}': queuing '{k}' — "
+                                f"dest size={_dest_size:,} bytes vs src size={_src_size:,} bytes "
+                                f"(dest mtime={_dest_mtime:.0f}, src mtime={_src_mtime:.0f})"
+                            )
+                            changes.append({
+                                "type":     "added",
+                                "path":     k,
+                                "new_hash": v["hash"],
+                                "size":     _src_size,
+                                "old_hash": None,
+                            })
+
+                if _skipped_seed:
                     logger.info(
-                        f"[sync] '{watch_name}': first backup — destination already has "
-                        f"{len(new_snapshot) - len(changes)} of {len(new_snapshot)} file(s); "
-                        f"only {len(changes)} file(s) need copying"
+                        f"[sync] '{watch_name}': {len(_skipped_seed)} file(s) already in "
+                        f"destination — skipped: {', '.join(_skipped_seed[:5])}"
+                        + (" ..." if len(_skipped_seed) > 5 else "")
+                    )
+                if changes:
+                    logger.info(
+                        f"[sync] '{watch_name}': {len(changes)} file(s) need copying "
+                        f"({_human_size(sum(c['size'] for c in changes))})"
                     )
             else:
                 changes = [
@@ -1871,7 +3077,24 @@ def run_backup(
                 ]
             files_to_copy = changes
 
-        result["changes"] = changes
+        # ── Record only real changes in result ───────────────────────────────
+        # `changes` is the raw diff_snapshots() output which can include false
+        # "modified" entries when both hashes are "" (robocopy fast-path) and
+        # the SMB mtime drifts slightly between snapshots.  The dest-size filter
+        # above already removed those from files_to_copy (nothing to re-copy),
+        # but they were still in `changes` — causing spurious "modified" rows in
+        # History and a phantom pending-change count of 1 after backup.
+        #
+        # Fix: rebuild the reported change list as:
+        #   • all entries that are actually queued for copy (files_to_copy), PLUS
+        #   • all "deleted" entries from the diff (never filtered by dest-size check).
+        # This means History only shows what was genuinely added/modified/deleted.
+        _deleted_changes = [c for c in changes if c.get("type") == "deleted"]
+        _copy_paths      = {c["path"] for c in files_to_copy}
+        # Avoid double-counting: deletions already in files_to_copy are impossible
+        # (deleted files are never queued for copy), but guard anyway.
+        _extra_deletes   = [c for c in _deleted_changes if c["path"] not in _copy_paths]
+        result["changes"] = files_to_copy + _extra_deletes
         total       = len(files_to_copy)
 
         # ── Size filter — skip files exceeding the per-watch size cap ─────────
@@ -1915,9 +3138,23 @@ def run_backup(
             f"sync_mode={sync_mode}, incremental={incremental}, "
             f"encrypt={bool(encrypt_key)}, compress={compress_level}"
         )
+        # ── Nothing to copy — destination already up to date ─────────────────
+        # Signal the UI immediately so it can show "Up to date" instead of
+        # staying frozen on "Preparing… X GB to copy" while we write the manifest.
+        if total == 0 and progress_cb:
+            try:
+                progress_cb(0, 0, "\x00uptodate\x00", 0, 0)
+            except Exception:
+                pass
         # Byte-level progress tracking for accurate ETA on large files.
         # total_bytes is pre-computed from the change list sizes; bytes_done
         # is incremented as each file finishes so the UI can show MB/s & ETA.
+        # NOTE: We intentionally do NOT re-stat size=0 entries here.
+        # Doing so fires one network round-trip per file before any copying starts,
+        # causing a multi-minute stall on large SMB shares before the first byte
+        # is copied.  The rglob scan already captured real sizes via stat();
+        # any residual size=0 entries are genuinely empty files or edge cases
+        # — the UI handles total_bytes gracefully by showing bytes-copied count.
         total_bytes = sum(c.get("size", 0) for c in files_to_copy)
         bytes_done  = 0
 
@@ -1963,9 +3200,13 @@ def run_backup(
                     _files_written_hashes[src_path.name] = _encrypt_file(source, str(backup_dir / src_path.name), encrypt_key)
                 elif compress_level > 0:
                     dest_gz = backup_dir / (src_path.name + '.gz')
+                    _ensure_writable(dest_gz)
                     with open(str(dest_gz), 'wb') as _raw_gz:
                         _hw = _HashingWriter(_raw_gz)
-                        with gzip.open(_hw, 'wb', compresslevel=compress_level) as f_out:
+                        # Use GzipFile instead of gzip.open() — gzip.open() calls
+                        # fileno() on the wrapper which fails on Windows (Errno 22).
+                        # GzipFile only needs write(), which _HashingWriter provides.
+                        with gzip.GzipFile(fileobj=_hw, mode='wb', compresslevel=compress_level) as f_out:
                             with open(source, 'rb') as f_in:
                                 _sh.copyfileobj(f_in, f_out)
                     _files_written_hashes[src_path.name + '.gz'] = _hw.hexdigest()
@@ -1974,6 +3215,7 @@ def run_backup(
                     # need a separate hash_file(src) or hash_file(dest) pass.
                     _h_sf = hashlib.sha256()
                     _dest_sf = backup_dir / src_path.name
+                    _ensure_writable(_dest_sf)
                     with open(source, 'rb') as _f_in, open(str(_dest_sf), 'wb') as _f_out:
                         while True:
                             _sf_chunk = _f_in.read(4 * 1024 * 1024)
@@ -2017,17 +3259,243 @@ def run_backup(
         # ── Directory source ───────────────────────────────
         else:
             # Choose chunk size based on source/dest path type.
-            # SMB/UNC network paths benefit greatly from larger chunks:
+            # UNC network paths benefit greatly from larger chunks:
             # fewer round-trips per file = much higher effective throughput.
             # Local paths use 4 MB (good balance of memory and speed).
             _src_str    = str(source).replace("/", "\\")
             _dest_str   = str(destination).replace("/", "\\")
             _is_network = _src_str.startswith("\\\\") or _dest_str.startswith("\\\\")
             _CHUNK      = 16 * 1024 * 1024 if _is_network else 4 * 1024 * 1024  # 16 MB for network, 4 MB local
+
+            # Same-host optimisation: when both UNC paths share the same server
+            # (e.g. \\PC\share1 → \\PC\share2) we can ask the PC to copy the
+            # data internally via the Windows CopyFileEx offload API.  The bytes
+            # never traverse the network — order-of-magnitude speed improvement.
+            _src_host  = _unc_host(_src_str)
+            _dest_host = _unc_host(_dest_str)
+            _is_same_host = bool(_src_host and _src_host == _dest_host)
+
+            # ── Whole-directory robocopy fast-path ─────────────────────────────
+            # robocopy is faster than Python's copy loop for ALL path combinations:
+            #
+            #   UNC → UNC (same host): robocopy /MT:8 /J — multi-threaded fast path
+            #   UNC → local (D:\):     one network hop, unbuffered /J, 8 threads
+            #   local → local:         unbuffered /J + /MT:8 vs Python's serial loop
+            #   local → UNC:           same as UNC→local in reverse
+            #
+            # Requires: Windows, no encryption, no compression, no throttle.
+            # Falls back to Python per-file loop if robocopy fails or isn't available.
+            #
+            # Previously same-host UNC skipped robocopy to try CopyFileEx ODX
+            # (FSCTL_SRV_COPYCHUNK server-side copy). However ODX only works when
+            # the Windows PC explicitly supports it — most configurations
+            # don't. When ODX is absent, CopyFileEx falls back to a single-threaded
+            # PC-mediated copy (read UNC → write UNC through PC RAM), which is
+            # 10-20× slower than robocopy's /MT:8 /J multi-threaded path.
+            # Robocopy is now the default for ALL path types including same-host UNC.
+            # CopyFileEx ODX is still attempted per-file in the fallback loop below
+            # (when robocopy is unavailable or fails for specific files).
+            _use_robocopy = (
+                os.name == "nt"
+                and not encrypt_key
+                and compress_level == 0
+                and not throttler
+                # Same-host UNC now uses robocopy too — identical treatment to
+                # local→UNC or UNC→local paths.  Much faster than single-threaded
+                # CopyFileEx when the PC does not support ODX/FSCTL_SRV_COPYCHUNK.
+            )
+            if _is_same_host and os.name == "nt":
+                logger.info(
+                    f"[same-host] '{watch_name}': source and destination are on the same "
+                    f"Windows host ({_src_host}) — using robocopy /MT:8 /J fast-path "
+                    f"(same treatment as all other path types)."
+                )
+            if _use_robocopy:
+                # ── Fast exit: nothing to copy on this incremental run ──────────
+                # When the incremental diff + sync-dest filter produced an empty
+                # files_to_copy list there is literally nothing to write.  Calling
+                # _robocopy_dir with an empty list makes it fall through to the
+                # full-tree /E scan, which on UNC→UNC can (a) take minutes just to
+                # scan and (b) return a non-zero exit code that triggers the slow
+                # Python per-file fallback.  Skip both entirely and go straight to
+                # finalisation so the UI shows "Up to date" and the backup
+                # completes in milliseconds.
+                if not files_to_copy:
+                    logger.info(
+                        f"[robocopy-dir] '{watch_name}': nothing to copy "
+                        f"(files_to_copy empty — incremental diff or sync-mode dest already seeded) — skipping robocopy"
+                    )
+                    if progress_cb:
+                        try:
+                            progress_cb(0, 1, "\x00uptodate\x00", 1, 1)
+                        except Exception:
+                            pass
+                    # files_to_copy is already [] — per-file loop will be a no-op
+                else:
+                    _rc_label = (
+                        f"same-host Windows server-side copy ({_src_host})" if _is_same_host
+                        else f"{_src_str} → {str(backup_dir)}"
+                    )
+                    logger.info(
+                        f"[robocopy-dir] '{watch_name}': using robocopy fast-path "
+                        f"(/MT:8 /J) — {_rc_label}"
+                    )
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    # Signal the UI immediately so it shows "Copying…" instead of
+                    # staying frozen on "Preparing…" for the entire robocopy run.
+                    # Emitted via ui_status (BlockingQueuedConnection) so the worker
+                    # blocks until the UI has actually painted the update before
+                    # robocopy starts — no sleep needed.
+                    if progress_cb:
+                        try:
+                            progress_cb(0, total or 1, "\x00robocopy\x00", 1, total_bytes or 1)
+                        except Exception:
+                            pass
+                    time.sleep(0.15)
+                    # For the size-hint queue: pass the full files_to_copy list so
+                    # robocopy's per-file percentage lines can be attributed to the
+                    # right file sizes.
+                    # Pass an explicit files_to_copy list to robocopy when we
+                    # have pre-filtered changes (excludes, max size, changed_paths)
+                    # so robocopy doesn't fall back to a full-tree /E scan that
+                    # would ignore those filters. Keep the previous behaviour of
+                    # using the files list for incremental runs too.
+                    # FIX: Always pass the explicit file list to robocopy when we
+                    # know exactly which files need copying.  Previously this was only
+                    # done for incremental runs, so a first/sync backup called robocopy
+                    # with /E (copy entire tree) even when only 2 out of 7 files actually
+                    # needed copying — robocopy had no file list and re-copied Thumbs.db
+                    # and old MANIFEST files that were already present in the destination.
+                    # Now we always pass files_to_copy when it is non-empty, so robocopy
+                    # copies only the files that the sync-mode diff identified as missing.
+                    _rc_files = files_to_copy if files_to_copy else None
+
+                    _rc_dir_ok, _rc_dir_files, _rc_dir_bytes = _robocopy_dir(
+                        src=_src_str,
+                        dst=str(backup_dir),
+                        cancel_event=cancel_event,
+                        progress_cb=progress_cb,
+                        total_files=total,
+                        total_bytes=total_bytes,
+                        files_to_copy=_rc_files,
+                        size_hints=files_to_copy,  # always pass for byte-accurate progress tracking
+                    )
+                    if _rc_dir_ok:
+                        # Use actual counts reported by robocopy stdout parser.
+                        # When total==0 (scan returned empty / incomplete snapshot),
+                        # _rc_dir_files captures the real number of files robocopy
+                        # processed so the log shows the correct count instead of "0".
+                        _effective_copied = _rc_dir_files if _rc_dir_files > 0 else total
+                        _effective_bytes  = _rc_dir_bytes  if _rc_dir_bytes  > 0 else total_bytes
+                        logger.info(
+                            f"[robocopy-dir] '{watch_name}': robocopy completed successfully "
+                            f"({_effective_copied} file(s), {_human_size(_effective_bytes)}) — skipping post-copy "
+                            f"hash (hashes backfilled on next incremental run)"
+                        )
+                        # Post-copy hashing: compute hashes for files just written by robocopy
+                        # so the returned snapshot contains real SHA-256 values even when
+                        # the fast-path was used. This keeps incremental runs deterministic
+                        # and avoids relying on a later backfill pass.
+                        for entry in files_to_copy:
+                            rel = entry["path"]
+                            dest_fp = backup_dir / rel
+                            try:
+                                h = hash_file(str(dest_fp))
+                            except Exception:
+                                h = ""
+                            _files_written_hashes[rel] = h
+                            if rel in new_snapshot and h:
+                                new_snapshot[rel]["hash"] = h
+                        copied     = _effective_copied
+                        bytes_done = _effective_bytes
+                        if progress_cb:
+                            try:
+                                # FIX: emit bytes_done == total_bytes so the UI
+                                # formula produces pct=100 → "Finalizing…".
+                                # The dest-size poll caps at (total_bytes - 1) to
+                                # avoid a premature 100% flash mid-copy, but
+                                # robocopy has now fully returned — safe to emit
+                                # the true 100% here so the bar completes.
+                                _final_total = max(total_bytes, bytes_done) or 1
+                                progress_cb(copied, max(total, copied) or 1, "", _final_total, _final_total)
+                            except Exception:
+                                pass
+                        # Skip the per-file loop entirely
+                        files_to_copy = []
+                    else:
+                        # If the user cancelled during robocopy, honour it immediately —
+                        # do NOT fall through to the Python/parallel copy loop.
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise InterruptedError("Backup cancelled by user")
+                        logger.warning(
+                            f"[robocopy-dir] '{watch_name}': robocopy fast-path failed "
+                            f"— falling back to Python per-file copy loop"
+                            + (" (parallel mode: 4 threads)" if _is_same_host and not encrypt_key and compress_level == 0 and not throttler else "")
+                        )
+                        # ── Parallel copy fast-path (UNC→UNC, no encrypt/compress/throttle) ──
+                        # When robocopy fails for a same-host UNC copy, run 4 concurrent
+                        # copy threads instead of the serial loop below.  On a Gigabit LAN
+                        # this typically 3-4× throughput vs single-threaded Python I/O.
+                        if _is_same_host and not encrypt_key and compress_level == 0 and not throttler and files_to_copy:
+                            logger.info(
+                                f"[parallel-copy] '{watch_name}': using 4-thread parallel "
+                                f"copy for UNC→UNC fallback ({len(files_to_copy)} file(s))"
+                            )
+                            _pc_copied, _pc_bytes, _pc_failed = _parallel_copy_files(
+                                entries=files_to_copy,
+                                src_root=src_path,
+                                dst_root=backup_dir,
+                                cancel_event=cancel_event,
+                                progress_cb=progress_cb,
+                                total_files=total,
+                                total_bytes=total_bytes,
+                                chunk_size=_CHUNK,
+                                max_workers=4,
+                            )
+                            for entry in files_to_copy:
+                                if entry not in _pc_failed:
+                                    _files_written_hashes[entry["path"]] = ""
+                            for entry in _pc_failed:
+                                result["failed_files"].append({
+                                    "path":   entry["path"],
+                                    "reason": "parallel copy failed — see log for details",
+                                })
+                            copied     += _pc_copied
+                            bytes_done += _pc_bytes
+                            if progress_cb:
+                                try:
+                                    # FIX: same as robocopy path — emit true 100%
+                                    _final_total = max(total_bytes, bytes_done) or 1
+                                    progress_cb(copied, max(total, copied) or 1, "", _final_total, _final_total)
+                                except Exception:
+                                    pass
+                            # Skip the serial per-file loop
+                            files_to_copy = []
+
+            # ── Emit initial "Copying…" signal before the per-file loop ──────
+            # The robocopy fast-path emits a "\x00robocopy\x00" sentinel above so
+            # the UI transitions from "Preparing…" to "Copying…" immediately.
+            # The per-file CopyFileEx path (same-host UNC) has no equivalent
+            # signal, so the UI stays frozen on "Preparing…" until the first
+            # file's progress callback fires — which for server-side UNC copies
+            # (FSCTL_SRV_COPYCHUNK) may never happen until the file is done.
+            # Emitting bytes_done=1 here guarantees the UI moves to "Copying…"
+            # the moment the copy loop begins, regardless of callback frequency.
+            if files_to_copy and progress_cb:
+                try:
+                    progress_cb(0, total or 1, files_to_copy[0]["path"], 1, total_bytes or 1)
+                except Exception:
+                    pass
+
             for entry in files_to_copy:
-                # ── Pause: wait if pause_event is not set ──────────────────
+                # ── Pause: wait if pause_event is not set, but keep polling
+                # cancel_event so a cancel issued while paused takes effect
+                # immediately instead of hanging forever behind the pause. ──
                 if pause_event is not None and not pause_event.is_set():
-                    pause_event.wait()
+                    while not pause_event.is_set():
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise InterruptedError("Backup cancelled by user")
+                        pause_event.wait(timeout=0.25)
 
                 src_file  = src_path / entry["path"]
                 dest_file = backup_dir / entry["path"]
@@ -2047,20 +3515,35 @@ def run_backup(
                 # pre-seeded the backup drive or re-adds a watch after a
                 # reinstall — without this every file would be re-written even
                 # though nothing changed.  The optimisation applies to ALL
-                # path-based destination types (local, UNC/SMB, mounted SFTP,
+                # path-based destination types (local, UNC, mounted SFTP,
                 # etc.) because the check is purely filesystem-level.
                 #
                 # Not applied for encrypt/compress because the destination file
                 # format differs from the source (we cannot compare sizes).
-                # Not applied for versioned (non-sync) mode because backup_dir
-                # is a fresh timestamped folder that must contain all files.
                 if sync_mode and not encrypt_key and compress_level == 0:
                     if _dest_already_identical(src_file, dest_file):
+                        # Seed-skip: dest already has same-size file — skip re-copy.
+                        # Do NOT call hash_file(src_file) here: for network sources
+                        # that reads the entire file over the wire just to store a hash,
+                        # turning a 0-work skip into a full network read (2 MB/s for 10 GB).
+                        # Store "" and let diff_snapshots use mtime+size for change detection;
+                        # the next real copy will backfill the hash inline at no extra cost.
+                        try:
+                            _seed_hash = ""  # skip expensive hash_file read over network
+                            if entry["path"] in new_snapshot:
+                                new_snapshot[entry["path"]]["hash"] = _seed_hash
+                            _files_written_hashes[entry["path"]] = _seed_hash
+                        except Exception:
+                            pass
                         copied     += 1
                         bytes_done += entry.get("size", 0)
                         if progress_cb:
                             try:
-                                progress_cb(copied, total or 1, entry["path"],
+                                # Prefix with sentinel so the UI can show
+                                # "Verifying" instead of "Copying" — the file
+                                # already exists at the destination unchanged.
+                                progress_cb(copied, total or 1,
+                                            "\x00verify\x00" + entry["path"],
                                             bytes_done, total_bytes)
                             except InterruptedError:
                                 raise
@@ -2070,10 +3553,58 @@ def run_backup(
                         if copied == 1:
                             logger.info(
                                 f"[seed-skip] '{watch_name}': destination already has "
-                                f"identical files — skipping unchanged (size+mtime match). "
+                                f"identical files — skipping unchanged (size match). "
                                 f"Only new/modified files will be copied."
                             )
                         continue
+
+                # ── Versioned-mode pre-seed optimisation ───────────────────
+                # If dest_root already has this file with identical content (same
+                # size AND same SHA-256 hash), copy it locally from dest_root to
+                # backup_dir instead of re-reading from the source.  The versioned
+                # backup still gets a complete copy in backup_dir (correct), but
+                # we avoid a slow re-read from a potentially remote/network source.
+                # Hash comparison (not size-only) ensures same-size but different-
+                # content files are correctly detected and read from source.
+                # Only applied on first backup and when no encryption/compression.
+                if (not sync_mode and not encrypt_key and compress_level == 0
+                        and not previous_snapshot):  # first backup only
+                    _preseed_file = dest_root / entry["path"]
+                    if _dest_already_identical(src_file, _preseed_file):
+                        try:
+                            # Hash both files to confirm content truly identical.
+                            # Size matched above; this catches same-size/different-content.
+                            _preseed_hash = hash_file(str(_preseed_file), cancel_event=cancel_event)
+                            _src_hash_ps  = hash_file(str(src_file),      cancel_event=cancel_event)
+                            if _preseed_hash and _src_hash_ps and _preseed_hash == _src_hash_ps:
+                                # Content confirmed identical — copy locally (fast)
+                                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(str(_preseed_file), str(dest_file))
+                                if entry["path"] in new_snapshot:
+                                    new_snapshot[entry["path"]]["hash"] = _preseed_hash
+                                _files_written_hashes[entry["path"]] = _preseed_hash
+                                copied     += 1
+                                bytes_done += entry.get("size", 0)
+                                if progress_cb:
+                                    try:
+                                        progress_cb(copied, total or 1, entry["path"],
+                                                    bytes_done, total_bytes)
+                                    except InterruptedError:
+                                        raise
+                                    except Exception:
+                                        pass
+                                if copied == 1:
+                                    logger.info(
+                                        f"[preseed] '{watch_name}': destination already has "
+                                        f"identical files (size+hash match) — copying locally "
+                                        f"instead of re-reading from source."
+                                    )
+                                continue
+                            # Hashes differ — same size, different content.
+                            # Fall through to normal source copy so correct file is backed up.
+                        except (OSError, PermissionError) as _pe:
+                            logger.debug(f"[preseed] Check failed for {entry['path']}: {_pe} — falling back to source read")
+                            # Fall through to normal source copy below
 
                 if src_file.exists():
                     try:
@@ -2098,14 +3629,23 @@ def run_backup(
                             # _HashingWriter intercepts every byte gzip writes to disk
                             # so we get the output hash without a second read of dest_gz.
                             _cmp_chunk_bytes = 0
+                            _ensure_writable(dest_gz)
                             with open(str(dest_gz), 'wb') as _raw_gz:
                                 _hw = _HashingWriter(_raw_gz)
-                                with gzip.open(_hw, 'wb', compresslevel=compress_level) as f_out:
+                                # Use GzipFile instead of gzip.open() — gzip.open() calls
+                                # fileno() on the wrapper which fails on Windows (Errno 22).
+                                # GzipFile only needs write(), which _HashingWriter provides.
+                                with gzip.GzipFile(fileobj=_hw, mode='wb', compresslevel=compress_level) as f_out:
                                     with open(str(src_file), 'rb') as f_in:
                                         while True:
-                                            # ── Pause: wait if pause_event is not set ──────────────────
+                                            # ── Pause: wait if pause_event is not set, but keep polling
+                                            # cancel_event so a cancel issued while paused takes effect
+                                            # immediately instead of hanging forever behind the pause. ──
                                             if pause_event is not None and not pause_event.is_set():
-                                                pause_event.wait()
+                                                while not pause_event.is_set():
+                                                    if cancel_event is not None and cancel_event.is_set():
+                                                        raise InterruptedError("Backup cancelled by user")
+                                                    pause_event.wait(timeout=0.25)
 
                                             chunk = f_in.read(_CHUNK)
                                             if not chunk:
@@ -2137,6 +3677,125 @@ def run_backup(
                             # stays accurate even if the file grew since the snapshot.
                             _cmp_actual_size = _cmp_chunk_bytes
                         else:
+                            # ── Fast-path hierarchy for same-host UNC copies ─────
+                            # Priority: CopyFileEx (ctypes/pywin32) → robocopy → chunked Python
+                            #
+                            # CopyFileEx: asks the OS to issue FSCTL_SRV_COPYCHUNK so the
+                            # Windows server-side copy — bytes stay on the same host.
+                            # Now uses ctypes (no pywin32 required), with pywin32 as backup.
+                            #
+                            # robocopy: Windows built-in tool, unbuffered I/O (/J), can also
+                            # trigger server-side copy and has better buffer management than
+                            # Python's read→write loop.  Used when CopyFileEx is not available
+                            # or the PC doesn't support FSCTL_SRV_COPYCHUNK.
+                            #
+                            # Chunked Python loop: always available fallback; slowest for
+                            # UNC→UNC because every byte travels PC RAM → remote over the network.
+                            _used_server_copy  = False
+                            _used_robocopy     = False
+                            if _is_same_host and not throttler:  # UNC→UNC same-host: use CopyFileEx offload or robocopy (avoids slow Python read→write loop)
+                                # ── Step 1: CopyFileEx (ctypes-first, no pywin32 needed) ──
+                                # Run in a background thread so cancel_event is honoured
+                                # while the native copy proceeds.
+                                _ensure_writable(dest_file)
+                                import threading as _threading
+                                _copy_result = [False]
+                                _server_bytes_written = [0]
+
+                                def _native_progress_cb(written, total):
+                                    _server_bytes_written[0] = written
+
+                                def _do_server_copy():
+                                    _copy_result[0] = _server_side_copy(
+                                        str(src_file), str(dest_file),
+                                        progress_cb=_native_progress_cb,
+                                    )
+                                _ct = _threading.Thread(target=_do_server_copy, daemon=True)
+                                _ct.start()
+                                while _ct.is_alive():
+                                    _ct.join(timeout=0.25)
+                                    if progress_cb:
+                                        try:
+                                            _written = _server_bytes_written[0]
+                                            if _written == 0:
+                                                # CopyFileEx server-side (FSCTL_SRV_COPYCHUNK): the PC
+                                                # copies data internally so the progress callback may
+                                                # never fire until completion.  Emit the server-copy
+                                                # sentinel so the UI shows a pulsing indeterminate bar
+                                                # + "Copying… (server-side)" instead of a
+                                                # frozen "0.00%" bar.
+                                                progress_cb(
+                                                    copied, total or 1,
+                                                    "\x00smb_copy\x00" + entry["path"],
+                                                    0, total_bytes or 1,
+                                                )
+                                            else:
+                                                # CopyFileEx is reporting real byte progress —
+                                                # switch to the normal percentage bar.
+                                                progress_cb(
+                                                    copied, total or 1, entry["path"],
+                                                    bytes_done + _written, total_bytes,
+                                                )
+                                        except InterruptedError:
+                                            raise
+                                        except Exception:
+                                            pass
+                                    if cancel_event is not None and cancel_event.is_set():
+                                        raise InterruptedError("Backup cancelled by user")
+                                _used_server_copy = _copy_result[0]
+                                if _used_server_copy:
+                                    if copied == 0:
+                                        logger.info(
+                                            f"[same-host] '{watch_name}': source and destination "
+                                            f"are on the same host ({_src_host}) — using "
+                                            f"CopyFileEx offload (no pywin32 needed)"
+                                        )
+                                    _src_hash    = hash_file(str(src_file), cancel_event=cancel_event) or ""
+                                    _chunk_bytes = entry.get("size", 0)
+                                    try:
+                                        shutil.copystat(str(src_file), str(dest_file))
+                                    except (PermissionError, OSError):
+                                        pass
+                                else:
+                                    # ── Step 2: robocopy (Windows built-in) ───────────
+                                    if copied == 0:
+                                        logger.info(
+                                            f"[same-host] '{watch_name}': CopyFileEx unavailable "
+                                            f"or failed — trying robocopy for UNC-to-UNC copy "
+                                            f"(host: {_src_host})"
+                                        )
+                                    _ensure_writable(dest_file)
+                                    _used_robocopy = _robocopy_file(
+                                        str(src_file), str(dest_file),
+                                        cancel_event=cancel_event,
+                                        progress_cb=progress_cb,
+                                        copied_files=copied,
+                                        total_files=total,
+                                        bytes_done_offset=bytes_done,
+                                        total_bytes=total_bytes,
+                                    )
+                                    if _used_robocopy:
+                                        if copied == 0:
+                                            logger.info(
+                                                f"[same-host] '{watch_name}': using robocopy "
+                                                f"(unbuffered /J mode) for UNC-to-UNC copy"
+                                            )
+                                        _src_hash    = hash_file(str(src_file), cancel_event=cancel_event) or ""
+                                        _chunk_bytes = entry.get("size", 0)
+                                        try:
+                                            shutil.copystat(str(src_file), str(dest_file))
+                                        except (PermissionError, OSError):
+                                            pass
+                                    else:
+                                        if copied == 0:
+                                            logger.warning(
+                                                f"[same-host] '{watch_name}': CopyFileEx and robocopy "
+                                                f"both unavailable — falling back to Python chunked "
+                                                f"copy (slower: data travels PC↔PC over network). "
+                                                f"Install pywin32 for server-side copy offload."
+                                            )
+
+                            if not _used_server_copy and not _used_robocopy:
                             # Cancellable chunked copy — checks cancel every chunk.
                             # Also computes source SHA-256 inline so we never need
                             # a separate hash_file(src) pass (saves one full read).
@@ -2144,68 +3803,102 @@ def run_backup(
                             # large files are paced evenly and progress_cb fires
                             # regularly — no multi-minute gaps from a single
                             # post-file throttle call.
-                            _h_src = hashlib.sha256()
-                            _chunk_bytes = 0  # bytes written so far for this file
-                            with open(str(src_file), 'rb') as f_in, open(str(dest_file), 'wb') as f_out:
-                                while True:
-                                    # ── Pause: wait if pause_event is not set ──────────────────
-                                    if pause_event is not None and not pause_event.is_set():
-                                        pause_event.wait()
+                                _h_src = hashlib.sha256()
+                                _chunk_bytes = 0  # bytes written so far for this file
+                                _ensure_writable(dest_file)
+                                # Use explicit large buffer for UNC/network destinations.
+                                # Python's default 8 KB buffer causes excessive syscalls
+                                # over network — batching at _CHUNK size matches the read size
+                                # and maximises throughput on both local and network paths.
+                                _write_buf = _CHUNK
+                                with open(str(src_file), 'rb', buffering=_CHUNK) as f_in, open(str(dest_file), 'wb', buffering=_write_buf) as f_out:
+                                    while True:
+                                        # ── Pause: wait if pause_event is not set, but keep polling
+                                        # cancel_event so a cancel issued while paused takes effect
+                                        # immediately instead of hanging forever behind the pause. ──
+                                        if pause_event is not None and not pause_event.is_set():
+                                            while not pause_event.is_set():
+                                                if cancel_event is not None and cancel_event.is_set():
+                                                    raise InterruptedError("Backup cancelled by user")
+                                                pause_event.wait(timeout=0.25)
 
-                                    chunk = f_in.read(_CHUNK)
-                                    if not chunk:
-                                        break
-                                    _h_src.update(chunk)
-                                    f_out.write(chunk)
-                                    _chunk_bytes += len(chunk)
-                                    # Throttle per-chunk for smooth, even pacing
-                                    if throttler:
-                                        try:
-                                            throttler.throttle(len(chunk))
-                                        except Exception:
-                                            logger.debug("[suppressed] Exception ignored near: # Throttle per-chunk for smooth, even pacing |                                  ", exc_info=True)
-                                            pass
-                                    # Honour cancel request between chunks
-                                    if progress_cb:
-                                        try:
-                                            # Clamp reported bytes so bar never prematurely
-                                            # hits 100% mid-copy (file may be larger than
-                                            # its snapshot size used in total_bytes).
-                                            _reported = min(bytes_done + _chunk_bytes,
-                                                            total_bytes - 1) if total_bytes > 0 else bytes_done + _chunk_bytes
-                                            progress_cb(copied, total or 1, entry["path"],
-                                                        _reported, total_bytes)
-                                        except InterruptedError:
-                                            raise
-                                        except Exception:
-                                            logger.debug('[suppressed] Exception ignored.', exc_info=True)
-                                            pass
-                            _src_hash = _h_src.hexdigest()
-                            # Preserve original timestamps (shutil.copy2 behaviour)
-                            shutil.copystat(str(src_file), str(dest_file))
+                                        chunk = f_in.read(_CHUNK)
+                                        if not chunk:
+                                            break
+                                        _h_src.update(chunk)
+                                        f_out.write(chunk)
+                                        _chunk_bytes += len(chunk)
+                                        # Throttle per-chunk for smooth, even pacing
+                                        if throttler:
+                                            try:
+                                                throttler.throttle(len(chunk))
+                                            except Exception:
+                                                logger.debug("[suppressed] Exception ignored near: # Throttle per-chunk for smooth, even pacing |                                  ", exc_info=True)
+                                                pass
+                                        # Honour cancel request between chunks
+                                        if progress_cb:
+                                            try:
+                                                # Clamp reported bytes so bar never prematurely
+                                                # hits 100% mid-copy (file may be larger than
+                                                # its snapshot size used in total_bytes).
+                                                _reported = min(bytes_done + _chunk_bytes,
+                                                                total_bytes - 1) if total_bytes > 0 else bytes_done + _chunk_bytes
+                                                progress_cb(copied, total or 1, entry["path"],
+                                                            _reported, total_bytes)
+                                            except InterruptedError:
+                                                raise
+                                            except Exception:
+                                                logger.debug('[suppressed] Exception ignored.', exc_info=True)
+                                                pass
+                                _src_hash = _h_src.hexdigest()
+                                # Preserve original timestamps (shutil.copy2 behaviour).
+                                # Wrapped in its own try/except: SMB sources can raise
+                                # PermissionError or OSError when reading metadata (mtime,
+                                # permissions) even after the file bytes were written
+                                # successfully.  A metadata failure must NOT discard the
+                                # successfully written file — only log a warning and continue.
+                                # Skip copystat for UNC/network destinations —
+                                # the extra metadata round-trip adds latency per file.
+                                if not str(dest_file).startswith("\\\\") and not str(dest_file).startswith("//"):
+                                    try:
+                                        shutil.copystat(str(src_file), str(dest_file))
+                                    except (PermissionError, OSError) as _cs_err:
+                                        logger.warning(
+                                            f"[copystat] '{watch_name}': could not copy metadata "
+                                            f"for {entry['path']} ({_cs_err}) — file data was "
+                                            f"written successfully; timestamps may differ."
+                                        )
                             # Lightweight integrity check: verify dest file size matches
                             # source size. We do NOT re-read the dest file to recompute
-                            # its hash — that would double the network traffic on SMB/UNC
-                            # sources (every byte read once to write, once to verify),
-                            # cutting effective throughput in half. The src hash was already
-                            # computed inline chunk-by-chunk during the write loop above,
-                            # and any OS-level write error would have raised an exception
-                            # before we reach this point.
+                            # its hash — that would double the network traffic on UNC
+                            # sources. The src hash was already computed inline during copy.
                             try:
                                 _dest_size = Path(str(dest_file)).stat().st_size
                                 _src_size  = entry.get("size", 0)
                                 if _src_size > 0 and _dest_size != _src_size:
                                     logger.warning(
                                         f"⚠ Size mismatch for {entry['path']} "
-                                        f"(src={_src_size}, dest={_dest_size}) — file may have changed during backup"
+                                        f"(src={_src_size}, dest={_dest_size}) — "
+                                        f"file may have changed during backup or copy was truncated"
                                     )
+                                    # Remove the partial/mismatched destination file so it
+                                    # is not mistaken for a valid backup on the next run.
+                                    try:
+                                        Path(str(dest_file)).unlink(missing_ok=True)
+                                    except OSError as _ul_err:
+                                        logger.debug(f"[cleanup] Could not remove partial dest file: {_ul_err}")
                                     result["failed_files"].append({
                                         "path":   entry["path"],
-                                        "reason": f"Size mismatch (src={_src_size}, dest={_dest_size})",
+                                        "reason": f"Size mismatch after copy (expected {_src_size}, got {_dest_size}) — partial file removed",
                                     })
                                     continue
-                            except OSError:
-                                pass  # dest stat failed — not critical, proceed
+                            except OSError as _st_err:
+                                # dest stat failed — warn but do not discard the file;
+                                # the write loop completed without error so the data is likely intact.
+                                logger.warning(
+                                    f"[integrity] Could not stat dest file {entry['path']} "
+                                    f"after copy ({_st_err}) — assuming write was successful"
+                                )
                             # Backfill the snapshot with the hash computed during copy.
                             # This is especially important on first backup where build_snapshot
                             # skipped hashing — without this the next backup would re-hash
@@ -2216,7 +3909,15 @@ def run_backup(
                             _files_written_hashes[entry["path"]] = _src_hash
 
                         copied     += 1
-                        bytes_done += entry.get("size", 0)
+                        # Use actual bytes written (_chunk_bytes for plain copies) not
+                        # the snapshot size estimate — they differ when the source file
+                        # changed size on the remote PC during the copy (grew or was truncated).
+                        # encrypt/compress paths track bytes differently so fall back to
+                        # snapshot size there (same as before).
+                        if not encrypt_key and compress_level == 0:
+                            bytes_done += _chunk_bytes
+                        else:
+                            bytes_done += entry.get("size", 0)
 
                     except (PermissionError, OSError) as e:
                         logger.warning(f"⚠ Skipped {entry['path']}: {e}")
@@ -2236,6 +3937,18 @@ def run_backup(
                     except Exception:
                         logger.debug('[suppressed] Exception ignored.', exc_info=True)
                         pass
+
+            # ── Emit true 100% now that all files are copied ─────────────────
+            # The dest-size poll caps at (total_bytes - 1) throughout the copy
+            # to avoid a premature 100% flash.  Now that the per-file loop is
+            # done, emit bytes_done == total_bytes so the UI transitions from
+            # "99% Copying…" → "100% Finalizing…" immediately.
+            if progress_cb and total_bytes > 0:
+                try:
+                    _loop_final = max(total_bytes, bytes_done) or 1
+                    progress_cb(copied, max(total, copied) or 1, "", _loop_final, _loop_final)
+                except Exception:
+                    pass
 
             # Write .DELETED markers — only in versioned (non-sync) mode.
             # In sync_mode backup_dir IS the live destination, so writing
@@ -2294,15 +4007,24 @@ def run_backup(
             except (IOError, RuntimeError) as e:
                 raise RuntimeError(f"BACKUP.sha256 was not written correctly: {e}")
 
-        # Use the pre-computed byte total so we never do a full rglob walk of the
-        # backup destination (which can be an SMB/UNC network path and takes
-        # minutes to re-scan).  For compressed backups the output size differs
-        # from the source size, so fall back to a local disk scan only in that
-        # case — compressed backup dirs are never on a remote path at this point.
+        # Use actual bytes written (bytes_done) for the reported size so the
+        # manifest and UI always show what was truly copied — not the pre-scan
+        # snapshot estimate (total_bytes).  Previously total_bytes was used,
+        # which meant if the source file changed size mid-copy (e.g. was
+        # truncated or replaced), the app would still report the old snapshot
+        # size (e.g. "10.0 GB") even though only 64 MB actually landed in the
+        # destination.  bytes_done is the authoritative count of bytes written.
+        # For compressed backups we still do the disk scan (output size differs
+        # from source size and bytes_done tracks pre-compression source bytes).
         if compress_level > 0:
             total_size = _safe_size(str(backup_dir))
         else:
-            total_size = total_bytes if total_bytes > 0 else bytes_done
+            # Always use actual bytes written — never fall back to the pre-scan
+            # estimate (total_bytes).  Previously the fallback meant that when
+            # 0 files were copied (e.g. all failed with OSError) the UI still
+            # reported the full source size (e.g. "10.0 GB") even though nothing
+            # landed in the destination.  bytes_done is the authoritative count.
+            total_size = bytes_done
         duration       = round(time.time() - started, 2)
         throughput_mbs = (total_size / (1024 * 1024)) / max(duration, 0.1) if duration > 0 else 0
 
@@ -2315,7 +4037,7 @@ def run_backup(
                 compression_ratio = round((1 - actual_size / uncompressed_est) * 100, 1)
 
         # ── Remote destination upload ──────────────────────────────────────────
-        # Handles multiple destinations: cloud (GDrive), sftp, ftp, smb, https, webdav.
+        # Handles multiple destinations: cloud (GDrive), sftp, ftp, https, webdav.
         def _upload_to_destination(backup_dir_path: str, dest_config: dict, progress_cb, allowed_rel_paths=None) -> dict:
             """Upload backup to a single destination."""
             dest_type = dest_config.get("_dest_type", "")
@@ -2335,9 +4057,6 @@ def run_backup(
                 ftp_cfg = dict(dest_config.get("ftp_config") or dest_config)
                 ftp_cfg["use_tls"] = True
                 return upload_to_ftp(backup_dir_path, ftp_cfg, progress_cb=progress_cb)
-            elif dest_type == "smb" and TRANSPORT_AVAILABLE:
-                smb_cfg = dest_config.get("smb_config") or dest_config
-                return upload_to_smb(backup_dir_path, smb_cfg, progress_cb=progress_cb)
             elif dest_type == "https" and TRANSPORT_AVAILABLE:
                 https_cfg = dest_config.get("https_config") or dest_config
                 return upload_to_https(backup_dir_path, https_cfg, progress_cb=progress_cb)
@@ -2354,7 +4073,11 @@ def run_backup(
         def _upload_progress(bytes_done, total_bytes, filename):
             if progress_cb:
                 try:
-                    progress_cb(0, total or 1, filename, bytes_done, total_bytes)
+                    # Tag with \x00upload\x00 prefix so the UI can distinguish
+                    # a real cloud upload from a single-file local/SMB copy.
+                    # (The old heuristic current==1 and total==1 was a false
+                    # positive for any backup that has exactly one file.)
+                    progress_cb(0, total or 1, "\x00upload\x00" + (filename or ""), bytes_done, total_bytes)
                 except Exception:
                     logger.debug("[suppressed] Exception ignored near: def _upload_progress(bytes_done, total_bytes, filename): |             if progre", exc_info=True)
                     pass
@@ -2426,11 +4149,6 @@ def run_backup(
                                                     progress_cb=_upload_progress,
                                                     verify=verify_remote_upload)
 
-            elif _dest_type == "smb" and TRANSPORT_AVAILABLE:
-                smb_cfg = (cloud_config or {}).get("smb_config") or cloud_config or {}
-                logger.info(f"📡 Uploading backup via SMB: {watch_name}")
-                cloud_upload_result = upload_to_smb(str(backup_dir), smb_cfg,
-                                                    progress_cb=_upload_progress)
 
             elif _dest_type == "https" and TRANSPORT_AVAILABLE:
                 https_cfg = (cloud_config or {}).get("https_config") or cloud_config or {}
@@ -2495,8 +4213,45 @@ def run_backup(
             "triggered_by":       triggered_by or "auto",
         }
 
-        # In sync mode, skip writing MANIFEST.json into the destination folder
-        # to avoid polluting the user's backed-up files.
+        # In sync mode, backup_dir IS the live destination — we cannot write
+        # MANIFEST.json there as it would pollute the user's backed-up files.
+        # Instead, write a lightweight manifest stub into a hidden metadata
+        # subfolder (.backupsys_meta) so the app can track backup history,
+        # show the last-backup time, and count backups correctly.
+        if sync_mode:
+            try:
+                _meta_dir = dest_root / ".backupsys_meta"
+                _meta_dir.mkdir(parents=True, exist_ok=True)
+                # Hide the metadata folder so it doesn't clutter the user's view
+                # in Windows Explorer.  Works on Windows (SMB share or local); is a
+                # no-op on Linux/Mac targets where FILE_ATTRIBUTE_HIDDEN has no meaning.
+                try:
+                    import ctypes as _ct
+                    _ct.windll.kernel32.SetFileAttributesW(
+                        str(_meta_dir),
+                        0x02 | 0x04,  # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+                    )
+                except Exception:
+                    pass  # Non-Windows host or permission denied — silently ignore
+                # Use timestamp as subfolder name (same convention as versioned mode)
+                _sync_manifest_dir = _meta_dir / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                _sync_manifest_dir.mkdir(parents=True, exist_ok=True)
+                _SYNC_KEYS = {
+                    "backup_id", "watch_id", "watch_name", "source",
+                    "timestamp", "status", "incremental", "compressed",
+                    "encrypted", "files_copied", "duration_s",
+                    "throughput_mbs", "total_size_bytes", "triggered_by",
+                }
+                _sync_stub = {k: v for k, v in manifest.items() if k in _SYNC_KEYS}
+                _sync_stub["sync_mode"] = True
+                _sync_stub["backup_dir"] = str(_sync_manifest_dir)
+                _sync_manifest_path = _sync_manifest_dir / "MANIFEST.json"
+                with open(_sync_manifest_path, "w", encoding="utf-8") as _f:
+                    json.dump(_sync_stub, _f, indent=2)
+                logger.debug(f"[sync] Wrote metadata stub to {_sync_manifest_path}")
+            except Exception as _sm_err:
+                logger.warning(f"[sync] Could not write metadata stub: {_sm_err}")
+
         if not sync_mode:
             manifest_path = backup_dir / "MANIFEST.json"
 
@@ -2545,8 +4300,17 @@ def run_backup(
                 raise RuntimeError(f"MANIFEST.json was not written correctly — backup is corrupted: {e}")
 
         # ── Update result dict with all final stats ──────────────────
+        # Determine final status: if there were files to copy but none succeeded,
+        # report "partial_failure" instead of "success" so the caller can surface
+        # this clearly to the user (e.g. all files hit OSError/PermissionError).
+        _final_status = "success"
+        if total > 0 and copied == 0 and result.get("failed_files"):
+            _final_status = "partial_failure"
+        elif total > 0 and 0 < copied < total and result.get("failed_files"):
+            _final_status = "partial_failure"
+
         result.update({
-            "status":            "success",
+            "status":            _final_status,
             "files_changed":     len([c for c in changes if c["type"] != "unchanged"]),
             "files_copied":      copied,
             "total_files":       len(new_snapshot),
@@ -2687,7 +4451,7 @@ def run_backup(
 
     # ── Post-backup hook ───────────────────────────────────────────────────────
     if post_backup_cmd:
-        result_cmd = subprocess.run(post_backup_cmd, shell=True, capture_output=True, text=True)
+        result_cmd = subprocess.run(post_backup_cmd, shell=True, capture_output=True, text=True, creationflags=_WIN_NO_WINDOW)
         if result_cmd.returncode != 0:
             logger.warning(f"Post-backup command failed (exit {result_cmd.returncode}): {result_cmd.stderr}")
 
@@ -2747,19 +4511,19 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
                    remote_type: str = None, remote_cfg: dict = None) -> dict:
     """Restore files from a backup directory back to target_path.
 
-    When backup_dir resides on a remote destination (SMB, WebDAV, rclone, SFTP,
+    When backup_dir resides on a remote destination (WebDAV, rclone, SFTP,
     FTP, or Google Drive) pass remote_type + remote_cfg and restore_backup() will
     download the store to a local temp directory before restoring, then clean up.
 
     Args:
         backup_dir: Path to the backup directory (local, or remote path when
-                    remote_type is set — e.g. the share sub-path for SMB/WebDAV).
+                    remote_type is set — e.g. the share sub-path for WebDAV).
         target_path: Path where files should be restored.
         incremental_only: If True, only restore files that don't already exist at target.
         encrypt_key: Fernet key for decryption.
         progress_cb: Optional callback(restored_count, total_files, filename).
         overwrite: If True, overwrite existing files; if False, skip them.
-        remote_type: One of "sftp"|"ftp"|"ftps"|"smb"|"webdav"|"rclone"|"gdrive".
+        remote_type: One of "sftp"|"ftp"|"ftps"|"webdav"|"rclone"|"gdrive".
                      When set, backup_dir is treated as the remote path.
         remote_cfg: Credentials / config dict matching remote_type.
     """
@@ -2776,9 +4540,6 @@ def restore_backup(backup_dir: str, target_path: str, incremental_only: bool = F
                 _dl = download_from_sftp(backup_dir, _restore_temp_dir, cfg)
             elif remote_type in ("ftp",):
                 _dl = download_from_ftp(backup_dir, _restore_temp_dir, cfg)
-            elif remote_type == "smb":
-                from transport_utils import download_from_smb
-                _dl = download_from_smb(backup_dir, _restore_temp_dir, cfg)
             elif remote_type == "webdav":
                 from transport_utils import download_from_webdav
                 _dl = download_from_webdav(backup_dir, _restore_temp_dir, cfg)
@@ -3792,3 +5553,75 @@ def rotate_encryption_key(backup_dir, old_key, new_key, progress_cb=None):
         errors.append(f"Failed to save manifest: {e}")
         return {"ok": False, "files_rotated": files_rotated, "errors": errors}
     return {"ok": len(errors) == 0, "files_rotated": files_rotated, "errors": errors}
+
+
+# ─── Cleanup helpers (preview + delete old backups) ──────────────────────────
+def preview_cleanup(backups_dir: str, retention_days: int, watch_id: str = None) -> dict:
+    """
+    Return a preview of backup folders that would be deleted under the
+    given retention policy. Result contains a `to_delete` list of folder paths.
+    """
+    p = Path(backups_dir)
+    now = datetime.utcnow()
+    to_delete = []
+    if not p.exists() or not p.is_dir():
+        return {"to_delete": []}
+
+    for child in p.iterdir():
+        if not child.is_dir():
+            continue
+        manifest = child / "MANIFEST.json"
+        if not manifest.exists():
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            mid = data.get("watch_id")
+            ts = data.get("timestamp")
+            if watch_id and mid != watch_id:
+                continue
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            age_days = (now - dt).days
+            if age_days > int(retention_days):
+                to_delete.append(str(child))
+        except Exception:
+            continue
+    return {"to_delete": to_delete}
+
+
+def cleanup_old_backups(backups_dir: str, retention_days: int, watch_id: str = None) -> dict:
+    """
+    Delete old backup folders under `backups_dir` older than `retention_days`.
+    Returns keys: ok, deleted (count), freed_bytes (int), freed_human (str).
+    """
+    preview = preview_cleanup(backups_dir, retention_days, watch_id=watch_id)
+    deleted = 0
+    freed = 0
+    for pstr in preview.get("to_delete", []):
+        try:
+            p = Path(pstr)
+            size = 0
+            for fp in p.rglob("*"):
+                try:
+                    if fp.is_file():
+                        size += fp.stat().st_size
+                except Exception:
+                    continue
+            shutil.rmtree(p, ignore_errors=True)
+            deleted += 1
+            freed += size
+        except Exception:
+            continue
+
+    def _human_size(n: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    return {"ok": True, "deleted": deleted, "freed_bytes": freed, "freed_human": _human_size(freed)}

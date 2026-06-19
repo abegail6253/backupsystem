@@ -1,0 +1,108 @@
+{
+  "destination": "./backups",
+  "dest_type": "local",
+  "auto_backup": false,
+  "interval_min": 30,
+  "interval_unit": "minutes",
+  "retention_days": 30,
+  "compression_enabled": false,
+  "auto_retry": true,
+  "retry_delay_min": 5,
+  "max_backup_mbps": 0,
+  "webhook_url": "",
+  "webhook_on_success": false,
+  "backup_schedule_times": [],
+  "backup_window_start": "",
+  "backup_window_end": "",
+  "idle_threshold_cpu": 0,
+  "watches": [],
+  "default_exclude_patterns": [
+    "*.tmp",
+    "*.log",
+    "~$*",
+    ".DS_Store",
+    "Thumbs.db",
+    "__pycache__",
+    "*.pyc",
+    ".git"
+  ],
+  "email_config": {
+    "enabled": false,
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_use_ssl": false,
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable \u2014 never paste passwords here",
+    "from_addr": "",
+    "to_addr": "",
+    "notify_on_success": false,
+    "notify_on_failure": true
+  },
+  "dest_sftp": {
+    "host": "",
+    "port": 22,
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable \u2014 never paste passwords here",
+    "remote_path": ""
+  },
+  "dest_ftp": {
+    "host": "",
+    "port": 21,
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable \u2014 never paste passwords here",
+    "use_tls": true
+  },
+  "pause_on_metered": false,
+  "force_full_interval_days": 0,
+  "ntfy_config": {
+    "enabled": false,
+    "server": "https://ntfy.sh",
+    "topic": "",
+    "token": "",
+    "priority": "default",
+    "notify_on_success": false,
+    "notify_on_failure": true
+  },
+  "telegram_config": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "parse_mode": "HTML",
+    "notify_on_success": false,
+    "notify_on_failure": true
+  },
+  "pushover_config": {
+    "enabled": false,
+    "user_key": "",
+    "api_token": "",
+    "device": "",
+    "priority": 0,
+    "sound": "",
+    "notify_on_success": false,
+    "notify_on_failure": true
+  },
+  "dest_https": {
+    "url": "",
+    "token": "",
+    "verify_ssl": true
+  },
+  "dest_webdav": {
+    "url": "",
+    "username": "",
+    "__password_note": "Store via Settings UI (OS keyring) or use an environment variable \u2014 never paste passwords here",
+    "webdav_root": "",
+    "remote_path": "",
+    "verify_ssl": true
+  },
+  "dest_rclone": {
+    "__note": "Set dest_type to 'rclone'. Run 'rclone config' to create a named remote, then set 'remote' to the name shown by 'rclone listremotes'.",
+    "remote": "",
+    "path": "/backups"
+  },
+  "dest_cloud": {
+    "__note": "Set dest_type to 'cloud'. Connect via Settings \u2192 Cloud \u2192 Connect Google Drive. folder_id and folder_name are written automatically \u2014 do not edit them manually.",
+    "provider": "gdrive",
+    "folder_id": "",
+    "folder_name": "My Drive (root)"
+  }
+}

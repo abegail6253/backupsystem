@@ -120,7 +120,21 @@ def create_env():
 def create_config():
     HDR("Step 4 — Default configuration")
 
+    # Always use the same path as config_manager so we don't create a blank
+    # config in the wrong location when BACKUPSYS_DATA_DIR is set.
+    # Prefer writing into the wizard's HERE so tests that monkeypatch HERE
+    # (see tests/_wizard_in) observe files created in the temp dir.  Only
+    # honour config_manager.CONFIG_PATH when an explicit BACKUPSYS_DATA_DIR
+    # environment override is in use (production deployments).
     cfg_path = HERE / "config.json"
+    try:
+        import config_manager as _cm
+        cm_path = getattr(_cm, "CONFIG_PATH", None)
+        if cm_path and os.environ.get("BACKUPSYS_DATA_DIR"):
+            cfg_path = cm_path
+    except Exception:
+        pass
+
     if cfg_path.exists():
         WRN("config.json already exists — not overwriting.")
         return
@@ -156,7 +170,6 @@ def create_config():
             "remote_path": "", "key_path": "", "key_passphrase": "",
         },
         "dest_ftp": {"host": "", "port": 21, "username": "", "use_tls": True},
-        "dest_smb": {"server": "", "share": "", "username": "", "remote_path": ""},
         "dest_https": {"url": "", "token": "", "verify_ssl": True},
         "dest_webdav": {"url": "", "username": "", "webdav_root": "", "remote_path": "", "verify_ssl": True},
         "dest_rclone": {"remote": "", "path": "/backups"},
@@ -234,7 +247,6 @@ def verify_install():
 
     optional = [
         ("google.oauth2",        "google-auth (optional — for Google Drive backup)"),
-        ("smbprotocol",          "smbprotocol (optional — for SMB/NAS backup on Linux/macOS)"),
     ]
     for mod, label in optional:
         try:
@@ -262,7 +274,7 @@ def print_summary(all_ok: bool):
 
   Next steps:
     1. Open Settings and add a Watch (the folder you want to back up)
-    2. Set your backup destination (local folder, SFTP, FTP, SMB, or cloud)
+    2. Set your backup destination (local folder, SFTP, FTP, or cloud)
     3. Enable Auto-Backup and set your preferred interval
     4. (Recommended) Add credentials to .env instead of config.json
 
