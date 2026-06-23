@@ -1040,9 +1040,11 @@ if WATCHDOG_AVAILABLE:
             if _history_persist_suppressor is not None:
                 try:
                     if _history_persist_suppressor(self.watch_id, event_type, src):
-                        logger.debug(
+                        logger.info(
                             f"[watchdog._record] SUPPRESSED by hook: "
-                            f"watch_id={self.watch_id!r} type={event_type!r} path={src!r}"
+                            f"watch_id={self.watch_id!r} type={event_type!r} path={src!r} "
+                            f"— event dropped before _pending queue (see "
+                            f"[_dest_event_suppressed] log above for reason)"
                         )
                         return
                 except Exception:
@@ -2343,10 +2345,12 @@ class WatcherManager:
                         if _history_persist_suppressor is not None:
                             try:
                                 if _history_persist_suppressor(_callback_id, entry["type"], full_path):
-                                    logger.debug(
+                                    logger.info(
                                         f"[watcher] UNC poll SUPPRESSED by hook: "
                                         f"watch_id={_callback_id!r} type={entry['type']!r} "
-                                        f"path={full_path!r}"
+                                        f"path={full_path!r} "
+                                        f"— event dropped before _pending queue (see "
+                                        f"[_dest_event_suppressed] log above for reason)"
                                     )
                                     continue
                             except Exception:

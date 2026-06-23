@@ -6873,6 +6873,25 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                             _nfe_filename.lower() in _nfe_ep_norm or
                             _nfe_target_local.lower() in _nfe_ep_norm
                         )
+                        # Exclude Office lock files (~$filename): these are created
+                        # by Excel/Word when a document is OPENED (for reading or
+                        # editing) and only prove someone has the file open, NOT
+                        # that they are the active writer saving right now.
+                        # Without this filter, ~$test sheet.xlsx matches target
+                        # 'test sheet.xlsx' via substring, causing the coworker
+                        # who merely has the file open in Excel to be attributed
+                        # as the writer when the local user saves.
+                        _nfe_ep_basename = _nfe_ep_norm.split('\\')[-1].split('/')[-1]
+                        _is_office_lock = _nfe_ep_basename.startswith('~$')
+                        if _match and _is_office_lock:
+                            _gei.info(
+                                f"[_get_editor_info] Step0-priority NetFileEnum handle[{_nfe_idx}]: "
+                                f"OFFICE-LOCK-SKIP — handle path {_nfe_ep!r} is an Office lock "
+                                f"file (~$ prefix). This proves the file is open, not that "
+                                f"this session is the active writer. Skipping this handle "
+                                f"to avoid misattributing the save to a passive reader."
+                            )
+                            _match = False
                         _gei.info(
                             f"[_get_editor_info] Step0-priority NetFileEnum handle[{_nfe_idx}]: "
                             f"match={_match} (target_filename={_nfe_filename!r} "
@@ -6987,9 +7006,44 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     max_snapshots=5,
                                 )
                                 if _s0_idle_hist:
+                                    # ── CN-POISON filter (Step0) ─────────────────────
+                                    # Discard idle snapshots captured within
+                                    # _CN_POISON_WINDOW seconds after a confirmed own
+                                    # write.  These are CHANGE_NOTIFY echoes, not genuine
+                                    # coworker activity, and must not trigger CHECK A/B.
+                                    _s0_CN_WINDOW = 90
+                                    _s0_prior_own = _get_recent_own_write()
+                                    _s0_hist_clean = _s0_idle_hist
+                                    _s0_poisoned = 0
+                                    if _s0_prior_own is not None:
+                                        import time as _s0_cn_t
+                                        _s0_own_ts = _s0_prior_own[0]
+                                        _s0_hist_clean = []
+                                        for _s0_ts, _s0_idle_v in _s0_idle_hist:
+                                            _s0_age = _s0_ts - _s0_own_ts
+                                            if 0 <= _s0_age <= _s0_CN_WINDOW:
+                                                _s0_poisoned += 1
+                                                _gei.info(
+                                                    f"[_get_editor_info] Step0-priority: "
+                                                    f"CN-POISON-FILTER — discarding snapshot "
+                                                    f"(idle={_s0_idle_v}s) taken {_s0_age:.1f}s "
+                                                    f"after confirmed own write at "
+                                                    f"{_s0_own_ts:.1f} "
+                                                    f"(file={_s0_prior_own[1]!r}). "
+                                                    f"CHANGE_NOTIFY echo, not genuine activity."
+                                                )
+                                            else:
+                                                _s0_hist_clean.append((_s0_ts, _s0_idle_v))
+                                        if _s0_poisoned:
+                                            _gei.info(
+                                                f"[_get_editor_info] Step0-priority: "
+                                                f"CN-POISON-FILTER — removed {_s0_poisoned} "
+                                                f"poisoned snapshot(s), "
+                                                f"{len(_s0_hist_clean)} remain."
+                                            )
                                     # CHECK A: any prior snapshot with idle ≤ 5s?
                                     _s0_low = [
-                                        idle for _, idle in _s0_idle_hist
+                                        idle for _, idle in _s0_hist_clean
                                         if idle is not None and idle <= 5
                                     ]
                                     if _s0_low:
@@ -7001,24 +7055,24 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     else:
                                         # CHECK B: min prior idle ≤ 10s with ≥2 snapshots
                                         _s0_min_idle = min(
-                                            (idle for _, idle in _s0_idle_hist
+                                            (idle for _, idle in _s0_hist_clean
                                              if idle is not None),
                                             default=None,
                                         )
-                                        if (len(_s0_idle_hist) >= 2 and
+                                        if (len(_s0_hist_clean) >= 2 and
                                                 _s0_min_idle is not None and
                                                 _s0_min_idle <= 10):
                                             _s0_is_monitor = True
                                             _s0_mon_reason = (
                                                 f"CHECK B: min_prior_idle={_s0_min_idle}s "
-                                                f"<=10s with {len(_s0_idle_hist)} snapshots "
+                                                f"<=10s with {len(_s0_hist_clean)} snapshots "
                                                 f"(ambiguous idle history)"
                                             )
                                         else:
                                             _s0_mon_reason = (
                                                 f"CHECK B passed: min_prior_idle="
                                                 f"{_s0_min_idle!r}s >10s or <2 snapshots "
-                                                f"({len(_s0_idle_hist)}) — genuine write"
+                                                f"({len(_s0_hist_clean)}) — genuine write"
                                             )
                                 else:
                                     # No idle history — fall back to linger cache
@@ -7045,7 +7099,8 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     f"gate (modified event) ip={_nfe_result_ip!r}: "
                                     f"is_monitor={_s0_is_monitor} "
                                     f"reason={_s0_mon_reason!r} "
-                                    f"idle_hist_count={len(_s0_idle_hist)}"
+                                    f"idle_hist_count={len(_s0_hist_clean)}"
+                                    f"(raw={len(_s0_idle_hist)}, cn_poisoned={_s0_poisoned})"
                                 )
                             except Exception as _s0_pm_err:
                                 _gei.info(
@@ -7386,15 +7441,51 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                             # If the client had idle_time <= _NFE_MONITOR_THRESHOLD in
                             # ANY recent snapshot, they were actively hitting the server
                             # before this event too → Explorer monitor, not a writer.
+                            # NOTE: we apply the CN-POISON filter here too — snapshots
+                            # taken within _CN_POISON_WINDOW after a confirmed own write
+                            # are CHANGE_NOTIFY echoes and must not count as low-idle
+                            # evidence.  We compute _cn_prior_own here early so both
+                            # CHECK A and CHECK B share the same filtered history.
                             _NFE_MONITOR_THRESHOLD = 5
+                            _cn_poison_window_a = 90
+                            _cn_prior_own_a = _get_recent_own_write()
+                            _idle_history_clean_a = _idle_history
+                            _cn_poisoned_a = 0
+                            if _cn_prior_own_a is not None:
+                                import time as _cn_a_t
+                                _cn_own_ts_a = _cn_prior_own_a[0]
+                                _idle_history_clean_a = []
+                                for _cn_ts_a, _cn_idle_a in _idle_history:
+                                    _cn_age_a = _cn_ts_a - _cn_own_ts_a
+                                    if 0 <= _cn_age_a <= _cn_poison_window_a:
+                                        _cn_poisoned_a += 1
+                                        _gei.info(
+                                            f"[_get_editor_info] Step1-early: CHECK A "
+                                            f"CN-POISON-FILTER — discarding snapshot "
+                                            f"(idle={_cn_idle_a}s) taken {_cn_age_a:.1f}s "
+                                            f"after confirmed own write at "
+                                            f"{_cn_own_ts_a:.1f} "
+                                            f"(file={_cn_prior_own_a[1]!r}). "
+                                            f"CHANGE_NOTIFY echo, not genuine activity."
+                                        )
+                                    else:
+                                        _idle_history_clean_a.append((_cn_ts_a, _cn_idle_a))
+                                if _cn_poisoned_a:
+                                    _gei.info(
+                                        f"[_get_editor_info] Step1-early: CHECK A "
+                                        f"CN-POISON-FILTER — removed {_cn_poisoned_a} "
+                                        f"poisoned snapshot(s) from {len(_idle_history)} "
+                                        f"total. {len(_idle_history_clean_a)} remain."
+                                    )
                             _low_idle_snaps = [
-                                (ts, idle) for ts, idle in _idle_history
+                                (ts, idle) for ts, idle in _idle_history_clean_a
                                 if idle is not None and idle <= _NFE_MONITOR_THRESHOLD
                             ]
                             _gei.info(
                                 f"[_get_editor_info] Step1-early: CHECK A — "
                                 f"prior snapshots with idle<={_NFE_MONITOR_THRESHOLD}s: "
-                                f"{len(_low_idle_snaps)}/{len(_idle_history)} "
+                                f"{len(_low_idle_snaps)}/{len(_idle_history_clean_a)} "
+                                f"(raw={len(_idle_history)}, cn_poisoned={_cn_poisoned_a}) "
                                 f"low_idle_snaps={[(round(_nfe_t.time()-2-ts, 0), idle) for ts, idle in _low_idle_snaps]!r}"
                             )
                             if _low_idle_snaps:
@@ -7415,21 +7506,39 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                 # With only 1 snapshot fall back to the active_time heuristic.
                                 _NFE_CLEAR_IDLE_THRESHOLD = 10
                                 _NFE_MIN_SNAPSHOTS = 2
+                                # ── CHANGE_NOTIFY poison filter ──────────────────────
+                                # CHECK A already applied the CN-POISON filter above,
+                                # producing _idle_history_clean_a and _cn_poisoned_a.
+                                # Reuse that result — no need to re-filter.
+                                _CN_POISON_WINDOW = 90
+                                _prior_own_cn = _cn_prior_own_a      # already fetched above
+                                _unpoisoned_history = _idle_history_clean_a
+                                _poisoned_count = _cn_poisoned_a
+                                # Log the reuse for clarity
+                                if _poisoned_count > 0:
+                                    _gei.info(
+                                        f"[_get_editor_info] Step1-early: CHECK B "
+                                        f"CN-POISON-FILTER (reusing CHECK A result) — "
+                                        f"{_poisoned_count} poisoned snapshot(s) already "
+                                        f"removed, {len(_unpoisoned_history)} remain."
+                                    )
                                 _all_have_idle = all(
-                                    idle is not None for _, idle in _idle_history
+                                    idle is not None for _, idle in _unpoisoned_history
                                 )
                                 _min_prior_idle = min(
-                                    (idle for _, idle in _idle_history if idle is not None),
+                                    (idle for _, idle in _unpoisoned_history if idle is not None),
                                     default=None
                                 )
                                 _gei.info(
                                     f"[_get_editor_info] Step1-early: CHECK B — "
-                                    f"snapshots={len(_idle_history)} min_required={_NFE_MIN_SNAPSHOTS} "
+                                    f"snapshots={len(_unpoisoned_history)} "
+                                    f"(raw={len(_idle_history)}, poisoned={_poisoned_count}) "
+                                    f"min_required={_NFE_MIN_SNAPSHOTS} "
                                     f"all_have_idle_field={_all_have_idle} "
                                     f"min_prior_idle={_min_prior_idle!r} "
                                     f"clear_idle_threshold={_NFE_CLEAR_IDLE_THRESHOLD}s"
                                 )
-                                if len(_idle_history) < _NFE_MIN_SNAPSHOTS:
+                                if len(_unpoisoned_history) < _NFE_MIN_SNAPSHOTS:
                                     # Too few snapshots to apply CHECK B's "all snapshots
                                     # agree" rule.
                                     #
@@ -7634,7 +7743,8 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     # 2+ snapshots all show client was clearly idle → genuine write
                                     _monitor_reason = (
                                         f"prior idle history all > {_NFE_CLEAR_IDLE_THRESHOLD}s "
-                                        f"(min={_min_prior_idle}s, snapshots={len(_idle_history)}) "
+                                        f"(min={_min_prior_idle}s, snapshots={len(_unpoisoned_history)}"
+                                        f"{f', {_poisoned_count} poisoned excluded' if _poisoned_count else ''}) "
                                         f"→ genuine write signal"
                                     )
                                 else:
@@ -7643,7 +7753,9 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     _monitor_reason = (
                                         f"prior idle history ambiguous "
                                         f"(min_prior_idle={_min_prior_idle!r} <= {_NFE_CLEAR_IDLE_THRESHOLD}s "
-                                        f"or no idle_time field) → conservative fallback to NTFS owner"
+                                        f"or no idle_time field"
+                                        f"{f'; {_poisoned_count} CN-poisoned snapshot(s) excluded' if _poisoned_count else ''}"
+                                        f") → conservative fallback to NTFS owner"
                                     )
                     except Exception as _hist_err:
                         _monitor_reason = f"history lookup failed: {_hist_err!r}"
@@ -18002,11 +18114,22 @@ class MainWindow(QMainWindow):
             if real_id in self._workers:
                 if not _is_backup_file_sup:
                     return False   # new file unrelated to the running backup — let it through
+                _sup_logger.info(
+                    f"[_dest_event_suppressed] DEST-BACKUP-ACTIVE suppressed: "
+                    f"watch_id={watch_id!r} event_type={event_type!r} path={path!r} — "
+                    f"backup running for {real_id!r}, file is a backup artifact."
+                )
                 return True
             finish = self._post_backup_finish.get(real_id)
             if finish is not None and (_now - finish) < self._POST_BACKUP_SUPPRESS_SECS:
                 if not _is_backup_file_sup:
                     return False   # new file unrelated to the last backup — let it through
+                _sup_logger.info(
+                    f"[_dest_event_suppressed] DEST-POST-BACKUP suppressed: "
+                    f"watch_id={watch_id!r} event_type={event_type!r} path={path!r} — "
+                    f"backup finished {_now - finish:.1f}s ago "
+                    f"(grace={self._POST_BACKUP_SUPPRESS_SECS}s), file is a backup artifact."
+                )
                 return True
 
             # ── Startup grace window: suppress modified/added for 10s after dest watcher starts ──
@@ -18015,6 +18138,12 @@ class MainWindow(QMainWindow):
             if event_type not in ("deleted", "renamed"):
                 _dest_start = self._watcher_start_times.get(watch_id)
                 if _dest_start is not None and (_now - _dest_start) < self._WATCHER_START_SUPPRESS_SECS:
+                    _sup_logger.info(
+                        f"[_dest_event_suppressed] DEST-STARTUP-GRACE suppressed: "
+                        f"watch_id={watch_id!r} event_type={event_type!r} path={path!r} — "
+                        f"dest watcher started {_now - _dest_start:.1f}s ago "
+                        f"(startup grace={self._WATCHER_START_SUPPRESS_SECS}s)."
+                    )
                     return True
 
             # ── Cross-watch suppression ──────────────────────────────────────
@@ -18073,11 +18202,27 @@ class MainWindow(QMainWindow):
         #   • robocopy touching the source file during copy (mtime/metadata update)
         #   • post-backup SMB mtime drift (~2 s precision on FAT/SMB shares)
         # Suppress during BOTH the active backup AND the 60 s post-backup grace window.
+        import logging as _sup_log
+        _sup_logger = _sup_log.getLogger(__name__)
         if event_type == "modified":
             if watch_id in self._workers:
+                _sup_logger.info(
+                    f"[_dest_event_suppressed] SOURCE-BACKUP-ACTIVE suppressed: "
+                    f"watch_id={watch_id!r} event_type={event_type!r} path={path!r} — "
+                    f"backup is currently running for this watch. "
+                    f"'modified' suppressed to avoid robocopy/mtime-drift false positives."
+                )
                 return True
             finish = self._post_backup_finish.get(watch_id)
             if finish is not None and (_now - finish) < self._POST_BACKUP_SUPPRESS_SECS:
+                _sup_logger.info(
+                    f"[_dest_event_suppressed] SOURCE-POST-BACKUP suppressed: "
+                    f"watch_id={watch_id!r} event_type={event_type!r} path={path!r} — "
+                    f"backup finished {_now - finish:.1f}s ago "
+                    f"(grace window={self._POST_BACKUP_SUPPRESS_SECS}s). "
+                    f"If this is a genuine coworker edit, it will reappear after the "
+                    f"grace window expires. Consider reducing POST_BACKUP_SUPPRESS_SECS."
+                )
                 return True
 
         # ── Startup grace window: suppress "modified" for source watcher on startup ──
@@ -18094,6 +18239,13 @@ class MainWindow(QMainWindow):
         if event_type not in ("deleted", "renamed", "added"):
             start_ts = self._watcher_start_times.get(watch_id)
             if start_ts is not None and (_now - start_ts) < self._WATCHER_START_SUPPRESS_SECS:
+                _sup_logger.info(
+                    f"[_dest_event_suppressed] SOURCE-STARTUP-GRACE suppressed: "
+                    f"watch_id={watch_id!r} event_type={event_type!r} path={path!r} — "
+                    f"watcher started {_now - start_ts:.1f}s ago "
+                    f"(startup grace={self._WATCHER_START_SUPPRESS_SECS}s). "
+                    f"Suppressing SACL Set-Acl phantom 'modified' events at startup."
+                )
                 return True
 
         return False
