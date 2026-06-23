@@ -218,7 +218,7 @@ _same_host_nfe_sig: str | None = None  # cached working signature for NetFileEnu
 import threading as _gei_threading
 _recent_remote_write_ts: dict = {}      # ip -> (ts, path)
 _recent_remote_write_lock = _gei_threading.Lock()
-_RECENT_WRITE_LINGER_S = 30             # how long idle_time=0 can linger after a write
+_RECENT_WRITE_LINGER_S = 60             # how long idle_time=0 can linger after a write
 _BURST_WINDOW_S = 2                     # files arriving within this many seconds of the
                                         # last confirmed remote write are part of the same
                                         # burst and should STILL be attributed to the remote
@@ -7006,39 +7006,57 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     max_snapshots=5,
                                 )
                                 if _s0_idle_hist:
-                                    # ── CN-POISON filter (Step0) ─────────────────────
+                                    # ── CN-POISON + REMOTE-LINGER filter (Step0) ─────
                                     # Discard idle snapshots captured within
                                     # _CN_POISON_WINDOW seconds after a confirmed own
-                                    # write.  These are CHANGE_NOTIFY echoes, not genuine
-                                    # coworker activity, and must not trigger CHECK A/B.
+                                    # write (CHANGE_NOTIFY echoes), OR within
+                                    # _RECENT_WRITE_LINGER_S after a confirmed remote
+                                    # write by the same IP (coworker prior-write tail).
                                     _s0_CN_WINDOW = 90
-                                    _s0_prior_own = _get_recent_own_write()
+                                    _s0_prior_own    = _get_recent_own_write()
+                                    _s0_prior_remote = _get_recent_remote_write(_nfe_result_ip)
                                     _s0_hist_clean = _s0_idle_hist
                                     _s0_poisoned = 0
-                                    if _s0_prior_own is not None:
+                                    if _s0_prior_own is not None or _s0_prior_remote is not None:
                                         import time as _s0_cn_t
-                                        _s0_own_ts = _s0_prior_own[0]
+                                        _s0_own_ts    = _s0_prior_own[0]    if _s0_prior_own    else None
+                                        _s0_own_file  = _s0_prior_own[1]    if _s0_prior_own    else None
+                                        _s0_rem_ts    = _s0_prior_remote[0] if _s0_prior_remote else None
+                                        _s0_rem_file  = _s0_prior_remote[1] if _s0_prior_remote else None
                                         _s0_hist_clean = []
                                         for _s0_ts, _s0_idle_v in _s0_idle_hist:
-                                            _s0_age = _s0_ts - _s0_own_ts
-                                            if 0 <= _s0_age <= _s0_CN_WINDOW:
+                                            _s0_discard = None
+                                            if _s0_own_ts is not None:
+                                                _s0_age = _s0_ts - _s0_own_ts
+                                                if 0 <= _s0_age <= _s0_CN_WINDOW:
+                                                    _s0_discard = (
+                                                        f"CN-POISON: {_s0_age:.1f}s after own write "
+                                                        f"(file={_s0_own_file!r})"
+                                                    )
+                                            if _s0_discard is None and _s0_rem_ts is not None:
+                                                _s0_rem_age = _s0_ts - _s0_rem_ts
+                                                if 0 <= _s0_rem_age <= _RECENT_WRITE_LINGER_S:
+                                                    _s0_discard = (
+                                                        f"REMOTE-LINGER: {_s0_rem_age:.1f}s after "
+                                                        f"remote write by {_nfe_result_ip!r} "
+                                                        f"(file={_s0_rem_file!r}, "
+                                                        f"window={_RECENT_WRITE_LINGER_S}s)"
+                                                    )
+                                            if _s0_discard:
                                                 _s0_poisoned += 1
                                                 _gei.info(
                                                     f"[_get_editor_info] Step0-priority: "
-                                                    f"CN-POISON-FILTER — discarding snapshot "
-                                                    f"(idle={_s0_idle_v}s) taken {_s0_age:.1f}s "
-                                                    f"after confirmed own write at "
-                                                    f"{_s0_own_ts:.1f} "
-                                                    f"(file={_s0_prior_own[1]!r}). "
-                                                    f"CHANGE_NOTIFY echo, not genuine activity."
+                                                    f"LINGER-FILTER — discarding snapshot "
+                                                    f"(idle={_s0_idle_v}s, ts={_s0_ts:.1f}): "
+                                                    f"{_s0_discard}"
                                                 )
                                             else:
                                                 _s0_hist_clean.append((_s0_ts, _s0_idle_v))
                                         if _s0_poisoned:
                                             _gei.info(
                                                 f"[_get_editor_info] Step0-priority: "
-                                                f"CN-POISON-FILTER — removed {_s0_poisoned} "
-                                                f"poisoned snapshot(s), "
+                                                f"LINGER-FILTER — removed {_s0_poisoned} "
+                                                f"snapshot(s), "
                                                 f"{len(_s0_hist_clean)} remain."
                                             )
                                     # CHECK A: any prior snapshot with idle ≤ 5s?
@@ -7446,35 +7464,62 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                             # are CHANGE_NOTIFY echoes and must not count as low-idle
                             # evidence.  We compute _cn_prior_own here early so both
                             # CHECK A and CHECK B share the same filtered history.
+                            # We ALSO filter snapshots taken within _RECENT_WRITE_LINGER_S
+                            # after a confirmed REMOTE write by the same IP — these capture
+                            # the tail of that write's activity (idle still near-zero as
+                            # their SMB session winds down) which must not be mistaken for
+                            # persistent monitoring behaviour.
                             _NFE_MONITOR_THRESHOLD = 5
                             _cn_poison_window_a = 90
-                            _cn_prior_own_a = _get_recent_own_write()
+                            _cn_prior_own_a    = _get_recent_own_write()
+                            _cn_prior_remote_a = _get_recent_remote_write(_rs_ip)
                             _idle_history_clean_a = _idle_history
                             _cn_poisoned_a = 0
-                            if _cn_prior_own_a is not None:
+                            if _cn_prior_own_a is not None or _cn_prior_remote_a is not None:
                                 import time as _cn_a_t
-                                _cn_own_ts_a = _cn_prior_own_a[0]
+                                _cn_own_ts_a   = _cn_prior_own_a[0]    if _cn_prior_own_a   else None
+                                _cn_own_file_a = _cn_prior_own_a[1]    if _cn_prior_own_a   else None
+                                _cn_rem_ts_a   = _cn_prior_remote_a[0] if _cn_prior_remote_a else None
+                                _cn_rem_file_a = _cn_prior_remote_a[1] if _cn_prior_remote_a else None
                                 _idle_history_clean_a = []
                                 for _cn_ts_a, _cn_idle_a in _idle_history:
-                                    _cn_age_a = _cn_ts_a - _cn_own_ts_a
-                                    if 0 <= _cn_age_a <= _cn_poison_window_a:
+                                    _discard_reason = None
+                                    # Own-write CHANGE_NOTIFY filter
+                                    if _cn_own_ts_a is not None:
+                                        _cn_age_a = _cn_ts_a - _cn_own_ts_a
+                                        if 0 <= _cn_age_a <= _cn_poison_window_a:
+                                            _discard_reason = (
+                                                f"CN-POISON: taken {_cn_age_a:.1f}s after "
+                                                f"confirmed own write at {_cn_own_ts_a:.1f} "
+                                                f"(file={_cn_own_file_a!r}) — CHANGE_NOTIFY echo"
+                                            )
+                                    # Remote-write linger filter (coworker's own prior write)
+                                    if _discard_reason is None and _cn_rem_ts_a is not None:
+                                        _cn_rem_age_a = _cn_ts_a - _cn_rem_ts_a
+                                        if 0 <= _cn_rem_age_a <= _RECENT_WRITE_LINGER_S:
+                                            _discard_reason = (
+                                                f"REMOTE-LINGER: taken {_cn_rem_age_a:.1f}s after "
+                                                f"confirmed remote write by {_rs_ip!r} at "
+                                                f"{_cn_rem_ts_a:.1f} (file={_cn_rem_file_a!r}, "
+                                                f"window={_RECENT_WRITE_LINGER_S}s) — "
+                                                f"coworker prior-write activity tail, "
+                                                f"not monitoring"
+                                            )
+                                    if _discard_reason:
                                         _cn_poisoned_a += 1
                                         _gei.info(
                                             f"[_get_editor_info] Step1-early: CHECK A "
-                                            f"CN-POISON-FILTER — discarding snapshot "
-                                            f"(idle={_cn_idle_a}s) taken {_cn_age_a:.1f}s "
-                                            f"after confirmed own write at "
-                                            f"{_cn_own_ts_a:.1f} "
-                                            f"(file={_cn_prior_own_a[1]!r}). "
-                                            f"CHANGE_NOTIFY echo, not genuine activity."
+                                            f"LINGER-FILTER — discarding snapshot "
+                                            f"(idle={_cn_idle_a}s, ts={_cn_ts_a:.1f}): "
+                                            f"{_discard_reason}"
                                         )
                                     else:
                                         _idle_history_clean_a.append((_cn_ts_a, _cn_idle_a))
                                 if _cn_poisoned_a:
                                     _gei.info(
                                         f"[_get_editor_info] Step1-early: CHECK A "
-                                        f"CN-POISON-FILTER — removed {_cn_poisoned_a} "
-                                        f"poisoned snapshot(s) from {len(_idle_history)} "
+                                        f"LINGER-FILTER — removed {_cn_poisoned_a} "
+                                        f"poisoned/linger snapshot(s) from {len(_idle_history)} "
                                         f"total. {len(_idle_history_clean_a)} remain."
                                     )
                             _low_idle_snaps = [
@@ -7653,7 +7698,11 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                         if (_own_min_at is not None and
                                                 _own_min_at < _OWN_LOOPBACK_THRESHOLD and
                                                 not _loopback_is_stale):
-                                            # Fresh loopback session (not stale) → local write
+                                            # Fresh loopback session (not stale) → confirmed local write.
+                                            # Record it NOW so the next event's stale-loopback check
+                                            # can correctly identify this session as belonging to
+                                            # THIS write (not to a future remote write).
+                                            _record_own_write(filepath)
                                             _is_persistent_monitor = True
                                             _monitor_reason = (
                                                 f"only {len(_idle_history)} prior snapshot(s); "
@@ -7671,7 +7720,8 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                                 f"single-snapshot LOOPBACK-LOCAL — "
                                                 f"own_min_active_time={_own_min_at}s < "
                                                 f"{_OWN_LOOPBACK_THRESHOLD}s, not stale → "
-                                                f"LOCAL write by own machine. "
+                                                f"LOCAL write by own machine confirmed. "
+                                                f"Recorded as own write (own-write cache updated). "
                                                 f"Remote idle_time=0 is CHANGE_NOTIFY noise. "
                                                 f"Falling back to NTFS owner (correct)."
                                             )
@@ -7873,15 +7923,21 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                         # Enable-PSRemoting -Force as Admin on this PC) for definitive
                         # per-file attribution.
                         info.update(_ntfs_owner_result)
-                        # Record this as a confirmed local write so the loopback check
-                        # can distinguish a stale own-session from a fresh one on the
-                        # next event (e.g. coworker uploads right after us).
-                        _record_own_write(filepath)
+                        # NOTE: we do NOT call _record_own_write() here.
+                        # This path is reached only when evidence is AMBIGUOUS —
+                        # the file may have been written by the local machine OR by
+                        # a remote user whose session looks like a passive monitor.
+                        # Recording this as a "confirmed own write" would poison the
+                        # loopback-staleness check for the next event, causing a
+                        # genuine remote write that follows to be misattributed to
+                        # the local machine.  _record_own_write() is only called in
+                        # the LOOPBACK-LOCAL branch where there is positive evidence
+                        # (fresh loopback session) of a local write.
                         _gei.info(
                             f"[_get_editor_info] Step1-early: persistent monitor — "
                             f"falling back to NTFS owner ({_monitor_reason}). "
-                            f"Recorded as confirmed local write (own-write cache updated). "
-                            f"NOTE: if this is wrong (coworker also monitors), enable SACL."
+                            f"NOTE: own-write cache NOT updated (ambiguous — no positive "
+                            f"local-write evidence). Enable SACL for definitive attribution."
                         )
                         return info
 
