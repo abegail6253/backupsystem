@@ -16,6 +16,17 @@ except ImportError:
 _pending: Dict[str, List[dict]] = {}
 _lock = threading.Lock()
 
+# Per-path SMB session snapshot cache.
+# Keyed by normalised lowercase path.  Written whenever watchdog captures a live
+# NetSessionEnum snapshot; read by the unc_poll snapshot-borrow in desktop_app.py
+# when the watchdog entry has not yet arrived in _pending (race where unc_poll
+# dispatches attribution before watchdog's on_change fires).
+# Format: { path_lower: (capture_timestamp_float, smb_sessions_snapshot_list) }
+# Entries expire after _PATH_SNAP_TTL_S seconds.
+_path_smb_snapshot: Dict[str, tuple] = {}
+_path_smb_snapshot_lock = threading.Lock()
+_PATH_SNAP_TTL_S = 30   # discard snapshots older than this
+
 # Optional suppression hook registered by desktop_app.
 # Signature: (watch_id: str, event_type: str, path: str) -> bool
 # When it returns True the event is suppressed: NOT persisted to history.json
@@ -49,15 +60,54 @@ _SMB_SESSION_POLL_INTERVAL_S  = 60      # poll every 60 seconds
 
 def _smb_session_cache_push(host: str, sessions: list) -> None:
     """Append a timestamped snapshot to the cache for *host*, pruning entries older than 24h."""
-    import datetime as _dt_sc
-    now = _dt_sc.datetime.utcnow()
-    cutoff = now.timestamp() - _SMB_SESSION_CACHE_MAX_AGE_S
+    import time as _t_sc
+    now_ts = _t_sc.time()  # use time.time() — datetime.utcnow().timestamp() mis-applies TZ offset
+    cutoff = now_ts - _SMB_SESSION_CACHE_MAX_AGE_S
     with _smb_session_cache_lock:
         bucket = _smb_session_cache.setdefault(host, [])
-        bucket.insert(0, (now.timestamp(), sessions))
+        bucket.insert(0, (now_ts, sessions))
         # Prune old entries (list is newest-first so we can break early)
         while bucket and bucket[-1][0] < cutoff:
             bucket.pop()
+
+
+def get_recent_idle_history(host: str, ip: str, event_ts: float,
+                             own_host: str = "", own_ip: str = "",
+                             max_snapshots: int = 5) -> list:
+    """
+    Return a list of (timestamp, idle_time) tuples for the given client IP,
+    taken from the most recent *max_snapshots* cache entries before event_ts.
+    Useful for detecting persistent-monitor behaviour (idle oscillates near 0)
+    vs genuine write (first drop to 0 after a long idle stretch).
+    Returns newest-first.
+    """
+    with _smb_session_cache_lock:
+        bucket = list(_smb_session_cache.get(host, []))
+
+    if not bucket:
+        return []
+
+    own_host_lower = own_host.lower()
+    result = []
+    for ts, sessions in bucket:
+        if ts > event_ts + 5:
+            continue
+        if event_ts - ts > _SMB_SESSION_CACHE_MAX_AGE_S:
+            break
+        for s in sessions:
+            m = (s.get("machine") or "").lower()
+            sip = s.get("ip") or ""
+            if own_host_lower and m == own_host_lower:
+                continue
+            if own_ip and sip == own_ip:
+                continue
+            if sip == ip:
+                result.append((ts, s.get("idle_time")))
+                break
+        if len(result) >= max_snapshots:
+            break
+    return result  # newest-first
+
 
 
 def get_cached_session_at_time(host: str, event_ts: float,
@@ -177,7 +227,13 @@ def start_smb_session_poller(host: str, smb_audit_cfg: dict,
                         continue
                     if own_ip and _cip == own_ip:
                         continue
-                    sessions.append({"username": _uname, "machine": _client, "ip": _cip})
+                    sessions.append({
+                        "username": _uname,
+                        "machine":  _client,
+                        "ip":       _cip,
+                        "idle_time":  _s.get("idle_time"),   # preserve for monitor-detection
+                        "active_time": _s.get("active_time"),
+                    })
 
                 _smb_session_cache_push(host, sessions)
                 if sessions:
@@ -585,6 +641,29 @@ if WATCHDOG_AVAILABLE:
                         _own_ip   = _sock.gethostbyname(_own_host)
                     except Exception:
                         pass
+                    # BUG-FIX (attribution, same root cause as desktop_app._get_editor_info):
+                    # the NetFileEnum filter below used to compare the handle's USERNAME
+                    # against the local HOSTNAME — those never match for a real account
+                    # name (e.g. 'user' vs 'desktop-0edubap'), so a local handle was never
+                    # excluded as "own", and the resulting "remote" snapshot could get
+                    # matched to a coworker's session purely because both PCs happen to
+                    # log in under the same generic Windows username. Resolve and use the
+                    # actual local username for this comparison instead.
+                    _own_user = ""
+                    try:
+                        import win32api as _w32api_own
+                        _own_user = (_w32api_own.GetUserName() or "").lower()
+                    except Exception:
+                        try:
+                            import os as _os_own
+                            _own_user = (_os_own.environ.get("USERNAME", "") or "").lower()
+                        except Exception:
+                            pass
+                    logger.info(
+                        f"[watchdog._record] own identity for local/remote disambiguation: "
+                        f"own_host={_own_host!r} own_ip={_own_ip!r} own_user={_own_user!r} "
+                        f"(watch_id={self.watch_id!r} type={event_type!r})"
+                    )
 
                     def _run_net_session_enum() -> list:
                         """Run NetSessionEnum level 10 using the probed calling convention."""
@@ -608,8 +687,18 @@ if WATCHDOG_AVAILABLE:
                             return []
 
                     def _build_snapshot(sessions: list) -> list:
-                        """Filter sessions to usable (non-own, has username) entries."""
+                        """Filter sessions to usable (non-own, has username) entries.
+
+                        Side-effect: populates _own_session_min_active_time with the
+                        minimum active_time seen across all own-machine sessions.  A
+                        short active_time (e.g. < 30s) on an own session means the local
+                        machine just opened a new loopback SMB connection to its own
+                        share — the hallmark of a local Explorer file-copy operation.
+                        This value is stored alongside smb_sessions_snapshot so
+                        _get_editor_info can use it as a local-write tiebreaker.
+                        """
                         _out = []
+                        _own_min_at = None   # track shortest own-session active_time
                         for _s in sessions:
                             _client = (_s.get("client_name") or "").lstrip("\\").lower()
                             _uname  = _s.get("user_name") or _s.get("username") or ""
@@ -640,10 +729,32 @@ if WATCHDOG_AVAILABLE:
                             )
                             if _verdict == "ACCEPT":
                                 _out.append({
-                                    "username": _uname,
-                                    "machine":  _client,
-                                    "ip":       _cip,
+                                    "username":    _uname,
+                                    "machine":     _client,
+                                    "ip":          _cip,
+                                    "idle_time":   _s.get("idle_time"),
+                                    "active_time": _s.get("active_time"),
                                 })
+                            elif _is_own:
+                                # Track the minimum active_time across own-machine
+                                # sessions.  A freshly-opened loopback SMB session
+                                # (active_time ~ a few seconds) is strong evidence
+                                # the local user just performed a file operation.
+                                _at = _s.get("active_time")
+                                if _at is not None:
+                                    _own_min_at = _at if _own_min_at is None else min(_own_min_at, _at)
+                        if _own_min_at is not None:
+                            # Attach min own-session active_time to every accepted
+                            # entry so _get_editor_info can inspect it for local-write
+                            # detection without needing a separate data channel.
+                            for _e in _out:
+                                _e["own_min_active_time"] = _own_min_at
+                            logger.info(
+                                f"[watchdog._record] own-session min active_time={_own_min_at}s "
+                                f"(attached to {len(_out)} snapshot entry(s) as "
+                                f"'own_min_active_time') "
+                                f"(watch_id={self.watch_id!r} type={event_type!r})"
+                            )
                         if not _out and sessions:
                             logger.info(
                                 f"[watchdog._record] NetSessionEnum: all {len(sessions)} raw session(s) "
@@ -693,6 +804,14 @@ if WATCHDOG_AVAILABLE:
 
                     if _snapped:
                         entry["smb_sessions_snapshot"] = _snapped
+                        # Also store in the per-path cache so unc_poll attribution
+                        # can find it even when watchdog's on_change fires after unc_poll
+                        # has already tried to borrow from _pending and failed.
+                        import time as _snap_ts
+                        _pkey = (entry.get("path") or "").lower()
+                        if _pkey:
+                            with _path_smb_snapshot_lock:
+                                _path_smb_snapshot[_pkey] = (_snap_ts.time(), list(_snapped))
                         logger.info(
                             f"[watchdog._record] NetSessionEnum snapshot captured: {_snapped} "
                             f"(watch_id={self.watch_id!r} type={event_type!r})"
@@ -862,13 +981,15 @@ if WATCHDOG_AVAILABLE:
                                     continue
                                 _fe_user_lower = _fe_user.lower()
                                 _is_own_user = (
+                                    _fe_user_lower == _own_user or
+                                    _fe_user_lower.endswith("\\" + _own_user) or
                                     _fe_user_lower == _own_host or
                                     _fe_user_lower.endswith("\\" + _own_host)
                                 )
                                 logger.info(
                                     f"[watchdog._record] NetFileEnum filter: "
                                     f"user={_fe_user!r} is_own={_is_own_user} "
-                                    f"own_host={_own_host!r}"
+                                    f"compared_against: own_user={_own_user!r} own_host={_own_host!r}"
                                 )
                                 if not _is_own_user:
                                     _snap_from_files.append({

@@ -8,7 +8,6 @@
   "compression_enabled": false,
   "auto_retry": true,
   "retry_delay_min": 5,
-  "auto_sacl_owned_smb_shares": true,
   "max_backup_mbps": 0,
   "webhook_url": "",
   "webhook_on_success": false,

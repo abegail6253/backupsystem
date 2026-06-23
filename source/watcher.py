@@ -393,6 +393,15 @@ if WATCHDOG_AVAILABLE:
                                 _cip = _sock.gethostbyname(_client) if _client else ""
                             except Exception:
                                 _cip = _client
+                            # Try reverse-DNS (and fall back silently) so the
+                            # History/Machine column prefers a readable hostname
+                            # instead of an IP literal when possible.
+                            _resolved_name = None
+                            try:
+                                if _cip:
+                                    _resolved_name = _sock.gethostbyaddr(_cip)[0].lower()
+                            except Exception:
+                                _resolved_name = None
                             _is_own = (
                                 _client == _own_host or
                                 (_own_ip and _cip == _own_ip)
@@ -415,9 +424,16 @@ if WATCHDOG_AVAILABLE:
                                 f"(watch_id={self.watch_id!r} type={event_type!r})"
                             )
                             if _verdict == "ACCEPT":
+                                _machine_value = _resolved_name or _client
+                                if _resolved_name and _resolved_name != _client:
+                                    logger.info(
+                                        f"[watchdog._record] NetSessionEnum: reverse-DNS/nbt resolved "
+                                        f"{_client!r} -> {_resolved_name!r} (ip={_cip!r}) "
+                                        f"(watch_id={self.watch_id!r})"
+                                    )
                                 _out.append({
                                     "username": _uname,
-                                    "machine":  _client,
+                                    "machine":  _machine_value,
                                     "ip":       _cip,
                                 })
                         if not _out and sessions:

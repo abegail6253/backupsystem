@@ -47,6 +47,7 @@ MAIN_PATH    = SCRIPT_DIR / MAIN_FILE
 CONFIG_PATH  = SCRIPT_DIR / "config.json"
 ICON_PATH    = SCRIPT_DIR / ICON_FILE
 SNAP_DIR     = SCRIPT_DIR / "snapshots"
+MANIFEST_PATH = SCRIPT_DIR / "backupsys_admin.manifest"
 
 # ── Auto-generate icon.ico from icon_256.png if needed ───────────────────────
 # PyInstaller requires a .ico file; only PNGs are checked in. Pillow converts
@@ -164,8 +165,36 @@ _bundle_config.write_text(_json.dumps(_BLANK_CONFIG, indent=2))
 CONFIG_PATH = _bundle_config   # point PyInstaller at the clean copy
 print(f"✅ Bundling clean blank config (live config.json excluded from .exe)")
 
-# Ensure snapshots directory exists so PyInstaller can include it
-SNAP_DIR.mkdir(parents=True, exist_ok=True)
+# ── Auto-generate admin manifest if missing ──────────────────────────────────
+# The manifest tells Windows to always prompt UAC and run as Administrator.
+# This gives BackupSys the rights it needs for NetFileEnum / 'net file' to
+# correctly attribute file changes to the right user on same-host SMB shares.
+if not MANIFEST_PATH.exists():
+    MANIFEST_PATH.write_text(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">\n'
+        '  <assemblyIdentity version="1.0.0.0" processorArchitecture="amd64"\n'
+        '      name="BackupSystem" type="win32"/>\n'
+        '  <description>BackupSystem</description>\n'
+        '  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">\n'
+        '    <security>\n'
+        '      <requestedPrivileges>\n'
+        '        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>\n'
+        '      </requestedPrivileges>\n'
+        '    </security>\n'
+        '  </trustInfo>\n'
+        '  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">\n'
+        '    <application>\n'
+        '      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>\n'
+        '      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>\n'
+        '    </application>\n'
+        '  </compatibility>\n'
+        '</assembly>\n',
+        encoding="utf-8",
+    )
+    print(f"✅ Generated admin manifest: {MANIFEST_PATH.name}")
+else:
+    print(f"✅ Using existing admin manifest: {MANIFEST_PATH.name}")
 
 # ── Change working directory so PyInstaller output lands next to the source ──
 os.chdir(SCRIPT_DIR)
@@ -177,6 +206,10 @@ args = [
     "--windowed",                        # No console window
     "--noconfirm",                       # Overwrite without asking
     "--clean",
+    # Embed the admin manifest so Windows always prompts UAC and runs as Administrator.
+    # This gives BackupSys the rights needed for NetFileEnum / 'net file' to correctly
+    # attribute SMB file changes to the right user on same-host watches.
+    "--manifest",   str(MANIFEST_PATH),
     # Use absolute paths so --add-data works from any cwd
     "--add-data",   f"{CONFIG_PATH}{os.pathsep}.",
     "--add-data",   f"{SNAP_DIR}{os.pathsep}snapshots",

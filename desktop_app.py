@@ -200,6 +200,72 @@ def _setup_logging():
 _setup_logging()
 logger = logging.getLogger(__name__)
 
+# ── Same-host open-file enumeration cache ──────────────────────────────────────
+# NetFileEnum and 'net file' both require admin rights. Once we've confirmed
+# they're inaccessible (Access Denied), cache that result to avoid probing
+# 11 signatures + subprocess on every file event. Reset to None on startup.
+# Values: None = not yet tested, True = works, False = access denied / unavailable
+_same_host_nfe_available: bool | None = None   # NetFileEnum pywin32
+_same_host_net_file_available: bool | None = None  # 'net file' subprocess
+_same_host_nfe_sig: str | None = None  # cached working signature for NetFileEnum
+
+# ── Recent remote-write attribution cache ──────────────────────────────────────
+# Tracks the last time each remote IP was successfully attributed as the WRITER
+# of a file on same-host watches.  Used by _get_editor_info to detect residual
+# idle_time=0 that lingers after a remote write (the SMB session stays active for
+# tens of seconds after a write finishes, keeping idle_time near 0).
+# Format: { ip_str: (attribution_timestamp_float, filepath_str) }
+import threading as _gei_threading
+_recent_remote_write_ts: dict = {}      # ip -> (ts, path)
+_recent_remote_write_lock = _gei_threading.Lock()
+_RECENT_WRITE_LINGER_S = 30             # how long idle_time=0 can linger after a write
+_BURST_WINDOW_S = 2                     # files arriving within this many seconds of the
+                                        # last confirmed remote write are part of the same
+                                        # burst and should STILL be attributed to the remote
+                                        # user (not treated as residual linger)
+
+def _record_remote_write(ip: str, filepath: str) -> None:
+    """Called when a remote IP is confirmed as the writer of a file."""
+    import time as _rwt
+    with _recent_remote_write_lock:
+        _recent_remote_write_ts[ip] = (_rwt.time(), filepath)
+
+def _get_recent_remote_write(ip: str) -> tuple | None:
+    """Return (ts, path) of the last confirmed write by ip, or None if expired/missing."""
+    import time as _rwt
+    with _recent_remote_write_lock:
+        entry = _recent_remote_write_ts.get(ip)
+    if entry and (_rwt.time() - entry[0]) <= _RECENT_WRITE_LINGER_S:
+        return entry
+    return None
+
+# ── Own-write tracker ─────────────────────────────────────────────────────────
+# Records the timestamp of the last confirmed local (own-machine) write per
+# watch_id.  Used by the loopback-session check to distinguish a FRESH own
+# loopback session (opened for the current event) from a STALE one that was
+# opened for a prior local write and is still alive.
+#
+# Without this, a loopback SMB session opened for write #1 at t=0 still has
+# active_time < 30s at t=16s when a coworker writes file #2 — causing the
+# coworker's write to be falsely attributed to the local machine.
+_recent_own_write_ts: dict = {}          # filepath_lower → (timestamp, filepath)
+_recent_own_write_lock = _gei_threading.Lock()
+
+def _record_own_write(filepath: str) -> None:
+    """Called when the local machine is confirmed as the writer of a file."""
+    import time as _owt
+    with _recent_own_write_lock:
+        _recent_own_write_ts["__last__"] = (_owt.time(), filepath)
+
+def _get_recent_own_write() -> tuple | None:
+    """Return (ts, path) of the last confirmed local write, or None if expired/missing."""
+    import time as _owt
+    with _recent_own_write_lock:
+        entry = _recent_own_write_ts.get("__last__")
+    if entry and (_owt.time() - entry[0]) <= _RECENT_WRITE_LINGER_S:
+        return entry
+    return None
+
 # ── Stylesheet ─────────────────────────────────────────────────────────────────
 DARK_STYLE = """
 QMainWindow, QDialog, QWidget {
@@ -6605,6 +6671,1224 @@ def _get_editor_info(filepath: str, detection_source: str = "",
         f"has_nas_creds={bool((smb_audit_cfg or {}).get('username'))}"
     )
 
+    # ── SAME-HOST WATCH detection ────────────────────────────────────────────
+    # BUG-FIX: a watch can be configured directly against a UNC path that
+    # happens to point back at THIS machine (e.g. a locally-hosted share
+    # watched via its own \\<own-ip>\share address — common when testing, or
+    # when the "source" and the backup destination subfolder live on the same
+    # PC). In that case NetSessionEnum-based attribution (Step0 live snapshot,
+    # Step0b session cache, Steps 2-4) is fundamentally unreliable:
+    #   - A session merely being OPEN on the share is not proof that machine
+    #     wrote *this* file — e.g. some other LAN machine may simply have the
+    #     share mapped as a drive or browsing it in Explorer, unrelated to
+    #     this specific write. NetSessionEnum has no concept of "who touched
+    #     this file," only "who currently has a session."
+    #   - A genuinely local write made directly on THIS PC's own console
+    #     (by far the most common case for a self-hosted share — e.g. saving
+    #     a screenshot straight to the shared folder) creates NO new SMB
+    #     session at all, so the real actor is invisible to NetSessionEnum.
+    #     Any "non-own" session it does find is therefore just a bystander.
+    # The NTFS file-owner lookup (Step1) does NOT have this problem here: the
+    # file genuinely lives on this machine's own disk, so GetFileSecurity
+    # correctly reports the real local account that created it. So for
+    # same-host watches we try Step1 FIRST, before trusting any
+    # NetSessionEnum-derived snapshot/cache.
+    _own_host_gei0 = ""
+    _own_ip_gei0   = ""
+    try:
+        _own_host_gei0 = socket.gethostname().lower()
+        _own_ip_gei0   = socket.gethostbyname(_own_host_gei0)
+    except Exception:
+        pass
+    _is_same_host_watch = bool(
+        is_unc and remote_host and not _skip_owner_lookup and (
+            remote_host.lower() == _own_host_gei0 or
+            (_own_ip_gei0 and remote_host == _own_ip_gei0)
+        )
+    )
+    _step1_done_early = False
+    if _is_same_host_watch:
+        _gei.info(
+            f"[_get_editor_info] SAME-HOST WATCH DETECTED — remote_host={remote_host!r} "
+            f"matches this machine's own address (own_host={_own_host_gei0!r} "
+            f"own_ip={_own_ip_gei0!r}). Checking SMB snapshot for a single unambiguous "
+            f"remote session before falling back to NTFS owner lookup. "
+            f"detection_source={detection_source!r}"
+        )
+        if detection_source in ("watchdog", "unc_poll", "unc_notify"):
+            # ── Step0-priority: use NetFileEnum to check if the file is currently
+            # held open by a remote SMB user on THIS machine.
+            #
+            # Background: on same-host watches, both idle_time and active_time on
+            # NetSessionEnum are unreliable for distinguishing local vs remote writes:
+            #   - idle_time resets to 0 on ANY network activity (Explorer refresh etc.)
+            #   - active_time counts continuously from session open, never resets on writes
+            #
+            # NetFileEnum (level 3) lists every open file handle on the server along
+            # with the username that holds it. If the target file appears in that list
+            # under a non-local username, that remote user is writing it right now.
+            # If it doesn't appear (or only appears under a local/system account), the
+            # write was made locally on this machine.
+            #
+            # We try NetFileEnum FIRST. If it succeeds and gives a definitive answer,
+            # use it. If it fails (access denied, pywin32 issue, etc.), fall back to
+            # the smb_sessions_snapshot heuristic, then NTFS owner.
+            _own_host_nfe = _own_host_gei0  # already computed above
+            _own_ip_nfe   = _own_ip_gei0
+            # BUG-FIX (attribution): the local/remote check below used to compare
+            # the NetFileEnum/'net file' USERNAME against the local machine's
+            # HOSTNAME (_own_host_nfe) — those are never the same thing, so a
+            # genuinely local handle (opened under your own Windows account,
+            # e.g. 'user') was never recognized as local and fell through to
+            # the "remote user" branch. If a coworker's PC happens to log in
+            # under the same generic account name (very common on home/test
+            # PCs that all use 'user' as the Windows username), the local edit
+            # then gets matched to THEIR cached SMB session by username and
+            # mis-attributed to their machine/IP. Fix: also resolve and compare
+            # against the actual local logged-on username.
+            _own_user_nfe = ""
+            try:
+                import win32api as _w32api_nfe
+                _own_user_nfe = (_w32api_nfe.GetUserName() or "").lower()
+            except Exception:
+                _own_user_nfe = (os.environ.get("USERNAME", "") or "").lower()
+            _gei.info(
+                f"[_get_editor_info] Step0-priority: own identity for local/remote "
+                f"disambiguation — own_host={_own_host_nfe!r} own_ip={_own_ip_nfe!r} "
+                f"own_user={_own_user_nfe!r} (own_user is what NetFileEnum/'net file' "
+                f"handle usernames are compared against to detect local writes)"
+            )
+
+            _nfe_result_user    = ""
+            _nfe_result_machine = ""
+            _nfe_result_ip      = ""
+            _nfe_attempted      = False
+            _nfe_succeeded      = False  # True if NetFileEnum call worked (even if no match)
+            _nfe_entries        = None   # populated by Step0; None = not yet attempted
+
+            # Normalize filepath to a local path for matching against NetFileEnum pathnames.
+            # NetFileEnum returns local paths (e.g. D:\testshare\file.png), not UNC paths.
+            _nfe_target_local = filepath
+            try:
+                # Strip the \\host\share prefix and replace with nothing — we just need
+                # the filename portion for a suffix match since NetFileEnum may return
+                # full local paths or just relative paths depending on the OS version.
+                import re as _re_nfe
+                _unc_match = _re_nfe.match(r'^\\\\[^\\]+\\[^\\]+\\?(.*)$', filepath)
+                if _unc_match:
+                    _nfe_target_local = _unc_match.group(1).replace('/', '\\')
+            except Exception:
+                pass
+            _nfe_filename = filepath.split('\\')[-1].split('/')[-1]
+
+            # ── Use module-level cache to skip re-probing known-denied methods ──
+            global _same_host_nfe_available, _same_host_net_file_available, _same_host_nfe_sig
+            if _same_host_nfe_available is False and _same_host_net_file_available is False:
+                _gei.debug(
+                    f"[_get_editor_info] Step0-priority: both NetFileEnum and 'net file' "
+                    f"previously returned Access Denied — skipping probe, falling through to NTFS owner"
+                )
+            else:
+                _gei.info(
+                    f"[_get_editor_info] Step0-priority (same-host NetFileEnum): "
+                    f"attempting NetFileEnum on host={remote_host!r} "
+                    f"target_file={_nfe_filename!r} target_local={_nfe_target_local!r} "
+                    f"(nfe_available={_same_host_nfe_available!r} net_file_available={_same_host_net_file_available!r})"
+                )
+
+            try:
+                import win32net as _w32nfe_gei
+                _nfe_attempted = True
+
+                # Probe all known pywin32 NetFileEnum signatures
+                _nfe_variants = [
+                    ("(host,'',3,0)",    lambda h=remote_host: _w32nfe_gei.NetFileEnum(h, "",   3, 0)),
+                    ("(host,None,3,0)",  lambda h=remote_host: _w32nfe_gei.NetFileEnum(h, None, 3, 0)),
+                    ("(host,3,0)",       lambda h=remote_host: _w32nfe_gei.NetFileEnum(h, 3, 0)),
+                    ("(host,3)",         lambda h=remote_host: _w32nfe_gei.NetFileEnum(h, 3)),
+                    ("(host,'','',3,0)", lambda h=remote_host: _w32nfe_gei.NetFileEnum(h, "", "", 3, 0)),
+                    ("(None,'',3,0)",    lambda: _w32nfe_gei.NetFileEnum(None, "",   3, 0)),
+                    ("(None,None,3,0)",  lambda: _w32nfe_gei.NetFileEnum(None, None, 3, 0)),
+                    ("(None,3,0)",       lambda: _w32nfe_gei.NetFileEnum(None, 3, 0)),
+                    ("(None,3)",         lambda: _w32nfe_gei.NetFileEnum(None, 3)),
+                    ("(3,0)",            lambda: _w32nfe_gei.NetFileEnum(3, 0)),
+                    ("(3,)",             lambda: _w32nfe_gei.NetFileEnum(3)),
+                ]
+                _nfe_entries = []
+                _nfe_sig_used = ""
+                for _nfe_sig, _nfe_call in _nfe_variants:
+                    try:
+                        _nfe_raw = _nfe_call()
+                        if isinstance(_nfe_raw, tuple) and len(_nfe_raw) >= 1:
+                            _nfe_entries = list(_nfe_raw[0])
+                        else:
+                            _nfe_entries = list(_nfe_raw)
+                        _nfe_sig_used = _nfe_sig
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum: "
+                            f"signature {_nfe_sig!r} accepted — "
+                            f"{len(_nfe_entries)} open handle(s) on {remote_host!r}"
+                        )
+                        break
+                    except TypeError as _nfe_te:
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum: "
+                            f"signature {_nfe_sig!r} → TypeError: {_nfe_te!r} (wrong pywin32 arity)"
+                        )
+                    except Exception as _nfe_e:
+                        _nfe_e_str = str(_nfe_e)
+                        _nfe_winerr = getattr(_nfe_e, "winerror", None)
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum: "
+                            f"signature {_nfe_sig!r} → {type(_nfe_e).__name__}: {_nfe_e_str!r} "
+                            f"winerror={_nfe_winerr!r}"
+                        )
+                        if "Access is denied" in _nfe_e_str or _nfe_winerr == 5:
+                            continue  # try next variant
+                        break
+
+                if _nfe_sig_used:
+                    _nfe_succeeded = True
+                    _s0_linger_gate = False  # set True if linger gate fires for this modified event
+                    # Log every open handle for debug visibility
+                    for _nfe_idx, _nfe_entry in enumerate(_nfe_entries):
+                        _nfe_eu = (
+                            _nfe_entry.get("fi3_username") or _nfe_entry.get("username") or
+                            _nfe_entry.get("fi2_username") or _nfe_entry.get("user_name") or ""
+                        )
+                        _nfe_ep = (
+                            _nfe_entry.get("fi3_pathname") or _nfe_entry.get("pathname") or
+                            _nfe_entry.get("fi2_pathname") or _nfe_entry.get("path") or
+                            _nfe_entry.get("path_name") or ""
+                        )
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum handle[{_nfe_idx}]: "
+                            f"user={_nfe_eu!r} path={_nfe_ep!r} all={dict(_nfe_entry)!r}"
+                        )
+                        if not _nfe_eu or not _nfe_ep:
+                            continue
+                        # Match: does this handle's path contain our target filename?
+                        _nfe_ep_norm = _nfe_ep.replace('/', '\\').lower()
+                        _match = (
+                            _nfe_filename.lower() in _nfe_ep_norm or
+                            _nfe_target_local.lower() in _nfe_ep_norm
+                        )
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum handle[{_nfe_idx}]: "
+                            f"match={_match} (target_filename={_nfe_filename!r} "
+                            f"target_local={_nfe_target_local!r} handle_path={_nfe_ep!r})"
+                        )
+                        if not _match:
+                            continue
+                        # Is this user a local/system account (i.e. the local machine writing)?
+                        _nfe_eu_lower = _nfe_eu.lower().lstrip("\\")
+                        _is_local_account = (
+                            _nfe_eu_lower == _own_user_nfe or
+                            _nfe_eu_lower.endswith("\\" + _own_user_nfe) or
+                            _nfe_eu_lower == _own_host_nfe or
+                            _nfe_eu_lower.endswith("\\" + _own_host_nfe) or
+                            _nfe_eu_lower in ("system", "local service", "network service",
+                                              "nt authority\\system", "nt authority\\local service")
+                        )
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum handle[{_nfe_idx}]: "
+                            f"is_local_account={_is_local_account} "
+                            f"(handle_user={_nfe_eu!r} compared_against: "
+                            f"own_user={_own_user_nfe!r} own_host={_own_host_nfe!r})"
+                        )
+                        if _is_local_account:
+                            # Username matches local account. In workgroup setups a
+                            # remote client connecting with the SAME username as the
+                            # local user also shows handle_user == own_user.  A file
+                            # handle in NetFileEnum is ALWAYS an SMB handle (from a
+                            # network client), so we must not blindly conclude "local
+                            # write" when the username is ambiguous.
+                            #
+                            # Disambiguation: if a REMOTE session (IP ≠ own IP) with
+                            # the same username and low idle_time exists, the open
+                            # handle almost certainly belongs to that remote client —
+                            # they are mid-write.  Only fall back to "local write" if
+                            # no such session exists (handle is from loopback or
+                            # system process).
+                            _same_name_remote_active = [
+                                _sn for _sn in (smb_sessions_snapshot or [])
+                                if _sn.get("ip") and _sn.get("ip") != _own_ip_nfe
+                                and _sn.get("username", "").lower().lstrip("\\") == _nfe_eu_lower
+                                and _sn.get("idle_time", 999) <= 5
+                            ]
+                            if _same_name_remote_active:
+                                # Remote client with same username has an active session
+                                # AND is writing (idle<=5s).  The file handle in
+                                # NetFileEnum is almost certainly theirs, not a local
+                                # loopback.  Fall through to the remote attribution
+                                # code below (do NOT break here).
+                                _rs0 = _same_name_remote_active[0]
+                                _gei.info(
+                                    f"[_get_editor_info] Step0-priority NetFileEnum: "
+                                    f"handle user {_nfe_eu!r} matches local account BUT "
+                                    f"remote session ip={_rs0.get('ip')!r} uses same username "
+                                    f"with idle_time={_rs0.get('idle_time')}s ≤ 5s — "
+                                    f"workgroup same-username: treating as remote SMB handle "
+                                    f"(falling through to remote attribution)"
+                                )
+                                # Do NOT break — fall through to remote attribution below.
+                            else:
+                                _gei.info(
+                                    f"[_get_editor_info] Step0-priority NetFileEnum: "
+                                    f"handle matched but user is local account {_nfe_eu!r} "
+                                    f"and no active remote session with same username — "
+                                    f"local write confirmed, falling through to NTFS owner"
+                                )
+                                break  # local write — skip to Step1
+                        # Remote user holds this file open — they're the writer
+                        # Try to resolve their IP from the snapshot
+                        for _snap_s in (smb_sessions_snapshot or []):
+                            if (_snap_s.get("username", "").lower() == _nfe_eu_lower or
+                                    _nfe_eu_lower.endswith("\\" + _snap_s.get("username", "").lower())):
+                                _nfe_result_machine = _snap_s.get("machine", "")
+                                _nfe_result_ip      = _snap_s.get("ip", "")
+                                break
+                        _nfe_result_user = _nfe_eu
+                        if not _nfe_result_ip:
+                            # fallback: use snapshot machine/ip if only one remote session
+                            _remote_snaps = [
+                                s for s in (smb_sessions_snapshot or [])
+                                if s.get("ip") and s.get("ip") != _own_ip_nfe
+                            ]
+                            if len(_remote_snaps) == 1:
+                                _nfe_result_machine = _remote_snaps[0].get("machine", "")
+                                _nfe_result_ip      = _remote_snaps[0].get("ip", "")
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum: MATCH → "
+                            f"user={_nfe_result_user!r} machine={_nfe_result_machine!r} "
+                            f"ip={_nfe_result_ip!r}"
+                        )
+                        # ── Linger gate (modified events only) ───────────────────────────
+                        # For 'modified' events the open handle may be a persistent
+                        # monitoring lock (e.g. .105 has the file open in Excel)
+                        # rather than the active write handle. The true writer (.106,
+                        # local) may have used an atomic rename, closing their handles
+                        # before unc_poll fired.
+                        # Apply the same CHECK A / CHECK B persistent-monitor logic as
+                        # Step1: if the matched session's idle history looks like a
+                        # persistent monitor, don't return early — let Step1 run its
+                        # full heuristic and fall back to NTFS owner.
+                        if event_type == "modified" and _nfe_result_ip:
+                            _s0_is_monitor = False
+                            _s0_mon_reason = ""
+                            try:
+                                import time as _s0_pm_t
+                                from watcher import get_recent_idle_history as _s0_grih
+                                _s0_idle_hist = _s0_grih(
+                                    remote_host or _nfe_result_ip,
+                                    _nfe_result_ip,
+                                    _s0_pm_t.time() - 2,
+                                    _own_host_nfe, _own_ip_nfe,
+                                    max_snapshots=5,
+                                )
+                                if _s0_idle_hist:
+                                    # CHECK A: any prior snapshot with idle ≤ 5s?
+                                    _s0_low = [
+                                        idle for _, idle in _s0_idle_hist
+                                        if idle is not None and idle <= 5
+                                    ]
+                                    if _s0_low:
+                                        _s0_is_monitor = True
+                                        _s0_mon_reason = (
+                                            f"CHECK A: prior idle history has low-idle "
+                                            f"snapshots {_s0_low!r} (<=5s)"
+                                        )
+                                    else:
+                                        # CHECK B: min prior idle ≤ 10s with ≥2 snapshots
+                                        _s0_min_idle = min(
+                                            (idle for _, idle in _s0_idle_hist
+                                             if idle is not None),
+                                            default=None,
+                                        )
+                                        if (len(_s0_idle_hist) >= 2 and
+                                                _s0_min_idle is not None and
+                                                _s0_min_idle <= 10):
+                                            _s0_is_monitor = True
+                                            _s0_mon_reason = (
+                                                f"CHECK B: min_prior_idle={_s0_min_idle}s "
+                                                f"<=10s with {len(_s0_idle_hist)} snapshots "
+                                                f"(ambiguous idle history)"
+                                            )
+                                        else:
+                                            _s0_mon_reason = (
+                                                f"CHECK B passed: min_prior_idle="
+                                                f"{_s0_min_idle!r}s >10s or <2 snapshots "
+                                                f"({len(_s0_idle_hist)}) — genuine write"
+                                            )
+                                else:
+                                    # No idle history — fall back to linger cache
+                                    import time as _s0_lc_t
+                                    _s0_lg_entry = _get_recent_remote_write(_nfe_result_ip)
+                                    if _s0_lg_entry:
+                                        _s0_lg_age = _s0_lc_t.time() - _s0_lg_entry[0]
+                                        if _s0_lg_age >= _BURST_WINDOW_S:
+                                            _s0_is_monitor = True
+                                            _s0_mon_reason = (
+                                                f"no idle history; linger cache: last "
+                                                f"confirmed write {_s0_lg_age:.1f}s ago "
+                                                f"(file={_s0_lg_entry[1]!r})"
+                                            )
+                                        else:
+                                            _s0_mon_reason = (
+                                                f"no idle history; burst range: last write "
+                                                f"{_s0_lg_age:.3f}s ago — trusting handle"
+                                            )
+                                    else:
+                                        _s0_mon_reason = "no idle history, no linger entry"
+                                _gei.info(
+                                    f"[_get_editor_info] Step0-priority: persistent-monitor "
+                                    f"gate (modified event) ip={_nfe_result_ip!r}: "
+                                    f"is_monitor={_s0_is_monitor} "
+                                    f"reason={_s0_mon_reason!r} "
+                                    f"idle_hist_count={len(_s0_idle_hist)}"
+                                )
+                            except Exception as _s0_pm_err:
+                                _gei.info(
+                                    f"[_get_editor_info] Step0-priority: persistent-monitor "
+                                    f"gate check failed ({_s0_pm_err!r}) — returning early"
+                                )
+                            if _s0_is_monitor:
+                                _s0_linger_gate = True
+                                _gei.info(
+                                    f"[_get_editor_info] Step0-priority: LINGER-GATE "
+                                    f"fired (modified, persistent-monitor) — "
+                                    f"ip={_nfe_result_ip!r}: {_s0_mon_reason}; "
+                                    f"NOT returning early, falling through to Step1"
+                                )
+                                _nfe_result_user = ""
+                                break  # exit handle loop without returning early
+
+                        if not _s0_linger_gate:
+                            _gei.info(
+                                f"[_get_editor_info] Step0-priority: returning early "
+                                f"(remote write confirmed) ip={_nfe_result_ip!r}"
+                            )
+                            info["user"]    = _nfe_result_user
+                            info["machine"] = _nfe_result_machine.lstrip("\\")
+                            info["ip"]      = _nfe_result_ip
+                            if _nfe_result_ip:
+                                _record_remote_write(_nfe_result_ip, filepath)
+                                _gei.info(
+                                    f"[_get_editor_info] Step0-priority: recorded remote "
+                                    f"write by ip={_nfe_result_ip!r} "
+                                    f"(filepath={filepath!r}) for burst-sibling detection"
+                                )
+                            return info
+
+                    if not _nfe_result_user and not _s0_linger_gate:
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum: "
+                            f"no handle matched target file {_nfe_filename!r} — "
+                            f"file handle may have closed already or was a local write; "
+                            f"falling through to NTFS owner lookup"
+                        )
+                    elif _s0_linger_gate:
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority NetFileEnum: "
+                            f"linger gate fired for modified event — "
+                            f"skipping early return, falling through to Step1"
+                        )
+                else:
+                    _gei.info(
+                        f"[_get_editor_info] Step0-priority NetFileEnum: "
+                        f"all signatures failed on {remote_host!r} — "
+                        f"falling through to snapshot heuristic then NTFS owner"
+                    )
+                    _same_host_nfe_available = False  # cache: don't probe again
+            except ImportError:
+                _gei.info(
+                    f"[_get_editor_info] Step0-priority NetFileEnum: "
+                    f"win32net not available — falling through to snapshot heuristic"
+                )
+                _nfe_attempted = False
+            except Exception as _nfe_outer:
+                _gei.info(
+                    f"[_get_editor_info] Step0-priority NetFileEnum: "
+                    f"unexpected error {_nfe_outer!r} — falling through"
+                )
+
+            # ── Step0-priority (B): 'net file' subprocess fallback ────────────
+            # NetFileEnum via pywin32 requires admin rights on this build (winerror=5).
+            # 'net file' is the CLI equivalent — it queries the same MRxSMB/LanmanServer
+            # open-file table and runs under the current process token. If the app
+            # is running as the share-owning user it usually has sufficient rights.
+            # Output format (English locale):
+            #   ID    Path                                    User name            # Locks
+            #   ----  --------------------------------------  -------------------  ------
+            #   123   D:\testshare\Screenshot...png           user                      0
+            if not _nfe_succeeded:
+                try:
+                    _net_file_result = subprocess.run(
+                        ["net", "file"],
+                        capture_output=True, text=True, timeout=5,
+                        creationflags=_WIN_NO_WINDOW,
+                    )
+                    _net_file_out = _net_file_result.stdout or ""
+                    _gei.info(
+                        f"[_get_editor_info] Step0-priority 'net file': "
+                        f"rc={_net_file_result.returncode} "
+                        f"stdout_lines={len(_net_file_out.splitlines())} "
+                        f"stderr={_net_file_result.stderr.strip()!r}"
+                    )
+                    _gei.info(
+                        f"[_get_editor_info] Step0-priority 'net file' full output:\n"
+                        f"{_net_file_out}"
+                    )
+                    if _net_file_result.returncode == 0 and _net_file_out.strip():
+                        _same_host_net_file_available = True
+                        # Parse: each open file spans one line after the header separator.
+                        # Columns are fixed-width or tab-separated depending on OS version.
+                        # We look for any line containing our target filename.
+                        _net_file_matched_user = ""
+                        for _nf_line in _net_file_out.splitlines():
+                            _nf_line_lower = _nf_line.lower()
+                            if _nfe_filename.lower() not in _nf_line_lower:
+                                continue
+                            _gei.info(
+                                f"[_get_editor_info] Step0-priority 'net file': "
+                                f"matched line: {_nf_line!r}"
+                            )
+                            # Extract username — it's the 3rd whitespace-delimited token
+                            # on lines like: "123   D:\path\file   username   0"
+                            # Split carefully: ID, path (may have spaces), user, locks
+                            # Strategy: split from right — last token=locks, second-to-last=user
+                            _nf_parts = _nf_line.split()
+                            _gei.info(
+                                f"[_get_editor_info] Step0-priority 'net file': "
+                                f"parsed parts={_nf_parts!r}"
+                            )
+                            if len(_nf_parts) >= 3:
+                                # Locks count is numeric last token; user is second-to-last
+                                _nf_locks = _nf_parts[-1]
+                                _nf_user  = _nf_parts[-2] if _nf_locks.isdigit() else _nf_parts[-1]
+                                _nf_user_lower = _nf_user.lower()
+                                _is_local = (
+                                    _nf_user_lower == _own_user_nfe or
+                                    _nf_user_lower.endswith("\\" + _own_user_nfe) or
+                                    _nf_user_lower == _own_host_nfe or
+                                    _nf_user_lower.endswith("\\" + _own_host_nfe)
+                                )
+                                _gei.info(
+                                    f"[_get_editor_info] Step0-priority 'net file': "
+                                    f"extracted user={_nf_user!r} is_local={_is_local} "
+                                    f"(compared_against: own_user={_own_user_nfe!r} "
+                                    f"own_host={_own_host_nfe!r})"
+                                )
+                                if not _is_local and _nf_user:
+                                    _net_file_matched_user = _nf_user
+                                    break
+                        if _net_file_matched_user:
+                            # Resolve IP from snapshot
+                            _nf_result_machine = ""
+                            _nf_result_ip      = ""
+                            for _snap_s in (smb_sessions_snapshot or []):
+                                _snap_u = _snap_s.get("username", "").lower()
+                                if (_snap_u == _net_file_matched_user.lower() or
+                                        _net_file_matched_user.lower().endswith("\\" + _snap_u)):
+                                    _nf_result_machine = _snap_s.get("machine", "")
+                                    _nf_result_ip      = _snap_s.get("ip", "")
+                                    break
+                            if not _nf_result_ip:
+                                _remote_snaps_nf = [
+                                    s for s in (smb_sessions_snapshot or [])
+                                    if s.get("ip") and s.get("ip") != _own_ip_nfe
+                                ]
+                                if len(_remote_snaps_nf) == 1:
+                                    _nf_result_machine = _remote_snaps_nf[0].get("machine", "")
+                                    _nf_result_ip      = _remote_snaps_nf[0].get("ip", "")
+                            info["user"]    = _net_file_matched_user
+                            info["machine"] = _nf_result_machine.lstrip("\\")
+                            info["ip"]      = _nf_result_ip
+                            _gei.info(
+                                f"[_get_editor_info] Step0-priority 'net file': MATCH → "
+                                f"user={info['user']!r} machine={info['machine']!r} "
+                                f"ip={info['ip']!r} — returning early"
+                            )
+                            return info
+                        else:
+                            _gei.info(
+                                f"[_get_editor_info] Step0-priority 'net file': "
+                                f"no remote-user handle found for {_nfe_filename!r} — "
+                                f"falling through to NTFS owner (local write assumed)"
+                            )
+                            _nfe_succeeded = True  # treat as authoritative: no remote handle
+                    else:
+                        _gei.info(
+                            f"[_get_editor_info] Step0-priority 'net file': "
+                            f"command failed or empty output — falling through to NTFS owner"
+                        )
+                        if _net_file_result.returncode != 0:
+                            _same_host_net_file_available = False  # cache: access denied
+                            if _same_host_nfe_available is False:
+                                # Both methods require admin — log a one-time actionable warning
+                                _gei.warning(
+                                    f"[_get_editor_info] ATTRIBUTION LIMITATION: Both NetFileEnum "
+                                    f"and 'net file' returned 'Access Denied' on {remote_host!r}. "
+                                    f"This means BackupSys cannot enumerate open file handles and "
+                                    f"cannot reliably distinguish local writes (you) from remote "
+                                    f"writes (coworker) on this same-host watch. "
+                                    f"FIX: Run BackupSys as Administrator, OR grant the running "
+                                    f"account SeLockMemoryPrivilege / local admin rights on this PC. "
+                                    f"Until then, attribution will fall back to NTFS owner (always "
+                                    f"shows the share host account for both local and remote writes)."
+                                )
+                except Exception as _nf_sub_err:
+                    _gei.info(
+                        f"[_get_editor_info] Step0-priority 'net file': "
+                        f"subprocess error {_nf_sub_err!r} — falling through to NTFS owner"
+                    )
+
+            # ── Step1-early: NTFS owner lookup.
+            # This runs whether NetFileEnum succeeded (and found no remote handle,
+            # confirming a local write) OR failed entirely. NTFS owner is the most
+            # reliable signal for local writes: files written directly on this
+            # machine's console carry the real local account as NTFS owner.
+            # We try this BEFORE the snapshot fallback because the snapshot heuristic
+            # (single remote session) is unreliable — a stale open session from a
+            # coworker who merely has the share mapped will always be present, causing
+            # false attribution to them even when the local machine did the write.
+            _ntfs_owner_result = {}
+            try:
+                import win32security
+                sd  = win32security.GetFileSecurity(
+                    filepath, win32security.OWNER_SECURITY_INFORMATION)
+                sid = sd.GetSecurityDescriptorOwner()
+                name, domain, _ = win32security.LookupAccountSid(None, sid)
+                _ntfs_machine = ""
+                _ntfs_ip      = ""
+                try:
+                    _ntfs_machine = socket.gethostname()
+                except Exception:
+                    pass
+                try:
+                    _ntfs_ip = socket.gethostbyname(_ntfs_machine) if _ntfs_machine else ""
+                except Exception:
+                    pass
+                _ntfs_owner_result = {"user": name, "machine": _ntfs_machine, "ip": _ntfs_ip}
+                _gei.info(
+                    f"[_get_editor_info] Step1-early (same-host owner lookup): "
+                    f"SUCCESS owner={name!r} domain={domain!r} — "
+                    f"NetFileEnum_succeeded={_nfe_succeeded}"
+                )
+            except Exception as _s1e0:
+                _gei.info(
+                    f"[_get_editor_info] Step1-early (same-host owner lookup): "
+                    f"FAILED — {_s1e0!r} (file already gone, or pywin32 absent)"
+                )
+
+            # If NetFileEnum ran successfully and found no remote handle, the handle
+            # may have already closed (remote client finished writing before attribution
+            # ran). Check the snapshot for a single active remote session (idle_time=0)
+            # before concluding the write was local — NTFS owner is always the share
+            # host's account for remotely-written files, so it cannot distinguish the two.
+            if _nfe_succeeded and _ntfs_owner_result:
+                # idle_time threshold: covers debounce delay (~2s) + processing time.
+                # Windows updates idle_time in whole-second ticks, so a client that
+                # just closed a file may show idle_time=1 by the time attribution runs.
+                _NFE_IDLE_THRESHOLD = 5
+                # "Persistent monitor" threshold: if the client's idle_time in the most
+                # recent session-poller snapshot was ALREADY <= this, they were active
+                # before the event too → background monitor, not a write signal.
+                # Use the SAME value as _NFE_IDLE_THRESHOLD: if prior_idle > 5s the
+                # client was genuinely idle before the event → the current activity IS
+                # the write.  30s was too loose: a prior_idle of ~7s still means the
+                # client was idle before the write and should be attributed as the writer.
+                _NFE_MONITOR_THRESHOLD = 5
+                _all_remote_sessions = [
+                    s for s in (smb_sessions_snapshot or [])
+                    if s.get("ip") and s.get("ip") != _own_ip_gei0
+                    and s.get("machine", "").lower().rstrip("\\") != _own_host_gei0
+                ]
+                _nfe_remote_active = [
+                    s for s in _all_remote_sessions
+                    if s.get("idle_time", 999) <= _NFE_IDLE_THRESHOLD
+                ]
+                _gei.info(
+                    f"[_get_editor_info] Step1-early: NetFileEnum found no open handle — "
+                    f"checking snapshot for recently-active remote sessions "
+                    f"(idle_time<={_NFE_IDLE_THRESHOLD}s): "
+                    f"{len(_nfe_remote_active)}/{len(_all_remote_sessions)} qualify — "
+                    f"all_remote={[(s.get('ip'), s.get('idle_time')) for s in _all_remote_sessions]!r} "
+                    f"active={_nfe_remote_active!r}"
+                )
+                if len(_nfe_remote_active) == 1:
+                    _rs = _nfe_remote_active[0]
+                    _rs_ip = _rs.get("ip", "")
+                    _rs_idle_now = _rs.get("idle_time", 999)
+
+                    # ── Persistent-monitor check ─────────────────────────────────
+                    # Query the session-poller cache for recent idle_time history of
+                    # this client.  A genuine writer's idle_time drops from HIGH to 0
+                    # right at the event.  A persistent Explorer monitor oscillates
+                    # near 0 continuously (SMB keep-alives / dir refresh every ~30-60s).
+                    _prior_idle = None
+                    _rs_active_time = _rs.get("active_time", 0)
+                    _NFE_NEW_SESSION_THRESHOLD = 300  # 5 minutes
+                    _is_persistent_monitor = False
+                    _monitor_reason = ""
+                    try:
+                        import time as _nfe_t
+                        from watcher import (get_cached_session_at_time as _gcs_fn,
+                                             get_recent_idle_history as _grih_fn)
+
+                        # Pull up to 5 recent snapshots to detect oscillation pattern
+                        _idle_history = _grih_fn(
+                            remote_host or _rs_ip,
+                            _rs_ip,
+                            _nfe_t.time() - 2,
+                            _own_host_gei0, _own_ip_gei0,
+                            max_snapshots=5,
+                        )
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: idle history for "
+                            f"ip={_rs_ip!r} (newest-first, up to 5 snapshots): "
+                            f"{[(round(_nfe_t.time()-2-ts, 0), idle) for ts, idle in _idle_history]!r} "
+                            f"(seconds-before-event, idle_time)"
+                        )
+
+                        # Determine prior_idle from most-recent snapshot
+                        if _idle_history:
+                            _prior_idle = _idle_history[0][1]  # most recent before event
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: prior cache entry "
+                            f"{'found' if _idle_history else 'NOT FOUND'} for ip={_rs_ip!r}: "
+                            f"prior_idle={_prior_idle!r} "
+                            f"(cache has idle_time={_prior_idle is not None})"
+                        )
+
+                        if not _idle_history:
+                            # No cache entry yet — use active_time heuristic
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: no usable prior cache entry "
+                                f"for ip={_rs_ip!r} — using active_time heuristic: "
+                                f"active_time={_rs_active_time}s threshold={_NFE_NEW_SESSION_THRESHOLD}s"
+                            )
+                            if _rs_active_time > _NFE_NEW_SESSION_THRESHOLD:
+                                _is_persistent_monitor = True
+                                _monitor_reason = (
+                                    f"no prior cache entry; active_time={_rs_active_time}s "
+                                    f"> {_NFE_NEW_SESSION_THRESHOLD}s (connected before app started)"
+                                )
+                            else:
+                                _monitor_reason = (
+                                    f"no prior cache entry; active_time={_rs_active_time}s "
+                                    f"<= {_NFE_NEW_SESSION_THRESHOLD}s (recently connected — treating as writer)"
+                                )
+                        else:
+                            # We have idle history.  Apply two checks:
+                            #
+                            # CHECK A — any prior snapshot already near-zero?
+                            # If the client had idle_time <= _NFE_MONITOR_THRESHOLD in
+                            # ANY recent snapshot, they were actively hitting the server
+                            # before this event too → Explorer monitor, not a writer.
+                            _NFE_MONITOR_THRESHOLD = 5
+                            _low_idle_snaps = [
+                                (ts, idle) for ts, idle in _idle_history
+                                if idle is not None and idle <= _NFE_MONITOR_THRESHOLD
+                            ]
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: CHECK A — "
+                                f"prior snapshots with idle<={_NFE_MONITOR_THRESHOLD}s: "
+                                f"{len(_low_idle_snaps)}/{len(_idle_history)} "
+                                f"low_idle_snaps={[(round(_nfe_t.time()-2-ts, 0), idle) for ts, idle in _low_idle_snaps]!r}"
+                            )
+                            if _low_idle_snaps:
+                                _is_persistent_monitor = True
+                                _monitor_reason = (
+                                    f"prior idle history shows low-idle snapshots: "
+                                    f"{[(round(_nfe_t.time()-2-ts, 0), idle) for ts, idle in _low_idle_snaps]!r} "
+                                    f"(persistent Explorer monitor)"
+                                )
+                            else:
+                                # CHECK B — did idle drop from a sufficiently high value?
+                                # All prior snapshots had idle_time > threshold.
+                                # ALSO require >= 2 prior snapshots: a single data point
+                                # (e.g. from the very first poll after app startup) cannot
+                                # confirm "consistently idle before write" — the remote
+                                # machine's idle may have just been reset by a CHANGE_NOTIFY
+                                # response triggered by the local write we're attributing.
+                                # With only 1 snapshot fall back to the active_time heuristic.
+                                _NFE_CLEAR_IDLE_THRESHOLD = 10
+                                _NFE_MIN_SNAPSHOTS = 2
+                                _all_have_idle = all(
+                                    idle is not None for _, idle in _idle_history
+                                )
+                                _min_prior_idle = min(
+                                    (idle for _, idle in _idle_history if idle is not None),
+                                    default=None
+                                )
+                                _gei.info(
+                                    f"[_get_editor_info] Step1-early: CHECK B — "
+                                    f"snapshots={len(_idle_history)} min_required={_NFE_MIN_SNAPSHOTS} "
+                                    f"all_have_idle_field={_all_have_idle} "
+                                    f"min_prior_idle={_min_prior_idle!r} "
+                                    f"clear_idle_threshold={_NFE_CLEAR_IDLE_THRESHOLD}s"
+                                )
+                                if len(_idle_history) < _NFE_MIN_SNAPSHOTS:
+                                    # Too few snapshots to apply CHECK B's "all snapshots
+                                    # agree" rule.
+                                    #
+                                    # KEY AMBIGUITY: a high prior_idle dropping to 0 at
+                                    # event time has TWO equally valid causes:
+                                    #   (A) Remote client actually wrote the file.
+                                    #   (B) Local user wrote the file → server sent SMB
+                                    #       CHANGE_NOTIFY to the remote client → their
+                                    #       SMB client responded, resetting idle_time to 0.
+                                    #
+                                    # We cannot distinguish (A) from (B) with a single
+                                    # snapshot.  A long-running session (active_time >> 5min)
+                                    # that was idle for minutes and then suddenly active
+                                    # right when a file appeared is exactly the pattern you
+                                    # see from a passive Explorer window receiving
+                                    # CHANGE_NOTIFY.  Only a SHORT-lived session (recently
+                                    # connected, < _NFE_NEW_SESSION_THRESHOLD) where prior
+                                    # idle was also high gives meaningful confidence of a
+                                    # genuine write — the client connected specifically to
+                                    # upload, not to monitor.
+                                    _NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE = 30
+                                    if (_min_prior_idle is not None and
+                                            _min_prior_idle > _NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE and
+                                            _rs_active_time <= _NFE_NEW_SESSION_THRESHOLD):
+                                        # Short session + high prior idle = recently
+                                        # connected for the purpose of writing.
+                                        _monitor_reason = (
+                                            f"only {len(_idle_history)} prior snapshot(s), but "
+                                            f"idle={_min_prior_idle}s > "
+                                            f"{_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
+                                            f"active_time={_rs_active_time}s <= "
+                                            f"{_NFE_NEW_SESSION_THRESHOLD}s — recently connected "
+                                            f"to write, not a passive monitor"
+                                        )
+                                        _gei.info(
+                                            f"[_get_editor_info] Step1-early: CHECK B "
+                                            f"single-snapshot override — prior_idle="
+                                            f"{_min_prior_idle}s > "
+                                            f"{_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
+                                            f"active_time={_rs_active_time}s <= "
+                                            f"{_NFE_NEW_SESSION_THRESHOLD}s — "
+                                            f"recently connected to write → NOT a monitor"
+                                        )
+                                    elif _rs_active_time > _NFE_NEW_SESSION_THRESHOLD:
+                                        # Long-running session + only 1 snapshot: the
+                                        # idle_time=0 at event time is ambiguous — it is
+                                        # indistinguishable from an SMB CHANGE_NOTIFY
+                                        # response triggered by a LOCAL write on this
+                                        # machine.  The coworker had the share open as a
+                                        # passive observer (Explorer mapped drive, etc.)
+                                        # and Windows notified them when the file appeared.
+                                        #
+                                        # TIEBREAKER — own-session loopback check:
+                                        # When the local machine copies files INTO its own
+                                        # SMB share via Explorer, Windows opens a NEW
+                                        # loopback SMB session to itself.  This appears in
+                                        # NetSessionEnum with is_own=True and a very short
+                                        # active_time (typically < 30s).
+                                        # _build_snapshot (watcher.py) now records the
+                                        # minimum own-session active_time in every accepted
+                                        # snapshot entry as 'own_min_active_time'.
+                                        #
+                                        # If that value is < 30s → local loopback write in
+                                        # progress → conservative NTFS fallback (correct).
+                                        # BUT: a loopback session opened for a PRIOR local
+                                        # write stays alive and keeps aging.  At t=0 we copy
+                                        # our files (own_min_active_time=9s ✓).  At t=7s our
+                                        # coworker copies their files, but the same loopback
+                                        # session is now active_time=16s — still < 30s, so
+                                        # the check would wrongly flag it as a fresh local
+                                        # write.
+                                        #
+                                        # FIX: compute the loopback session's estimated
+                                        # creation time (= now − active_time).  If that
+                                        # predates the last confirmed own write (recorded
+                                        # by _record_own_write when NTFS fallback fires),
+                                        # the session is STALE — it belongs to that prior
+                                        # write, not this event → skip loopback detection
+                                        # and treat this event as potentially remote.
+                                        _OWN_LOOPBACK_THRESHOLD = 30  # seconds
+                                        _own_min_at = _rs.get("own_min_active_time")
+                                        import time as _lb_t
+                                        _prior_own = _get_recent_own_write()
+                                        # Estimate when the loopback session was created
+                                        _loopback_created_at = (
+                                            _lb_t.time() - _own_min_at
+                                            if _own_min_at is not None else None
+                                        )
+                                        # Is the loopback session stale? (created before
+                                        # the last confirmed own write, with a small grace
+                                        # window for clock jitter)
+                                        _STALE_GRACE_S = 2
+                                        _loopback_is_stale = (
+                                            _prior_own is not None and
+                                            _loopback_created_at is not None and
+                                            _loopback_created_at <= (_prior_own[0] + _STALE_GRACE_S)
+                                        )
+                                        _gei.info(
+                                            f"[_get_editor_info] Step1-early: CHECK B "
+                                            f"single-snapshot LOOPBACK-CHECK — "
+                                            f"own_min_active_time={_own_min_at!r}s "
+                                            f"threshold={_OWN_LOOPBACK_THRESHOLD}s "
+                                            f"active_time={_rs_active_time}s > "
+                                            f"{_NFE_NEW_SESSION_THRESHOLD}s "
+                                            f"loopback_created_at={_loopback_created_at!r} "
+                                            f"prior_own_write_ts={_prior_own[0] if _prior_own else None!r} "
+                                            f"prior_own_write_file={_prior_own[1] if _prior_own else None!r} "
+                                            f"loopback_is_stale={_loopback_is_stale} "
+                                            f"(stale=session belongs to prior local write, "
+                                            f"not this event)"
+                                        )
+                                        if (_own_min_at is not None and
+                                                _own_min_at < _OWN_LOOPBACK_THRESHOLD and
+                                                not _loopback_is_stale):
+                                            # Fresh loopback session (not stale) → local write
+                                            _is_persistent_monitor = True
+                                            _monitor_reason = (
+                                                f"only {len(_idle_history)} prior snapshot(s); "
+                                                f"own-machine loopback SMB session has "
+                                                f"active_time={_own_min_at}s < "
+                                                f"{_OWN_LOOPBACK_THRESHOLD}s and is not stale "
+                                                f"(created after last own write) — local file-copy "
+                                                f"detected (Explorer loopback write). "
+                                                f"Remote session idle_time=0 is CHANGE_NOTIFY "
+                                                f"noise, not a write. "
+                                                f"→ conservative fallback to NTFS owner."
+                                            )
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: CHECK B "
+                                                f"single-snapshot LOOPBACK-LOCAL — "
+                                                f"own_min_active_time={_own_min_at}s < "
+                                                f"{_OWN_LOOPBACK_THRESHOLD}s, not stale → "
+                                                f"LOCAL write by own machine. "
+                                                f"Remote idle_time=0 is CHANGE_NOTIFY noise. "
+                                                f"Falling back to NTFS owner (correct)."
+                                            )
+                                        elif (_own_min_at is not None and
+                                                _own_min_at < _OWN_LOOPBACK_THRESHOLD and
+                                                _loopback_is_stale):
+                                            # Loopback session exists but is stale — it was
+                                            # opened for our PREVIOUS write, not this event.
+                                            # Do NOT treat this as a local write signal.
+                                            # Fall through to conservative NTFS anyway (1 snapshot).
+                                            _is_persistent_monitor = True
+                                            _monitor_reason = (
+                                                f"only {len(_idle_history)} prior snapshot(s); "
+                                                f"own-machine loopback SMB session "
+                                                f"(active_time={_own_min_at}s < "
+                                                f"{_OWN_LOOPBACK_THRESHOLD}s) is STALE — "
+                                                f"created at ~{_loopback_created_at:.1f} which "
+                                                f"predates/matches last confirmed own write at "
+                                                f"{_prior_own[0]:.1f} "
+                                                f"(file={_prior_own[1]!r}). "
+                                                f"This event may be a remote write. "
+                                                f"Falling back to NTFS owner (ambiguous)."
+                                            )
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: CHECK B "
+                                                f"single-snapshot LOOPBACK-STALE — "
+                                                f"loopback session (active_time={_own_min_at}s) "
+                                                f"was opened for prior own write, not this event. "
+                                                f"loopback_created≈{_loopback_created_at:.1f} "
+                                                f"last_own_write={_prior_own[0]:.1f} "
+                                                f"(file={_prior_own[1]!r}). "
+                                                f"Skipping loopback-local conclusion. "
+                                                f"Falling back to NTFS owner (ambiguous — "
+                                                f"enable SACL for definitive attribution)."
+                                            )
+                                        else:
+                                            # No loopback evidence + only 1 snapshot →
+                                            # conservative NTFS fallback.
+                                            _is_persistent_monitor = True
+                                            _monitor_reason = (
+                                                f"only {len(_idle_history)} prior snapshot(s) — "
+                                                f"insufficient to distinguish genuine write from "
+                                                f"CHANGE_NOTIFY response; "
+                                                f"active_time={_rs_active_time}s > "
+                                                f"{_NFE_NEW_SESSION_THRESHOLD}s (long-running passive "
+                                                f"session); own_min_active_time={_own_min_at!r}s "
+                                                f"(no fresh loopback — ambiguous) → conservative "
+                                                f"fallback to NTFS owner. "
+                                                f"Enable SACL for definitive attribution."
+                                            )
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: CHECK B "
+                                                f"single-snapshot AMBIGUOUS — prior_idle="
+                                                f"{_min_prior_idle!r}s, active_time="
+                                                f"{_rs_active_time}s > {_NFE_NEW_SESSION_THRESHOLD}s, "
+                                                f"own_min_active_time={_own_min_at!r}s. "
+                                                f"idle_time drop to 0 is indistinguishable from "
+                                                f"SMB CHANGE_NOTIFY response to a local write. "
+                                                f"Falling back to NTFS owner (conservative)."
+                                            )
+                                    else:
+                                        _monitor_reason = (
+                                            f"only {len(_idle_history)} prior snapshot(s) — "
+                                            f"insufficient pattern; "
+                                            f"active_time={_rs_active_time}s <= {_NFE_NEW_SESSION_THRESHOLD}s "
+                                            f"→ treating as writer (recently connected)"
+                                        )
+                                elif _min_prior_idle is not None and _min_prior_idle > _NFE_CLEAR_IDLE_THRESHOLD:
+                                    # 2+ snapshots all show client was clearly idle → genuine write
+                                    _monitor_reason = (
+                                        f"prior idle history all > {_NFE_CLEAR_IDLE_THRESHOLD}s "
+                                        f"(min={_min_prior_idle}s, snapshots={len(_idle_history)}) "
+                                        f"→ genuine write signal"
+                                    )
+                                else:
+                                    # Can't be confident — conservative fallback
+                                    _is_persistent_monitor = True
+                                    _monitor_reason = (
+                                        f"prior idle history ambiguous "
+                                        f"(min_prior_idle={_min_prior_idle!r} <= {_NFE_CLEAR_IDLE_THRESHOLD}s "
+                                        f"or no idle_time field) → conservative fallback to NTFS owner"
+                                    )
+                    except Exception as _hist_err:
+                        _monitor_reason = f"history lookup failed: {_hist_err!r}"
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: session history lookup failed "
+                            f"({_hist_err!r}) — will treat as non-monitor"
+                        )
+                    _gei.info(
+                        f"[_get_editor_info] Step1-early: persistent-monitor check for "
+                        f"ip={_rs_ip!r}: current_idle={_rs_idle_now}s "
+                        f"active_time={_rs_active_time}s "
+                        f"prior_idle={_prior_idle!r}s "
+                        f"monitor_threshold={_NFE_MONITOR_THRESHOLD}s "
+                        f"new_session_threshold={_NFE_NEW_SESSION_THRESHOLD}s "
+                        f"is_persistent_monitor={_is_persistent_monitor} "
+                        f"reason={_monitor_reason!r}"
+                    )
+
+                    # ── Linger check ──────────────────────────────────────────────
+                    # Even if the monitor check says "not persistent", the remote
+                    # client's idle_time=0 may be RESIDUAL from a write they completed
+                    # recently (SMB sessions keep idle_time near 0 for ~10-30s after a
+                    # file close).  If we already attributed a write to this IP within
+                    # the last _RECENT_WRITE_LINGER_S seconds, their current idle_time=0
+                    # is most likely leftover from THAT write, not from this new file.
+                    if not _is_persistent_monitor:
+                        import time as _linger_t
+                        _linger_entry = _get_recent_remote_write(_rs_ip)
+                        if _linger_entry:
+                            _linger_age = _linger_t.time() - _linger_entry[0]
+                            if _linger_age < _BURST_WINDOW_S:
+                                # File arrived within the burst window of the last confirmed
+                                # remote write — this is a simultaneous multi-file upload,
+                                # NOT residual idle_time=0 from a previous write.
+                                # Attribute to the remote user and record this write too.
+                                _gei.info(
+                                    f"[_get_editor_info] Step1-early: LINGER CHECK — "
+                                    f"ip={_rs_ip!r} last attributed write was only "
+                                    f"{_linger_age:.3f}s ago (file={_linger_entry[1]!r}) — "
+                                    f"within burst window ({_BURST_WINDOW_S}s); "
+                                    f"treating as same-burst upload, NOT residual linger"
+                                )
+                                _monitor_reason = (
+                                    f"burst: sibling file of write by {_rs_ip!r} "
+                                    f"{_linger_age:.3f}s ago (within {_BURST_WINDOW_S}s burst window)"
+                                )
+                                # fall through — _is_persistent_monitor stays False
+                            else:
+                                _gei.info(
+                                    f"[_get_editor_info] Step1-early: LINGER CHECK — "
+                                    f"ip={_rs_ip!r} last attributed write was "
+                                    f"{_linger_age:.1f}s ago (file={_linger_entry[1]!r}), "
+                                    f"linger_window={_RECENT_WRITE_LINGER_S}s — "
+                                    f"idle_time=0 may be residual; treating as persistent monitor "
+                                    f"and falling back to NTFS owner"
+                                )
+                                _is_persistent_monitor = True
+                                _monitor_reason = (
+                                    f"linger: last confirmed remote write by {_rs_ip!r} was "
+                                    f"{_linger_age:.1f}s ago — idle_time=0 is residual"
+                                )
+                        else:
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: LINGER CHECK — "
+                                f"ip={_rs_ip!r} no recent write in cache (or expired) — "
+                                f"idle_time=0 treated as genuine write signal"
+                            )
+
+                    # ── Burst override ────────────────────────────────────────────
+                    # The persistent-monitor check may have concluded is_persistent_monitor=True
+                    # due to insufficient snapshot history (e.g. app just started, only 1 poll).
+                    # Before giving up, check if this remote IP just had a CONFIRMED write
+                    # recorded (e.g. Step0 NFE handle matched a burst sibling a moment ago).
+                    # If so, this file is part of the same upload burst → override.
+                    if _is_persistent_monitor:
+                        import time as _burst_ov_t
+                        _burst_ov_entry = _get_recent_remote_write(_rs_ip)
+                        if _burst_ov_entry:
+                            _burst_ov_age = _burst_ov_t.time() - _burst_ov_entry[0]
+                            if _burst_ov_age < _BURST_WINDOW_S:
+                                _is_persistent_monitor = False
+                                _monitor_reason = (
+                                    f"burst-override: sibling of confirmed write by {_rs_ip!r} "
+                                    f"{_burst_ov_age:.3f}s ago (file={_burst_ov_entry[1]!r}) "
+                                    f"within {_BURST_WINDOW_S}s burst window — "
+                                    f"overriding persistent-monitor decision"
+                                )
+                                _gei.info(
+                                    f"[_get_editor_info] Step1-early: BURST-OVERRIDE — "
+                                    f"ip={_rs_ip!r} had a confirmed write {_burst_ov_age:.3f}s ago "
+                                    f"(file={_burst_ov_entry[1]!r}) within burst window "
+                                    f"({_BURST_WINDOW_S}s); overriding is_persistent_monitor=True "
+                                    f"→ treating as same-burst sibling"
+                                )
+                            else:
+                                _gei.info(
+                                    f"[_get_editor_info] Step1-early: BURST-OVERRIDE skipped — "
+                                    f"ip={_rs_ip!r} last write was {_burst_ov_age:.1f}s ago "
+                                    f"(file={_burst_ov_entry[1]!r}) — outside burst window "
+                                    f"({_BURST_WINDOW_S}s); keeping persistent-monitor decision"
+                                )
+                        else:
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: BURST-OVERRIDE — "
+                                f"ip={_rs_ip!r} no recent write in cache — "
+                                f"keeping persistent-monitor decision"
+                            )
+
+                    if _is_persistent_monitor:
+                        # Client was already active before this event; their current
+                        # idle_time=0 is background noise, not a write signal.
+                        # Fall back to NTFS owner (conservative).
+                        # NOTE: this will misattribute coworker writes when they are
+                        # ALSO always monitoring the share.  Enable SACL (run
+                        # Enable-PSRemoting -Force as Admin on this PC) for definitive
+                        # per-file attribution.
+                        info.update(_ntfs_owner_result)
+                        # Record this as a confirmed local write so the loopback check
+                        # can distinguish a stale own-session from a fresh one on the
+                        # next event (e.g. coworker uploads right after us).
+                        _record_own_write(filepath)
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: persistent monitor — "
+                            f"falling back to NTFS owner ({_monitor_reason}). "
+                            f"Recorded as confirmed local write (own-write cache updated). "
+                            f"NOTE: if this is wrong (coworker also monitors), enable SACL."
+                        )
+                        return info
+
+                    # ── NFE file-handle cross-check (informational only) ─────────────
+                    # Log open handle breakdown for debugging.  We do NOT block on
+                    # "no file handles" here — a completed write closes the file handle
+                    # immediately, so file_handles=0 is the NORMAL case when attribution
+                    # runs after the write is done.  The prior_idle check above is the
+                    # authoritative signal; this block is for debug visibility only.
+                    if _nfe_succeeded and _nfe_entries is not None:
+                        _nfe_filename_lower = _nfe_filename.lower()
+                        _nfe_file_handles   = []
+                        _nfe_dir_handles    = []
+                        for _nfe_chk in _nfe_entries:
+                            _chk_path = (
+                                _nfe_chk.get("fi3_pathname") or _nfe_chk.get("pathname") or
+                                _nfe_chk.get("fi2_pathname") or _nfe_chk.get("path") or
+                                _nfe_chk.get("path_name") or ""
+                            ).lower()
+                            _chk_perm = _nfe_chk.get("permissions", 1)
+                            _chk_is_file = (
+                                _nfe_filename_lower in _chk_path or
+                                (_chk_perm > 1 and not _chk_path.endswith("\\"))
+                            )
+                            if _chk_is_file:
+                                _nfe_file_handles.append(_nfe_chk)
+                            elif _chk_path.endswith("\\") or _chk_path.endswith("/"):
+                                _nfe_dir_handles.append(_nfe_chk)
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: NFE handle breakdown (info only) — "
+                            f"total_handles={len(_nfe_entries)} "
+                            f"file_handles={len(_nfe_file_handles)} "
+                            f"dir_only_handles={len(_nfe_dir_handles)} "
+                            f"file_handle_paths={[(_nfe_chk.get('path_name') or _nfe_chk.get('path','')) for _nfe_chk in _nfe_file_handles]!r} "
+                            f"(file_handles=0 is normal — write handle closes before attribution runs)"
+                        )
+
+                    info["user"]    = _rs.get("username") or _rs.get("user") or ""
+                    info["machine"] = _rs.get("machine", "").lstrip("\\")
+                    info["ip"]      = _rs.get("ip", "")
+                    # Record this attribution so future events can detect idle linger
+                    _record_remote_write(_rs_ip, filepath)
+                    _gei.info(
+                        f"[_get_editor_info] Step1-early: single recently-active remote session "
+                        f"(idle_time={_rs_idle_now}s <= {_NFE_IDLE_THRESHOLD}s, "
+                        f"active_time={_rs_active_time}s, "
+                        f"prior_idle={_prior_idle!r}s, {_monitor_reason}) "
+                        f"overrides NTFS owner — handle closed before attribution ran — "
+                        f"user={info['user']!r} machine={info['machine']!r} ip={info['ip']!r}"
+                    )
+                    return info
+                elif len(_nfe_remote_active) == 0:
+                    info.update(_ntfs_owner_result)
+                    _gei.info(
+                        f"[_get_editor_info] Step1-early: no recently-active remote sessions "
+                        f"(threshold={_NFE_IDLE_THRESHOLD}s) — "
+                        f"returning NTFS owner as confirmed local write"
+                    )
+                    return info
+                else:
+                    # Multiple recently-active remote sessions — ambiguous; fall back to NTFS owner
+                    _gei.info(
+                        f"[_get_editor_info] Step1-early: {len(_nfe_remote_active)} recently-active "
+                        f"remote sessions (threshold={_NFE_IDLE_THRESHOLD}s) — "
+                        f"ambiguous, falling back to NTFS owner"
+                    )
+                    info.update(_ntfs_owner_result)
+                    return info
+
+            # If NetFileEnum failed AND NTFS lookup succeeded, still return NTFS
+            # owner — it's more reliable than blindly trusting a stale snapshot session.
+            # The logic: a local write on the share host will always show the local
+            # account as NTFS owner. A remote write ALSO shows the local account as
+            # NTFS owner (SMB writes land under the host's credentials). So NTFS owner
+            # alone can't distinguish the two cases when NetFileEnum is unavailable.
+            # However, for the common scenario where the share owner (you) is also the
+            # one running BackupSys, local writes are far more frequent than remote ones,
+            # and defaulting to NTFS owner is correct more often than defaulting to the
+            # snapshot remote session.
+            #
+            # ── Step0b-fallback (last resort): only use the snapshot if NTFS lookup
+            # also failed (file already gone, pywin32 missing, etc.)
+            if _ntfs_owner_result:
+                info.update(_ntfs_owner_result)
+                _gei.info(
+                    f"[_get_editor_info] Step1-early: returning NTFS owner "
+                    f"(NetFileEnum unavailable; NTFS owner preferred over snapshot heuristic)"
+                )
+                return info
+
+            # Both NetFileEnum and NTFS failed — last resort: snapshot
+            _remote_snap_sessions = [
+                s for s in (smb_sessions_snapshot or [])
+                if s.get("ip") and s.get("ip") != _own_ip_gei0
+                and s.get("machine", "").lower().rstrip("\\") != _own_host_gei0
+            ]
+            _gei.info(
+                f"[_get_editor_info] Step0b-fallback (last resort — both NetFileEnum and NTFS failed): "
+                f"{len(_remote_snap_sessions)} remote session(s) in snapshot — "
+                f"snapshot={_remote_snap_sessions!r}"
+            )
+            if len(_remote_snap_sessions) == 1:
+                _rs = _remote_snap_sessions[0]
+                info["user"]    = _rs.get("username") or _rs.get("user") or ""
+                info["machine"] = _rs.get("machine", "").lstrip("\\")
+                info["ip"]      = _rs.get("ip", "")
+                _gei.info(
+                    f"[_get_editor_info] Step0b-fallback: single remote session → "
+                    f"user={info['user']!r} machine={info['machine']!r} ip={info['ip']!r} "
+                    f"— returning (last resort guess)"
+                )
+                return info
+            else:
+                _gei.info(
+                    f"[_get_editor_info] Step0b-fallback: "
+                    f"{len(_remote_snap_sessions)} remote session(s) — ambiguous or none"
+                )
+            _step1_done_early = True  # NTFS lookup already attempted above
+
     if is_unc and remote_host:
         _gei.debug(f"[_get_editor_info] UNC path — SMB host={remote_host!r}")
 
@@ -6612,6 +7896,14 @@ def _get_editor_info(filepath: str, detection_source: str = "",
         # The snapshot is taken at watchdog fire time — before the 2s debounce
         # delay closes the session. This is the only reliable way to identify
         # who deleted a file on a Windows SMB share.
+        #
+        # NOTE: when _is_same_host_watch is True, Step1 (file owner) already
+        # ran above and we only get here if it failed — so a NetSessionEnum
+        # hit at this point is genuinely a last resort, not a confident answer.
+        # We still use it (better than "Unknown"), but it is no longer the
+        # FIRST thing trusted, which is what caused changes made locally on a
+        # self-hosted share to be misattributed to an unrelated bystander
+        # machine that merely had an open session to the share.
         if smb_sessions_snapshot:
             _gei.info(
                 f"[_get_editor_info] Step0 (SMB snapshot): "
@@ -6835,6 +8127,12 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                 f"share owner, never the real remote writer). "
                 f"Falling through to Steps 2-4 (NetSessionEnum / session "
                 f"cache / Security Event Log) for real attribution."
+            )
+        elif _step1_done_early:
+            _gei.debug(
+                f"[_get_editor_info] Step1 (win32security): SKIPPED — "
+                f"already attempted (and failed) by the same-host early check "
+                f"above; retrying would just fail again the same way."
             )
         elif detection_source in ("watchdog", "unc_poll", "unc_notify"):
             try:
@@ -15684,6 +16982,20 @@ class MainWindow(QMainWindow):
         # Key: (watch_id, norm_path)  Value: threading.Event (set when delete arrives)
         self._pending_mod_before_del: dict = {}
         self._pending_mod_lock             = _threading_init.Lock()
+        # Content fingerprint cache for destination paths: lets us tell a real
+        # edit apart from a no-op SMB/NTFS write-notification.  Windows (and
+        # this app's own NtQueryDirectoryFile RestartScan cache-flushing, plus
+        # SMB2 CHANGE_NOTIFY handle-reopen churn after ERROR_NOTIFY_ENUM_DIR
+        # buffer overflows) can re-fire MODIFIED for a file that was never
+        # touched, arbitrarily long after it was created — sometimes minutes
+        # later.  A pure time-window suppression (see _SPURIOUS_MOD_WINDOW)
+        # only catches the *first* burst right after ADDED; later re-fires
+        # outside that window were previously treated as genuine edits and
+        # written to history, even though nothing changed on disk.
+        # Key: (watch_id, norm_path)  Value: (size, mtime) last accepted as
+        # the file's real state (recorded on add and on every genuine edit).
+        self._dest_content_fp: dict   = {}
+        self._dest_content_fp_lock    = _threading_init.Lock()
 
         # Load persisted history from previous sessions
         if BACKEND_AVAILABLE:
@@ -17370,764 +18682,976 @@ class MainWindow(QMainWindow):
             except Exception:
                 _local_smb_host = ""
 
-            # ── Suppress destination events caused by the backup itself ─────────
-            # Two suppression layers:
-            #
-            # 1. ACTIVE BACKUP: suppress while robocopy is running (worker present).
-            # 2. POST-BACKUP GRACE PERIOD (60 s): suppress after worker exits because
-            #    robocopy tail-end writes and the unc_poll safety-net cycle both fire
-            #    add/modified events on the destination after the backup completes.
-            #
-            # IMPORTANT: deleted and renamed events are NEVER suppressed by either
-            # layer.  A backup copy cannot delete or rename files, so those event
-            # types always represent a real user action (e.g. a coworker removing a
-            # file from the destination folder).
-            import time as _time
-            _now_mono = _time.monotonic()
-            _etype    = entry.get("type", "")
-            _is_destructive = _etype in ("deleted", "renamed")
+        # ── Suppress destination events caused by the backup itself ─────────
+        # Two suppression layers:
+        #
+        # 1. ACTIVE BACKUP: suppress while robocopy is running (worker present).
+        # 2. POST-BACKUP GRACE PERIOD (60 s): suppress after worker exits because
+        #    robocopy tail-end writes and the unc_poll safety-net cycle both fire
+        #    add/modified events on the destination after the backup completes.
+        #
+        # IMPORTANT: deleted and renamed events are NEVER suppressed by either
+        # layer.  A backup copy cannot delete or rename files, so those event
+        # types always represent a real user action (e.g. a coworker removing a
+        # file from the destination folder).
+        import time as _time
+        _now_mono = _time.monotonic()
+        _etype    = entry.get("type", "")
+        _is_destructive = _etype in ("deleted", "renamed")
 
-            # ── Early-stamp ADDED events for spurious-modified suppression ───────
-            # NOTE: The primary early-stamp is now set in _on_file_change (the
-            # outer wrapper) BEFORE attribution begins, so a concurrent MODIFIED
-            # thread can always find it even while this thread is blocked inside
-            # wevtutil / NetSessionEnum.  The update below is kept to:
-            #   a) refresh the timestamp with the post-attribution monotonic value
-            #   b) periodically prune the dict
-            _EARLY_STAMP_WINDOW = 10  # seconds
-            if _etype == "added":
-                _early_path = entry.get("path", "").lower()
-                _early_key  = (watch_id, _early_path)
-                with self._dest_added_lock:
-                    self._dest_added_early[_early_key] = _now_mono
-                    # Prune old entries
-                    if len(self._dest_added_early) > 500:
-                        _cutoff_e = _now_mono - _EARLY_STAMP_WINDOW
-                        self._dest_added_early = {
-                            k: v for k, v in self._dest_added_early.items()
-                            if v > _cutoff_e
-                        }
+        # ── Early-stamp ADDED events for spurious-modified suppression ───────
+        # NOTE: The primary early-stamp is now set in _on_file_change (the
+        # outer wrapper) BEFORE attribution begins, so a concurrent MODIFIED
+        # thread can always find it even while this thread is blocked inside
+        # wevtutil / NetSessionEnum.  The update below is kept to:
+        #   a) refresh the timestamp with the post-attribution monotonic value
+        #   b) periodically prune the dict
+        _EARLY_STAMP_WINDOW = 10  # seconds
+        if _etype == "added":
+            _early_path = entry.get("path", "").lower()
+            _early_key  = (watch_id, _early_path)
+            with self._dest_added_lock:
+                self._dest_added_early[_early_key] = _now_mono
+                # Prune old entries
+                if len(self._dest_added_early) > 500:
+                    _cutoff_e = _now_mono - _EARLY_STAMP_WINDOW
+                    self._dest_added_early = {
+                        k: v for k, v in self._dest_added_early.items()
+                        if v > _cutoff_e
+                    }
+            _dbg.info(
+                f"[desktop._on_file_change] EARLY-STAMP added (inner refresh): "
+                f"path={entry.get('path')!r} at mono={_now_mono:.3f} "
+                f"watch_id={watch_id!r} — stamp already set pre-attribution; refreshed here"
+            )
+            # ── Seed content fingerprint on ADDED ─────────────────────────────
+            # Record the file's (size, mtime) the moment it's added, so that
+            # ANY later spurious MODIFIED — even the very first one, even if
+            # it arrives after the time-window suppression below has expired —
+            # has something to compare against. Without this seed, the first
+            # late spurious MODIFIED would see "no prior fingerprint" and be
+            # incorrectly waved through as a genuine edit.
+            try:
+                _fp_seed_path = entry.get("path", "")
+                _fp_seed_stat = os.stat(_fp_seed_path)
+                # Use float mtime (sub-second precision) so that files saved
+                # within the same wall-clock second but at different milliseconds
+                # (common with Excel atomic-rename saves over SMB) are detected
+                # as changed.  int(mtime) was the previous value and caused
+                # genuine edits to be FINGERPRINT-SUPPRESSED when size happened
+                # to be the same byte count and the save landed in the same second.
+                _fp_seed_mtime = _fp_seed_stat.st_mtime  # float, not int
+                # Also compute a quick content hash (first 64 KB) as a last-resort
+                # tiebreaker for the rare case where size AND float mtime are both
+                # identical after an in-place overwrite (e.g. same-content save or
+                # a file system that rounds mtime to 1-second granularity).
+                _fp_seed_hash = None
+                try:
+                    import hashlib as _fp_hashlib
+                    _FP_HASH_BYTES = 65536  # 64 KB sample
+                    with open(_fp_seed_path, "rb") as _fp_fh:
+                        _fp_seed_hash = _fp_hashlib.sha256(_fp_fh.read(_FP_HASH_BYTES)).hexdigest()
+                except Exception as _fp_hash_err:
+                    _dbg.info(
+                        f"[desktop._on_file_change] FINGERPRINT-SEED hash failed "
+                        f"(will use size+mtime only): path={_fp_seed_path!r} "
+                        f"error={_fp_hash_err!r}"
+                    )
+                _fp_seed_tuple = (_fp_seed_stat.st_size, _fp_seed_mtime, _fp_seed_hash)
+                with self._dest_content_fp_lock:
+                    self._dest_content_fp[_early_key] = _fp_seed_tuple
                 _dbg.info(
-                    f"[desktop._on_file_change] EARLY-STAMP added (inner refresh): "
-                    f"path={entry.get('path')!r} at mono={_now_mono:.3f} "
-                    f"watch_id={watch_id!r} — stamp already set pre-attribution; refreshed here"
+                    f"[desktop._on_file_change] FINGERPRINT-SEED on added: "
+                    f"path={_fp_seed_path!r} watch_id={watch_id!r} "
+                    f"fp=(size={_fp_seed_stat.st_size}, "
+                    f"mtime_float={_fp_seed_mtime}, "
+                    f"sha256_64k={_fp_seed_hash!r})"
+                )
+            except Exception as _fp_seed_err:
+                _dbg.info(
+                    f"[desktop._on_file_change] FINGERPRINT-SEED failed (stat error, "
+                    f"will rely on first modified to seed it): path={entry.get('path')!r} "
+                    f"error={_fp_seed_err!r}"
                 )
 
-            if not _is_destructive:
-                # ── Helper: quick attribution probe ──────────────────────────────
-                # Before suppressing an added/modified event whose filename matches
-                # the last backup set, do a fast SMB audit.  If the audit resolves
-                # to a machine OTHER than our own backup machine, a coworker (not
-                # robocopy) added the file and the event must NOT be suppressed.
-                def _suppressor_probe_third_party(event_path: str, event_type_p: str) -> bool:
-                    """Return True if SMB audit identifies a third-party (non-own) actor.
-                    Returns False when audit is inconclusive or resolves to own machine."""
-                    import socket as _sp_sock
-                    import logging as _sp_log
-                    _sp = _sp_log.getLogger(__name__)
-                    try:
-                        _own_ip_sp = _sp_sock.gethostbyname(_sp_sock.gethostname())
-                        _own_host_sp = _sp_sock.gethostname().lower()
-                    except Exception:
-                        _own_ip_sp = ""
-                        _own_host_sp = ""
-                    _sp.debug(
-                        f"[desktop._on_file_change] SUPPRESSOR_PROBE: checking third-party "
-                        f"attribution for '{event_path}' type={event_type_p!r} "
-                        f"own_ip={_own_ip_sp!r} own_host={_own_host_sp!r}"
+        if not _is_destructive:
+            # ── Helper: quick attribution probe ──────────────────────────────
+            # Before suppressing an added/modified event whose filename matches
+            # the last backup set, do a fast SMB audit.  If the audit resolves
+            # to a machine OTHER than our own backup machine, a coworker (not
+            # robocopy) added the file and the event must NOT be suppressed.
+            def _suppressor_probe_third_party(event_path: str, event_type_p: str) -> bool:
+                """Return True if SMB audit identifies a third-party (non-own) actor.
+                Returns False when audit is inconclusive or resolves to own machine."""
+                import socket as _sp_sock
+                import logging as _sp_log
+                _sp = _sp_log.getLogger(__name__)
+                try:
+                    _own_ip_sp = _sp_sock.gethostbyname(_sp_sock.gethostname())
+                    _own_host_sp = _sp_sock.gethostname().lower()
+                except Exception:
+                    _own_ip_sp = ""
+                    _own_host_sp = ""
+                _sp.debug(
+                    f"[desktop._on_file_change] SUPPRESSOR_PROBE: checking third-party "
+                    f"attribution for '{event_path}' type={event_type_p!r} "
+                    f"own_ip={_own_ip_sp!r} own_host={_own_host_sp!r}"
+                )
+                try:
+                    _probe_editor = _get_editor_info(
+                        event_path,
+                        entry.get("detection_source", ""),
+                        timestamp_iso=entry.get("timestamp", ""),
+                        event_type=event_type_p,
+                        smb_audit_cfg=_smb_audit_cfg,
+                        smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
                     )
-                    try:
-                        _probe_editor = _get_editor_info(
-                            event_path,
-                            entry.get("detection_source", ""),
-                            timestamp_iso=entry.get("timestamp", ""),
-                            event_type=event_type_p,
-                            smb_audit_cfg=_smb_audit_cfg,
-                            smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
-                        )
-                        _probe_ip   = _probe_editor.get("ip", "")
-                        _probe_mach = _probe_editor.get("machine", "").lower()
-                        _probe_user = _probe_editor.get("user", "")
-                        _sp.info(
-                            f"[desktop._on_file_change] SUPPRESSOR_PROBE result: "
-                            f"user={_probe_user!r} machine={_probe_mach!r} ip={_probe_ip!r} "
-                            f"own_ip={_own_ip_sp!r} own_host={_own_host_sp!r} "
-                            f"path={event_path!r}"
-                        )
-                        if not _probe_ip and not _probe_mach:
-                            _sp.debug(
-                                f"[desktop._on_file_change] SUPPRESSOR_PROBE: inconclusive "
-                                f"(no ip/machine returned) — treating as backup-engine event"
-                            )
-                            return False
-                        _is_own = (
-                            (_own_ip_sp and _probe_ip == _own_ip_sp)
-                            or (_own_host_sp and _probe_mach == _own_host_sp)
-                        )
-                        if _is_own:
-                            _sp.debug(
-                                f"[desktop._on_file_change] SUPPRESSOR_PROBE: resolved to OWN "
-                                f"machine — this is a backup-engine write, suppressing"
-                            )
-                            return False
-                        # Resolved to a different machine → real coworker action
-                        _sp.info(
-                            f"[desktop._on_file_change] SUPPRESSOR_PROBE: THIRD-PARTY ACTOR "
-                            f"detected — user={_probe_user!r} machine={_probe_mach!r} "
-                            f"ip={_probe_ip!r} is NOT own machine ({_own_ip_sp!r}). "
-                            f"Event will NOT be suppressed."
-                        )
-                        # Pre-fill attribution into the entry so downstream enrichment
-                        # doesn't double-query SMB (saves a round-trip)
-                        entry["_probe_editor"] = _probe_editor
-                        return True
-                    except Exception as _sp_err:
-                        _sp.warning(
-                            f"[desktop._on_file_change] SUPPRESSOR_PROBE: exception during "
-                            f"attribution probe — {_sp_err!r}. Treating as backup-engine event."
+                    _probe_ip   = _probe_editor.get("ip", "")
+                    _probe_mach = _probe_editor.get("machine", "").lower()
+                    _probe_user = _probe_editor.get("user", "")
+                    _sp.info(
+                        f"[desktop._on_file_change] SUPPRESSOR_PROBE result: "
+                        f"user={_probe_user!r} machine={_probe_mach!r} ip={_probe_ip!r} "
+                        f"own_ip={_own_ip_sp!r} own_host={_own_host_sp!r} "
+                        f"path={event_path!r}"
+                    )
+                    if not _probe_ip and not _probe_mach:
+                        _sp.debug(
+                            f"[desktop._on_file_change] SUPPRESSOR_PROBE: inconclusive "
+                            f"(no ip/machine returned) — treating as backup-engine event"
                         )
                         return False
-                # ─────────────────────────────────────────────────────────────────
-
-                if watch_id in self._workers:
-                    # Suppress MODIFIED events for files being copied by the running
-                    # backup AND for files already present in the destination.
-                    # Robocopy can touch pre-existing dest files' timestamps while
-                    # copying new files into the same directory, causing Windows to
-                    # fire MODIFIED on those unchanged files.  Without suppressing
-                    # them here they would appear in History as genuine edits.
-                    # A file added by a truly remote user appears in neither set and
-                    # correctly passes through.
-                    import os as _os_ab
-                    _event_basename_ab = _os_ab.path.basename(entry.get("path", ""))
-                    _backed_fnames_ab  = self._post_backup_filenames.get(watch_id, set())
-                    _dest_fnames_ab    = self._post_backup_dest_fnames.get(watch_id, set())
-                    _is_backup_file_ab = (
-                        (not _backed_fnames_ab)
-                        or (_event_basename_ab in _backed_fnames_ab)
-                        or (_event_basename_ab in _dest_fnames_ab)
+                    _is_own = (
+                        (_own_ip_sp and _probe_ip == _own_ip_sp)
+                        or (_own_host_sp and _probe_mach == _own_host_sp)
                     )
-                    if _is_backup_file_ab:
-                        # Before suppressing, probe SMB to detect a coworker adding
-                        # a file with the same name as the currently-backed-up file.
+                    if _is_own:
+                        _sp.debug(
+                            f"[desktop._on_file_change] SUPPRESSOR_PROBE: resolved to OWN "
+                            f"machine — this is a backup-engine write, suppressing"
+                        )
+                        return False
+                    # Resolved to a different machine → real coworker action
+                    _sp.info(
+                        f"[desktop._on_file_change] SUPPRESSOR_PROBE: THIRD-PARTY ACTOR "
+                        f"detected — user={_probe_user!r} machine={_probe_mach!r} "
+                        f"ip={_probe_ip!r} is NOT own machine ({_own_ip_sp!r}). "
+                        f"Event will NOT be suppressed."
+                    )
+                    # Pre-fill attribution into the entry so downstream enrichment
+                    # doesn't double-query SMB (saves a round-trip)
+                    entry["_probe_editor"] = _probe_editor
+                    return True
+                except Exception as _sp_err:
+                    _sp.warning(
+                        f"[desktop._on_file_change] SUPPRESSOR_PROBE: exception during "
+                        f"attribution probe — {_sp_err!r}. Treating as backup-engine event."
+                    )
+                    return False
+            # ─────────────────────────────────────────────────────────────────
+
+            if watch_id in self._workers:
+                # Suppress MODIFIED events for files being copied by the running
+                # backup AND for files already present in the destination.
+                # Robocopy can touch pre-existing dest files' timestamps while
+                # copying new files into the same directory, causing Windows to
+                # fire MODIFIED on those unchanged files.  Without suppressing
+                # them here they would appear in History as genuine edits.
+                # A file added by a truly remote user appears in neither set and
+                # correctly passes through.
+                import os as _os_ab
+                _event_basename_ab = _os_ab.path.basename(entry.get("path", ""))
+                _backed_fnames_ab  = self._post_backup_filenames.get(watch_id, set())
+                _dest_fnames_ab    = self._post_backup_dest_fnames.get(watch_id, set())
+                _is_backup_file_ab = (
+                    (not _backed_fnames_ab)
+                    or (_event_basename_ab in _backed_fnames_ab)
+                    or (_event_basename_ab in _dest_fnames_ab)
+                )
+                if _is_backup_file_ab:
+                    # Before suppressing, probe SMB to detect a coworker adding
+                    # a file with the same name as the currently-backed-up file.
+                    logger.info(
+                        f"[desktop._on_file_change] SUPPRESSOR: candidate for suppression "
+                        f"during active backup — basename={_event_basename_ab!r} "
+                        f"backed_set={_backed_fnames_ab!r} "
+                        f"watch_id={watch_id!r} type={_etype!r} "
+                        f"path={entry.get('path')!r} — probing SMB attribution ..."
+                    )
+                    if _suppressor_probe_third_party(entry.get("path", ""), _etype):
+                        logger.info(
+                            f"[desktop._on_file_change] SUPPRESSOR: OVERRIDE — third-party "
+                            f"actor confirmed during active backup; NOT suppressing "
+                            f"watch_id={watch_id!r} type={_etype!r} path={entry.get('path')!r}"
+                        )
+                        # Fall through to normal processing below
+                    else:
+                        logger.debug(
+                            f"[desktop._on_file_change] SUPPRESSED dest event during backup "
+                            f"(backup-engine write confirmed or inconclusive): "
+                            f"watch_id={watch_id!r} type={_etype!r} "
+                            f"path={entry.get('path')!r}"
+                        )
+                        return
+                else:
+                    logger.debug(
+                        f"[desktop._on_file_change] ALLOWED dest event during backup — "
+                        f"filename not in backup set or dest snapshot: "
+                        f"watch_id={watch_id!r} type={_etype!r} "
+                        f"path={entry.get('path')!r} basename={_event_basename_ab!r}"
+                    )
+
+            _finish_mono = self._post_backup_finish.get(watch_id)
+            if _finish_mono is not None:
+                _elapsed = _now_mono - _finish_mono
+                if _elapsed < self._POST_BACKUP_SUPPRESS_SECS:
+                    # Suppress MODIFIED events for:
+                    #   (a) files that were actually copied by this backup, AND
+                    #   (b) files that were already present in the destination.
+                    # Robocopy touching pre-existing dest files (e.g. updating
+                    # directory timestamps) causes Windows to fire MODIFIED on those
+                    # files even though this backup didn't copy them.  Without (b),
+                    # pre-existing dest files like "test sheet.xlsx" would leak into
+                    # History as genuine edits every time any backup runs.
+                    # New files added by a truly remote user still pass through
+                    # because they appear in neither _backed_fnames nor _dest_fnames.
+                    import os as _os_gs
+                    _event_basename = _os_gs.path.basename(entry.get("path", ""))
+                    _backed_fnames  = self._post_backup_filenames.get(watch_id, set())
+                    _dest_fnames    = self._post_backup_dest_fnames.get(watch_id, set())
+                    _is_backup_file = (
+                        (not _backed_fnames)                     # no file list → suppress all
+                        or (_event_basename in _backed_fnames)   # file was newly copied this run
+                        or (_event_basename in _dest_fnames)     # file was already in dest (robocopy touched mtime)
+                    )
+                    if _is_backup_file:
+                        # Before suppressing, probe SMB attribution to detect a
+                        # coworker adding a same-named file during the grace window.
                         logger.info(
                             f"[desktop._on_file_change] SUPPRESSOR: candidate for suppression "
-                            f"during active backup — basename={_event_basename_ab!r} "
-                            f"backed_set={_backed_fnames_ab!r} "
+                            f"in post-backup grace window ({_elapsed:.1f}s / "
+                            f"{self._POST_BACKUP_SUPPRESS_SECS}s) — "
+                            f"basename={_event_basename!r} backed_set={_backed_fnames!r} "
                             f"watch_id={watch_id!r} type={_etype!r} "
-                            f"path={entry.get('path')!r} — probing SMB attribution ..."
+                            f"path={entry.get('path')!r} "
+                            f"detection_source={entry.get('detection_source')!r} "
+                            f"— probing SMB attribution ..."
                         )
                         if _suppressor_probe_third_party(entry.get("path", ""), _etype):
                             logger.info(
                                 f"[desktop._on_file_change] SUPPRESSOR: OVERRIDE — third-party "
-                                f"actor confirmed during active backup; NOT suppressing "
+                                f"actor confirmed in post-backup grace window; NOT suppressing "
                                 f"watch_id={watch_id!r} type={_etype!r} path={entry.get('path')!r}"
                             )
                             # Fall through to normal processing below
                         else:
                             logger.debug(
-                                f"[desktop._on_file_change] SUPPRESSED dest event during backup "
-                                f"(backup-engine write confirmed or inconclusive): "
+                                f"[desktop._on_file_change] SUPPRESSED dest event in post-backup "
+                                f"grace window ({_elapsed:.1f}s < {self._POST_BACKUP_SUPPRESS_SECS}s): "
                                 f"watch_id={watch_id!r} type={_etype!r} "
-                                f"path={entry.get('path')!r}"
+                                f"path={entry.get('path')!r} "
+                                f"detection_source={entry.get('detection_source')!r}"
                             )
                             return
                     else:
                         logger.debug(
-                            f"[desktop._on_file_change] ALLOWED dest event during backup — "
-                            f"filename not in backup set or dest snapshot: "
+                            f"[desktop._on_file_change] ALLOWED dest event in post-backup "
+                            f"grace window — filename not in backup set or dest snapshot: "
                             f"watch_id={watch_id!r} type={_etype!r} "
-                            f"path={entry.get('path')!r} basename={_event_basename_ab!r}"
+                            f"path={entry.get('path')!r} basename={_event_basename!r}"
                         )
-
-                _finish_mono = self._post_backup_finish.get(watch_id)
-                if _finish_mono is not None:
-                    _elapsed = _now_mono - _finish_mono
-                    if _elapsed < self._POST_BACKUP_SUPPRESS_SECS:
-                        # Suppress MODIFIED events for:
-                        #   (a) files that were actually copied by this backup, AND
-                        #   (b) files that were already present in the destination.
-                        # Robocopy touching pre-existing dest files (e.g. updating
-                        # directory timestamps) causes Windows to fire MODIFIED on those
-                        # files even though this backup didn't copy them.  Without (b),
-                        # pre-existing dest files like "test sheet.xlsx" would leak into
-                        # History as genuine edits every time any backup runs.
-                        # New files added by a truly remote user still pass through
-                        # because they appear in neither _backed_fnames nor _dest_fnames.
-                        import os as _os_gs
-                        _event_basename = _os_gs.path.basename(entry.get("path", ""))
-                        _backed_fnames  = self._post_backup_filenames.get(watch_id, set())
-                        _dest_fnames    = self._post_backup_dest_fnames.get(watch_id, set())
-                        _is_backup_file = (
-                            (not _backed_fnames)                     # no file list → suppress all
-                            or (_event_basename in _backed_fnames)   # file was newly copied this run
-                            or (_event_basename in _dest_fnames)     # file was already in dest (robocopy touched mtime)
-                        )
-                        if _is_backup_file:
-                            # Before suppressing, probe SMB attribution to detect a
-                            # coworker adding a same-named file during the grace window.
-                            logger.info(
-                                f"[desktop._on_file_change] SUPPRESSOR: candidate for suppression "
-                                f"in post-backup grace window ({_elapsed:.1f}s / "
-                                f"{self._POST_BACKUP_SUPPRESS_SECS}s) — "
-                                f"basename={_event_basename!r} backed_set={_backed_fnames!r} "
-                                f"watch_id={watch_id!r} type={_etype!r} "
-                                f"path={entry.get('path')!r} "
-                                f"detection_source={entry.get('detection_source')!r} "
-                                f"— probing SMB attribution ..."
-                            )
-                            if _suppressor_probe_third_party(entry.get("path", ""), _etype):
-                                logger.info(
-                                    f"[desktop._on_file_change] SUPPRESSOR: OVERRIDE — third-party "
-                                    f"actor confirmed in post-backup grace window; NOT suppressing "
-                                    f"watch_id={watch_id!r} type={_etype!r} path={entry.get('path')!r}"
-                                )
-                                # Fall through to normal processing below
-                            else:
-                                logger.debug(
-                                    f"[desktop._on_file_change] SUPPRESSED dest event in post-backup "
-                                    f"grace window ({_elapsed:.1f}s < {self._POST_BACKUP_SUPPRESS_SECS}s): "
-                                    f"watch_id={watch_id!r} type={_etype!r} "
-                                    f"path={entry.get('path')!r} "
-                                    f"detection_source={entry.get('detection_source')!r}"
-                                )
-                                return
-                        else:
-                            logger.debug(
-                                f"[desktop._on_file_change] ALLOWED dest event in post-backup "
-                                f"grace window — filename not in backup set or dest snapshot: "
-                                f"watch_id={watch_id!r} type={_etype!r} "
-                                f"path={entry.get('path')!r} basename={_event_basename!r}"
-                            )
-                    else:
-                        # Grace period expired — clean up so the dict doesn't grow
-                        self._post_backup_finish.pop(watch_id, None)
-                        self._post_backup_filenames.pop(watch_id, None)
-                        self._post_backup_dest_fnames.pop(watch_id, None)
-
-            # ── Spurious-modified suppression ────────────────────────────────────
-            # When a file is created over SMB, Windows always fires both an
-            # ADDED event and a MODIFIED event for the same path within ~1 s.
-            # The MODIFIED is not a real user edit — it is an SMB/NTFS write
-            # notification that piggybacks on the file-create.  Suppress it if:
-            #   • event type is "modified", AND
-            #   • an "added" event for the same path was early-stamped OR recorded
-            #     in _dest_event_seen within the last _SPURIOUS_MOD_WINDOW seconds.
-            # Two sources are checked because:
-            #   - _dest_added_early: stamped the instant ADDED enters this block,
-            #     catches the race where ADDED and MODIFIED arrive simultaneously
-            #     on separate threads (MODIFIED may arrive before ADDED is done).
-            #   - _dest_event_seen: catches the case where MODIFIED arrives a few
-            #     seconds after ADDED has already fully processed.
-            _SPURIOUS_MOD_WINDOW = 10  # seconds — generous to cover slow SMB links
-            if _etype == "modified":
-                import time as _suppress_time
-                _mod_path = entry.get("path", "").lower()
-                # The pre-stamp in _on_file_change is stored with the ORIGINAL watch_id
-                # (including the "__dest" suffix) because that outer wrapper runs before
-                # this inner function strips the suffix.  We must therefore also check
-                # the __dest-suffixed key, otherwise spurious-modified events on the
-                # destination are never suppressed (key mismatch → early_hit=False).
-                _early_stamp_key      = (watch_id, _mod_path)
-                _early_stamp_key_dest = (watch_id + "__dest", _mod_path) if _is_dest else None
-                _seen_added_key = (watch_id, _mod_path, "added")
-
-                # ── Race-condition retry loop ──────────────────────────────────
-                # Windows SMB fires ADDED and MODIFIED simultaneously on separate
-                # watchdog threads.  With per-(path,type) debouncing both fire
-                # independently after DEBOUNCE_DELAY (2s), nearly simultaneously
-                # on separate Timer threads.  The MODIFIED thread can reach this
-                # check before the ADDED thread has written the PRE-STAMP.
-                # We retry for up to _RETRY_MAX seconds to catch this race.
-                #
-                # 500ms is sufficient when both come from watchdog (same Timer
-                # delay → fire within ms of each other).  We use 3s to also
-                # cover edge cases where the ADDED timer fires slightly late
-                # (e.g. system load delay).  The unc_poll ADDED (~15s later)
-                # is NOT waited for here — if MODIFIED arrives from watchdog and
-                # no watchdog ADDED stamp is found within 3s, it's treated as a
-                # genuine edit (the unc_poll ADDED will set its own event later).
-                _RETRY_INTERVAL = 0.10   # 100 ms per poll
-                _RETRY_MAX      = 3.0    # give up after 3s (covers 2s debounce + margin)
-                _retry_elapsed  = 0.0
-                _early_added_at = None
-                _seen_added_at  = None
-                _early_dict_keys = []
-
-                while True:
-                    with self._dest_added_lock:
-                        _early_added_at  = self._dest_added_early.get(_early_stamp_key)
-                        # Also check the __dest-suffixed key: the outer _on_file_change
-                        # stores the pre-stamp with the original watch_id (before this
-                        # inner function strips "__dest"), so for destination events both
-                        # keys must be checked to correctly detect the pre-stamp.
-                        if _early_added_at is None and _early_stamp_key_dest is not None:
-                            _early_added_at = self._dest_added_early.get(_early_stamp_key_dest)
-                        _early_dict_keys = list(self._dest_added_early.keys())
-                    _seen_added_at = self._dest_event_seen.get(_seen_added_key)
-
-                    if _early_added_at is not None or _seen_added_at is not None:
-                        break  # stamp found — no need to wait further
-                    if _retry_elapsed >= _RETRY_MAX:
-                        break  # gave up — stamp never appeared within _RETRY_MAX
-                    _suppress_time.sleep(_RETRY_INTERVAL)
-                    _retry_elapsed += _RETRY_INTERVAL
-
-                _dbg.info(
-                    f"[desktop._on_file_change] MODIFIED-SUPPRESS-CHECK: "
-                    f"watch_id={watch_id!r} path={entry.get('path')!r} "
-                    f"early_stamp_key={_early_stamp_key!r} "
-                    f"early_stamp_key_dest={_early_stamp_key_dest!r} "
-                    f"early_hit={_early_added_at is not None} "
-                    f"seen_added_key={_seen_added_key!r} seen_hit={_seen_added_at is not None} "
-                    f"retry_elapsed={_retry_elapsed:.3f}s "
-                    f"early_dict_size={len(_early_dict_keys)} "
-                    f"early_dict_keys={_early_dict_keys!r}"
-                )
-                # Use the most recent of the two timestamps
-                _added_at = None
-                if _early_added_at is not None and _seen_added_at is not None:
-                    _added_at = max(_early_added_at, _seen_added_at)
-                elif _early_added_at is not None:
-                    _added_at = _early_added_at
-                elif _seen_added_at is not None:
-                    _added_at = _seen_added_at
-                if _added_at is not None and (_now_mono - _added_at) < _SPURIOUS_MOD_WINDOW:
-                    _dbg.info(
-                        f"[desktop._on_file_change] SPURIOUS-MODIFIED suppressed: "
-                        f"'modified' arrived {_now_mono - _added_at:.3f}s after 'added' "
-                        f"for the same path — Windows SMB write-notification artifact, not a real edit. "
-                        f"early_stamp={_early_added_at is not None} "
-                        f"seen_stamp={_seen_added_at is not None} "
-                        f"retry_elapsed={_retry_elapsed:.3f}s "
-                        f"watch_id={watch_id!r} path={entry.get('path')!r} "
-                        f"detection_source={entry.get('detection_source')!r}"
-                    )
-                    return
                 else:
-                    _dbg.info(
-                        f"[desktop._on_file_change] MODIFIED not suppressed: "
-                        f"no recent 'added' stamp found within {_SPURIOUS_MOD_WINDOW}s "
-                        f"(retried {_retry_elapsed:.3f}s) — treating as genuine edit. "
-                        f"early_stamp_age={f'{_now_mono - _early_added_at:.3f}s' if _early_added_at else 'none'} "
-                        f"seen_stamp_age={f'{_now_mono - _seen_added_at:.3f}s' if _seen_added_at else 'none'} "
-                        f"watch_id={watch_id!r} path={entry.get('path')!r}"
-                    )
+                    # Grace period expired — clean up so the dict doesn't grow
+                    self._post_backup_finish.pop(watch_id, None)
+                    self._post_backup_filenames.pop(watch_id, None)
+                    self._post_backup_dest_fnames.pop(watch_id, None)
 
-            # ── Pre-delete modified suppression ───────────────────────────────────
-            # Windows SMB fires a MODIFIED event immediately before a DELETED event
-            # when a remote client deletes a file.  The MODIFIED is not a real user
-            # edit — it is an SMB/NTFS notification artifact.  We suppress it if a
-            # DELETED for the same path arrives within _PRE_DEL_MOD_WINDOW seconds.
+        # ── Spurious-modified suppression ────────────────────────────────────
+        # When a file is created over SMB, Windows always fires both an
+        # ADDED event and a MODIFIED event for the same path within ~1 s.
+        # The MODIFIED is not a real user edit — it is an SMB/NTFS write
+        # notification that piggybacks on the file-create.  Suppress it if:
+        #   • event type is "modified", AND
+        #   • an "added" event for the same path was early-stamped OR recorded
+        #     in _dest_event_seen within the last _SPURIOUS_MOD_WINDOW seconds.
+        # Two sources are checked because:
+        #   - _dest_added_early: stamped the instant ADDED enters this block,
+        #     catches the race where ADDED and MODIFIED arrive simultaneously
+        #     on separate threads (MODIFIED may arrive before ADDED is done).
+        #   - _dest_event_seen: catches the case where MODIFIED arrives a few
+        #     seconds after ADDED has already fully processed.
+        _SPURIOUS_MOD_WINDOW = 10  # seconds — generous to cover slow SMB links
+        if _etype == "modified":
+            import time as _suppress_time
+            _mod_path = entry.get("path", "").lower()
+            # The pre-stamp in _on_file_change is stored with the ORIGINAL watch_id
+            # (including the "__dest" suffix) because that outer wrapper runs before
+            # this inner function strips the suffix.  We must therefore also check
+            # the __dest-suffixed key, otherwise spurious-modified events on the
+            # destination are never suppressed (key mismatch → early_hit=False).
+            _early_stamp_key      = (watch_id, _mod_path)
+            _early_stamp_key_dest = (watch_id + "__dest", _mod_path) if _is_dest else None
+            _seen_added_key = (watch_id, _mod_path, "added")
+
+            # ── Race-condition retry loop ──────────────────────────────────
+            # Windows SMB fires ADDED and MODIFIED simultaneously on separate
+            # watchdog threads.  With per-(path,type) debouncing both fire
+            # independently after DEBOUNCE_DELAY (2s), nearly simultaneously
+            # on separate Timer threads.  The MODIFIED thread can reach this
+            # check before the ADDED thread has written the PRE-STAMP.
+            # We retry for up to _RETRY_MAX seconds to catch this race.
             #
-            # Mechanism:
-            #   1. When a dest MODIFIED arrives (and was not suppressed above),
-            #      register a threading.Event in _pending_mod_before_del and block
-            #      this thread for up to _PRE_DEL_MOD_WINDOW seconds waiting for it.
-            #   2. When a dest DELETED arrives, set the Event for the same key so
-            #      any waiting MODIFIED thread wakes and suppresses itself.
-            #   3. If the window expires without a DELETED, fall through and treat
-            #      the MODIFIED as a genuine edit.
-            #
-            # Only applies to destination-watch modified events (source-side
-            # modified events from other machines are handled separately).
-            _PRE_DEL_MOD_WINDOW = 3.0  # seconds to wait for a following delete
-            if _etype == "modified" and _is_dest:
-                import threading as _pdm_threading
-                import time as _pdm_time
-                _pdm_key = (watch_id, entry.get("path", "").lower())
-                _pdm_event = _pdm_threading.Event()
-                with self._pending_mod_lock:
-                    self._pending_mod_before_del[_pdm_key] = _pdm_event
+            # 500ms is sufficient when both come from watchdog (same Timer
+            # delay → fire within ms of each other).  We use 3s to also
+            # cover edge cases where the ADDED timer fires slightly late
+            # (e.g. system load delay).  The unc_poll ADDED (~15s later)
+            # is NOT waited for here — if MODIFIED arrives from watchdog and
+            # no watchdog ADDED stamp is found within 3s, it's treated as a
+            # genuine edit (the unc_poll ADDED will set its own event later).
+            _RETRY_INTERVAL = 0.10   # 100 ms per poll
+            _RETRY_MAX      = 3.0    # give up after 3s (covers 2s debounce + margin)
+            _retry_elapsed  = 0.0
+            _early_added_at = None
+            _seen_added_at  = None
+            _early_dict_keys = []
+
+            while True:
+                with self._dest_added_lock:
+                    _early_added_at  = self._dest_added_early.get(_early_stamp_key)
+                    # Also check the __dest-suffixed key: the outer _on_file_change
+                    # stores the pre-stamp with the original watch_id (before this
+                    # inner function strips "__dest"), so for destination events both
+                    # keys must be checked to correctly detect the pre-stamp.
+                    if _early_added_at is None and _early_stamp_key_dest is not None:
+                        _early_added_at = self._dest_added_early.get(_early_stamp_key_dest)
+                    _early_dict_keys = list(self._dest_added_early.keys())
+                _seen_added_at = self._dest_event_seen.get(_seen_added_key)
+
+                if _early_added_at is not None or _seen_added_at is not None:
+                    break  # stamp found — no need to wait further
+                if _retry_elapsed >= _RETRY_MAX:
+                    break  # gave up — stamp never appeared within _RETRY_MAX
+                _suppress_time.sleep(_RETRY_INTERVAL)
+                _retry_elapsed += _RETRY_INTERVAL
+
+            _dbg.info(
+                f"[desktop._on_file_change] MODIFIED-SUPPRESS-CHECK: "
+                f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                f"early_stamp_key={_early_stamp_key!r} "
+                f"early_stamp_key_dest={_early_stamp_key_dest!r} "
+                f"early_hit={_early_added_at is not None} "
+                f"seen_added_key={_seen_added_key!r} seen_hit={_seen_added_at is not None} "
+                f"retry_elapsed={_retry_elapsed:.3f}s "
+                f"early_dict_size={len(_early_dict_keys)} "
+                f"early_dict_keys={_early_dict_keys!r}"
+            )
+            # Use the most recent of the two timestamps
+            _added_at = None
+            if _early_added_at is not None and _seen_added_at is not None:
+                _added_at = max(_early_added_at, _seen_added_at)
+            elif _early_added_at is not None:
+                _added_at = _early_added_at
+            elif _seen_added_at is not None:
+                _added_at = _seen_added_at
+            if _added_at is not None and (_now_mono - _added_at) < _SPURIOUS_MOD_WINDOW:
                 _dbg.info(
-                    f"[desktop._on_file_change] PRE-DELETE-MOD-HOLD: holding 'modified' for "
-                    f"up to {_PRE_DEL_MOD_WINDOW}s to detect following delete. "
+                    f"[desktop._on_file_change] SPURIOUS-MODIFIED suppressed: "
+                    f"'modified' arrived {_now_mono - _added_at:.3f}s after 'added' "
+                    f"for the same path — Windows SMB write-notification artifact, not a real edit. "
+                    f"early_stamp={_early_added_at is not None} "
+                    f"seen_stamp={_seen_added_at is not None} "
+                    f"retry_elapsed={_retry_elapsed:.3f}s "
+                    f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                    f"detection_source={entry.get('detection_source')!r}"
+                )
+                return
+            else:
+                _dbg.info(
+                    f"[desktop._on_file_change] MODIFIED not suppressed by time-window: "
+                    f"no recent 'added' stamp found within {_SPURIOUS_MOD_WINDOW}s "
+                    f"(retried {_retry_elapsed:.3f}s) — falling through to fingerprint check. "
+                    f"early_stamp_age={f'{_now_mono - _early_added_at:.3f}s' if _early_added_at else 'none'} "
+                    f"seen_stamp_age={f'{_now_mono - _seen_added_at:.3f}s' if _seen_added_at else 'none'} "
                     f"watch_id={watch_id!r} path={entry.get('path')!r}"
                 )
-                _pdm_deleted = _pdm_event.wait(timeout=_PRE_DEL_MOD_WINDOW)
-                with self._pending_mod_lock:
-                    self._pending_mod_before_del.pop(_pdm_key, None)
-                if _pdm_deleted:
+
+                # ── Fingerprint suppression (second line of defense) ─────────
+                # The time-window check above only catches the FIRST burst of
+                # spurious MODIFIED notifications shortly after ADDED. Windows
+                # SMB (and this app's own NtQueryDirectoryFile RestartScan
+                # cache-flushing + SMB2 CHANGE_NOTIFY handle-reopen churn after
+                # ERROR_NOTIFY_ENUM_DIR buffer overflows) can keep re-firing
+                # MODIFIED for a file that was never actually touched again,
+                # arbitrarily long after the time window has expired. Without
+                # this check, every one of those re-fires gets written to
+                # history as a "genuine edit" even though nothing on disk
+                # changed — this is the bug reported where a single manual
+                # file-drop produces several extra "modified" rows over the
+                # following minutes with no further user action.
+                #
+                # Fix: compare the file's current (size, mtime) on disk
+                # against the fingerprint recorded the last time we accepted
+                # an add/edit for this path. If unchanged, this MODIFIED is
+                # an SMB notification artifact, not a real edit — suppress it
+                # unconditionally (no time limit). If the stat call itself
+                # fails (file briefly locked/in-flight), do NOT suppress —
+                # fail open so we never hide a real change we couldn't verify.
+                _fp_path_raw = entry.get("path", "")
+                _fp_key = (watch_id, _fp_path_raw.lower())
+                _fp_current = None
+                _fp_current_hash = None  # SHA-256 of first 64 KB, computed lazily
+                try:
+                    _fp_stat = os.stat(_fp_path_raw)
+                    # Use float mtime (sub-second precision) instead of int(mtime).
+                    # This is the primary fix for the bug where Excel saves a file
+                    # in-place and the new mtime lands within the same wall-clock
+                    # second as the original — int() truncation made them look equal
+                    # even though the file genuinely changed.
+                    _fp_current = (_fp_stat.st_size, _fp_stat.st_mtime)
+                except Exception as _fp_stat_err:
                     _dbg.info(
-                        f"[desktop._on_file_change] PRE-DELETE-MOD suppressed: "
-                        f"'modified' cancelled because 'deleted' arrived within "
-                        f"{_PRE_DEL_MOD_WINDOW}s for same path — Windows SMB pre-delete "
-                        f"notification artifact, not a real edit. "
-                        f"watch_id={watch_id!r} path={entry.get('path')!r} "
-                        f"detection_source={entry.get('detection_source')!r}"
-                    )
-                    return
-                else:
-                    _dbg.info(
-                        f"[desktop._on_file_change] PRE-DELETE-MOD not suppressed: "
-                        f"no 'deleted' arrived within {_PRE_DEL_MOD_WINDOW}s — "
-                        f"treating as genuine edit. "
-                        f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                        f"[desktop._on_file_change] FINGERPRINT-CHECK: stat failed "
+                        f"({_fp_stat_err!r}) for path={_fp_path_raw!r} — cannot verify, "
+                        f"not suppressing (fail open). watch_id={watch_id!r}"
                     )
 
-            # ── Signal a pending MODIFIED to suppress itself when a DELETE arrives ─
-            # If a MODIFIED for this path is currently held in the pre-delete window,
-            # wake it so it can suppress itself.
-            if _etype == "deleted" and _is_dest:
-                _pdm_key = (watch_id, entry.get("path", "").lower())
-                with self._pending_mod_lock:
-                    _pdm_ev = self._pending_mod_before_del.get(_pdm_key)
-                if _pdm_ev is not None:
-                    _dbg.info(
-                        f"[desktop._on_file_change] PRE-DELETE-MOD signal: 'deleted' waking "
-                        f"held 'modified' for suppression. "
-                        f"watch_id={watch_id!r} path={entry.get('path')!r}"
-                    )
-                    _pdm_ev.set()
+                if _fp_current is not None:
+                    with self._dest_content_fp_lock:
+                        _fp_prev = self._dest_content_fp.get(_fp_key)
 
-            # ── Dedup: watchdog + unc_poll can both fire for the same event ──────
-            # If the same (watch_id, path, type) was already recorded within 25 s,
-            # drop the duplicate regardless of which detection source fires second.
-            # 25s covers the max watchdog→unc_poll gap (15s poll + processing).
-            # deleted/renamed are also deduped — two detectors seeing the same
-            # deletion is still just one deletion.
-            _dedup_key = (watch_id, entry.get("path", "").lower(), _etype)
-            _DEDUP_WINDOW = 25  # seconds — covers watchdog+unc_poll overlap (max ~15s gap)
-            # Atomic check-and-claim: prevents two concurrent threads from both
-            # passing "key not found" before either writes the key.
-            if not hasattr(self, '_dest_event_seen_lock'):
-                import threading as _dee_init
-                self._dest_event_seen_lock = _dee_init.Lock()
-            with self._dest_event_seen_lock:
-                _last_seen = self._dest_event_seen.get(_dedup_key)
-                _dest_is_dupe = _last_seen is not None and (_now_mono - _last_seen) < _DEDUP_WINDOW
-                if not _dest_is_dupe:
-                    self._dest_event_seen[_dedup_key] = _now_mono  # claim slot
-            if _dest_is_dupe:
-                # For deleted events: whichever detector fires second gets a chance
-                # to improve attribution on the already-stored entry.
-                #
-                # Two race-condition scenarios:
-                #
-                #  A) watchdog first, unc_poll second (previous fix):
-                #     watchdog fires while file is already gone → win32security fails
-                #     → last-resort SMB host stored as machine, user=''.
-                #     unc_poll arrives later with detection_source='unc_poll' and can
-                #     try NetSessionEnum which may still find the open session.
-                #
-                #  B) unc_poll first, watchdog second (this fix):
-                #     unc_poll wins the race → same last-resort SMB host result.
-                #     watchdog arrives with detection_source='watchdog' ~1s later;
-                #     win32security may still succeed if the file handle is cached.
-                #
-                # Retry condition: editor_user is empty AND (editor_machine is also
-                # empty OR editor_machine equals the SMB host IP, which is only the
-                # last-resort fallback, not a real user attribution).
-                if _etype == "deleted":
-                    _path_lower = entry.get("path", "").lower()
-                    # Extract the SMB host from the UNC path for last-resort detection
-                    def _unc_host_of(p):
-                        # Use single-backslash replace so \\host → //host (two slashes)
-                        # Double-backslash replace produces /host (one slash) which
-                        # fails the startswith("//") check and returns "" — Bug #1 fix.
-                        n = p.replace("\\", "/")
-                        if n.startswith("//"):
-                            parts = n.lstrip("/").split("/")
-                            return parts[0] if parts else ""
-                        return ""
-                    _nas_host = _unc_host_of(entry.get("path", ""))
+                    # Normalise for comparison: old entries stored as (size, int_mtime)
+                    # or (size, float_mtime) or (size, float_mtime, hash).  Extract
+                    # comparable fields regardless of tuple length so the transition
+                    # from the old int-mtime format doesn't cause a false "no_prev_fp".
+                    _fp_prev_size  = _fp_prev[0] if _fp_prev and len(_fp_prev) >= 1 else None
+                    _fp_prev_mtime = _fp_prev[1] if _fp_prev and len(_fp_prev) >= 2 else None
+                    _fp_prev_hash  = _fp_prev[2] if _fp_prev and len(_fp_prev) >= 3 else None
+
+                    # Size + float-mtime match → check SHA-256 as final tiebreaker.
+                    # This catches the rare case where a file system rounds mtime to
+                    # 1-second granularity (FAT32, some SMB servers) AND the file
+                    # happened to be saved at the same byte count (e.g. Excel workbook
+                    # with a minor cell edit that doesn't change compressed XLSX size).
+                    _fp_size_mtime_match = (
+                        _fp_prev_size is not None
+                        and _fp_prev_mtime is not None
+                        # Compare sizes exactly; compare mtimes with a tiny tolerance
+                        # (0.001 s) to absorb float precision differences across Python
+                        # versions and OS stat implementations.
+                        and _fp_prev_size == _fp_current[0]
+                        and abs(float(_fp_prev_mtime) - _fp_current[1]) < 0.001
+                    )
+                    _fp_suppress = False
+                    _fp_suppress_reason = ""
+                    if _fp_size_mtime_match:
+                        # Size and mtime match — do a content-hash check before
+                        # deciding to suppress.  If we already have a stored hash
+                        # for this path AND the current content hashes the same,
+                        # this is a spurious notification.  If either hash is
+                        # unavailable (file locked, hash not stored), fail open.
+                        try:
+                            import hashlib as _fp_hashlib2
+                            _FP_HASH_BYTES2 = 65536  # 64 KB sample
+                            with open(_fp_path_raw, "rb") as _fp_fh2:
+                                _fp_current_hash = _fp_hashlib2.sha256(
+                                    _fp_fh2.read(_FP_HASH_BYTES2)
+                                ).hexdigest()
+                        except Exception as _fp_hash_err2:
+                            _dbg.info(
+                                f"[desktop._on_file_change] FINGERPRINT-CHECK: "
+                                f"size+mtime matched but SHA-256 read failed "
+                                f"({_fp_hash_err2!r}) for path={_fp_path_raw!r} — "
+                                f"cannot verify content, NOT suppressing (fail open). "
+                                f"watch_id={watch_id!r}"
+                            )
+                        if _fp_current_hash is not None:
+                            if _fp_prev_hash is not None and _fp_prev_hash == _fp_current_hash:
+                                _fp_suppress = True
+                                _fp_suppress_reason = (
+                                    f"size={_fp_current[0]} mtime_float={_fp_current[1]} "
+                                    f"sha256_64k={_fp_current_hash!r} all identical to "
+                                    f"last accepted add/edit"
+                                )
+                            elif _fp_prev_hash is None:
+                                # Old entry had no hash (transition from earlier code
+                                # version). Treat as a genuine edit so we don't miss it,
+                                # and store the hash going forward.
+                                _dbg.info(
+                                    f"[desktop._on_file_change] FINGERPRINT-CHECK: "
+                                    f"size+mtime matched but prev entry has no hash "
+                                    f"(legacy format or hash failed at seed time) — "
+                                    f"treating as genuine edit to avoid false suppression. "
+                                    f"path={_fp_path_raw!r} watch_id={watch_id!r} "
+                                    f"current_hash={_fp_current_hash!r}"
+                                )
+                            else:
+                                # Hash differs despite same size+mtime → genuine edit
+                                # (file system mtime granularity masked the change).
+                                _dbg.info(
+                                    f"[desktop._on_file_change] FINGERPRINT-CHECK: "
+                                    f"size+mtime matched BUT sha256_64k differs — "
+                                    f"genuine content change detected via hash fallback. "
+                                    f"path={_fp_path_raw!r} watch_id={watch_id!r} "
+                                    f"prev_hash={_fp_prev_hash!r} "
+                                    f"current_hash={_fp_current_hash!r} "
+                                    f"size={_fp_current[0]} mtime_float={_fp_current[1]}"
+                                )
+
+                    _dbg.info(
+                        f"[desktop._on_file_change] FINGERPRINT-CHECK: "
+                        f"path={_fp_path_raw!r} watch_id={watch_id!r} "
+                        f"prev_fp={_fp_prev!r} "
+                        f"current=(size={_fp_current[0]}, mtime_float={_fp_current[1]}, "
+                        f"sha256_64k={_fp_current_hash!r}) "
+                        f"size_mtime_match={_fp_size_mtime_match} "
+                        f"suppress={_fp_suppress}"
+                    )
+                    if _fp_suppress:
+                        _dbg.info(
+                            f"[desktop._on_file_change] FINGERPRINT-SUPPRESSED: "
+                            f"'modified' for path={_fp_path_raw!r} — {_fp_suppress_reason} — "
+                            f"no real change on disk, stale SMB/NTFS write-notification "
+                            f"artifact (cache-flush or CHANGE_NOTIFY handle-reopen churn). "
+                            f"watch_id={watch_id!r} "
+                            f"detection_source={entry.get('detection_source')!r}"
+                        )
+                        return
+                    # Either no prior fingerprint, or fingerprint genuinely differs
+                    # (real size/mtime/content change) — accept as a real edit and
+                    # record the new fingerprint (including hash) so future spurious
+                    # re-fires of this same file state get suppressed.
+                    _fp_new_tuple = (_fp_current[0], _fp_current[1], _fp_current_hash)
+                    with self._dest_content_fp_lock:
+                        self._dest_content_fp[_fp_key] = _fp_new_tuple
+                        if len(self._dest_content_fp) > 2000:
+                            # Simple cap to avoid unbounded growth; drop oldest
+                            # half arbitrarily (dict insertion order in py3.7+).
+                            _keys_to_drop = list(self._dest_content_fp.keys())[:1000]
+                            for _k in _keys_to_drop:
+                                self._dest_content_fp.pop(_k, None)
+                    _dbg.info(
+                        f"[desktop._on_file_change] FINGERPRINT-ACCEPTED: "
+                        f"'modified' for path={_fp_path_raw!r} is a genuine edit. "
+                        f"new_fp=(size={_fp_current[0]}, mtime_float={_fp_current[1]}, "
+                        f"sha256_64k={_fp_current_hash!r}) "
+                        f"prev_fp={_fp_prev!r} "
+                        f"watch_id={watch_id!r}"
+                    )
+
+        # ── Pre-delete modified suppression ───────────────────────────────────
+        # Windows SMB fires a MODIFIED event immediately before a DELETED event
+        # when a remote client deletes a file.  The MODIFIED is not a real user
+        # edit — it is an SMB/NTFS notification artifact.  We suppress it if a
+        # DELETED for the same path arrives within _PRE_DEL_MOD_WINDOW seconds.
+        #
+        # Mechanism:
+        #   1. When a dest MODIFIED arrives (and was not suppressed above),
+        #      register a threading.Event in _pending_mod_before_del and block
+        #      this thread for up to _PRE_DEL_MOD_WINDOW seconds waiting for it.
+        #   2. When a dest DELETED arrives, set the Event for the same key so
+        #      any waiting MODIFIED thread wakes and suppresses itself.
+        #   3. If the window expires without a DELETED, fall through and treat
+        #      the MODIFIED as a genuine edit.
+        #
+        # Only applies to destination-watch modified events (source-side
+        # modified events from other machines are handled separately).
+        _PRE_DEL_MOD_WINDOW = 3.0  # seconds to wait for a following delete
+        if _etype == "modified" and _is_dest:
+            import threading as _pdm_threading
+            import time as _pdm_time
+            _pdm_key = (watch_id, entry.get("path", "").lower())
+            _pdm_event = _pdm_threading.Event()
+            with self._pending_mod_lock:
+                self._pending_mod_before_del[_pdm_key] = _pdm_event
+            _dbg.info(
+                f"[desktop._on_file_change] PRE-DELETE-MOD-HOLD: holding 'modified' for "
+                f"up to {_PRE_DEL_MOD_WINDOW}s to detect following delete. "
+                f"watch_id={watch_id!r} path={entry.get('path')!r}"
+            )
+            _pdm_deleted = _pdm_event.wait(timeout=_PRE_DEL_MOD_WINDOW)
+            with self._pending_mod_lock:
+                self._pending_mod_before_del.pop(_pdm_key, None)
+            if _pdm_deleted:
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-DELETE-MOD suppressed: "
+                    f"'modified' cancelled because 'deleted' arrived within "
+                    f"{_PRE_DEL_MOD_WINDOW}s for same path — Windows SMB pre-delete "
+                    f"notification artifact, not a real edit. "
+                    f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                    f"detection_source={entry.get('detection_source')!r}"
+                )
+                return
+            else:
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-DELETE-MOD not suppressed: "
+                    f"no 'deleted' arrived within {_PRE_DEL_MOD_WINDOW}s — "
+                    f"treating as genuine edit. "
+                    f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                )
+
+        # ── Signal a pending MODIFIED to suppress itself when a DELETE arrives ─
+        # If a MODIFIED for this path is currently held in the pre-delete window,
+        # wake it so it can suppress itself.
+        if _etype == "deleted" and _is_dest:
+            _pdm_key = (watch_id, entry.get("path", "").lower())
+            with self._pending_mod_lock:
+                _pdm_ev = self._pending_mod_before_del.get(_pdm_key)
+            if _pdm_ev is not None:
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-DELETE-MOD signal: 'deleted' waking "
+                    f"held 'modified' for suppression. "
+                    f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                )
+                _pdm_ev.set()
+
+        # ── Dedup: watchdog + unc_poll can both fire for the same event ──────
+        # If the same (watch_id, path, type) was already recorded within 25 s,
+        # drop the duplicate regardless of which detection source fires second.
+        # 25s covers the max watchdog→unc_poll gap (15s poll + processing).
+        # deleted/renamed are also deduped — two detectors seeing the same
+        # deletion is still just one deletion.
+        _dedup_key = (watch_id, entry.get("path", "").lower(), _etype)
+        _DEDUP_WINDOW = 25  # seconds — covers watchdog+unc_poll overlap (max ~15s gap)
+        # Atomic check-and-claim: prevents two concurrent threads from both
+        # passing "key not found" before either writes the key.
+        if not hasattr(self, '_dest_event_seen_lock'):
+            import threading as _dee_init
+            self._dest_event_seen_lock = _dee_init.Lock()
+        with self._dest_event_seen_lock:
+            _last_seen = self._dest_event_seen.get(_dedup_key)
+            _dest_is_dupe = _last_seen is not None and (_now_mono - _last_seen) < _DEDUP_WINDOW
+            if not _dest_is_dupe:
+                self._dest_event_seen[_dedup_key] = _now_mono  # claim slot
+        if _dest_is_dupe:
+            # For deleted events: whichever detector fires second gets a chance
+            # to improve attribution on the already-stored entry.
+            #
+            # Two race-condition scenarios:
+            #
+            #  A) watchdog first, unc_poll second (previous fix):
+            #     watchdog fires while file is already gone → win32security fails
+            #     → last-resort SMB host stored as machine, user=''.
+            #     unc_poll arrives later with detection_source='unc_poll' and can
+            #     try NetSessionEnum which may still find the open session.
+            #
+            #  B) unc_poll first, watchdog second (this fix):
+            #     unc_poll wins the race → same last-resort SMB host result.
+            #     watchdog arrives with detection_source='watchdog' ~1s later;
+            #     win32security may still succeed if the file handle is cached.
+            #
+            # Retry condition: editor_user is empty AND (editor_machine is also
+            # empty OR editor_machine equals the SMB host IP, which is only the
+            # last-resort fallback, not a real user attribution).
+            if _etype == "deleted":
+                _path_lower = entry.get("path", "").lower()
+                # Extract the SMB host from the UNC path for last-resort detection
+                def _unc_host_of(p):
+                    # Use single-backslash replace so \\host → //host (two slashes)
+                    # Double-backslash replace produces /host (one slash) which
+                    # fails the startswith("//") check and returns "" — Bug #1 fix.
+                    n = p.replace("\\", "/")
+                    if n.startswith("//"):
+                        parts = n.lstrip("/").split("/")
+                        return parts[0] if parts else ""
+                    return ""
+                _nas_host = _unc_host_of(entry.get("path", ""))
+                logger.info(
+                    f"[desktop._on_file_change] DEDUP retry scan: "
+                    f"path_lower={_path_lower!r} nas_host={_nas_host!r} "
+                    f"history_len={len(self._history_log)} "
+                    f"incoming_source={entry.get('detection_source')!r}"
+                )
+                _dedup_matched_stored = False
+                for _stored in reversed(self._history_log):
+                    _smach = _stored.get("editor_machine", "")
+                    _suser = _stored.get("editor_user", "")
+                    _stype = _stored.get("type", "")
+                    _spath = _stored.get("path", "").lower()
+                    _is_nas_fallback = (
+                        _smach == _nas_host or
+                        _smach == _stored.get("editor_ip", "NOMATCH")
+                    )
+                    _path_match  = (_spath == _path_lower)
+                    _type_match  = (_stype == "deleted")
+                    # Treat 'Unknown' the same as empty — it means all
+                    # attribution strategies failed on the first attempt.
+                    # A second detector (e.g. watchdog arriving ~1 s after
+                    # unc_poll, carrying a fresh smb_sessions_snapshot from
+                    # NetSessionEnum) must still be allowed to upgrade the
+                    # stored entry to a real user identity.
+                    _user_empty  = (not _suser) or (_suser == "Unknown")
+                    _mach_ok     = (not _smach or _is_nas_fallback)
                     logger.info(
-                        f"[desktop._on_file_change] DEDUP retry scan: "
-                        f"path_lower={_path_lower!r} nas_host={_nas_host!r} "
-                        f"history_len={len(self._history_log)} "
-                        f"incoming_source={entry.get('detection_source')!r}"
+                        f"[desktop._on_file_change] DEDUP retry candidate: "
+                        f"path_match={_path_match} type_match={_type_match} "
+                        f"user_empty={_user_empty} mach_ok={_mach_ok} "
+                        f"stored_user={_suser!r} stored_machine={_smach!r} "
+                        f"stored_ip={_stored.get('editor_ip', '')!r} "
+                        f"nas_host={_nas_host!r} is_nas_fallback={_is_nas_fallback} "
+                        f"attribution_unknown={_stored.get('attribution_unknown', False)}"
                     )
-                    _dedup_matched_stored = False
-                    for _stored in reversed(self._history_log):
-                        _smach = _stored.get("editor_machine", "")
-                        _suser = _stored.get("editor_user", "")
-                        _stype = _stored.get("type", "")
-                        _spath = _stored.get("path", "").lower()
-                        _is_nas_fallback = (
-                            _smach == _nas_host or
-                            _smach == _stored.get("editor_ip", "NOMATCH")
-                        )
-                        _path_match  = (_spath == _path_lower)
-                        _type_match  = (_stype == "deleted")
-                        # Treat 'Unknown' the same as empty — it means all
-                        # attribution strategies failed on the first attempt.
-                        # A second detector (e.g. watchdog arriving ~1 s after
-                        # unc_poll, carrying a fresh smb_sessions_snapshot from
-                        # NetSessionEnum) must still be allowed to upgrade the
-                        # stored entry to a real user identity.
-                        _user_empty  = (not _suser) or (_suser == "Unknown")
-                        _mach_ok     = (not _smach or _is_nas_fallback)
+                    if not (_path_match and _type_match):
+                        # This entry doesn't correspond to our deletion — keep scanning
+                        continue
+                    # Found a stored deletion for the same path.
+                    # Before treating it as a duplicate, check whether the stored
+                    # entry already has a *real* attributed user from a *different*
+                    # machine.  If so this is a genuinely new deletion by a different
+                    # actor (e.g. the folder owner deleting the file again after the
+                    # backup user already deleted it once) and must NOT be deduped.
+                    _stored_has_real_user = (
+                        bool(_suser)
+                        and _suser != "Unknown"
+                        and not _stored.get("attribution_unknown", False)
+                    )
+                    _stored_from_different_machine = (
+                        _smach
+                        and _smach.lower() != _nas_host.lower()
+                        and not _is_nas_fallback
+                    )
+                    if _stored_has_real_user and _stored_from_different_machine:
+                        # This is a real second deletion by a different actor.
+                        # Do NOT mark as dedup-matched; fall through to append
+                        # a fresh row after the loop.
                         logger.info(
-                            f"[desktop._on_file_change] DEDUP retry candidate: "
-                            f"path_match={_path_match} type_match={_type_match} "
-                            f"user_empty={_user_empty} mach_ok={_mach_ok} "
-                            f"stored_user={_suser!r} stored_machine={_smach!r} "
-                            f"stored_ip={_stored.get('editor_ip', '')!r} "
-                            f"nas_host={_nas_host!r} is_nas_fallback={_is_nas_fallback} "
-                            f"attribution_unknown={_stored.get('attribution_unknown', False)}"
+                            f"[desktop._on_file_change] DEDUP: stored deletion has real "
+                            f"user {_suser!r} from different machine {_smach!r} — "
+                            f"treating incoming event as a NEW deletion (not a duplicate). "
+                            f"nas_host={_nas_host!r} is_nas_fallback={_is_nas_fallback}"
                         )
-                        if not (_path_match and _type_match):
-                            # This entry doesn't correspond to our deletion — keep scanning
-                            continue
-                        # Found a stored deletion for the same path.
-                        # Before treating it as a duplicate, check whether the stored
-                        # entry already has a *real* attributed user from a *different*
-                        # machine.  If so this is a genuinely new deletion by a different
-                        # actor (e.g. the folder owner deleting the file again after the
-                        # backup user already deleted it once) and must NOT be deduped.
-                        _stored_has_real_user = (
-                            bool(_suser)
-                            and _suser != "Unknown"
-                            and not _stored.get("attribution_unknown", False)
+                        # Clear the dedup key so this new event is registered
+                        self._dest_event_seen.pop(_dedup_key, None)
+                        _last_seen = None
+                        break
+                    # Same actor (or unresolved) — normal dedup upgrade path
+                    _dedup_matched_stored = True
+                    if _user_empty and _mach_ok:
+                        _has_snap = bool(entry.get("smb_sessions_snapshot"))
+                        logger.info(
+                            f"[desktop._on_file_change] DEDUP retry: matched stored entry — "
+                            f"calling _get_editor_info with "
+                            f"detection_source={entry.get('detection_source')!r} "
+                            f"has_smb_sessions_snapshot={_has_snap} "
+                            f"(snapshot carries live NetSessionEnum data taken at watchdog fire time)"
                         )
-                        _stored_from_different_machine = (
-                            _smach
-                            and _smach.lower() != _nas_host.lower()
-                            and not _is_nas_fallback
+                        _retry_editor = _get_editor_info(
+                            entry.get("path", ""),
+                            entry.get("detection_source", ""),
+                            timestamp_iso=entry.get("timestamp", ""),
+                            event_type="deleted",
+                            smb_audit_cfg=_smb_audit_cfg,
+                            smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
+                            is_dest_watch=_is_dest,
                         )
-                        if _stored_has_real_user and _stored_from_different_machine:
-                            # This is a real second deletion by a different actor.
-                            # Do NOT mark as dedup-matched; fall through to append
-                            # a fresh row after the loop.
+                        logger.info(
+                            f"[desktop._on_file_change] DEDUP retry _get_editor_info result: "
+                            f"user={_retry_editor.get('user')!r} "
+                            f"machine={_retry_editor.get('machine')!r} "
+                            f"ip={_retry_editor.get('ip')!r}"
+                        )
+                        # Only upgrade if we got a REAL user identity —
+                        # "Unknown" and "" both mean attribution failed;
+                        # overwriting with "Unknown" is not an improvement.
+                        # Bug #2 fix: previously `if _retry_editor.get("user")`
+                        # was True for "Unknown" (non-empty string).
+                        _retry_user = _retry_editor.get("user", "")
+                        if _retry_user and _retry_user != "Unknown":
+                            _stored["editor_user"]        = _retry_editor["user"]
+                            _stored["editor_machine"]     = _retry_editor["machine"]
+                            _stored["editor_ip"]          = _retry_editor["ip"]
+                            # Clear the "attribution_unknown" flag that was set
+                            # during the first (failed) attribution attempt so
+                            # the UI stops showing the "Unknown" badge.
+                            _stored["attribution_unknown"] = False
                             logger.info(
-                                f"[desktop._on_file_change] DEDUP: stored deletion has real "
-                                f"user {_suser!r} from different machine {_smach!r} — "
-                                f"treating incoming event as a NEW deletion (not a duplicate). "
-                                f"nas_host={_nas_host!r} is_nas_fallback={_is_nas_fallback}"
+                                f"[desktop._on_file_change] DEDUP enrichment retry succeeded "
+                                f"for deleted event: path={entry.get('path')!r} "
+                                f"user={_retry_editor['user']!r} "
+                                f"machine={_retry_editor['machine']!r} "
+                                f"detection_source={entry.get('detection_source')!r}"
                             )
-                            # Clear the dedup key so this new event is registered
-                            self._dest_event_seen.pop(_dedup_key, None)
-                            _last_seen = None
-                            break
-                        # Same actor (or unresolved) — normal dedup upgrade path
-                        _dedup_matched_stored = True
-                        if _user_empty and _mach_ok:
-                            _has_snap = bool(entry.get("smb_sessions_snapshot"))
+                            # Patch the existing row in-place (don't insert a new one)
+                            if self._history_window and self._history_window.isVisible():
+                                self._history_window.update_entry(_stored)
+                        else:
+                            # Detect same-host SMB: if the SMB host is the same as the
+                            # destination host, Win32 session enum cannot distinguish
+                            # the backup machine from a coworker. Call this out explicitly.
+                            _path_unc_host = _nas_host  # already extracted above
                             logger.info(
-                                f"[desktop._on_file_change] DEDUP retry: matched stored entry — "
-                                f"calling _get_editor_info with "
-                                f"detection_source={entry.get('detection_source')!r} "
-                                f"has_smb_sessions_snapshot={_has_snap} "
-                                f"(snapshot carries live NetSessionEnum data taken at watchdog fire time)"
-                            )
-                            _retry_editor = _get_editor_info(
-                                entry.get("path", ""),
-                                entry.get("detection_source", ""),
-                                timestamp_iso=entry.get("timestamp", ""),
-                                event_type="deleted",
-                                smb_audit_cfg=_smb_audit_cfg,
-                                smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
-                                is_dest_watch=_is_dest,
-                            )
-                            logger.info(
-                                f"[desktop._on_file_change] DEDUP retry _get_editor_info result: "
+                                f"[desktop._on_file_change] DEDUP retry: enrichment still "
+                                f"could not resolve user — stored entry unchanged. "
                                 f"user={_retry_editor.get('user')!r} "
                                 f"machine={_retry_editor.get('machine')!r} "
-                                f"ip={_retry_editor.get('ip')!r}"
+                                f"ip={_retry_editor.get('ip')!r}. "
+                                f"To fix: "
+                                f"(1) add SMB credentials in watch settings (same admin account used to access the share), "
+                                f"(2) enable object auditing (SACL) on the Windows shared folder — "
+                                f""
+                                f""
+                                f"Windows: Security event log 4663. "
+                                + (
+                                f"(3) SAME-HOST DETECTED (dest={_path_unc_host!r}): "
+                                f"Win32 session enumeration (NetSessionEnum/NetFileEnum) cannot "
+                                f"identify a coworker when both the backup machine and the coworker "
+                                f"connect to the same Windows host. Security Event Log (step 2 above) is the "
+                                f"ONLY reliable fix for this scenario. "
+                                if _path_unc_host else ""
+                                )
                             )
-                            # Only upgrade if we got a REAL user identity —
-                            # "Unknown" and "" both mean attribution failed;
-                            # overwriting with "Unknown" is not an improvement.
-                            # Bug #2 fix: previously `if _retry_editor.get("user")`
-                            # was True for "Unknown" (non-empty string).
-                            _retry_user = _retry_editor.get("user", "")
-                            if _retry_user and _retry_user != "Unknown":
-                                _stored["editor_user"]        = _retry_editor["user"]
-                                _stored["editor_machine"]     = _retry_editor["machine"]
-                                _stored["editor_ip"]          = _retry_editor["ip"]
-                                # Clear the "attribution_unknown" flag that was set
-                                # during the first (failed) attribution attempt so
-                                # the UI stops showing the "Unknown" badge.
-                                _stored["attribution_unknown"] = False
+                    break  # matched — stop scanning
+                if not _dedup_matched_stored:
+                    # The first detector (watchdog/poll) hasn't appended the entry
+                    # yet — it's still blocked in _get_editor_info (network call,
+                    # typically 0.5–3 s).  The dedup key is set but the history
+                    # entry isn't there yet.
+                    #
+                    # Strategy: wait up to 5 s in 200 ms increments for the first
+                    # detector's entry to appear, then attempt the DEDUP upgrade as
+                    # normal.  This eliminates the race that previously caused both
+                    # detectors to append separate rows.
+                    import time as _dedup_wait_time
+                    _wait_deadline = _dedup_wait_time.monotonic() + 40.0
+                    _dedup_found_late = False
+                    logger.info(
+                        f"[desktop._on_file_change] DEDUP retry: no stored deletion yet for "
+                        f"path={_path_lower!r} — first detector still in-flight; "
+                        f"waiting up to 40s for it to append "
+                        f"(source={entry.get('detection_source')!r})"
+                    )
+                    while _dedup_wait_time.monotonic() < _wait_deadline:
+                        _dedup_wait_time.sleep(0.2)
+                        for _stored_late in reversed(self._history_log):
+                            _sl_path  = _stored_late.get("path", "").lower()
+                            _sl_type  = _stored_late.get("type", "")
+                            _sl_user  = _stored_late.get("editor_user", "")
+                            _sl_mach  = _stored_late.get("editor_machine", "")
+                            _sl_ip    = _stored_late.get("editor_ip", "")
+                            _sl_is_nas = (_sl_mach == _nas_host or _sl_mach == _sl_ip)
+                            _sl_user_empty = (not _sl_user) or (_sl_user == "Unknown")
+                            _sl_mach_ok    = (not _sl_mach or _sl_is_nas)
+                            if _sl_path == _path_lower and _sl_type == "deleted":
+                                _dedup_found_late = True
                                 logger.info(
-                                    f"[desktop._on_file_change] DEDUP enrichment retry succeeded "
-                                    f"for deleted event: path={entry.get('path')!r} "
-                                    f"user={_retry_editor['user']!r} "
-                                    f"machine={_retry_editor['machine']!r} "
-                                    f"detection_source={entry.get('detection_source')!r}"
+                                    f"[desktop._on_file_change] DEDUP late-match: "
+                                    f"first-detector entry now present — "
+                                    f"stored_user={_sl_user!r} stored_machine={_sl_mach!r} "
+                                    f"user_empty={_sl_user_empty} mach_ok={_sl_mach_ok} "
+                                    f"(source={entry.get('detection_source')!r})"
                                 )
-                                # Patch the existing row in-place (don't insert a new one)
-                                if self._history_window and self._history_window.isVisible():
-                                    self._history_window.update_entry(_stored)
-                            else:
-                                # Detect same-host SMB: if the SMB host is the same as the
-                                # destination host, Win32 session enum cannot distinguish
-                                # the backup machine from a coworker. Call this out explicitly.
-                                _path_unc_host = _nas_host  # already extracted above
-                                logger.info(
-                                    f"[desktop._on_file_change] DEDUP retry: enrichment still "
-                                    f"could not resolve user — stored entry unchanged. "
-                                    f"user={_retry_editor.get('user')!r} "
-                                    f"machine={_retry_editor.get('machine')!r} "
-                                    f"ip={_retry_editor.get('ip')!r}. "
-                                    f"To fix: "
-                                    f"(1) add SMB credentials in watch settings (same admin account used to access the share), "
-                                    f"(2) enable object auditing (SACL) on the Windows shared folder — "
-                                    f""
-                                    f""
-                                    f"Windows: Security event log 4663. "
-                                    + (
-                                    f"(3) SAME-HOST DETECTED (dest={_path_unc_host!r}): "
-                                    f"Win32 session enumeration (NetSessionEnum/NetFileEnum) cannot "
-                                    f"identify a coworker when both the backup machine and the coworker "
-                                    f"connect to the same Windows host. Security Event Log (step 2 above) is the "
-                                    f"ONLY reliable fix for this scenario. "
-                                    if _path_unc_host else ""
+                                if _sl_user_empty and _sl_mach_ok:
+                                    # Try to upgrade attribution with this detector's data
+                                    _has_snap2 = bool(entry.get("smb_sessions_snapshot"))
+                                    _retry2 = _get_editor_info(
+                                        entry.get("path", ""),
+                                        entry.get("detection_source", ""),
+                                        timestamp_iso=entry.get("timestamp", ""),
+                                        event_type="deleted",
+                                        smb_audit_cfg=_smb_audit_cfg,
+                                        smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
+                                        is_dest_watch=_is_dest,
                                     )
-                                )
-                        break  # matched — stop scanning
-                    if not _dedup_matched_stored:
-                        # The first detector (watchdog/poll) hasn't appended the entry
-                        # yet — it's still blocked in _get_editor_info (network call,
-                        # typically 0.5–3 s).  The dedup key is set but the history
-                        # entry isn't there yet.
-                        #
-                        # Strategy: wait up to 5 s in 200 ms increments for the first
-                        # detector's entry to appear, then attempt the DEDUP upgrade as
-                        # normal.  This eliminates the race that previously caused both
-                        # detectors to append separate rows.
-                        import time as _dedup_wait_time
-                        _wait_deadline = _dedup_wait_time.monotonic() + 40.0
-                        _dedup_found_late = False
+                                    logger.info(
+                                        f"[desktop._on_file_change] DEDUP late-retry _get_editor_info: "
+                                        f"user={_retry2.get('user')!r} "
+                                        f"machine={_retry2.get('machine')!r} "
+                                        f"ip={_retry2.get('ip')!r} "
+                                        f"has_snap={_has_snap2}"
+                                    )
+                                    _r2_user = _retry2.get("user", "")
+                                    if _r2_user and _r2_user != "Unknown":
+                                        _stored_late["editor_user"]        = _retry2["user"]
+                                        _stored_late["editor_machine"]     = _retry2["machine"]
+                                        _stored_late["editor_ip"]          = _retry2["ip"]
+                                        _stored_late["attribution_unknown"] = False
+                                        logger.info(
+                                            f"[desktop._on_file_change] DEDUP late-retry UPGRADED: "
+                                            f"user={_retry2['user']!r} machine={_retry2['machine']!r}"
+                                        )
+                                        if self._history_window and self._history_window.isVisible():
+                                            self._history_window.update_entry(_stored_late)
+                                    else:
+                                        logger.info(
+                                            f"[desktop._on_file_change] DEDUP late-retry: "
+                                            f"still unresolved — stored entry unchanged"
+                                        )
+                                break  # matched — stop scanning
+                        if _dedup_found_late:
+                            break  # stop waiting
+
+                    if _dedup_found_late:
+                        # Successfully deduped — do NOT append a second row
                         logger.info(
-                            f"[desktop._on_file_change] DEDUP retry: no stored deletion yet for "
-                            f"path={_path_lower!r} — first detector still in-flight; "
-                            f"waiting up to 40s for it to append "
+                            f"[desktop._on_file_change] DEDUP late-match: "
+                            f"suppressing duplicate append for "
+                            f"path={_path_lower!r} source={entry.get('detection_source')!r}"
+                        )
+                        return
+                    else:
+                        # Waited 5 s and still no matching entry — the first
+                        # detector must have genuinely failed to append (exception,
+                        # suppression, etc.).  Fall through so this detector appends.
+                        logger.info(
+                            f"[desktop._on_file_change] DEDUP late-match: "
+                            f"timed out after 40s — first-detector entry never appeared; "
+                            f"falling through to append "
                             f"(source={entry.get('detection_source')!r})"
                         )
-                        while _dedup_wait_time.monotonic() < _wait_deadline:
-                            _dedup_wait_time.sleep(0.2)
-                            for _stored_late in reversed(self._history_log):
-                                _sl_path  = _stored_late.get("path", "").lower()
-                                _sl_type  = _stored_late.get("type", "")
-                                _sl_user  = _stored_late.get("editor_user", "")
-                                _sl_mach  = _stored_late.get("editor_machine", "")
-                                _sl_ip    = _stored_late.get("editor_ip", "")
-                                _sl_is_nas = (_sl_mach == _nas_host or _sl_mach == _sl_ip)
-                                _sl_user_empty = (not _sl_user) or (_sl_user == "Unknown")
-                                _sl_mach_ok    = (not _sl_mach or _sl_is_nas)
-                                if _sl_path == _path_lower and _sl_type == "deleted":
-                                    _dedup_found_late = True
-                                    logger.info(
-                                        f"[desktop._on_file_change] DEDUP late-match: "
-                                        f"first-detector entry now present — "
-                                        f"stored_user={_sl_user!r} stored_machine={_sl_mach!r} "
-                                        f"user_empty={_sl_user_empty} mach_ok={_sl_mach_ok} "
-                                        f"(source={entry.get('detection_source')!r})"
-                                    )
-                                    if _sl_user_empty and _sl_mach_ok:
-                                        # Try to upgrade attribution with this detector's data
-                                        _has_snap2 = bool(entry.get("smb_sessions_snapshot"))
-                                        _retry2 = _get_editor_info(
-                                            entry.get("path", ""),
-                                            entry.get("detection_source", ""),
-                                            timestamp_iso=entry.get("timestamp", ""),
-                                            event_type="deleted",
-                                            smb_audit_cfg=_smb_audit_cfg,
-                                            smb_sessions_snapshot=entry.get("smb_sessions_snapshot"),
-                                            is_dest_watch=_is_dest,
-                                        )
-                                        logger.info(
-                                            f"[desktop._on_file_change] DEDUP late-retry _get_editor_info: "
-                                            f"user={_retry2.get('user')!r} "
-                                            f"machine={_retry2.get('machine')!r} "
-                                            f"ip={_retry2.get('ip')!r} "
-                                            f"has_snap={_has_snap2}"
-                                        )
-                                        _r2_user = _retry2.get("user", "")
-                                        if _r2_user and _r2_user != "Unknown":
-                                            _stored_late["editor_user"]        = _retry2["user"]
-                                            _stored_late["editor_machine"]     = _retry2["machine"]
-                                            _stored_late["editor_ip"]          = _retry2["ip"]
-                                            _stored_late["attribution_unknown"] = False
-                                            logger.info(
-                                                f"[desktop._on_file_change] DEDUP late-retry UPGRADED: "
-                                                f"user={_retry2['user']!r} machine={_retry2['machine']!r}"
-                                            )
-                                            if self._history_window and self._history_window.isVisible():
-                                                self._history_window.update_entry(_stored_late)
-                                        else:
-                                            logger.info(
-                                                f"[desktop._on_file_change] DEDUP late-retry: "
-                                                f"still unresolved — stored entry unchanged"
-                                            )
-                                    break  # matched — stop scanning
-                            if _dedup_found_late:
-                                break  # stop waiting
+                        self._dest_event_seen.pop(_dedup_key, None)
+                        _last_seen = None
 
-                        if _dedup_found_late:
-                            # Successfully deduped — do NOT append a second row
-                            logger.info(
-                                f"[desktop._on_file_change] DEDUP late-match: "
-                                f"suppressing duplicate append for "
-                                f"path={_path_lower!r} source={entry.get('detection_source')!r}"
-                            )
-                            return
-                        else:
-                            # Waited 5 s and still no matching entry — the first
-                            # detector must have genuinely failed to append (exception,
-                            # suppression, etc.).  Fall through so this detector appends.
-                            logger.info(
-                                f"[desktop._on_file_change] DEDUP late-match: "
-                                f"timed out after 40s — first-detector entry never appeared; "
-                                f"falling through to append "
-                                f"(source={entry.get('detection_source')!r})"
-                            )
-                            self._dest_event_seen.pop(_dedup_key, None)
-                            _last_seen = None
-
-                # ── If enrichment still returned no user, mark honestly ──────
-                # Never borrow attribution from another machine/event — that
-                # would show the wrong person (e.g. the backup machine .106)
-                # as the actor when it was really a coworker (.101).
-                # Instead label the entry clearly as unattributable.
-                _path_lower_ls = entry.get("path", "").lower()
-                for _stored2 in reversed(self._history_log):
-                    if (_stored2.get("path", "").lower() == _path_lower_ls
-                            and _stored2.get("type") == "deleted"
-                            and not _stored2.get("editor_user")
-                            and not _stored2.get("attribution_unknown")):
-                        _nas_ip = (_stored2.get("editor_ip", "")
-                                   or _stored2.get("editor_machine", ""))
-                        _stored2["editor_user"]         = "Unknown"
-                        # Don't show the share-server's own hostname as the
-                        # machine — it's misleading (e.g. DESKTOP-KGG55PU is
-                        # the host of the share, not the actor's PC).
-                        # Leave machine blank so the UI shows nothing in that
-                        # column rather than pointing at the wrong machine.
-                        _stored2["editor_machine"]      = ""
-                        _stored2["editor_ip"]           = ""
-                        _stored2["attribution_unknown"] = True
-                        logger.info(
-                            f"[desktop._on_file_change] Attribution unresolvable — "
-                            f"marked as Unknown (SMB host {_nas_ip!r}) for "
-                            f"path={entry.get('path')!r}. "
-                            f"Tip: enter SMB credentials in watch settings (same account used to access the share) "
-                            f"and enable object auditing (SACL) on the shared folder."
-                        )
-                        if self._history_window and self._history_window.isVisible():
-                            self._history_window.update_entry(_stored2)
-                        break
-                if _last_seen is None:
-                    # Fall-through path: first detector crashed before appending,
-                    # _last_seen was cleared so this event should be appended normally.
-                    pass
-                else:
-                    logger.debug(
-                        f"[desktop._on_file_change] DEDUP dropped dest event "
-                        f"(already seen {_now_mono - _last_seen:.1f}s ago): "
-                        f"watch_id={watch_id!r} type={_etype!r} "
-                        f"path={entry.get('path')!r} "
-                        f"detection_source={entry.get('detection_source')!r}"
+            # ── If enrichment still returned no user, mark honestly ──────
+            # Never borrow attribution from another machine/event — that
+            # would show the wrong person (e.g. the backup machine .106)
+            # as the actor when it was really a coworker (.101).
+            # Instead label the entry clearly as unattributable.
+            _path_lower_ls = entry.get("path", "").lower()
+            for _stored2 in reversed(self._history_log):
+                if (_stored2.get("path", "").lower() == _path_lower_ls
+                        and _stored2.get("type") == "deleted"
+                        and not _stored2.get("editor_user")
+                        and not _stored2.get("attribution_unknown")):
+                    _nas_ip = (_stored2.get("editor_ip", "")
+                               or _stored2.get("editor_machine", ""))
+                    _stored2["editor_user"]         = "Unknown"
+                    # Don't show the share-server's own hostname as the
+                    # machine — it's misleading (e.g. DESKTOP-KGG55PU is
+                    # the host of the share, not the actor's PC).
+                    # Leave machine blank so the UI shows nothing in that
+                    # column rather than pointing at the wrong machine.
+                    _stored2["editor_machine"]      = ""
+                    _stored2["editor_ip"]           = ""
+                    _stored2["attribution_unknown"] = True
+                    logger.info(
+                        f"[desktop._on_file_change] Attribution unresolvable — "
+                        f"marked as Unknown (SMB host {_nas_ip!r}) for "
+                        f"path={entry.get('path')!r}. "
+                        f"Tip: enter SMB credentials in watch settings (same account used to access the share) "
+                        f"and enable object auditing (SACL) on the shared folder."
                     )
-                    return
-            self._dest_event_seen[_dedup_key] = _now_mono
-            # Prune old dedup entries to avoid unbounded growth
-            if len(self._dest_event_seen) > 500:
-                _cutoff = _now_mono - _DEDUP_WINDOW
-                self._dest_event_seen = {
-                    k: v for k, v in self._dest_event_seen.items() if v > _cutoff
-                }
+                    if self._history_window and self._history_window.isVisible():
+                        self._history_window.update_entry(_stored2)
+                    break
+            if _last_seen is None:
+                # Fall-through path: first detector crashed before appending,
+                # _last_seen was cleared so this event should be appended normally.
+                pass
+            else:
+                logger.debug(
+                    f"[desktop._on_file_change] DEDUP dropped dest event "
+                    f"(already seen {_now_mono - _last_seen:.1f}s ago): "
+                    f"watch_id={watch_id!r} type={_etype!r} "
+                    f"path={entry.get('path')!r} "
+                    f"detection_source={entry.get('detection_source')!r}"
+                )
+                return
+        self._dest_event_seen[_dedup_key] = _now_mono
+        # Prune old dedup entries to avoid unbounded growth
+        if len(self._dest_event_seen) > 500:
+            _cutoff = _now_mono - _DEDUP_WINDOW
+            self._dest_event_seen = {
+                k: v for k, v in self._dest_event_seen.items() if v > _cutoff
+            }
         # ── Source-watcher: spurious-modified suppression ────────────────────
         # Same Windows SMB artifact as on the destination: a remote file-create
         # fires both ADDED and MODIFIED nearly simultaneously on separate threads.
@@ -18318,28 +19842,151 @@ class MainWindow(QMainWindow):
                 # unc_poll uses snapshot diff → only real size changes → never suppress
                 _src_is_poll = _src_det_src in ("unc_poll", "poll_reset_recovery")
                 if _src_added_at is not None and (_src_now - _src_added_at) < _SRC_SPURIOUS_WINDOW and not _src_is_poll:
-                    _dbg.info(
-                        f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED suppressed: "
-                        f"'modified' arrived {_src_now - _src_added_at:.3f}s after 'added' "
-                        f"for same path — Windows SMB write-notification artifact, not a real edit. "
-                        f"early_stamp={_src_early_at is not None} seen_stamp={_src_seen_at is not None} "
-                        f"retry_elapsed={_src_retry_elapsed:.3f}s "
-                        f"watch_id={watch_id!r} path={entry.get('path')!r} "
-                        f"detection_source={_src_det_src!r}"
-                    )
-                    # Release the dedup slot so that a later unc_poll-sourced
-                    # "modified" for this file is not dropped as a duplicate.
-                    # Without this, watchdog claims the slot at T1, gets spuriously
-                    # blocked, but the slot stays set — unc_poll's detection 15s later
-                    # sees T1 as recent (< 25s) and is silently dropped as a dupe.
-                    with self._source_event_seen_lock:
-                        if self._source_event_seen.get(_src_dedup_key) == _src_now:
-                            self._source_event_seen.pop(_src_dedup_key, None)
+                    # ── Fingerprint override ──────────────────────────────────
+                    # Before suppressing, check whether the file's fingerprint
+                    # has actually changed since the last accepted add/edit.
+                    # The 300 s window was designed to absorb SMB re-fire noise
+                    # for files that were ONLY added (never edited), but it also
+                    # incorrectly suppresses GENUINE edits made shortly after the
+                    # add — e.g. a user drops a file and immediately edits it.
+                    # The unc_poll safety net that was supposed to catch these is
+                    # unreliable when Excel saves in-place with the same byte count
+                    # (poll sees UNCHANGED mtime/size and does not fire).
+                    # Fix: do the same fingerprint check used by the dest path.
+                    # If size, mtime, or content hash has changed → genuine edit,
+                    # bypass suppression entirely.
+                    _src_fp_path = entry.get("path", "")
+                    _src_fp_key  = (watch_id, _src_fp_path.lower())
+                    _src_fp_override = False  # True → bypass suppression
+                    try:
+                        import os as _src_os
+                        _src_fp_stat = _src_os.stat(_src_fp_path)
+                        _src_fp_current = (_src_fp_stat.st_size, _src_fp_stat.st_mtime)
+                        with self._dest_content_fp_lock:
+                            _src_fp_prev = self._dest_content_fp.get(_src_fp_key)
+                        _src_fp_prev_size  = _src_fp_prev[0] if _src_fp_prev and len(_src_fp_prev) >= 1 else None
+                        _src_fp_prev_mtime = _src_fp_prev[1] if _src_fp_prev and len(_src_fp_prev) >= 2 else None
+                        _src_fp_prev_hash  = _src_fp_prev[2] if _src_fp_prev and len(_src_fp_prev) >= 3 else None
+                        _src_size_mtime_match = (
+                            _src_fp_prev_size is not None
+                            and _src_fp_prev_mtime is not None
+                            and _src_fp_prev_size == _src_fp_current[0]
+                            and abs(float(_src_fp_prev_mtime) - _src_fp_current[1]) < 0.001
+                        )
+                        if not _src_size_mtime_match:
+                            # Size or mtime changed → definitely a genuine edit
+                            _src_fp_override = True
                             _dbg.info(
-                                f"[desktop._on_file_change] SOURCE SPURIOUS dedup-slot RELEASED: "
-                                f"key={_src_dedup_key!r} — unc_poll detection can still reach history"
+                                f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
+                                f"FINGERPRINT-OVERRIDE: size/mtime changed — genuine edit, "
+                                f"bypassing {_SRC_SPURIOUS_WINDOW}s suppression window. "
+                                f"path={_src_fp_path!r} "
+                                f"prev_fp={_src_fp_prev!r} "
+                                f"current=(size={_src_fp_current[0]}, mtime_float={_src_fp_current[1]}) "
+                                f"watch_id={watch_id!r} "
+                                f"elapsed_since_add={_src_now - _src_added_at:.3f}s"
                             )
-                    return
+                            # Record new fingerprint
+                            with self._dest_content_fp_lock:
+                                self._dest_content_fp[_src_fp_key] = (
+                                    _src_fp_current[0], _src_fp_current[1], None
+                                )
+                        else:
+                            # Size+mtime match → check content hash as tiebreaker
+                            _src_fp_current_hash = None
+                            try:
+                                import hashlib as _src_hashlib
+                                with open(_src_fp_path, "rb") as _src_fh:
+                                    _src_fp_current_hash = _src_hashlib.sha256(
+                                        _src_fh.read(65536)
+                                    ).hexdigest()
+                            except Exception as _src_hash_err:
+                                _dbg.info(
+                                    f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
+                                    f"fingerprint hash read failed ({_src_hash_err!r}) — "
+                                    f"cannot verify content, NOT suppressing (fail open). "
+                                    f"path={_src_fp_path!r} watch_id={watch_id!r}"
+                                )
+                                _src_fp_override = True  # fail open
+
+                            if not _src_fp_override:
+                                if _src_fp_current_hash is not None and _src_fp_prev_hash is not None:
+                                    if _src_fp_current_hash != _src_fp_prev_hash:
+                                        _src_fp_override = True
+                                        _dbg.info(
+                                            f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
+                                            f"FINGERPRINT-OVERRIDE: size+mtime matched but sha256_64k "
+                                            f"differs — genuine content change, bypassing suppression. "
+                                            f"path={_src_fp_path!r} "
+                                            f"prev_hash={_src_fp_prev_hash!r} "
+                                            f"current_hash={_src_fp_current_hash!r} "
+                                            f"watch_id={watch_id!r} "
+                                            f"elapsed_since_add={_src_now - _src_added_at:.3f}s"
+                                        )
+                                        with self._dest_content_fp_lock:
+                                            self._dest_content_fp[_src_fp_key] = (
+                                                _src_fp_current[0], _src_fp_current[1], _src_fp_current_hash
+                                            )
+                                    else:
+                                        _dbg.info(
+                                            f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
+                                            f"fingerprint confirmed unchanged (size+mtime+hash all match) "
+                                            f"— suppression confirmed. "
+                                            f"path={_src_fp_path!r} watch_id={watch_id!r} "
+                                            f"sha256_64k={_src_fp_current_hash!r}"
+                                        )
+                                elif _src_fp_prev_hash is None and _src_fp_current_hash is not None:
+                                    # No prior hash (legacy/seed-failed entry) — fail open
+                                    # to avoid hiding a real change we can't verify.
+                                    _src_fp_override = True
+                                    _dbg.info(
+                                        f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
+                                        f"fingerprint prev has no hash (legacy format) — "
+                                        f"treating as genuine edit to avoid false suppression. "
+                                        f"path={_src_fp_path!r} watch_id={watch_id!r} "
+                                        f"current_hash={_src_fp_current_hash!r}"
+                                    )
+                    except Exception as _src_fp_err:
+                        # stat failed (file locked/deleted) → fail open
+                        _src_fp_override = True
+                        _dbg.info(
+                            f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
+                            f"fingerprint stat failed ({_src_fp_err!r}) — "
+                            f"cannot verify, NOT suppressing (fail open). "
+                            f"path={_src_fp_path!r} watch_id={watch_id!r}"
+                        )
+
+                    if _src_fp_override:
+                        # Fall through to normal processing — do NOT return.
+                        _dbg.info(
+                            f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
+                            f"suppression BYPASSED by fingerprint override. "
+                            f"path={_src_fp_path!r} watch_id={watch_id!r} "
+                            f"elapsed_since_add={_src_now - _src_added_at:.3f}s"
+                        )
+                    else:
+                        _dbg.info(
+                            f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED suppressed: "
+                            f"'modified' arrived {_src_now - _src_added_at:.3f}s after 'added' "
+                            f"for same path — Windows SMB write-notification artifact, not a real edit. "
+                            f"early_stamp={_src_early_at is not None} seen_stamp={_src_seen_at is not None} "
+                            f"retry_elapsed={_src_retry_elapsed:.3f}s "
+                            f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                            f"detection_source={_src_det_src!r}"
+                        )
+                        # Release the dedup slot so that a later unc_poll-sourced
+                        # "modified" for this file is not dropped as a duplicate.
+                        # Without this, watchdog claims the slot at T1, gets spuriously
+                        # blocked, but the slot stays set — unc_poll's detection 15s later
+                        # sees T1 as recent (< 25s) and is silently dropped as a dupe.
+                        with self._source_event_seen_lock:
+                            if self._source_event_seen.get(_src_dedup_key) == _src_now:
+                                self._source_event_seen.pop(_src_dedup_key, None)
+                                _dbg.info(
+                                    f"[desktop._on_file_change] SOURCE SPURIOUS dedup-slot RELEASED: "
+                                    f"key={_src_dedup_key!r} — unc_poll detection can still reach history"
+                                )
+                        return
 
                 # ── unc_notify overflow-reopen storm suppression ─────────────
                 # When the SMB2 CHANGE_NOTIFY buffer overflows (during robocopy or
@@ -18433,7 +20080,8 @@ class MainWindow(QMainWindow):
                     with _watcher_lock:
                         _peer_entries = list(_watcher_pending.get(watch_id, []))
                     for _pe in reversed(_peer_entries):
-                        if (_pe.get("path") or "").lower() == _epath_lower and                                 _pe.get("smb_sessions_snapshot"):
+                        if (_pe.get("path") or "").lower() == _epath_lower and \
+                                _pe.get("smb_sessions_snapshot"):
                             _snap_for_gei = _pe["smb_sessions_snapshot"]
                             _snap_log.getLogger(__name__).info(
                                 f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
@@ -18444,11 +20092,49 @@ class MainWindow(QMainWindow):
                             )
                             break
                     else:
-                        _snap_log.getLogger(__name__).info(
-                            f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
-                            f"no watchdog snapshot found in _pending for {entry.get('path')!r} — "
-                            f"will rely on session cache / audit log for attribution."
-                        )
+                        # _pending borrow failed — try the per-path snapshot cache.
+                        # This handles the race where unc_poll dispatches attribution
+                        # BEFORE watchdog's on_change inserts into _pending, but watchdog
+                        # already wrote the snapshot to _path_smb_snapshot during _record().
+                        import time as _borrow_t
+                        try:
+                            from watcher import (
+                                _path_smb_snapshot as _wpath_snap,
+                                _path_smb_snapshot_lock as _wpath_lock,
+                                _PATH_SNAP_TTL_S as _wpath_ttl,
+                            )
+                            with _wpath_lock:
+                                _pcache = _wpath_snap.get(_epath_lower)
+                            if _pcache:
+                                _pcache_age = _borrow_t.time() - _pcache[0]
+                                if _pcache_age <= _wpath_ttl:
+                                    _snap_for_gei = _pcache[1]
+                                    _snap_log.getLogger(__name__).info(
+                                        f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
+                                        f"unc_poll 'added' for {entry.get('path')!r} — "
+                                        f"_pending miss but found per-path snapshot cache hit "
+                                        f"(age={_pcache_age:.2f}s, ttl={_wpath_ttl}s): "
+                                        f"{_snap_for_gei!r} — using it for attribution."
+                                    )
+                                else:
+                                    _snap_log.getLogger(__name__).info(
+                                        f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
+                                        f"no watchdog snapshot found in _pending for {entry.get('path')!r}; "
+                                        f"per-path cache hit but EXPIRED "
+                                        f"(age={_pcache_age:.1f}s > ttl={_wpath_ttl}s) — "
+                                        f"will rely on session cache / audit log for attribution."
+                                    )
+                            else:
+                                _snap_log.getLogger(__name__).info(
+                                    f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
+                                    f"no watchdog snapshot found in _pending for {entry.get('path')!r} — "
+                                    f"will rely on session cache / audit log for attribution."
+                                )
+                        except Exception as _pcache_err:
+                            _snap_log.getLogger(__name__).info(
+                                f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
+                                f"per-path cache lookup failed: {_pcache_err!r}"
+                            )
                 except Exception as _snap_err:
                     pass
             editor = _get_editor_info(
@@ -22663,6 +24349,31 @@ def _acquire_single_instance_lock():
 
 
 def main():
+    # ── Auto-elevate to Administrator if not already running as admin ──────────
+    # NetFileEnum and 'net file' both require admin rights to enumerate open
+    # SMB file handles (needed for correct attribution on same-host watches).
+    # On Windows, if we're not admin, re-launch ourselves elevated via UAC.
+    # This is a no-op when already running as admin or on non-Windows platforms.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                # Re-launch the current process with 'runas' verb (triggers UAC prompt)
+                _script = sys.executable if getattr(sys, "frozen", False) else __file__
+                _params = " ".join(f'"{a}"' for a in sys.argv[1:])
+                _ret = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", sys.executable if getattr(sys, "frozen", False) else sys.executable,
+                    (f'"{_script}" {_params}').strip() if not getattr(sys, "frozen", False)
+                    else _params,
+                    None, 1  # SW_SHOWNORMAL
+                )
+                if _ret > 32:
+                    # Successfully launched elevated process — exit this non-admin instance
+                    sys.exit(0)
+                # If ShellExecuteW returned <= 32, user cancelled UAC or error occurred
+                # — fall through and run without admin (degraded attribution)
+        except Exception:
+            pass  # If ctypes/IsUserAnAdmin fails for any reason, proceed normally
     import faulthandler
     if sys.stderr is not None:
         faulthandler.enable()
