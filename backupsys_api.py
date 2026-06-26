@@ -251,7 +251,7 @@ else:
                 response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, X-BackupSys-Signature, Authorization"
+            "Content-Type, X-BackupSys-Signature, X-BackupSys-Timestamp, Authorization"
         )
         return response
 
@@ -273,7 +273,7 @@ else:
             headers={
                 "Access-Control-Allow-Origin": allowed,
                 "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-BackupSys-Signature, Authorization",
+                "Access-Control-Allow-Headers": "Content-Type, X-BackupSys-Signature, X-BackupSys-Timestamp, Authorization",
                 "Access-Control-Max-Age": "86400",
             },
         )
@@ -649,9 +649,11 @@ def backup_event():
 
     # ── Rate limit (per-IP and, when present, per-machine) ─────────────────
     # Checked after JSON parse so machine_id is available for the finer-
-    # grained machine window.  IP is still checked independently so
-    # unauthenticated/pre-parse traffic is also covered by require_auth above.
-    client_ip = request.remote_addr or "unknown"
+    # grained machine window.  Use _client_ip() (not request.remote_addr) so the
+    # per-IP window keys on the real client behind a trusted reverse proxy —
+    # otherwise every client shares the proxy's IP and the per-IP limit collapses
+    # into one global bucket. (All other endpoints already use _client_ip().)
+    client_ip = _client_ip()
     if not _event_rate_limit_check(client_ip, machine_id):
         logger.warning(f"[event] rate-limited ip={client_ip} machine={machine_id!r}")
         _log_request(429)

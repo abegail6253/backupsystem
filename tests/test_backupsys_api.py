@@ -412,6 +412,29 @@ class TestBackupEvent:
         r = self._post(client, {"status": "success"})
         assert r.status_code == 429
 
+    def test_rate_limit_keys_on_forwarded_ip_behind_trusted_proxy(self, client, monkeypatch):
+        """Regression: the per-IP event rate limit must key on the real client IP
+        (X-Forwarded-For) when behind a trusted proxy, not request.remote_addr
+        (the shared proxy address). backup_event used request.remote_addr
+        directly, which collapsed every client into one shared bucket."""
+        monkeypatch.setattr(api, "TRUSTED_PROXY", True)
+        with api._event_rl_lock:
+            api._event_rl_store.clear()
+            # Client A's forwarded IP is already at the limit.
+            api._event_rl_store["203.0.113.7"] = [time.time()] * api.EVENT_RATE_LIMIT
+        body = json.dumps({"status": "success"}).encode()
+        base = {**_auth_headers(body), "Content-Type": "application/json"}
+
+        # Client A (over limit) → 429 (only true if keyed on the forwarded IP)
+        r_a = client.post("/backup/event", data=body,
+                          headers={**base, "X-Forwarded-For": "203.0.113.7"})
+        assert r_a.status_code == 429
+
+        # Client B shares the proxy's remote_addr but has its own empty bucket → allowed
+        r_b = client.post("/backup/event", data=body,
+                          headers={**base, "X-Forwarded-For": "198.51.100.9"})
+        assert r_b.status_code != 429
+
     def test_rolling_cap_enforced(self, client, _isolated_db, monkeypatch):
         """DB must never hold more than MAX_EVENTS rows."""
         monkeypatch.setattr(api, "MAX_EVENTS", 3)
