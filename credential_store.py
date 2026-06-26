@@ -166,9 +166,9 @@ def set_webdav_password(webdav_cfg: dict, password: str) -> bool:
 
 def get_smtp_password(email_cfg: dict) -> str:
     """
-    Return SMTP password.  Priority order:
-      1. OS keyring
-      2. BACKUPSYS_EMAIL_PASSWORD environment variable
+    Return SMTP password.  Priority order (matches the code below):
+      1. BACKUPSYS_EMAIL_PASSWORD environment variable (explicit override)
+      2. OS keyring
       3. email_config.password in config.json (plaintext fallback)
     """
     import os
