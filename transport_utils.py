@@ -237,6 +237,7 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None, verify=F
             _mkdir_p(remote_dir)
             try:
                 def _do_upload_sftp():
+                    nonlocal _bytes_done
                     with open(str(fp), "rb") as fh:
                         if progress_cb:
                             f_handle = sftp.open(remote_file, "wb")
@@ -271,7 +272,15 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None, verify=F
         # ── Post-upload verification: remote file count must match local ──────
         result = {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
         _expected = len(_all_files)
-        if _expected > 0 and uploaded != _expected:
+        if _expected > 0 and uploaded == 0:
+            # Total failure — every file errored. Reporting ok=True here would
+            # mask complete data loss as success, so fail explicitly.
+            result["ok"] = False
+            result["error"] = (
+                f"All {_expected} file(s) failed to upload to {host} "
+                f"— check the log for per-file errors"
+            )
+        elif _expected > 0 and uploaded != _expected:
             _missing = _expected - uploaded
             logger.warning(
                 f"[sftp] Verification warning: expected {_expected} file(s), "
@@ -432,7 +441,14 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None, verify=Fal
         # ── Post-upload verification ──────────────────────────────────────────
         result = {"ok": True, "uploaded": uploaded, "path": f"{remote_base}/{ld.name}"}
         _expected = len(_all_files)
-        if _expected > 0 and uploaded != _expected:
+        if _expected > 0 and uploaded == 0:
+            # Total failure — reporting ok=True would mask complete data loss.
+            result["ok"] = False
+            result["error"] = (
+                f"All {_expected} file(s) failed to upload to {host} "
+                f"— check the log for per-file errors"
+            )
+        elif _expected > 0 and uploaded != _expected:
             _missing = _expected - uploaded
             logger.warning(
                 f"[ftp] Verification warning: expected {_expected} file(s), "
@@ -1286,7 +1302,10 @@ def cleanup_rclone_backups(rclone_cfg: dict, retention_days: int, watch_id: str 
     if proc.returncode != 0:
         return {"ok": False, "error": f"lsd failed: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}"}
 
-    now = datetime.datetime.utcnow()
+    # Local time, not UTC: backup folder names are stamped with the local-time
+    # datetime.now() in run_backup(), so the age comparison must also be local
+    # (mixing utcnow() with a local timestamp skewed pruning by the UTC offset).
+    now = datetime.datetime.now()
     deleted = 0
     remote_count = 0
     errors = []

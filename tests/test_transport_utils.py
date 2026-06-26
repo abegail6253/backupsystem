@@ -99,6 +99,109 @@ class TestUploadSftp(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("paramiko", result["error"].lower())
 
+    @staticmethod
+    def _fake_paramiko(open_factory=None, putfo_side_effect=None):
+        """Build a fake `paramiko` module good enough to drive upload_to_sftp.
+
+        upload_to_sftp does a local `import paramiko`, so it must be injected
+        into sys.modules — patching transport_utils.paramiko is shadowed by
+        that re-import and has no effect.
+        """
+        import types
+        m = types.ModuleType("paramiko")
+
+        class _HostKeys:
+            def load(self, *a, **k): pass
+            def lookup(self, *a, **k): return None
+            def add(self, *a, **k): pass
+            def save(self, *a, **k): pass
+
+        class _Key:
+            def get_name(self): return "ssh-ed25519"
+
+        class _Transport:
+            def __init__(self, *a, **k):
+                self.default_window_size = 0
+                self.default_max_packet_size = 0
+            def connect(self, *a, **k): pass
+            def get_remote_server_key(self): return _Key()
+            def auth_password(self, *a, **k): pass
+            def auth_publickey(self, *a, **k): pass
+            def is_authenticated(self): return True
+            def close(self): pass
+
+        class _DefaultFH:
+            def write(self, data): pass
+            def close(self): pass
+
+        class _SFTPClient:
+            @classmethod
+            def from_transport(cls, t): return cls()
+            def stat(self, p): raise FileNotFoundError()
+            def mkdir(self, p): pass
+            def open(self, p, mode): return (open_factory() if open_factory else _DefaultFH())
+            def putfo(self, fh, remote, file_size=0):
+                if putfo_side_effect:
+                    raise putfo_side_effect
+            def close(self): pass
+
+        class _SSHException(Exception): pass
+        class _AuthException(Exception): pass
+
+        m.HostKeys = _HostKeys
+        m.Transport = _Transport
+        m.SFTPClient = _SFTPClient
+        m.RSAKey = m.Ed25519Key = m.ECDSAKey = _Key
+        m.SSHException = _SSHException
+        m.AuthenticationException = _AuthException
+        m.ssh_exception = types.SimpleNamespace(PasswordRequiredException=_SSHException)
+        return m
+
+    def test_upload_with_progress_cb_succeeds(self):
+        """Regression: the progress_cb chunked path used to raise
+        UnboundLocalError (_bytes_done missing `nonlocal`), so every SFTP
+        upload failed when a progress callback was supplied (the normal case)."""
+        import tempfile, shutil
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            bd = _make_backup_dir(tmp)  # two real local files to stream
+            calls = []
+            with patch.dict("sys.modules", {"paramiko": self._fake_paramiko()}), \
+                 patch("transport_utils._CRED_STORE", False):
+                result = transport_utils.upload_to_sftp(
+                    str(bd),
+                    {"host": "sftp.example.com", "username": "user",
+                     "password": "pass", "remote_path": "/backups"},
+                    progress_cb=lambda *a: calls.append(a),
+                    max_retries=0,
+                )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["uploaded"], 2)
+            self.assertGreaterEqual(len(calls), 1)  # progress actually reported
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_total_upload_failure_reports_not_ok(self):
+        """A total upload failure (0 of N files) must report ok=False, not a
+        bare warning with ok=True (which masked data loss as success)."""
+        import tempfile, shutil
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            bd = _make_backup_dir(tmp)
+            fake = self._fake_paramiko(putfo_side_effect=OSError("disk full"))
+            with patch.dict("sys.modules", {"paramiko": fake}), \
+                 patch("transport_utils._CRED_STORE", False):
+                result = transport_utils.upload_to_sftp(
+                    str(bd),
+                    {"host": "sftp.example.com", "username": "user",
+                     "password": "pass", "remote_path": "/backups"},
+                    max_retries=0,  # no progress_cb → putfo path, which fails
+                )
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["uploaded"], 0)
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
 
 # ─── FTP tests ────────────────────────────────────────────────────────────────
 
