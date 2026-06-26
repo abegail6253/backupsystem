@@ -626,6 +626,33 @@ class TestConvenienceTestFunctions(unittest.TestCase):
         mock_urlopen.assert_called_once()
 
 
+class TestDispatchNtfy(unittest.TestCase):
+    """dispatch_ntfy priority handling (README: failures are always 'high')."""
+
+    def _result(self, status="success"):
+        return {"status": status, "watch_name": "W", "timestamp": "2026-06-26T10:00:00",
+                "error": "boom" if status not in ("success", "cancelled") else ""}
+
+    @patch("notification_utils.send_ntfy_notification")
+    def test_failure_forces_high_priority_over_config(self, mock_send):
+        mock_send.return_value = {"ok": True, "status": 200, "error": None}
+        cfg = {"ntfy_config": {"enabled": True, "topic": "t",
+                               "priority": "low", "notify_on_failure": True}}
+        notification_utils.dispatch_ntfy(cfg, self._result(status="failed"))
+        mock_send.assert_called_once()
+        # Failures must go out at 'high' regardless of the configured 'low'.
+        self.assertEqual(mock_send.call_args.kwargs.get("priority"), "high")
+
+    @patch("notification_utils.send_ntfy_notification")
+    def test_success_uses_configured_priority(self, mock_send):
+        mock_send.return_value = {"ok": True, "status": 200, "error": None}
+        cfg = {"ntfy_config": {"enabled": True, "topic": "t",
+                               "priority": "min", "notify_on_success": True}}
+        notification_utils.dispatch_ntfy(cfg, self._result(status="success"))
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args.kwargs.get("priority"), "min")
+
+
 if __name__ == "__main__":
     unittest.main()
 

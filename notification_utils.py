@@ -291,8 +291,9 @@ def test_email(email_config: dict) -> dict:
     Mirrors test_webhook() — returns { ok: bool, error: str | None }.
 
     Useful for validating settings before saving, without waiting for a real backup.
-    The caller should set email_config["enabled"] = True before calling this,
-    since send_email_notification() returns early when enabled is False.
+    Note: send_email_notification() does not itself check the "enabled" flag —
+    callers (run_backup, desktop_app) gate on it.  This helper forces a send so a
+    test works even while notifications are disabled.
     """
     to_addr = email_config.get("to_addr", "").strip()
     if not to_addr:
@@ -433,8 +434,14 @@ def dispatch_ntfy(cfg: dict, result: dict):
         return
 
     title, message, priority, tags = build_ntfy_notification(result)
-    # Allow config to override priority
-    priority = nc.get("priority", priority)
+    # Failure notifications go out at the priority build_ntfy_notification chose
+    # ("high") REGARDLESS of the configured priority, so they break through Do Not
+    # Disturb on supported devices (documented behaviour). The configured priority
+    # only overrides success/cancelled notifications.  Previously the unconditional
+    # override below demoted failure alerts to the configured priority (default
+    # "default"), silently breaking the README's guarantee.
+    if result.get("status") in ("success", "cancelled"):
+        priority = nc.get("priority", priority)
     result_r = send_ntfy_notification(nc, title, message, priority=priority, tags=tags)
     if not result_r["ok"]:
         logger.warning(f"[ntfy] Notification failed: {result_r['error']}")
