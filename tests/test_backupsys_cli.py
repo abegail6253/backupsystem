@@ -405,16 +405,34 @@ class TestCmdRestore:
         assert rc == 1
 
     def test_specific_backup_id_is_used(self, watch_a):
+        # Use the real list_backups() keys (backup_id / backup_dir). The previous
+        # mock used "id"/"dir", which list_backups never returns — that mismatch
+        # is exactly the bug that was fixed in cmd_restore.
         backups = [
-            {"id": "bk_old", "timestamp": "2026-04-01T00:00:00", "size_human": "1 MB",
-             "status": "success", "dir": "/b/old"},
-            {"id": "bk_new", "timestamp": "2026-05-01T00:00:00", "size_human": "2 MB",
-             "status": "success", "dir": "/b/new"},
+            {"backup_id": "bk_old", "timestamp": "2026-04-01T00:00:00", "total_size_bytes": 1024,
+             "status": "success", "backup_dir": "/b/old"},
+            {"backup_id": "bk_new", "timestamp": "2026-05-01T00:00:00", "total_size_bytes": 2048,
+             "status": "success", "backup_dir": "/b/new"},
         ]
         _be_mock.list_backups.return_value = backups
         _be_mock.restore_backup.return_value = {"ok": True, "files_restored": 3, "skipped": 0}
         cli.cmd_restore(self._args(backup_id="bk_old"), self._cfg(watch_a))
         assert _be_mock.restore_backup.call_args[1]["backup_dir"] == "/b/old"
+
+    def test_restore_resolves_real_backup_dir_key(self, watch_a):
+        """Regression: cmd_restore must read list_backups()'s real "backup_dir"
+        key. It used to read "dir"/"path" (always None), so single-snapshot
+        restore failed with 'Could not determine backup directory path'. This
+        mock uses ONLY the real keys, so a revert to "dir" would fail here."""
+        _be_mock.list_backups.return_value = [
+            {"backup_id": "bk_1", "timestamp": "2026-05-01T10:00:00",
+             "total_size_bytes": 5_000_000, "status": "success",
+             "backup_dir": "/b/real_snap"},
+        ]
+        _be_mock.restore_backup.return_value = {"ok": True, "files_restored": 2, "skipped": 0}
+        rc = cli.cmd_restore(self._args(), self._cfg(watch_a))
+        assert rc == 0
+        assert _be_mock.restore_backup.call_args[1]["backup_dir"] == "/b/real_snap"
 
     def test_unknown_backup_id_returns_one(self, watch_a):
         _be_mock.list_backups.return_value = [

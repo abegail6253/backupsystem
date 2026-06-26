@@ -218,7 +218,7 @@ def cmd_rotate_key(args, cfg):
         return 1
 
     info(f"Rotating keys in: {backup_dir}")
-    warn("This will re-encrypt every .enc file in place.  Make sure you have a backup before proceeding.")
+    warn("This will re-encrypt every encrypted backup file in place.  Make sure you have a backup before proceeding.")
     if not args.yes:
         ans = input("  Continue? [y/N] ").strip().lower()
         if ans != "y":
@@ -425,13 +425,17 @@ def cmd_restore(args, cfg):
 
     # Resolve which backup to restore
     if backup_id:
-        match = next((b for b in backup_list if b.get("id") == backup_id or
-                      b.get("dir", "").endswith(backup_id)), None)
+        # list_backups() returns manifest dicts keyed backup_id / backup_dir
+        # (NOT id / dir / path — those were always None, so the previous code
+        # could never match a backup or resolve its directory).
+        match = next((b for b in backup_list
+                      if b.get("backup_id") == backup_id
+                      or b.get("backup_dir", "").endswith(backup_id)), None)
         if not match:
             err(f"Backup ID '{backup_id}' not found. Available backups:")
             for b in backup_list[-10:]:
-                info(f"  {b.get('id', '?')}  {b.get('timestamp', '?')}  "
-                     f"{b.get('size_human', '?')}  {b.get('status', '?')}")
+                info(f"  {b.get('backup_id', '?')}  {b.get('timestamp', '?')}  "
+                     f"{_human(b.get('total_size_bytes', 0))}  {b.get('status', '?')}")
             return 1
         chosen = match
     else:
@@ -439,7 +443,7 @@ def cmd_restore(args, cfg):
         chosen = next((b for b in reversed(backup_list)
                        if b.get("status") == "success"), backup_list[-1])
 
-    backup_dir = chosen.get("dir") or chosen.get("path", "")
+    backup_dir = chosen.get("backup_dir") or chosen.get("dir") or chosen.get("path", "")
     if not backup_dir:
         err("Could not determine backup directory path.")
         if temp_dir:
@@ -447,7 +451,7 @@ def cmd_restore(args, cfg):
         return 1
 
     info(f"Backup:  {chosen.get('timestamp', '?')}  "
-         f"({chosen.get('size_human', '?')})  [{chosen.get('id', '?')}]")
+         f"({_human(chosen.get('total_size_bytes', 0))})  [{chosen.get('backup_id', '?')}]")
     info(f"Restoring to: {target}")
     if full_chain:
         info("Mode: full incremental chain")
@@ -468,7 +472,7 @@ def cmd_restore(args, cfg):
                     destination=w_dest,
                     watch_id=w["id"],
                     target_path=target,
-                    up_to_backup_id=chosen.get("id"),
+                    up_to_backup_id=chosen.get("backup_id"),
                     encrypt_key=encrypt_key,
                     overwrite=overwrite,
                     progress_cb=_progress,
@@ -1007,7 +1011,7 @@ def main():
         "rotate-key",
         help="Re-encrypt all backup files in a directory with a new key",
         description=(
-            "Rotate the encryption key for every .enc file inside a backup directory.\n"
+            "Rotate the encryption key for every encrypted file inside a backup directory.\n"
             "Decrypts each file with the old key and immediately re-encrypts it with\n"
             "the new key in place.  The manifest hashes are updated accordingly.\n\n"
             "IMPORTANT: keep a safe copy of both keys until you have verified that the\n"
@@ -1019,7 +1023,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_rk.add_argument("--backup-dir", required=True, metavar="PATH",
-                      help="Path to the backup directory containing .enc files")
+                      help="Path to the encrypted backup directory to rotate")
     p_rk.add_argument("--old-key", default=None, metavar="KEY",
                       help="Current encryption key (prompted securely if omitted)")
     p_rk.add_argument("--new-key", default=None, metavar="KEY",
