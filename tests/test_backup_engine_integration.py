@@ -458,3 +458,120 @@ class TestEndToEnd:
         else:
             # Decryption failure may simply skip the file and report an error
             assert rr["errors"] or not rr["ok"]
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# validate_backup — overall + per-file integrity (plain / compressed / encrypted)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestValidateBackup:
+    def test_plain_backup_validates(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha")
+        _write(src / "sub" / "b.txt", b"bravo")
+        r = _run_backup(src, tmp_path / "dest")
+        v = be.validate_backup(r["backup_dir"])
+        assert v["valid"] is True
+        assert v["manifest_ok"] is True
+
+    def test_compressed_backup_validates(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha" * 100)
+        r = _run_backup(src, tmp_path / "dest", compress=6)
+        assert be.validate_backup(r["backup_dir"])["valid"] is True
+
+    def test_encrypted_backup_validates(self, tmp_path):
+        """Regression: the encrypted MANIFEST.json.enc must not be folded into the
+        content hash, otherwise every encrypted backup reported valid=False."""
+        if not be.CRYPTO_AVAILABLE:
+            pytest.skip("cryptography not installed")
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha")
+        _write(src / "sub" / "b.txt", b"bravo")
+        key = be.generate_encryption_key()
+        r = _run_backup(src, tmp_path / "dest", encrypt_key=key)
+        assert be.validate_backup(r["backup_dir"])["valid"] is True
+
+    def test_tampered_file_fails_validation(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha")
+        r = _run_backup(src, tmp_path / "dest")
+        (Path(r["backup_dir"]) / "a.txt").write_bytes(b"tampered")
+        assert be.validate_backup(r["backup_dir"])["valid"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# rotate_encryption_key — must rotate data files, not just the manifest
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRotateEncryptionKey:
+    @pytest.fixture(autouse=True)
+    def _skip_if_no_crypto(self):
+        if not be.CRYPTO_AVAILABLE:
+            pytest.skip("cryptography not installed")
+
+    def test_rotate_reencrypts_all_data_files(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha")
+        _write(src / "sub" / "b.txt", b"bravo")
+        key = be.generate_encryption_key()
+        r = _run_backup(src, tmp_path / "dest", encrypt_key=key)
+        bdir = r["backup_dir"]
+
+        new_key = be.generate_encryption_key()
+        rot = be.rotate_encryption_key(bdir, key, new_key)
+        assert rot["ok"] is True
+        # Both data files rotated — not just the manifest.
+        assert rot["files_rotated"] == 2
+
+    def test_restore_with_new_key_succeeds_after_rotation(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha data")
+        key = be.generate_encryption_key()
+        r = _run_backup(src, tmp_path / "dest", encrypt_key=key)
+        bdir = r["backup_dir"]
+
+        new_key = be.generate_encryption_key()
+        be.rotate_encryption_key(bdir, key, new_key)
+
+        restore = tmp_path / "restore"
+        rr = be.restore_backup(bdir, str(restore), encrypt_key=new_key)
+        assert rr["ok"] is True
+        assert (restore / "a.txt").read_bytes() == b"alpha data"
+
+    def test_old_key_rejected_after_rotation(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha data")
+        key = be.generate_encryption_key()
+        r = _run_backup(src, tmp_path / "dest", encrypt_key=key)
+        bdir = r["backup_dir"]
+
+        new_key = be.generate_encryption_key()
+        be.rotate_encryption_key(bdir, key, new_key)
+
+        restore = tmp_path / "restore"
+        rr = be.restore_backup(bdir, str(restore), encrypt_key=key)
+        assert rr["ok"] is False
+
+    def test_validate_passes_after_rotation(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha")
+        _write(src / "sub" / "b.txt", b"bravo")
+        key = be.generate_encryption_key()
+        r = _run_backup(src, tmp_path / "dest", encrypt_key=key)
+        bdir = r["backup_dir"]
+
+        new_key = be.generate_encryption_key()
+        be.rotate_encryption_key(bdir, key, new_key)
+        assert be.validate_backup(bdir)["valid"] is True
+
+    def test_rotate_plaintext_backup_reports_clearly(self, tmp_path):
+        src = tmp_path / "src"
+        _write(src / "a.txt", b"alpha")
+        r = _run_backup(src, tmp_path / "dest")  # not encrypted
+        rot = be.rotate_encryption_key(r["backup_dir"],
+                                       be.generate_encryption_key(),
+                                       be.generate_encryption_key())
+        assert rot["ok"] is False
+        assert rot["files_rotated"] == 0

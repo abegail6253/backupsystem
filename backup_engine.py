@@ -227,7 +227,8 @@ def _parallel_copy_files(
     (seed-skip) — avoids re-copying when the user pre-populated the dest
     or a previous backup already wrote the file.
 
-    Returns (files_copied, bytes_skipped_seed, bytes_copied, failed_entries).
+    Returns (files_copied, bytes_done, failed_entries) where bytes_done counts
+    both seed-skipped and freshly-copied bytes.
     Thread-safe progress reporting via a lock-protected counter.
     """
     import concurrent.futures as _cf
@@ -1075,7 +1076,11 @@ def _dest_already_identical(src_file: Path, dest_file: Path) -> bool:
 
 # Fix #3 — exclude MANIFEST.json so the directory hash stays stable after
 # the manifest is written during run_backup().
-EXCLUDE = {"BACKUP.sha256", "MANIFEST.json"}
+# MANIFEST.json.enc (the encrypted manifest written for encrypted backups) is
+# also excluded: run_backup computes BACKUP.sha256 from the data files BEFORE
+# the manifest is written, so including the encrypted manifest in validate's
+# recomputed hash made every encrypted backup report valid=False.
+EXCLUDE = {"BACKUP.sha256", "MANIFEST.json", "MANIFEST.json.enc"}
 
 
 class _HashingWriter:
@@ -2173,12 +2178,19 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Opti
         # Internal backup metadata — never upload to cloud storage
         _SKIP = {"MANIFEST.json", "BACKUP.sha256"}
 
+        # Quote a value for a Drive query string.  The Drive API only accepts
+        # single-quoted string literals with '\' and "'" backslash-escaped —
+        # repr() emits a DOUBLE-quoted string for names containing an apostrophe
+        # (e.g. "John's report.docx"), which the API rejects with a 400 error.
+        def _q(value: str) -> str:
+            return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
         # Find an existing folder by name under parent, or create it
         def _find_or_create_folder(name: str, parent_id: str) -> str:
             q = (
-                f"name = {repr(name)} "
+                f"name = {_q(name)} "
                 f"and mimeType = 'application/vnd.google-apps.folder' "
-                f"and \'{parent_id}\' in parents "
+                f"and {_q(parent_id)} in parents "
                 f"and trashed = false"
             )
             res = service.files().list(q=q, fields="files(id)", pageSize=1).execute()
@@ -2199,8 +2211,8 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Opti
             name  = upload_name or fp.name
             media = MediaFileUpload(str(fp), resumable=True)
             q = (
-                f"name = {repr(name)} "
-                f"and \'{parent_id}\' in parents "
+                f"name = {_q(name)} "
+                f"and {_q(parent_id)} in parents "
                 f"and trashed = false"
             )
             res = service.files().list(q=q, fields="files(id)", pageSize=1).execute()
@@ -3176,7 +3188,14 @@ def run_backup(
         # abort early rather than failing halfway through a large upload.
         if TRANSPORT_AVAILABLE and storage_type not in ("local", ""):
             try:
-                _remote_space = check_remote_free_space(storage_type, cfg, needed)
+                # NOTE: `cloud_config` carries the destination credentials for
+                # this run.  check_remote_free_space() safely no-ops (returns
+                # skipped=True) when the expected keys are absent, so passing a
+                # mismatched/partial config can never wrongly block a backup.
+                # (Previously this referenced an undefined `cfg`, which raised
+                # NameError on every remote backup and silently disabled the
+                # pre-flight space check via the broad except below.)
+                _remote_space = check_remote_free_space(storage_type, cloud_config or {}, needed)
                 if not _remote_space.get("ok") and not _remote_space.get("skipped"):
                     result["status"] = "failed"
                     result["error"]  = _remote_space["error"]
@@ -5490,9 +5509,23 @@ def _short_id() -> str:
 
 def rotate_encryption_key(backup_dir, old_key, new_key, progress_cb=None):
     """
-    Rotate encryption key for all .enc files in backup_dir.
-    Decrypts each .enc file with old_key, re-encrypts with new_key, replaces in place,
-    and updates the manifest.json hash entry for that file.
+    Rotate the encryption key for an encrypted backup directory.
+
+    The engine stores encrypted *data* files under their ORIGINAL relative path
+    (no .enc suffix); only the manifest carries the .enc suffix
+    (MANIFEST.json.enc).  This function therefore rotates the data files listed
+    in the manifest's change list — not files matched by a "*.enc" glob, which
+    would catch only the manifest and silently leave every data file encrypted
+    with the old key (corrupting the backup).
+
+    Steps:
+      1. Load the authoritative manifest (decrypting MANIFEST.json.enc with the
+         old key when present; otherwise the plaintext MANIFEST.json).
+      2. For each backed-up data file: decrypt with old_key, re-encrypt with
+         new_key, replace in place, and update its manifest hash.
+      3. Re-encrypt the manifest with the new key (or rewrite the plaintext one).
+      4. Recompute BACKUP.sha256 so validate_backup() still passes afterwards.
+
     progress_cb(rel_path, idx, total) is called for progress updates if provided.
     Returns: {ok: bool, files_rotated: int, errors: list}
     """
@@ -5501,57 +5534,116 @@ def rotate_encryption_key(backup_dir, old_key, new_key, progress_cb=None):
     bd = Path(backup_dir)
     errors = []
     files_rotated = 0
-    manifest_path = bd / "MANIFEST.json"
-    # Load manifest
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-    except Exception as e:
-        return {"ok": False, "files_rotated": 0, "errors": [f"Failed to load manifest: {e}"]}
 
-    # Find all .enc files
-    enc_files = [f for f in bd.rglob("*.enc") if f.is_file()]
-    total = len(enc_files)
-    for idx, enc_file in enumerate(enc_files):
-        rel_path = str(enc_file.relative_to(bd))
+    enc_manifest_path = bd / "MANIFEST.json.enc"
+    manifest_path     = bd / "MANIFEST.json"
+    manifest_encrypted = enc_manifest_path.exists()
+
+    # ── 1. Load the authoritative manifest (with the file list) ──────────────
+    if manifest_encrypted:
         try:
-            # Decrypt to temp file
+            manifest = json.loads(_decrypt_bytes(enc_manifest_path.read_bytes(), old_key))
+        except Exception as e:
+            return {"ok": False, "files_rotated": 0,
+                    "errors": [f"Could not decrypt MANIFEST.json.enc with the old key "
+                               f"(wrong key or corrupted backup): {e}"]}
+    else:
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception as e:
+            return {"ok": False, "files_rotated": 0, "errors": [f"Failed to load manifest: {e}"]}
+
+    snap = manifest.get("snapshot", {})
+
+    # Guard: a plaintext backup has no ciphertext to rotate.  Detect it via the
+    # absence of an encrypted manifest AND a falsy "encrypted" flag, and report
+    # clearly instead of failing later with a misleading "wrong key" decrypt error.
+    if not manifest_encrypted and not manifest.get("encrypted"):
+        return {"ok": False, "files_rotated": 0,
+                "errors": ["This backup is not encrypted — there is nothing to rotate."]}
+
+    # ── 2. Rotate each backed-up data file (dedup, preserve manifest order) ──
+    rel_paths, _seen = [], set()
+    for entry in manifest.get("changes", []):
+        if entry.get("type") in ("added", "modified"):
+            rp = entry.get("path", "")
+            if rp and rp not in _seen:
+                _seen.add(rp)
+                rel_paths.append(rp)
+
+    total = len(rel_paths)
+    for idx, rel_path in enumerate(rel_paths):
+        data_file = bd / rel_path
+        if not data_file.is_file():
+            # Listed in the manifest but absent on disk (e.g. an incremental
+            # backup only stores changed files) — nothing to rotate here.
+            if progress_cb:
+                try: progress_cb(rel_path, idx + 1, total)
+                except Exception: pass
+            continue
+        tmp_dec_path = tmp_enc_path = None
+        try:
             with tempfile.NamedTemporaryFile(delete=False) as tmp_dec:
                 tmp_dec_path = tmp_dec.name
-            _decrypt_file(str(enc_file), tmp_dec_path, old_key)
-            # Encrypt to temp file
+            _decrypt_file(str(data_file), tmp_dec_path, old_key)
             with tempfile.NamedTemporaryFile(delete=False) as tmp_enc:
                 tmp_enc_path = tmp_enc.name
             new_hash = _encrypt_file(tmp_dec_path, tmp_enc_path, new_key)
-            # Replace original file with new encrypted file
-            os.replace(tmp_enc_path, str(enc_file))
-            os.remove(tmp_dec_path)
+            os.replace(tmp_enc_path, str(data_file))
+            tmp_enc_path = None  # consumed by os.replace
             files_rotated += 1
-            # Update manifest hash if present
-            snap = manifest.get("snapshot", {})
             if rel_path in snap:
                 snap[rel_path]["hash"] = new_hash
         except Exception as e:
             errors.append(f"{rel_path}: {e}")
-            # Clean up temp files if they exist
-            for p in [locals().get('tmp_dec_path'), locals().get('tmp_enc_path')]:
+        finally:
+            for p in (tmp_dec_path, tmp_enc_path):
                 if p and os.path.exists(p):
                     try: os.remove(p)
                     except Exception:
-                        logger.debug("[suppressed] Exception ignored near: # Clean up temp files if they exist |             for p in [locals().get('tmp_de", exc_info=True)
+                        logger.debug("[rotate] could not remove temp file", exc_info=True)
         if progress_cb:
             try:
                 progress_cb(rel_path, idx + 1, total)
             except Exception:
-                logger.debug("[suppressed] Exception ignored near: except Exception: pass |         if progress_cb: |             try: |           ", exc_info=True)
-                pass
-    # Save manifest
+                logger.debug("[rotate] progress_cb raised", exc_info=True)
+
+    # If there were files to rotate but none decrypted, the old key was almost
+    # certainly wrong — fail loudly rather than reporting a bogus success.
+    if total > 0 and files_rotated == 0:
+        return {"ok": False, "files_rotated": 0,
+                "errors": errors or ["No files could be re-encrypted — wrong old key?"]}
+
+    # ── 3. Persist the manifest under the new key ────────────────────────────
     try:
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
+        if manifest_encrypted:
+            enc_manifest_path.write_bytes(
+                _encrypt_bytes(json.dumps(manifest, indent=2).encode(), new_key)
+            )
+        else:
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
     except Exception as e:
         errors.append(f"Failed to save manifest: {e}")
         return {"ok": False, "files_rotated": files_rotated, "errors": errors}
+
+    # ── 4. Refresh BACKUP.sha256 so validate_backup() still matches ──────────
+    # The ciphertext changed, so the stored content hash is now stale.  Recompute
+    # it with the same algorithm validate_backup() uses (rglob + EXCLUDE).
+    try:
+        hash_file_path = bd / "BACKUP.sha256"
+        if hash_file_path.exists():
+            _bh = hashlib.sha256()
+            for fp in sorted(bd.rglob("*")):
+                if fp.is_file() and fp.name not in EXCLUDE:
+                    _r = str(fp.relative_to(bd))
+                    _bh.update(_r.encode())
+                    _bh.update(hash_file(str(fp)).encode())
+            hash_file_path.write_text(f"{_bh.hexdigest()}  {bd.name}\n")
+    except Exception as e:
+        errors.append(f"Failed to update BACKUP.sha256: {e}")
+
     return {"ok": len(errors) == 0, "files_rotated": files_rotated, "errors": errors}
 
 
@@ -5562,7 +5654,12 @@ def preview_cleanup(backups_dir: str, retention_days: int, watch_id: str = None)
     given retention policy. Result contains a `to_delete` list of folder paths.
     """
     p = Path(backups_dir)
-    now = datetime.utcnow()
+    # Use local time, not UTC: backup timestamps are written with
+    # datetime.now().isoformat() (naive local time) in run_backup(), so the
+    # age comparison below must also be in local time.  Mixing utcnow() with a
+    # local timestamp skewed every age by the UTC offset, which could prune
+    # backups up to a whole day early or late depending on the timezone.
+    now = datetime.now()
     to_delete = []
     if not p.exists() or not p.is_dir():
         return {"to_delete": []}
