@@ -217,8 +217,20 @@ def save_backup_queue(queue: list):
     try:
         with _save_lock:
             QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(QUEUE_PATH, "w", encoding="utf-8") as f:
-                json.dump(queue, f, indent=2)
+            # Atomic write (temp file + os.replace) so a crash mid-write can't
+            # truncate the queue — matches save_history / save / save_snapshot.
+            fd, tmp = tempfile.mkstemp(dir=QUEUE_PATH.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(queue, f, indent=2)
+                os.replace(tmp, QUEUE_PATH)
+            except Exception:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                raise
             logger.info(f"💾 Backup queue saved: {len(queue)} item(s)")
     except Exception as e:
         logger.warning(f"⚠️  Failed to save backup queue: {e}")
@@ -848,7 +860,8 @@ def update_watch_meta(
             if color            is not None: w["color"]            = color[:7]  # max #rrggbb
             if interval_min     is not None: w["interval_min"]     = max(0, int(interval_min))
             if active           is not None: w["active"]           = bool(active)
-            if compression      is not None: w["compression"]      = compression            # ← updated to store int            if encrypt_key      is not None: w["encrypt_key"]      = encrypt_key.strip()          # ← added
+            if compression      is not None: w["compression"]      = compression            # ← updated to store int
+            if encrypt_key      is not None: w["encrypt_key"]      = encrypt_key.strip()     # ← persist key edits/clears from the UI
             if sync_mode        is not None: w["sync_mode"]        = bool(sync_mode)              # ← added
             if destination      is not None: w["destination"]      = destination.strip()           # ← per-watch destination
             if schedule_times   is not None:                                                       # ← per-watch schedule

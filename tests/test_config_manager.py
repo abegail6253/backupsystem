@@ -110,6 +110,26 @@ class TestWatchCrud:
         updated = next(x for x in _fresh()["watches"] if x["id"] == w["id"])
         assert updated.get("encrypt_key") == "mykey"
 
+    def test_encrypt_key_set_via_update(self, tmp_path):
+        # Regression: update_watch_meta(encrypt_key=...) used to be swallowed
+        # into a comment, so the UI could never set a key on an existing watch.
+        w = cm.add_watch(_fresh(), "NoKey", str(tmp_path))
+        cm.update_watch_meta(_fresh(), w["id"], encrypt_key="  newkey  ")
+        updated = next(x for x in _fresh()["watches"] if x["id"] == w["id"])
+        assert updated.get("encrypt_key") == "newkey"  # also stripped
+
+    def test_encrypt_key_changed_via_update(self, tmp_path):
+        w = cm.add_watch(_fresh(), "Enc", str(tmp_path), encrypt_key="oldkey")
+        cm.update_watch_meta(_fresh(), w["id"], encrypt_key="rotatedkey")
+        updated = next(x for x in _fresh()["watches"] if x["id"] == w["id"])
+        assert updated.get("encrypt_key") == "rotatedkey"
+
+    def test_encrypt_key_cleared_via_update(self, tmp_path):
+        w = cm.add_watch(_fresh(), "Enc", str(tmp_path), encrypt_key="oldkey")
+        cm.update_watch_meta(_fresh(), w["id"], encrypt_key="")
+        updated = next(x for x in _fresh()["watches"] if x["id"] == w["id"])
+        assert updated.get("encrypt_key") == ""
+
     def test_get_watch_by_id(self, tmp_path):
         w = cm.add_watch(_fresh(), "Find Me", str(tmp_path))
         found = cm.get_watch(_fresh(), w["id"])
