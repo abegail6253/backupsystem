@@ -130,8 +130,10 @@ class IntegrityWorker(QThread):
         watch_name  str   — display name (for signals / logging)
         watch_id    str   — watch ID (used to update last_integrity_check)
         backup_dir  str   — path to the backup directory to validate
-        sync_mode   bool  — True → validate dest folder directly (sync watches)
-    cfg : dict — the current global config (needed for destination path)
+    cfg : dict — the current global config (reserved; stamping reloads config)
+
+    Note: sync-mode watches are filtered out by IntegrityScheduler._tick before
+    reaching the worker — they have no BACKUP.sha256 to validate against.
     """
 
     # Emitted once per watch as soon as its check completes.
@@ -357,6 +359,20 @@ class IntegrityScheduler:
             if not watch.get("active", True) or watch.get("paused", False):
                 continue
 
+            # Sync-mode watches mirror files straight to the destination and do
+            # NOT write BACKUP.sha256 or a full MANIFEST (run_backup skips both
+            # for sync). validate_backup() requires BACKUP.sha256, so checking a
+            # sync watch always reports valid=False — false-failure alerts and
+            # notification spam on every run. Skip them until a sync-aware
+            # validator exists.
+            if watch.get("sync_mode", False):
+                logger.debug(
+                    "IntegrityScheduler: skipping sync-mode watch '%s' "
+                    "(not validatable via validate_backup)",
+                    watch.get("name", watch["id"]),
+                )
+                continue
+
             # Has this watch ever been backed up?
             if not watch.get("last_backup"):
                 continue
@@ -390,7 +406,6 @@ class IntegrityScheduler:
                 "watch_name": watch.get("name", watch["id"]),
                 "watch_id":   watch["id"],
                 "backup_dir": backup_dir,
-                "sync_mode":  watch.get("sync_mode", False),
             })
 
         if not jobs:

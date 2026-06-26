@@ -320,6 +320,42 @@ class TestIntegritySchedulerTick:
 
         mock_be.list_backups.assert_not_called()
 
+    def test_tick_skips_sync_mode_watch(self):
+        """Regression: sync watches have no BACKUP.sha256, so validate_backup
+        always fails on them — they must be skipped (even on a forced run) to
+        avoid false-failure alerts and notification spam."""
+        sched = self._make_sched({})
+        cfg = {
+            "integrity_check_enabled": True,
+            "integrity_check_interval_days": 7,
+            "watches": [
+                {"id": "w1", "name": "SyncWatch", "active": True,
+                 "last_backup": "2026-01-01T00:00:00",
+                 "last_integrity_check": None, "sync_mode": True},
+            ],
+        }
+        mock_be = MagicMock()
+        mock_be.list_backups.return_value = [{"backup_dir": "/b/1"}]
+        mock_cm = MagicMock()
+        mock_cm.load.return_value = cfg
+
+        launched = []
+
+        def _fake_worker(jobs, cfg_arg, parent=None):
+            m = MagicMock(); m.isRunning.return_value = False
+            launched.append(jobs)
+            return m
+
+        with patch.object(isch, "backup_engine", mock_be), \
+             patch.object(isch, "config_manager", mock_cm), \
+             patch.object(isch, "_BACKEND_AVAILABLE", True), \
+             patch.object(isch, "IntegrityWorker", side_effect=_fake_worker):
+            sched._tick(force=False)
+            sched._tick(force=True)  # even a forced run skips sync watches
+
+        mock_be.list_backups.assert_not_called()
+        assert launched == []  # no worker launched for a sync-only watch set
+
     def test_tick_skips_watch_checked_recently(self):
         sched = self._make_sched({})
         recent = (datetime.now() - timedelta(days=1)).isoformat()
