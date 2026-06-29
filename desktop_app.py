@@ -219,24 +219,47 @@ import threading as _gei_threading
 _recent_remote_write_ts: dict = {}      # ip -> (ts, path)
 _recent_remote_write_lock = _gei_threading.Lock()
 _RECENT_WRITE_LINGER_S = 60             # how long idle_time=0 can linger after a write
-_BURST_WINDOW_S = 2                     # files arriving within this many seconds of the
+_BURST_WINDOW_S = 60                    # files arriving within this many seconds of the
+                                        # last confirmed remote write are treated as same-
+                                        # session siblings.  Raised from 2→60s: Office
+                                        # autosave/save cycles on shared SMB files produce
+                                        # multiple saves spread 5-30s apart — all from the
+                                        # same remote session.  2s was too tight and caused
+                                        # the burst-override to expire between saves,
+                                        # misattributing later saves to the local NTFS owner.
                                         # last confirmed remote write are part of the same
                                         # burst and should STILL be attributed to the remote
                                         # user (not treated as residual linger)
 
-def _record_remote_write(ip: str, filepath: str) -> None:
-    """Called when a remote IP is confirmed as the writer of a file."""
+def _record_remote_write(ip: str, filepath: str, event_type: str = "") -> None:
+    """Called when a remote IP is confirmed as the writer of a file.
+    Stores the last 2 writes per IP so the LINGER-FILTER can catch idle snapshots
+    that fall within 60s of either the most recent OR the previous write.
+    event_type ("added", "modified", "deleted", ...) is stored at index [3] so that
+    BURST-OVERRIDE can refuse to cross event-type boundaries (e.g. a prior 'added'
+    burst must never promote a 'modified' event to the same actor).
+    Tuple layout: (ts, filepath, prev_entry_or_None, event_type)
+    """
     import time as _rwt
+    _now = _rwt.time()
     with _recent_remote_write_lock:
-        _recent_remote_write_ts[ip] = (_rwt.time(), filepath)
+        _prev = _recent_remote_write_ts.get(ip)
+        # Shift: current becomes prev2, new entry becomes current
+        # Index 3 stores the event_type for cross-type burst guard.
+        _recent_remote_write_ts[ip] = (_now, filepath, _prev, event_type)
 
 def _get_recent_remote_write(ip: str) -> tuple | None:
-    """Return (ts, path) of the last confirmed write by ip, or None if expired/missing."""
+    """Return (ts, path, prev, event_type) of the last confirmed write by ip,
+    or None if expired/missing.
+    Index 3 (event_type) is present on entries written by the new _record_remote_write;
+    older/legacy entries without it return "" for event_type via index access with default.
+    """
     import time as _rwt
+    _CACHE_TTL = 300
     with _recent_remote_write_lock:
         entry = _recent_remote_write_ts.get(ip)
-    if entry and (_rwt.time() - entry[0]) <= _RECENT_WRITE_LINGER_S:
-        return entry
+    if entry and (_rwt.time() - entry[0]) <= _CACHE_TTL:
+        return entry   # (ts, filepath, prev_entry_or_None, event_type)
     return None
 
 # ── Own-write tracker ─────────────────────────────────────────────────────────
@@ -258,11 +281,15 @@ def _record_own_write(filepath: str) -> None:
         _recent_own_write_ts["__last__"] = (_owt.time(), filepath)
 
 def _get_recent_own_write() -> tuple | None:
-    """Return (ts, path) of the last confirmed local write, or None if expired/missing."""
+    """Return (ts, path) of the last confirmed local write, or None if expired/missing.
+    Cache TTL = 300s so the CN-POISON filter can still access old own-write records
+    when checking whether an idle snapshot was a CHANGE_NOTIFY echo.
+    """
     import time as _owt
+    _CACHE_TTL = 300
     with _recent_own_write_lock:
         entry = _recent_own_write_ts.get("__last__")
-    if entry and (_owt.time() - entry[0]) <= _RECENT_WRITE_LINGER_S:
+    if entry and (_owt.time() - entry[0]) <= _CACHE_TTL:
         return entry
     return None
 
@@ -6524,7 +6551,40 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
     return result
 
 
-def _get_editor_info(filepath: str, detection_source: str = "",
+def _get_editor_info(*args, **kwargs) -> dict:
+    """Thin wrapper around _get_editor_info_impl that emits ONE consolidated
+    'ATTRIBUTION DECISION' log line per call.
+
+    Every time the app decides who gets credited for a change, this logs a single
+    greppable line with: the network-detected actor (ip/machine/user), the
+    'own active' signal that was checked, whether the burst-override logic
+    intervened, and the final attributed actor — so a misattribution can be
+    diagnosed from the log alone without re-tracing the whole decision tree.
+    The full attribution logic lives in _get_editor_info_impl below.
+    """
+    import logging as _gei_w_log
+    _gei_w = _gei_w_log.getLogger(__name__)
+    info = _get_editor_info_impl(*args, **kwargs)
+    try:
+        _fp = args[0] if args else kwargs.get("filepath", "")
+        # Diagnostic fields are attached by the impl at the decision point;
+        # pop them so they never leak into the persisted history entry.
+        _net   = info.pop("_attrib_net_actor", "n/a")
+        _own   = info.pop("_attrib_own_active", "n/a")
+        _burst = info.pop("_attrib_burst", "n/a")
+        _gei_w.info(
+            "[_get_editor_info] ATTRIBUTION DECISION: file=%r "
+            "net_detected_actor=%s own_active_signal=%s burst_override=%s "
+            "-> FINAL user=%r machine=%r ip=%r",
+            _fp, _net, _own, _burst,
+            info.get("user", ""), info.get("machine", ""), info.get("ip", ""),
+        )
+    except Exception:
+        pass
+    return info
+
+
+def _get_editor_info_impl(filepath: str, detection_source: str = "",
                      timestamp_iso: str = "", event_type: str = "",
                      smb_audit_cfg: dict | None = None,
                      smb_sessions_snapshot: list | None = None,
@@ -6591,7 +6651,7 @@ def _get_editor_info(filepath: str, detection_source: str = "",
             f"local path {filepath!r} through UNC SMB audit as {_lsh_unc!r} "
             f"with _skip_owner_lookup=True (see Step1 below for why)"
         )
-        return _get_editor_info(
+        return _get_editor_info_impl(
             _lsh_unc,
             detection_source=detection_source,
             timestamp_iso=timestamp_iso,
@@ -6600,7 +6660,7 @@ def _get_editor_info(filepath: str, detection_source: str = "",
             smb_sessions_snapshot=smb_sessions_snapshot,
             force_local=False,
             is_dest_watch=is_dest_watch,
-            local_smb_host="",   # prevent infinite recursion
+            local_smb_host="",   # prevent infinite recursion (and avoid double-logging)
             # BUG-FIX: the UNC host here (local_smb_host) IS this machine — it's
             # a loopback redirect, not a real remote server. win32security.
             # GetFileSecurity() on \\<own-ip>\share\file resolves to the exact
@@ -6850,6 +6910,18 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                 if _nfe_sig_used:
                     _nfe_succeeded = True
                     _s0_linger_gate = False  # set True if linger gate fires for this modified event
+                    _s0_linger_gate_user    = ""  # Step0-confirmed user when linger gate fires
+                    _s0_linger_gate_machine = ""  # Step0-confirmed machine when linger gate fires
+                    # BUGFIX (misattribution to coworker on same-host watches):
+                    # True only when the linger gate fired BECAUSE this event was
+                    # detected by the local watchdog/kernel filesystem notifier
+                    # (detection_source == 'watchdog') on a same-host watch. That is
+                    # a hard signal the write happened on THIS machine's disk — a
+                    # remote SMB client cannot generate it. Step1's
+                    # LINGER-GATE-TRUST-HANDLE bypass must never override it, even
+                    # if a coworker happens to hold the file open (passive reader)
+                    # under the same workgroup username. See Step1 usage below.
+                    _s0_linger_gate_is_watchdog = False
                     # Log every open handle for debug visibility
                     for _nfe_idx, _nfe_entry in enumerate(_nfe_entries):
                         _nfe_eu = (
@@ -6950,6 +7022,210 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     f"workgroup same-username: treating as remote SMB handle "
                                     f"(falling through to remote attribution)"
                                 )
+                                # ── Step0 watchdog-guard for 'added' events ──────────────
+                                # A watchdog event on a same-host watch means the NTFS
+                                # kernel driver on THIS machine fired — remote SMB clients
+                                # cannot produce a local watchdog notification.  So for
+                                # 'added' + watchdog + same-host: the local machine wrote
+                                # the file in most cases.  The remote session's idle_time=0
+                                # is typically a CHANGE_NOTIFY echo, not a write signal.
+                                #
+                                # However the live NFE handle is also strong evidence:
+                                # when the remote client has the file open right now, they
+                                # ARE the writer.  The veto must only fire when we have
+                                # POSITIVE evidence that the local machine (not the remote)
+                                # wrote this specific file — i.e. a stale prior remote
+                                # write combined with a recent local write.
+                                #
+                                # Three paths:
+                                #
+                                # PATH A — no prior confirmed remote write at all
+                                #   (burst_age is None): the live NFE handle is the FIRST
+                                #   and ONLY evidence of a remote write.  Trust it.
+                                #   Rationale: .106 writing via direct NTFS never creates
+                                #   a NetFileEnum handle; only the remote client's SMB
+                                #   connection shows up in NFE.  If the handle is there
+                                #   and no local loopback is established, it's genuine.
+                                #
+                                # PATH B — prior confirmed remote write is very fresh
+                                #   (<8s, burst_very_recent): burst is genuine — allow.
+                                #   The remote client is mid-copy; the local-recent flag
+                                #   cannot override a confirmed sub-8s burst.
+                                #
+                                # PATH C — prior confirmed remote write is stale (>=8s)
+                                #   AND local machine wrote recently (<30s): veto.
+                                #   A stale burst + recent local write is the loopback
+                                #   pattern where .106 copies files using its own SMB
+                                #   loopback handle — that handle is from .106, not .105.
+                                #
+                                # This mirrors Step1's OWN-ACTIVE VETO / ADDED-BURST-GUARD
+                                # logic but at Step0, before the early-return fires.
+                                _s0_wg_veto = False
+                                _s0wg_veto_reason = ""
+                                if (event_type == "added"
+                                        and detection_source == "watchdog"
+                                        and _is_same_host_watch):
+                                    import time as _s0wg_t
+                                    _S0_WG_TIGHT_S = 8    # confirmed burst must be fresher than this
+                                    # Own-write threshold for loopback detection.
+                                    # A loopback session's idle_time ≈ own_write_age;
+                                    # _same_name_remote_active already requires idle≤5s,
+                                    # so if own_write_age ≥ 8s any loopback would have
+                                    # idle_time > 5s and is already excluded — PATH-C
+                                    # cannot help and must NOT veto a genuine remote handle.
+                                    _S0_WG_WIDE_S  = 8    # loopback candidate window (s)
+                                    _s0wg_burst = _get_recent_remote_write(_rs0.get("ip", ""))
+                                    _s0wg_burst_age = (
+                                        (_s0wg_t.time() - _s0wg_burst[0]) if _s0wg_burst else None
+                                    )
+                                    _s0wg_own   = _get_recent_own_write()
+                                    _s0wg_own_age = (
+                                        (_s0wg_t.time() - _s0wg_own[0]) if _s0wg_own else None
+                                    )
+                                    _s0wg_remote_idle = _rs0.get("idle_time")
+                                    _s0wg_burst_very_recent = (
+                                        _s0wg_burst_age is not None
+                                        and _s0wg_burst_age < _S0_WG_TIGHT_S
+                                    )
+                                    _s0wg_local_recent = (
+                                        _s0wg_own_age is not None
+                                        and _s0wg_own_age < _S0_WG_WIDE_S
+                                    )
+                                    # PATH A: no prior confirmed remote write at all →
+                                    # live handle is first evidence; trust it.
+                                    _s0wg_handle_is_first_evidence = _s0wg_burst_age is None
+                                    # PATH B: prior confirmed write very fresh (<8s) → trust.
+                                    # PATH C: stale prior write + local wrote very recently (<8s)
+                                    #   → veto (loopback candidate: local MAY be using own SMB
+                                    #   handle; loopback idle ≈ own_write_age, still ≤5s so it
+                                    #   passed _same_name_remote_active filter).
+                                    # PATH D: stale burst + local not recent (≥8s) → trust;
+                                    #   no loopback session can have idle≤5s at this point.
+                                    _s0wg_stale_burst_plus_local = (
+                                        _s0wg_burst_age is not None    # some prior write exists
+                                        and not _s0wg_burst_very_recent # but it's stale (>=8s)
+                                        and _s0wg_local_recent          # AND local wrote very recently (<8s)
+                                    )
+                                    # ── PATH-A persistent-monitor sub-check ──────────────
+                                    # PATH-A normally trusts the live handle when there is
+                                    # no prior confirmed remote write (burst_age=None).
+                                    # BUT: when both machines share the same Windows username
+                                    # (workgroup setup), the "handle" in NetFileEnum is an
+                                    # SMB directory-enumeration or read handle that belongs to
+                                    # .105 monitoring the folder — NOT a write handle for the
+                                    # specific file. The evidence that .105 wrote this file is:
+                                    #   • NFE file-handle has user='user'  ← ambiguous (same on both)
+                                    #   • .105's session has idle_time=0   ← CHANGE_NOTIFY echo
+                                    #   • .105's session has active_time=3376s ← long-running bystander
+                                    #   • own_min_active_time=3078s         ← no fresh loopback
+                                    #
+                                    # Persistent-monitor pattern on same-host watch:
+                                    #   active_time > 300s  AND  idle ≤5s (CHANGE_NOTIFY echo)
+                                    #   AND own_min_active_time > 300s (no fresh loopback)
+                                    #   AND only 1 prior idle snapshot (insufficient history)
+                                    # → the handle is a bystander directory handle, not a write.
+                                    # Veto it so NTFS owner (the real local write) is used.
+                                    _s0wg_remote_active_time = _rs0.get("active_time", 0) or 0
+                                    _s0wg_own_min_active = (
+                                        (smb_sessions_snapshot or [{}])[0].get("own_min_active_time")
+                                        if smb_sessions_snapshot else None
+                                    )
+                                    _S0_MONITOR_ACTIVE_THRESHOLD = 300   # seconds — persistent session
+                                    _S0_OWN_LOOPBACK_THRESHOLD   = 30    # seconds — fresh loopback
+                                    _s0wg_is_persistent_bystander = (
+                                        _s0wg_handle_is_first_evidence          # PATH-A gate
+                                        and _s0wg_remote_active_time > _S0_MONITOR_ACTIVE_THRESHOLD
+                                        and (
+                                            _s0wg_own_min_active is None        # no fresh loopback at all
+                                            or _s0wg_own_min_active > _S0_OWN_LOOPBACK_THRESHOLD
+                                        )
+                                    )
+                                    if _s0wg_handle_is_first_evidence:
+                                        if _s0wg_is_persistent_bystander:
+                                            # PATH-A-BYSTANDER: the remote session is a
+                                            # long-running monitor (active_time >> 300s) with
+                                            # idle=0 only because of the CHANGE_NOTIFY echo from
+                                            # this very add event.  There is no fresh loopback,
+                                            # so the local machine wrote directly via NTFS.
+                                            # The same-username NFE handle is a directory/read
+                                            # handle from .105's monitoring, not a write handle.
+                                            # Veto → let NTFS owner run.
+                                            _s0_wg_veto = True
+                                            _s0wg_veto_reason = (
+                                                f"PATH-A-BYSTANDER: burst_age=None but "
+                                                f"remote session active_time={_s0wg_remote_active_time}s "
+                                                f"> {_S0_MONITOR_ACTIVE_THRESHOLD}s (persistent monitor) "
+                                                f"AND own_min_active_time={_s0wg_own_min_active!r}s "
+                                                f"> {_S0_OWN_LOOPBACK_THRESHOLD}s (no fresh loopback) — "
+                                                f"idle=0 is a CHANGE_NOTIFY echo, not a write signal. "
+                                                f"Same-username NFE handle belongs to bystander. "
+                                                f"Falling through to NTFS owner (local write)."
+                                            )
+                                        else:
+                                            _s0_wg_veto = False
+                                            _s0wg_veto_reason = (
+                                                f"PATH-A: burst_age=None — live handle is first "
+                                                f"evidence of remote write; trusting handle "
+                                                f"(remote_active_time={_s0wg_remote_active_time}s "
+                                                f"<= {_S0_MONITOR_ACTIVE_THRESHOLD}s OR "
+                                                f"own_min_active={_s0wg_own_min_active!r}s "
+                                                f"<= {_S0_OWN_LOOPBACK_THRESHOLD}s fresh loopback — "
+                                                f"local_recent={_s0wg_local_recent} "
+                                                f"own_write_age={_s0wg_own_age!r}s)"
+                                            )
+                                    elif _s0wg_burst_very_recent:
+                                        _s0_wg_veto = False
+                                        _s0wg_veto_reason = (
+                                            f"PATH-B: burst_age={_s0wg_burst_age:.3f}s < "
+                                            f"{_S0_WG_TIGHT_S}s — very fresh confirmed burst; "
+                                            f"trusting handle"
+                                        )
+                                    elif _s0wg_stale_burst_plus_local:
+                                        _s0_wg_veto = True
+                                        _s0wg_veto_reason = (
+                                            f"PATH-C: stale burst (burst_age={_s0wg_burst_age:.3f}s "
+                                            f">= {_S0_WG_TIGHT_S}s) + local_recent=True "
+                                            f"(own_write_age={_s0wg_own_age!r}s < {_S0_WG_WIDE_S}s) "
+                                            f"— loopback candidate: local wrote so recently that its "
+                                            f"loopback session idle≤5s; falling through to Step1"
+                                        )
+                                    else:
+                                        # stale/missing burst, local not recent → trust handle;
+                                        # own_write_age≥8s means loopback idle>5s already excluded
+                                        _s0_wg_veto = False
+                                        _s0wg_veto_reason = (
+                                            f"PATH-D: no loopback pattern "
+                                            f"(burst_age={_s0wg_burst_age!r}s "
+                                            f"own_write_age={_s0wg_own_age!r}s >= {_S0_WG_WIDE_S}s "
+                                            f"local_recent={_s0wg_local_recent} "
+                                            f"remote_idle={_s0wg_remote_idle!r}s) — "
+                                            f"trusting handle; loopback already excluded by idle filter"
+                                        )
+                                    _gei.info(
+                                        f"[_get_editor_info] Step0-priority NetFileEnum: "
+                                        f"ADDED-WATCHDOG-GUARD — "
+                                        f"event_type='added' detection_source='watchdog' "
+                                        f"same_host=True. "
+                                        f"burst_age={_s0wg_burst_age!r}s (tight={_S0_WG_TIGHT_S}s) "
+                                        f"own_write_age={_s0wg_own_age!r}s (loopback_window={_S0_WG_WIDE_S}s) "
+                                        f"remote_session_idle={_s0wg_remote_idle!r}s "
+                                        f"remote_active_time={_s0wg_remote_active_time}s "
+                                        f"own_min_active={_s0wg_own_min_active!r}s "
+                                        f"is_persistent_bystander={_s0wg_is_persistent_bystander} "
+                                        f"burst_very_recent={_s0wg_burst_very_recent} "
+                                        f"local_recent={_s0wg_local_recent} "
+                                        f"handle_is_first_evidence={_s0wg_handle_is_first_evidence} "
+                                        f"stale_burst_plus_local={_s0wg_stale_burst_plus_local} "
+                                        f"veto={_s0_wg_veto} ip={_rs0.get('ip')!r} "
+                                        f"reason={_s0wg_veto_reason!r} "
+                                        f"[{'VETOING — falling through to Step1 (NTFS owner)' if _s0_wg_veto else 'ALLOWING — handle confirmed as genuine remote write'}]"
+                                    )
+                                    if _s0_wg_veto:
+                                        # Suppress this handle; let Step1 run NTFS owner fallback
+                                        _nfe_result_user    = ""
+                                        _nfe_result_ip      = ""
+                                        _nfe_result_machine = ""
+                                        break
                                 # Do NOT break — fall through to remote attribution below.
                             else:
                                 _gei.info(
@@ -7005,6 +7281,8 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     _own_host_nfe, _own_ip_nfe,
                                     max_snapshots=5,
                                 )
+                                _s0_hist_clean = _s0_idle_hist  # default when no filtering runs
+                                _s0_poisoned = 0
                                 if _s0_idle_hist:
                                     # ── CN-POISON + REMOTE-LINGER filter (Step0) ─────
                                     # Discard idle snapshots captured within
@@ -7015,18 +7293,29 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     _s0_CN_WINDOW = 90
                                     _s0_prior_own    = _get_recent_own_write()
                                     _s0_prior_remote = _get_recent_remote_write(_nfe_result_ip)
-                                    _s0_hist_clean = _s0_idle_hist
-                                    _s0_poisoned = 0
-                                    if _s0_prior_own is not None or _s0_prior_remote is not None:
+                                    if _s0_prior_own is not None or _s0_prior_remote is not None or True:
                                         import time as _s0_cn_t
+                                        _s0_event_ts = _s0_cn_t.time() - 2
                                         _s0_own_ts    = _s0_prior_own[0]    if _s0_prior_own    else None
                                         _s0_own_file  = _s0_prior_own[1]    if _s0_prior_own    else None
                                         _s0_rem_ts    = _s0_prior_remote[0] if _s0_prior_remote else None
                                         _s0_rem_file  = _s0_prior_remote[1] if _s0_prior_remote else None
+                                        _s0_rem_prev  = (
+                                            _s0_prior_remote[2]
+                                            if _s0_prior_remote and len(_s0_prior_remote) >= 3
+                                            else None
+                                        )
                                         _s0_hist_clean = []
                                         for _s0_ts, _s0_idle_v in _s0_idle_hist:
                                             _s0_discard = None
-                                            if _s0_own_ts is not None:
+                                            # Co-temporal guard
+                                            _s0_snap_age = _s0_event_ts - _s0_ts
+                                            if _s0_snap_age < 2:
+                                                _s0_discard = (
+                                                    f"CO-TEMPORAL: age={_s0_snap_age:.1f}s "
+                                                    f"(≤2s grace) — captures the write itself"
+                                                )
+                                            if _s0_discard is None and _s0_own_ts is not None:
                                                 _s0_age = _s0_ts - _s0_own_ts
                                                 if 0 <= _s0_age <= _s0_CN_WINDOW:
                                                     _s0_discard = (
@@ -7042,6 +7331,16 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                                         f"(file={_s0_rem_file!r}, "
                                                         f"window={_RECENT_WRITE_LINGER_S}s)"
                                                     )
+                                                elif _s0_rem_prev is not None:
+                                                    _s0_prev_age = _s0_ts - _s0_rem_prev[0]
+                                                    if 0 <= _s0_prev_age <= _RECENT_WRITE_LINGER_S:
+                                                        _s0_discard = (
+                                                            f"REMOTE-LINGER (prev): {_s0_prev_age:.1f}s "
+                                                            f"after prior remote write by "
+                                                            f"{_nfe_result_ip!r} "
+                                                            f"(file={_s0_rem_prev[1]!r}, "
+                                                            f"window={_RECENT_WRITE_LINGER_S}s)"
+                                                        )
                                             if _s0_discard:
                                                 _s0_poisoned += 1
                                                 _gei.info(
@@ -7087,11 +7386,34 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                                 f"(ambiguous idle history)"
                                             )
                                         else:
-                                            _s0_mon_reason = (
-                                                f"CHECK B passed: min_prior_idle="
-                                                f"{_s0_min_idle!r}s >10s or <2 snapshots "
-                                                f"({len(_s0_hist_clean)}) — genuine write"
-                                            )
+                                            # <2 clean snapshots OR min_prior_idle > threshold:
+                                            # normally "genuine write", but apply the same
+                                            # WATCHDOG-GUARD as Step1: if this event was detected
+                                            # by the local watchdog (direct NTFS kernel driver),
+                                            # the write came from the LOCAL machine's filesystem.
+                                            # The coworker's ~$lock-file handle only proves they
+                                            # have the file OPEN — not that they wrote it right now.
+                                            # Treat as monitor (fall through to Step1) so the
+                                            # LINGER/CO-TEMPORAL filters there can examine idle
+                                            # history properly.
+                                            _s0_is_watchdog = (detection_source == "watchdog")
+                                            if _s0_is_watchdog:
+                                                _s0_is_monitor = True
+                                                _s0_mon_reason = (
+                                                    f"CHECK B watchdog-guard: "
+                                                    f"detection_source='watchdog' on same-host "
+                                                    f"watch → local filesystem write; coworker "
+                                                    f"handle is passive reader, not active writer. "
+                                                    f"min_prior_idle={_s0_min_idle!r}s "
+                                                    f"snapshots={len(_s0_hist_clean)} "
+                                                    f"→ falling through to Step1."
+                                                )
+                                            else:
+                                                _s0_mon_reason = (
+                                                    f"CHECK B passed: min_prior_idle="
+                                                    f"{_s0_min_idle!r}s >10s or <2 snapshots "
+                                                    f"({len(_s0_hist_clean)}) — genuine write"
+                                                )
                                 else:
                                     # No idle history — fall back to linger cache
                                     import time as _s0_lc_t
@@ -7111,7 +7433,27 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                                 f"{_s0_lg_age:.3f}s ago — trusting handle"
                                             )
                                     else:
-                                        _s0_mon_reason = "no idle history, no linger entry"
+                                        # No idle history and no linger entry.
+                                        # Apply WATCHDOG-GUARD here too: a same-host
+                                        # watchdog event means the write came from the
+                                        # local NTFS kernel driver, not from a remote
+                                        # client.  Even without idle-history data, a
+                                        # coworker's open handle proves they have the
+                                        # file open for reading, not that they wrote it
+                                        # right now.  Fall through to Step1 so the full
+                                        # NTFS-owner heuristic runs.
+                                        _s0_no_hist_watchdog = (detection_source == "watchdog")
+                                        if _s0_no_hist_watchdog:
+                                            _s0_is_monitor = True
+                                            _s0_mon_reason = (
+                                                f"no idle history, no linger entry; "
+                                                f"detection_source='watchdog' → local "
+                                                f"filesystem write; coworker handle is "
+                                                f"passive reader, not active writer → "
+                                                f"falling through to Step1"
+                                            )
+                                        else:
+                                            _s0_mon_reason = "no idle history, no linger entry"
                                 _gei.info(
                                     f"[_get_editor_info] Step0-priority: persistent-monitor "
                                     f"gate (modified event) ip={_nfe_result_ip!r}: "
@@ -7127,11 +7469,28 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                 )
                             if _s0_is_monitor:
                                 _s0_linger_gate = True
+                                _s0_linger_gate_user    = _nfe_result_user    # save before clear
+                                _s0_linger_gate_machine = _nfe_result_machine # save before clear
+                                # BUGFIX: detection_source=='watchdog' on a same-host
+                                # watch means a real NTFS write happened on THIS box —
+                                # that can never be generated by a remote SMB client.
+                                # Flag it so Step1's LINGER-GATE-TRUST-HANDLE bypass
+                                # (which would otherwise blindly trust the ambiguous
+                                # NetFileEnum handle below) refuses to fire and instead
+                                # lets the full Step1 idle-history heuristics run.
+                                _s0_linger_gate_is_watchdog = (detection_source == "watchdog")
                                 _gei.info(
                                     f"[_get_editor_info] Step0-priority: LINGER-GATE "
                                     f"fired (modified, persistent-monitor) — "
-                                    f"ip={_nfe_result_ip!r}: {_s0_mon_reason}; "
-                                    f"NOT returning early, falling through to Step1"
+                                    f"ip={_nfe_result_ip!r} user={_nfe_result_user!r}: "
+                                    f"{_s0_mon_reason}; "
+                                    f"NOT returning early, falling through to Step1. "
+                                    f"Saving hint: linger_gate_ip={_nfe_result_ip!r} "
+                                    f"linger_gate_user={_nfe_result_user!r} "
+                                    f"linger_gate_machine={_nfe_result_machine!r} "
+                                    f"linger_gate_is_watchdog={_s0_linger_gate_is_watchdog} "
+                                    f"(detection_source={detection_source!r}) — "
+                                    f"{'Step1 TRUST-HANDLE bypass will be BLOCKED for this event because the local watchdog already confirmed a same-host write.' if _s0_linger_gate_is_watchdog else 'Step1 TRUST-HANDLE bypass remains eligible (event was not watchdog-detected).'}"
                                 )
                                 _nfe_result_user = ""
                                 break  # exit handle loop without returning early
@@ -7145,10 +7504,10 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                             info["machine"] = _nfe_result_machine.lstrip("\\")
                             info["ip"]      = _nfe_result_ip
                             if _nfe_result_ip:
-                                _record_remote_write(_nfe_result_ip, filepath)
+                                _record_remote_write(_nfe_result_ip, filepath, event_type)
                                 _gei.info(
                                     f"[_get_editor_info] Step0-priority: recorded remote "
-                                    f"write by ip={_nfe_result_ip!r} "
+                                    f"write by ip={_nfe_result_ip!r} event_type={event_type!r} "
                                     f"(filepath={filepath!r}) for burst-sibling detection"
                                 )
                             return info
@@ -7394,6 +7753,75 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                     _rs_ip = _rs.get("ip", "")
                     _rs_idle_now = _rs.get("idle_time", 999)
 
+                    # ── LINGER-GATE-TRUST-HANDLE bypass ──────────────────────────
+                    # Step0 (NetFileEnum) confirmed this exact remote IP has the
+                    # write handle open, but LINGER-GATE deferred the return because
+                    # this client is classified as a persistent monitor. Now in Step1,
+                    # we see this is the only active remote session, confirming it IS
+                    # the writer. Trust the Step0 NetFileEnum result directly — skip
+                    # all Step1 heuristics (OWN-ACTIVE VETO, WATCHDOG-GUARD, etc.)
+                    # The local own_min_idle=0s is background-polling noise, NOT a
+                    # local-write signal, and cannot override a confirmed remote handle.
+                    #
+                    # BUGFIX: this bypass must NOT fire when the gate was raised
+                    # because of CHECK B watchdog-guard (_s0_linger_gate_is_watchdog).
+                    # In that case the local watchdog/kernel filesystem notifier
+                    # already confirmed the write happened on THIS machine's disk —
+                    # a remote SMB client physically cannot generate that event. The
+                    # only reason Step0 produced a remote ip/user at all is a
+                    # workgroup username collision (e.g. both PCs logged in as the
+                    # generic local account "user"), in which case NetFileEnum's
+                    # handle is just a coworker passively holding the file open
+                    # (e.g. an Office "~$" lock or a stale browse), not the writer.
+                    # Skipping the bypass here lets the full Step1 idle-history /
+                    # OWN-ACTIVE VETO heuristics below run and correctly attribute
+                    # the edit to the local machine instead.
+                    if (_s0_linger_gate
+                            and _nfe_result_ip
+                            and _nfe_result_ip == _rs_ip
+                            and not _s0_linger_gate_is_watchdog):
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: LINGER-GATE-TRUST-HANDLE — "
+                            f"Step0 NetFileEnum confirmed write handle from "
+                            f"ip={_nfe_result_ip!r} (user={_s0_linger_gate_user!r} "
+                            f"machine={_s0_linger_gate_machine!r}), and this is the "
+                            f"only active remote session in the snapshot. "
+                            f"Trusting Step0 result. "
+                            f"OWN-ACTIVE VETO bypassed — local SMB polling keeps "
+                            f"own_min_idle=0s permanently; it is background noise, "
+                            f"not a local-write signal. "
+                            f"rs_idle_now={_rs_idle_now}s "
+                            f"rs_active_time={_rs.get('active_time', 0)}s"
+                        )
+                        info["user"]    = _s0_linger_gate_user
+                        info["machine"] = _s0_linger_gate_machine.lstrip("\\")
+                        info["ip"]      = _nfe_result_ip
+                        _record_remote_write(_nfe_result_ip, filepath, event_type)
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: LINGER-GATE-TRUST-HANDLE "
+                            f"— recorded remote write by ip={_nfe_result_ip!r} event_type={event_type!r} "
+                            f"and returning attribution."
+                        )
+                        return info
+                    elif (_s0_linger_gate
+                            and _nfe_result_ip
+                            and _nfe_result_ip == _rs_ip
+                            and _s0_linger_gate_is_watchdog):
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: LINGER-GATE-TRUST-HANDLE "
+                            f"SKIPPED (bugfix) — ip={_nfe_result_ip!r} (user="
+                            f"{_s0_linger_gate_user!r} machine={_s0_linger_gate_machine!r}) "
+                            f"is the only active remote session, but this event's "
+                            f"detection_source was 'watchdog' on a same-host watch, "
+                            f"which already proves the write happened locally. "
+                            f"NOT trusting the NetFileEnum handle (likely a username "
+                            f"collision / coworker passive reader). Falling through to "
+                            f"full Step1 idle-history + OWN-ACTIVE VETO heuristics below "
+                            f"to attribute correctly. rs_idle_now={_rs_idle_now}s "
+                            f"rs_active_time={_rs.get('active_time', 0)}s"
+                        )
+
+
                     # ── Persistent-monitor check ─────────────────────────────────
                     # Query the session-poller cache for recent idle_time history of
                     # this client.  A genuine writer's idle_time drops from HIGH to 0
@@ -7471,21 +7899,44 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                             # persistent monitoring behaviour.
                             _NFE_MONITOR_THRESHOLD = 5
                             _cn_poison_window_a = 90
+                            _event_ts_a = _nfe_t.time() - 2   # approximate event wall-clock time
                             _cn_prior_own_a    = _get_recent_own_write()
                             _cn_prior_remote_a = _get_recent_remote_write(_rs_ip)
                             _idle_history_clean_a = _idle_history
                             _cn_poisoned_a = 0
-                            if _cn_prior_own_a is not None or _cn_prior_remote_a is not None:
+                            if _cn_prior_own_a is not None or _cn_prior_remote_a is not None or True:
+                                # Always run the filter loop — we need the co-temporal guard
+                                # even when no prior write is recorded.
                                 import time as _cn_a_t
                                 _cn_own_ts_a   = _cn_prior_own_a[0]    if _cn_prior_own_a   else None
                                 _cn_own_file_a = _cn_prior_own_a[1]    if _cn_prior_own_a   else None
                                 _cn_rem_ts_a   = _cn_prior_remote_a[0] if _cn_prior_remote_a else None
                                 _cn_rem_file_a = _cn_prior_remote_a[1] if _cn_prior_remote_a else None
+                                # Also get previous write entry (3rd element)
+                                _cn_rem_prev_a = (
+                                    _cn_prior_remote_a[2]
+                                    if _cn_prior_remote_a and len(_cn_prior_remote_a) >= 3
+                                    else None
+                                )
                                 _idle_history_clean_a = []
                                 for _cn_ts_a, _cn_idle_a in _idle_history:
                                     _discard_reason = None
-                                    # Own-write CHANGE_NOTIFY filter
-                                    if _cn_own_ts_a is not None:
+                                    # ── Co-temporal guard ──────────────────────────────
+                                    # A snapshot taken AT or AFTER the event time captures
+                                    # the write itself being observed (idle=0 because the
+                                    # coworker is actively saving right now).  This is not
+                                    # "prior monitoring history" — exclude it unconditionally.
+                                    # age < 0  means snapshot_ts > event_ts (future/co-temporal)
+                                    _snap_age_before_event = _event_ts_a - _cn_ts_a
+                                    if _snap_age_before_event < 2:   # < 2s grace for clock skew
+                                        _discard_reason = (
+                                            f"CO-TEMPORAL: snapshot taken "
+                                            f"{_snap_age_before_event:.1f}s before event "
+                                            f"(≤2s grace) — captures the write itself, "
+                                            f"not prior monitoring behaviour"
+                                        )
+                                    # ── Own-write CHANGE_NOTIFY filter ─────────────────
+                                    if _discard_reason is None and _cn_own_ts_a is not None:
                                         _cn_age_a = _cn_ts_a - _cn_own_ts_a
                                         if 0 <= _cn_age_a <= _cn_poison_window_a:
                                             _discard_reason = (
@@ -7493,7 +7944,7 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                                 f"confirmed own write at {_cn_own_ts_a:.1f} "
                                                 f"(file={_cn_own_file_a!r}) — CHANGE_NOTIFY echo"
                                             )
-                                    # Remote-write linger filter (coworker's own prior write)
+                                    # ── Remote-write linger filter ─────────────────────
                                     if _discard_reason is None and _cn_rem_ts_a is not None:
                                         _cn_rem_age_a = _cn_ts_a - _cn_rem_ts_a
                                         if 0 <= _cn_rem_age_a <= _RECENT_WRITE_LINGER_S:
@@ -7505,12 +7956,29 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                                 f"coworker prior-write activity tail, "
                                                 f"not monitoring"
                                             )
+                                        # Also check previous write entry
+                                        elif _cn_rem_prev_a is not None:
+                                            _cn_rem_prev_ts   = _cn_rem_prev_a[0]
+                                            _cn_rem_prev_file = _cn_rem_prev_a[1]
+                                            _cn_rem_prev_age  = _cn_ts_a - _cn_rem_prev_ts
+                                            if 0 <= _cn_rem_prev_age <= _RECENT_WRITE_LINGER_S:
+                                                _discard_reason = (
+                                                    f"REMOTE-LINGER (prev write): taken "
+                                                    f"{_cn_rem_prev_age:.1f}s after prior confirmed "
+                                                    f"remote write by {_rs_ip!r} at "
+                                                    f"{_cn_rem_prev_ts:.1f} "
+                                                    f"(file={_cn_rem_prev_file!r}, "
+                                                    f"window={_RECENT_WRITE_LINGER_S}s) — "
+                                                    f"coworker prior-write activity tail, "
+                                                    f"not monitoring"
+                                                )
                                     if _discard_reason:
                                         _cn_poisoned_a += 1
                                         _gei.info(
                                             f"[_get_editor_info] Step1-early: CHECK A "
                                             f"LINGER-FILTER — discarding snapshot "
-                                            f"(idle={_cn_idle_a}s, ts={_cn_ts_a:.1f}): "
+                                            f"(idle={_cn_idle_a}s, ts={_cn_ts_a:.1f}, "
+                                            f"age={_snap_age_before_event:.1f}s before event): "
                                             f"{_discard_reason}"
                                         )
                                     else:
@@ -7608,25 +8076,77 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                     if (_min_prior_idle is not None and
                                             _min_prior_idle > _NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE and
                                             _rs_active_time <= _NFE_NEW_SESSION_THRESHOLD):
-                                        # Short session + high prior idle = recently
-                                        # connected for the purpose of writing.
-                                        _monitor_reason = (
-                                            f"only {len(_idle_history)} prior snapshot(s), but "
-                                            f"idle={_min_prior_idle}s > "
-                                            f"{_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
-                                            f"active_time={_rs_active_time}s <= "
-                                            f"{_NFE_NEW_SESSION_THRESHOLD}s — recently connected "
-                                            f"to write, not a passive monitor"
+                                        # Short session + high prior idle looks like "recently
+                                        # connected to write" — BUT this signal is unreliable
+                                        # when the own machine is actively writing at the same
+                                        # time (watchdog + own_min_idle ≤ 5s): Windows SMB
+                                        # sends a CHANGE_NOTIFY to every watching client
+                                        # (including .105) the moment the local file appears,
+                                        # resetting their idle_time to ~0 regardless of prior
+                                        # idle.  So prior_idle=228s drops to 0 NOT because
+                                        # .105 wrote the file but because .106 did and the
+                                        # server notified .105.  Block the "recently connected"
+                                        # shortcut and fall back to NTFS owner (correct).
+                                        _sso_own_min_idle = _rs.get("own_min_idle_time")
+                                        _SSO_OWN_VETO_THRESHOLD = 5  # seconds
+                                        _sso_own_active_veto = (
+                                            detection_source == "watchdog" and
+                                            _sso_own_min_idle is not None and
+                                            _sso_own_min_idle <= _SSO_OWN_VETO_THRESHOLD
                                         )
-                                        _gei.info(
-                                            f"[_get_editor_info] Step1-early: CHECK B "
-                                            f"single-snapshot override — prior_idle="
-                                            f"{_min_prior_idle}s > "
-                                            f"{_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
-                                            f"active_time={_rs_active_time}s <= "
-                                            f"{_NFE_NEW_SESSION_THRESHOLD}s — "
-                                            f"recently connected to write → NOT a monitor"
-                                        )
+                                        if _sso_own_active_veto:
+                                            # Own machine actively writing — remote idle drop
+                                            # is a CHANGE_NOTIFY echo, not a write signal.
+                                            _is_persistent_monitor = True
+                                            _own_active_veto = True
+                                            _monitor_reason = (
+                                                f"single-snapshot: prior_idle={_min_prior_idle}s > "
+                                                f"{_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
+                                                f"active_time={_rs_active_time}s ≤ "
+                                                f"{_NFE_NEW_SESSION_THRESHOLD}s looks 'recently "
+                                                f"connected', but OWN-ACTIVE VETO overrides "
+                                                f"(watchdog, own_min_idle={_sso_own_min_idle}s ≤ "
+                                                f"{_SSO_OWN_VETO_THRESHOLD}s) — remote idle=0 is "
+                                                f"CHANGE_NOTIFY echo from local write"
+                                            )
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: CHECK B "
+                                                f"single-snapshot override BLOCKED by "
+                                                f"OWN-ACTIVE VETO — prior_idle={_min_prior_idle}s "
+                                                f"> {_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
+                                                f"active_time={_rs_active_time}s ≤ "
+                                                f"{_NFE_NEW_SESSION_THRESHOLD}s, BUT "
+                                                f"detection_source='watchdog' AND "
+                                                f"own_min_idle={_sso_own_min_idle}s ≤ "
+                                                f"{_SSO_OWN_VETO_THRESHOLD}s — own machine is "
+                                                f"actively writing; remote idle drop is "
+                                                f"CHANGE_NOTIFY noise. ip={_rs_ip!r} "
+                                                f"[debug: own_min_idle={_sso_own_min_idle}s "
+                                                f"own_min_active_time={_rs.get('own_min_active_time')!r}s]"
+                                            )
+                                        else:
+                                            # Short session + high prior idle + own machine
+                                            # not actively writing = recently connected to write.
+                                            _monitor_reason = (
+                                                f"only {len(_idle_history)} prior snapshot(s), but "
+                                                f"idle={_min_prior_idle}s > "
+                                                f"{_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
+                                                f"active_time={_rs_active_time}s <= "
+                                                f"{_NFE_NEW_SESSION_THRESHOLD}s — recently connected "
+                                                f"to write, not a passive monitor"
+                                            )
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: CHECK B "
+                                                f"single-snapshot override — prior_idle="
+                                                f"{_min_prior_idle}s > "
+                                                f"{_NFE_SINGLE_SNAPSHOT_CONFIDENT_IDLE}s AND "
+                                                f"active_time={_rs_active_time}s <= "
+                                                f"{_NFE_NEW_SESSION_THRESHOLD}s — "
+                                                f"recently connected to write → NOT a monitor "
+                                                f"[debug: own_min_idle={_sso_own_min_idle!r}s "
+                                                f"(> {_SSO_OWN_VETO_THRESHOLD}s or None — "
+                                                f"own machine not actively writing)]"
+                                            )
                                     elif _rs_active_time > _NFE_NEW_SESSION_THRESHOLD:
                                         # Long-running session + only 1 snapshot: the
                                         # idle_time=0 at event time is ambiguous — it is
@@ -7704,6 +8224,27 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                             # THIS write (not to a future remote write).
                                             _record_own_write(filepath)
                                             _is_persistent_monitor = True
+                                            # BUG-FIX (misattribution to a bystander coworker IP):
+                                            # LOOPBACK-LOCAL is just as strong a "this machine wrote
+                                            # the file" signal as OWN-ACTIVE VETO (own_min_idle<=5s) —
+                                            # both prove the write happened on this machine's own
+                                            # console. But only OWN-ACTIVE VETO was wired into
+                                            # `_own_active_veto`, the flag BURST-OVERRIDE checks before
+                                            # discarding a persistent-monitor verdict. Without this,
+                                            # BURST-OVERRIDE saw the remote IP had written a *different*
+                                            # file ~19s earlier (an unrelated screenshot burst) and
+                                            # flipped this correct local-write verdict back to
+                                            # "remote", misattributing this file to that bystander IP
+                                            # even though LOOPBACK-LOCAL had just proven it was local.
+                                            # Setting the same veto flag here makes BURST-OVERRIDE
+                                            # respect this determination too.
+                                            # _loopback_local_fired distinguishes this hard
+                                            # positive-evidence veto from the weaker OWN-ACTIVE
+                                            # VETO (idle=0 passive signal), so the BURST-OVERRIDE
+                                            # gate can still exempt very-fresh bursts for the
+                                            # passive case while preserving LOOPBACK-LOCAL.
+                                            _loopback_local_fired = True
+                                            _own_active_veto = True
                                             _monitor_reason = (
                                                 f"only {len(_idle_history)} prior snapshot(s); "
                                                 f"own-machine loopback SMB session has "
@@ -7758,37 +8299,479 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                                 f"enable SACL for definitive attribution)."
                                             )
                                         else:
-                                            # No loopback evidence + only 1 snapshot →
-                                            # conservative NTFS fallback.
-                                            _is_persistent_monitor = True
-                                            _monitor_reason = (
-                                                f"only {len(_idle_history)} prior snapshot(s) — "
-                                                f"insufficient to distinguish genuine write from "
-                                                f"CHANGE_NOTIFY response; "
-                                                f"active_time={_rs_active_time}s > "
-                                                f"{_NFE_NEW_SESSION_THRESHOLD}s (long-running passive "
-                                                f"session); own_min_active_time={_own_min_at!r}s "
-                                                f"(no fresh loopback — ambiguous) → conservative "
-                                                f"fallback to NTFS owner. "
-                                                f"Enable SACL for definitive attribution."
+                                            # No loopback evidence + only 1 snapshot.
+                                            # Before falling back conservatively, check if the
+                                            # prior idle is HIGH ENOUGH to rule out CHANGE_NOTIFY:
+                                            # A CHANGE_NOTIFY response requires a recent local write.
+                                            # If no own write is in cache AND prior idle is very high
+                                            # (coworker was idle a long time BEFORE this event),
+                                            # there is no plausible CHANGE_NOTIFY source — the idle
+                                            # drop must be from a genuine remote write.
+                                            _HIGH_IDLE_GENUINE_THRESHOLD = 20  # seconds (lowered from 30: 24s prior_idle
+                                            # is real idle, not CHANGE_NOTIFY linger noise)
+                                            _no_recent_own_write = (
+                                                _get_recent_own_write() is None
+                                            )
+                                            # WATCHDOG-GUARD: when detection_source='watchdog'
+                                            # on a same-host watch, the event was raised by
+                                            # the local NTFS kernel driver — meaning the write
+                                            # came from the LOCAL machine (Explorer, cmd, etc.)
+                                            # firing a local-filesystem notification.  A remote
+                                            # write arrives via SMB and is never seen by the
+                                            # local watchdog until the kernel flushes the buffer
+                                            # (~1–2 s delay), but more importantly: a local
+                                            # Explorer copy triggers watchdog IMMEDIATELY.  If
+                                            # we see a same-host watchdog event AND no SMB
+                                            # loopback was recorded, it almost certainly means
+                                            # the local user wrote the file directly, NOT that
+                                            # the coworker wrote it.  HIGH-IDLE-GENUINE must
+                                            # NOT fire in this case — the coworker's idle=0 is
+                                            # a CHANGE_NOTIFY echo from our local write, and
+                                            # the absence of a loopback is because the write
+                                            # bypassed SMB entirely (direct local filesystem).
+                                            _is_watchdog_same_host = (
+                                                detection_source == "watchdog"
+                                            )
+                                            # WATCHDOG-GUARD override: if prior_idle is
+                                            # extremely high (> 60s), it is impossible for
+                                            # it to be a CHANGE_NOTIFY echo from a local write
+                                            # (CN echoes reset idle to ~0 within 1-5s and
+                                            # decay back above 60s only after 1+ minutes of
+                                            # genuine inactivity).  Even on a same-host watchdog
+                                            # event, a prior_idle of 60s+ is unambiguous proof
+                                            # that the remote machine was genuinely idle before
+                                            # this write — the watchdog-guard doesn't apply.
+                                            #
+                                            # EXCEPTION — OWN-ACTIVE VETO: if the local
+                                            # machine's own SMB sessions also show near-zero
+                                            # idle_time at the moment of the event, it means
+                                            # the local machine was actively doing SMB I/O
+                                            # (e.g. Explorer copying files via the loopback
+                                            # path without opening a fresh short-lived session).
+                                            # In this case, even a 60s+ remote prior_idle is
+                                            # ambiguous — the CHANGE_NOTIFY echo isn't from a
+                                            # local write that already happened, it IS from the
+                                            # local write happening right now.  Block the bypass
+                                            # and fall through to NTFS owner (conservative).
+                                            _WATCHDOG_GUARD_BYPASS_IDLE = 60  # seconds
+                                            _OWN_ACTIVE_VETO_THRESHOLD = 5    # seconds
+                                            # BACKGROUND-POLLING EXCEPTION: the BackupSys
+                                            # app itself constantly scans the SMB share
+                                            # (every 5-15s) keeping local own sessions at
+                                            # idle_time=0-1s permanently regardless of user
+                                            # activity.  So own_min_idle is ALWAYS low and
+                                            # the veto would fire on every event including
+                                            # genuine remote writes.  Fix: also require that
+                                            # the remote prior_idle is low enough to plausibly
+                                            # be a CHANGE_NOTIFY echo (≤120s).  If the remote
+                                            # was idle for >120s, no local background-polling
+                                            # DIRECTORY SCAN write could explain that state.
+                                            #
+                                            # EXCEPTION TO THE EXCEPTION — 'added' events:
+                                            # A local file CREATION (not a polling scan) sends
+                                            # CHANGE_NOTIFY to every watching client immediately,
+                                            # resetting their idle_time to 0 regardless of how
+                                            # long they were previously idle.  Prior_idle=246s
+                                            # means they were idle BEFORE the local write, not
+                                            # that they did the write.  So for 'added' events
+                                            # detected by same-host watchdog, always apply the
+                                            # veto — do not skip it just because prior_idle>120s.
+                                            _OWN_VETO_MAX_PRIOR_IDLE = 120   # seconds
+                                            _own_min_idle = _rs.get("own_min_idle_time")
+                                            # ADDED-BURST-GUARD: for 'added' events, skip the
+                                            # event_type='added' veto override when there is
+                                            # already a confirmed recent remote write from this
+                                            # IP within a window.  A sibling file in the same
+                                            # burst copy can arrive seconds to tens of seconds
+                                            # after the confirmed write (slow sequential copies,
+                                            # network latency, Explorer copying multiple files).
+                                            # A separate user's write appearing well AFTER the
+                                            # burst is NOT a sibling and must NOT skip the veto.
+                                            #
+                                            # Two-tier window:
+                                            #   _ADDED_BURST_GUARD_WINDOW_S (30s) — used when
+                                            #     own_min_idle=0 (machine actively busy) because
+                                            #     a slow sequential copy from a coworker can span
+                                            #     10-25s between individual files; the previous
+                                            #     tight 8s window caused false VETO for burst
+                                            #     siblings arriving 10-17s after a confirmed
+                                            #     remote write (bug: files attributed to .106
+                                            #     instead of .105 in slow multi-file transfers).
+                                            #   _ADDED_BURST_GUARD_WINDOW_TIGHT_S (8s) — used
+                                            #     when own_min_idle > 0 (machine was quiet) as a
+                                            #     safety check; a genuinely local add 12-15s
+                                            #     after a remote burst would not falsely match
+                                            #     because the machine's own_min_idle would not be
+                                            #     near-zero.
+                                            _ADDED_BURST_GUARD_WINDOW_TIGHT_S = 8   # when local machine was idle
+                                            _ADDED_BURST_GUARD_WINDOW_S = 30         # when local machine is busy (own_min_idle=0)
+                                            import time as _avc_t
+                                            _avc_burst_entry  = _get_recent_remote_write(_rs_ip) if _rs_ip else None
+                                            _avc_burst_age    = (_avc_t.time() - _avc_burst_entry[0]) if _avc_burst_entry else None
+                                            # Pick the applicable window based on own_min_idle:
+                                            # when own_min_idle=0 the local machine is busy (or
+                                            # polling), so we allow a wider window to avoid
+                                            # vetoing genuine remote burst siblings.
+                                            _own_min_idle_for_burst = _rs.get("own_min_idle_time") if _rs else None
+                                            _avc_effective_window = (
+                                                _ADDED_BURST_GUARD_WINDOW_S
+                                                if (_own_min_idle_for_burst is not None and _own_min_idle_for_burst == 0)
+                                                else _ADDED_BURST_GUARD_WINDOW_TIGHT_S
+                                            )
+                                            # LOCAL-OWN-WRITE GUARD: even if a remote burst is
+                                            # active, do NOT bypass OWN-ACTIVE VETO when the
+                                            # local machine has a recent confirmed own-write
+                                            # within _ADDED_BURST_GUARD_WINDOW_S.
+                                            # Scenario: .106 writes files A+B (OWN-ACTIVE VETO
+                                            # fires for A; B is correctly suppressed).  22s later
+                                            # .106 writes files C+D. At that point .105's prior
+                                            # confirmed remote burst (from ~12s ago) would satisfy
+                                            # _avc_burst_active=True and bypass the veto, causing
+                                            # .106's own C+D to be misattributed to .105.
+                                            # Fix: if the local machine just wrote anything in the
+                                            # same burst window, the remote burst cannot override.
+                                            #
+                                            # INNER EXCEPTION — VERY-RECENT REMOTE BURST:
+                                            # If the remote burst was confirmed by Step0 NFE
+                                            # handle match (extremely fresh, < tight window 8s),
+                                            # it OVERRIDES the local-own-write guard. Scenario:
+                                            # .105 copies file A (Step0 NFE confirms → burst
+                                            # recorded 0.05s ago) then file B arrives immediately.
+                                            # Without this exception, the local-own-write guard
+                                            # (triggered by a .106 write from seconds earlier)
+                                            # would block the burst and wrongly attribute B to
+                                            # .106.  A sub-8s confirmed remote burst is stronger
+                                            # evidence than a recent local write.
+                                            _avc_own_recent = _get_recent_own_write()
+                                            _avc_own_write_age = (
+                                                (_avc_t.time() - _avc_own_recent[0])
+                                                if _avc_own_recent else None
+                                            )
+                                            # Only activate guard when local write is recent
+                                            # AND the remote burst is NOT within the tight window
+                                            # (i.e. the remote burst is older / less certain).
+                                            _avc_burst_very_recent = (
+                                                _avc_burst_age is not None and
+                                                _avc_burst_age < _ADDED_BURST_GUARD_WINDOW_TIGHT_S
+                                            )
+                                            _avc_local_recent_write = (
+                                                _avc_own_write_age is not None and
+                                                _avc_own_write_age < _avc_effective_window and
+                                                not _avc_burst_very_recent  # inner exception: sub-8s burst wins
                                             )
                                             _gei.info(
-                                                f"[_get_editor_info] Step1-early: CHECK B "
-                                                f"single-snapshot AMBIGUOUS — prior_idle="
-                                                f"{_min_prior_idle!r}s, active_time="
-                                                f"{_rs_active_time}s > {_NFE_NEW_SESSION_THRESHOLD}s, "
-                                                f"own_min_active_time={_own_min_at!r}s. "
-                                                f"idle_time drop to 0 is indistinguishable from "
-                                                f"SMB CHANGE_NOTIFY response to a local write. "
-                                                f"Falling back to NTFS owner (conservative)."
+                                                f"[_get_editor_info] Step1-early: LOCAL-OWN-WRITE GUARD — "
+                                                f"own_recent_write_age={_avc_own_write_age!r}s "
+                                                f"effective_window={_avc_effective_window}s "
+                                                f"burst_very_recent={_avc_burst_very_recent} "
+                                                f"(burst_age={_avc_burst_age!r}s tight={_ADDED_BURST_GUARD_WINDOW_TIGHT_S}s) "
+                                                f"local_recent_write={_avc_local_recent_write} "
+                                                f"(own_recent_file={_avc_own_recent[1] if _avc_own_recent else 'n/a'!r})"
                                             )
+                                            _avc_burst_active = (
+                                                _avc_burst_entry is not None and
+                                                _avc_burst_age is not None and
+                                                _avc_burst_age < _avc_effective_window and
+                                                not _avc_local_recent_write  # suppress if local wrote recently (unless burst is very fresh)
+                                            )
+                                            # True when 'added' AND no burst within effective window
+                                            # from this IP → safe to apply the veto (local add or
+                                            # post-burst remote add — both need veto).
+                                            # False when 'added' AND burst is active within window
+                                            # → skip veto so HIGH-IDLE-GENUINE fires for the
+                                            # remote burst sibling.
+                                            _added_no_burst = event_type == "added" and not _avc_burst_active
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: ADDED-BURST-GUARD decision — "
+                                                f"ip={_rs_ip!r} own_min_idle_for_burst={_own_min_idle_for_burst!r}s "
+                                                f"effective_window={_avc_effective_window}s "
+                                                f"(tight={_ADDED_BURST_GUARD_WINDOW_TIGHT_S}s wide={_ADDED_BURST_GUARD_WINDOW_S}s) "
+                                                f"burst_entry={'yes' if _avc_burst_entry else 'none'} "
+                                                f"burst_age={_avc_burst_age!r}s "
+                                                f"burst_very_recent={_avc_burst_very_recent} "
+                                                f"local_recent_write={_avc_local_recent_write} "
+                                                f"(own_write_age={_avc_own_write_age!r}s) "
+                                                f"burst_active={_avc_burst_active} "
+                                                f"added_no_burst={_added_no_burst} "
+                                                f"event_type={event_type!r}"
+                                            )
+                                            _own_active_veto = (
+                                                _is_watchdog_same_host and
+                                                _own_min_idle is not None and
+                                                _own_min_idle <= _OWN_ACTIVE_VETO_THRESHOLD and
+                                                (
+                                                    _min_prior_idle is None or
+                                                    _min_prior_idle <= _OWN_VETO_MAX_PRIOR_IDLE or
+                                                    _added_no_burst  # 'added' with no active remote burst
+                                                )
+                                            )
+                                            # STALE-LOOPBACK-GENUINE: the veto fired ONLY because
+                                            # _added_no_burst (prior_idle > _OWN_VETO_MAX_PRIOR_IDLE,
+                                            # so the prior_idle ≤ 120s gate alone didn't trigger it).
+                                            # When own_min_at > 300s the own loopback is the long-
+                                            # running monitoring connection — not a fresh write session.
+                                            # own_min_idle=0 is permanent monitoring-connection noise
+                                            # (CHANGE_NOTIFY receipts / background polls), NOT a
+                                            # local-write signal.  When there is also no confirmed
+                                            # recent own write in cache (_avc_own_recent=None), there
+                                            # is zero positive evidence of a local write.  Allow
+                                            # WATCHDOG-GUARD bypass so HIGH-IDLE-GENUINE can
+                                            # correctly attribute the file to the coworker whose
+                                            # high prior_idle is the genuine write signal.
+                                            _own_veto_stale_loopback_genuine = (
+                                                _own_active_veto and
+                                                _added_no_burst and
+                                                _min_prior_idle is not None and
+                                                _min_prior_idle > _OWN_VETO_MAX_PRIOR_IDLE and
+                                                _own_min_at is not None and
+                                                _own_min_at > _NFE_NEW_SESSION_THRESHOLD and
+                                                _avc_own_recent is None
+                                            )
+                                            _watchdog_guard_bypassed = (
+                                                _is_watchdog_same_host and
+                                                _min_prior_idle is not None and
+                                                _min_prior_idle > _WATCHDOG_GUARD_BYPASS_IDLE and
+                                                (not _own_active_veto or _own_veto_stale_loopback_genuine)
+                                            )
+                                            _own_veto_reason = (
+                                                f"prior_idle={_min_prior_idle!r}s ≤ {_OWN_VETO_MAX_PRIOR_IDLE}s"
+                                                if (_min_prior_idle is not None and _min_prior_idle <= _OWN_VETO_MAX_PRIOR_IDLE)
+                                                else (
+                                                    f"event_type='added' + ADDED-BURST-GUARD "
+                                                    f"(no recent burst from {_rs_ip!r} within {_avc_effective_window}s "
+                                                    f"[tight={_ADDED_BURST_GUARD_WINDOW_TIGHT_S}s wide={_ADDED_BURST_GUARD_WINDOW_S}s own_min_idle_for_burst={_own_min_idle_for_burst!r}s], "
+                                                    f"burst_age={_avc_burst_age!r}s ≥ {_avc_effective_window}s) "
+                                                    f"— file creation CHANGE_NOTIFY resets remote "
+                                                    f"idle_time regardless of prior_idle={_min_prior_idle!r}s"
+                                                    if _added_no_burst
+                                                    else f"prior_idle=None"
+                                                )
+                                            )
+                                            if _own_active_veto and _is_watchdog_same_host:
+                                                _gei.info(
+                                                    f"[_get_editor_info] Step1-early: "
+                                                    f"OWN-ACTIVE VETO — "
+                                                    f"own_min_idle_time={_own_min_idle}s ≤ "
+                                                    f"{_OWN_ACTIVE_VETO_THRESHOLD}s AND "
+                                                    f"{_own_veto_reason}: "
+                                                    f"{'WATCHDOG-GUARD bypass still ALLOWED (STALE-LOOPBACK-GENUINE — own_min_at=' + str(_own_min_at) + 's > 300s monitoring loopback, no recent own write; veto is noise-only, not a local-write signal)' if _own_veto_stale_loopback_genuine else 'local machine (' + str(_own_ip_nfe) + ') is the likely writer — blocking WATCHDOG-GUARD bypass'}. "
+                                                    f"ip={_rs_ip!r} "
+                                                    f"[debug: own_min_idle={_own_min_idle}s "
+                                                    f"own_min_active={_own_min_at!r}s "
+                                                    f"event_type={event_type!r} "
+                                                    f"added_no_burst={_added_no_burst} "
+                                                    f"stale_loopback_genuine={_own_veto_stale_loopback_genuine} "
+                                                    f"burst_active={_avc_burst_active} "
+                                                    f"burst_age={_avc_burst_age!r}s "
+                                                    f"burst_guard_window={_avc_effective_window}s "
+                                                    f"(tight={_ADDED_BURST_GUARD_WINDOW_TIGHT_S}s wide={_ADDED_BURST_GUARD_WINDOW_S}s own_min_idle_for_burst={_own_min_idle_for_burst!r}s) "
+                                                    f"OWN_VETO_MAX_PRIOR_IDLE={_OWN_VETO_MAX_PRIOR_IDLE}s]"
+                                                )
+                                            elif not _own_active_veto and _is_watchdog_same_host and _own_min_idle is not None and _own_min_idle <= _OWN_ACTIVE_VETO_THRESHOLD:
+                                                _skip_label = (
+                                                    "ADDED-BURST-GUARD"
+                                                    if (event_type == "added" and _avc_burst_active)
+                                                    else "bg-polling"
+                                                )
+                                                _skip_detail = (
+                                                    f"event_type='added' AND burst_active=True "
+                                                    f"(burst_age={_avc_burst_age!r}s < {_avc_effective_window}s window "
+                                                    f"[tight={_ADDED_BURST_GUARD_WINDOW_TIGHT_S}s wide={_ADDED_BURST_GUARD_WINDOW_S}s own_min_idle_for_burst={_own_min_idle_for_burst!r}s], "
+                                                    f"sibling confirmed from {_rs_ip!r}): "
+                                                    f"treating as remote burst sibling, not local write"
+                                                    if (event_type == "added" and _avc_burst_active)
+                                                    else (
+                                                        f"prior_idle={_min_prior_idle!r}s > "
+                                                        f"{_OWN_VETO_MAX_PRIOR_IDLE}s AND "
+                                                        f"event_type={event_type!r} (not 'added'): "
+                                                        f"remote was idle too long for a bg-polling "
+                                                        f"CN echo — own_min_idle is background-polling noise"
+                                                    )
+                                                )
+                                                _gei.info(
+                                                    f"[_get_editor_info] Step1-early: "
+                                                    f"OWN-ACTIVE VETO SKIPPED ({_skip_label}) — "
+                                                    f"own_min_idle={_own_min_idle}s ≤ "
+                                                    f"{_OWN_ACTIVE_VETO_THRESHOLD}s BUT "
+                                                    f"{_skip_detail}. "
+                                                    f"ip={_rs_ip!r} "
+                                                    f"[debug: own_min_active={_own_min_at!r}s "
+                                                    f"added_no_burst={_added_no_burst} "
+                                                    f"burst_active={_avc_burst_active} "
+                                                    f"burst_age={_avc_burst_age!r}s "
+                                                    f"burst_very_recent={_avc_burst_very_recent} "
+                                                    f"local_recent_write={_avc_local_recent_write} "
+                                                    f"own_write_age={_avc_own_write_age!r}s "
+                                                    f"burst_guard_window={_avc_effective_window}s "
+                                                    f"(tight={_ADDED_BURST_GUARD_WINDOW_TIGHT_S}s wide={_ADDED_BURST_GUARD_WINDOW_S}s own_min_idle_for_burst={_own_min_idle_for_burst!r}s)]"
+                                                )
+                                            elif _watchdog_guard_bypassed:
+                                                _gei.info(
+                                                    f"[_get_editor_info] Step1-early: "
+                                                    f"WATCHDOG-GUARD BYPASSED"
+                                                    + (
+                                                        f" via STALE-LOOPBACK-GENUINE "
+                                                        f"(own_min_at={_own_min_at}s > 300s "
+                                                        f"monitoring loopback; no recent own write; "
+                                                        f"added+no-burst veto was noise-only)"
+                                                        if _own_veto_stale_loopback_genuine else ""
+                                                    ) +
+                                                    f" — prior_idle={_min_prior_idle}s > "
+                                                    f"{_WATCHDOG_GUARD_BYPASS_IDLE}s bypass "
+                                                    f"threshold; CHANGE_NOTIFY echo implausible "
+                                                    f"at this idle level. "
+                                                    f"Treating as genuine remote write. ip={_rs_ip!r} "
+                                                    f"is_watchdog_same_host={_is_watchdog_same_host} "
+                                                    f"[debug: own_min_idle={_own_min_idle!r}s "
+                                                    f"own_min_active={_own_min_at!r}s "
+                                                    f"own_active_veto={_own_active_veto} "
+                                                    f"stale_loopback_genuine={_own_veto_stale_loopback_genuine}]"
+                                                )
+                                            if (
+                                                _min_prior_idle is not None and
+                                                _min_prior_idle > _HIGH_IDLE_GENUINE_THRESHOLD and
+                                                _no_recent_own_write and
+                                                (not _is_watchdog_same_host or _watchdog_guard_bypassed)
+                                            ):
+                                                # High prior idle + no recent local write =
+                                                # genuine remote write signal even with 1 snapshot.
+                                                _monitor_reason = (
+                                                    f"only {len(_idle_history)} prior snapshot(s) — "
+                                                    f"but prior_idle={_min_prior_idle}s > "
+                                                    f"{_HIGH_IDLE_GENUINE_THRESHOLD}s AND no recent "
+                                                    f"own write in cache → no CHANGE_NOTIFY source. "
+                                                    f"High idle-before-write is genuine remote write "
+                                                    f"signal (single-snapshot HIGH-IDLE-GENUINE)."
+                                                )
+                                                _gei.info(
+                                                    f"[_get_editor_info] Step1-early: CHECK B "
+                                                    f"single-snapshot HIGH-IDLE-GENUINE — "
+                                                    f"prior_idle={_min_prior_idle}s > "
+                                                    f"{_HIGH_IDLE_GENUINE_THRESHOLD}s threshold "
+                                                    f"AND no recent own write → CHANGE_NOTIFY "
+                                                    f"explanation is implausible. "
+                                                    f"Treating as genuine remote write by "
+                                                    f"{_rs_ip!r}. "
+                                                    f"active_time={_rs_active_time}s "
+                                                    f"own_min_active_time={_own_min_at!r}s."
+                                                )
+                                            else:
+                                                # Conservative fallback — can't be confident.
+                                                _is_persistent_monitor = True
+                                                _monitor_reason = (
+                                                    f"only {len(_idle_history)} prior snapshot(s) — "
+                                                    f"insufficient to distinguish genuine write from "
+                                                    f"CHANGE_NOTIFY response; "
+                                                    f"active_time={_rs_active_time}s > "
+                                                    f"{_NFE_NEW_SESSION_THRESHOLD}s (long-running "
+                                                    f"passive session); "
+                                                    f"own_min_active_time={_own_min_at!r}s "
+                                                    f"(no fresh loopback — ambiguous); "
+                                                    f"prior_idle={_min_prior_idle!r}s "
+                                                    f"(≤{_HIGH_IDLE_GENUINE_THRESHOLD}s or "
+                                                    f"own-write in cache or watchdog-same-host) "
+                                                    f"→ conservative fallback to NTFS owner. "
+                                                    f"Enable SACL for definitive attribution."
+                                                )
+                                                _gei.info(
+                                                    f"[_get_editor_info] Step1-early: CHECK B "
+                                                    f"single-snapshot AMBIGUOUS — prior_idle="
+                                                    f"{_min_prior_idle!r}s, active_time="
+                                                    f"{_rs_active_time}s > "
+                                                    f"{_NFE_NEW_SESSION_THRESHOLD}s, "
+                                                    f"own_min_active_time={_own_min_at!r}s, "
+                                                    f"no_recent_own_write={_no_recent_own_write}, "
+                                                    f"is_watchdog_same_host={_is_watchdog_same_host}. "
+                                                    f"HIGH-IDLE-GENUINE blocked: "
+                                                    f"{'watchdog same-host write (local filesystem write detected)' if _is_watchdog_same_host else 'prior_idle too low or own-write in cache'}. "
+                                                    f"Falling back to NTFS owner (conservative). "
+                                                    f"[debug: prior_idle={_min_prior_idle!r}s threshold={_HIGH_IDLE_GENUINE_THRESHOLD}s bypass_threshold={_WATCHDOG_GUARD_BYPASS_IDLE}s own_min_idle={_own_min_idle!r}s own_active_veto={_own_active_veto} stale_loopback_genuine={locals().get('_own_veto_stale_loopback_genuine', False)} no_recent_own_write={_no_recent_own_write} is_watchdog_same_host={_is_watchdog_same_host} watchdog_guard_bypassed={_watchdog_guard_bypassed} BURST_WINDOW_S={_BURST_WINDOW_S}s]"
+                                                )
+
                                     else:
-                                        _monitor_reason = (
-                                            f"only {len(_idle_history)} prior snapshot(s) — "
-                                            f"insufficient pattern; "
-                                            f"active_time={_rs_active_time}s <= {_NFE_NEW_SESSION_THRESHOLD}s "
-                                            f"→ treating as writer (recently connected)"
-                                        )
+                                        # SHORT-LINGER GUARD: short-session (active_time <=
+                                        # _NFE_NEW_SESSION_THRESHOLD) with no usable prior
+                                        # snapshot data (all discarded by CO-TEMPORAL or
+                                        # linger filter).  Normally we'd treat idle_time=0
+                                        # as a genuine write signal, but if the remote IP
+                                        # already had a CONFIRMED write more than
+                                        # _SHORT_LINGER_TIGHT_S seconds ago, its current
+                                        # idle_time=0 is RESIDUAL from that prior write
+                                        # (lingering SMB session keeping idle near zero)
+                                        # rather than evidence of writing THIS file.
+                                        # Set _own_active_veto=True so the burst-override
+                                        # at ~line 8583 is also suppressed (the burst-
+                                        # override would otherwise fire for writes within
+                                        # _BURST_WINDOW_S and undo this guard).
+                                        import time as _slg_t
+                                        _slg_entry = _get_recent_remote_write(_rs_ip)
+                                        _SHORT_LINGER_TIGHT_S = 15  # seconds
+                                        if (
+                                            _slg_entry and
+                                            (_slg_t.time() - _slg_entry[0]) > _SHORT_LINGER_TIGHT_S
+                                        ):
+                                            _slg_age = _slg_t.time() - _slg_entry[0]
+                                            _is_persistent_monitor = True
+                                            _own_active_veto = True
+                                            _monitor_reason = (
+                                                f"SHORT-LINGER: short-session ({_rs_active_time}s "
+                                                f"<= {_NFE_NEW_SESSION_THRESHOLD}s) but prior "
+                                                f"confirmed write by {_rs_ip!r} was "
+                                                f"{_slg_age:.1f}s ago "
+                                                f"(file={_slg_entry[1]!r}) > tight burst "
+                                                f"threshold ({_SHORT_LINGER_TIGHT_S}s); all prior "
+                                                f"snapshot(s) discarded by CO-TEMPORAL filter — "
+                                                f"idle_time=0 is RESIDUAL, not a write signal "
+                                                f"→ conservative NTFS fallback"
+                                            )
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: "
+                                                f"SHORT-LINGER GUARD FIRED — "
+                                                f"ip={_rs_ip!r} active_time={_rs_active_time}s "
+                                                f"<= {_NFE_NEW_SESSION_THRESHOLD}s (short session) "
+                                                f"but last confirmed write was {_slg_age:.1f}s ago "
+                                                f"(file={_slg_entry[1]!r}) > "
+                                                f"{_SHORT_LINGER_TIGHT_S}s tight threshold; "
+                                                f"all prior snapshot(s) discarded — "
+                                                f"setting is_persistent_monitor=True + "
+                                                f"own_active_veto=True (suppress burst-override); "
+                                                f"will fall back to NTFS owner "
+                                                f"[debug: prior_idle={_prior_idle!r} "
+                                                f"active_time={_rs_active_time}s "
+                                                f"idle_time_now={_rs_idle_now}s "
+                                                f"BURST_WINDOW_S={_BURST_WINDOW_S}s]"
+                                            )
+                                        else:
+                                            _slg_age_val = (
+                                                (_slg_t.time() - _slg_entry[0])
+                                                if _slg_entry else None
+                                            )
+                                            _monitor_reason = (
+                                                f"only {len(_idle_history)} prior snapshot(s) — "
+                                                f"insufficient pattern; "
+                                                f"active_time={_rs_active_time}s <= "
+                                                f"{_NFE_NEW_SESSION_THRESHOLD}s "
+                                                f"→ treating as writer (recently connected)"
+                                                + (
+                                                    f"; last write {_slg_age_val:.1f}s ago"
+                                                    f" (≤ {_SHORT_LINGER_TIGHT_S}s tight threshold"
+                                                    f" — treating as burst sibling)"
+                                                    if _slg_entry else ""
+                                                )
+                                            )
+                                            _gei.info(
+                                                f"[_get_editor_info] Step1-early: "
+                                                f"SHORT-LINGER CHECK — "
+                                                f"ip={_rs_ip!r} "
+                                                + (
+                                                    f"last write {_slg_age_val:.3f}s ago "
+                                                    f"(≤ {_SHORT_LINGER_TIGHT_S}s tight threshold) "
+                                                    f"— treating as burst sibling (guard not fired)"
+                                                    if _slg_entry else
+                                                    f"no prior write in cache "
+                                                    f"— treating as writer (recently connected)"
+                                                )
+                                            )
                                 elif _min_prior_idle is not None and _min_prior_idle > _NFE_CLEAR_IDLE_THRESHOLD:
                                     # 2+ snapshots all show client was clearly idle → genuine write
                                     _monitor_reason = (
@@ -7831,7 +8814,13 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                     # file close).  If we already attributed a write to this IP within
                     # the last _RECENT_WRITE_LINGER_S seconds, their current idle_time=0
                     # is most likely leftover from THAT write, not from this new file.
-                    if not _is_persistent_monitor:
+                    # NOTE: skip this check for 'added' events — when someone adds a new
+                    # file, their idle=0 reflects genuine activity (the upload), not
+                    # residual linger from a prior write to a DIFFERENT file.  The
+                    # CHANGE_NOTIFY linger mechanism only applies to re-saves of the
+                    # same file (modified events), where the prior write could have caused
+                    # a false idle=0 echo.
+                    if not _is_persistent_monitor and event_type != "added":
                         import time as _linger_t
                         _linger_entry = _get_recent_remote_write(_rs_ip)
                         if _linger_entry:
@@ -7880,32 +8869,216 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                     # Before giving up, check if this remote IP just had a CONFIRMED write
                     # recorded (e.g. Step0 NFE handle matched a burst sibling a moment ago).
                     # If so, this file is part of the same upload burst → override.
-                    if _is_persistent_monitor:
-                        import time as _burst_ov_t
-                        _burst_ov_entry = _get_recent_remote_write(_rs_ip)
+                    #
+                    # EXCEPTION 1: if OWN-ACTIVE VETO fired (local machine had near-zero idle
+                    # at write time), the burst-override must NOT fire — the local machine was
+                    # the writer, and the coworker's previous write is a red herring from a
+                    # different activity. Burst siblings across different actors should not be
+                    # linked just because they happened within the same time window.
+                    #
+                    # EXCEPTION 2 (COMPETING-OWN-WRITE): if the local machine had a CONFIRMED
+                    # write very recently (< 8s, the loopback-candidate window) AND the remote
+                    # burst is not extremely fresh (≥ 8s old), attribution is ambiguous —
+                    # suppress to avoid crediting a local file to the remote user's prior burst.
+                    # A sub-8s remote burst overrides this guard (remote still mid-copy).
+                    # The 8s own-write threshold mirrors the loopback-candidate window used in
+                    # ADDED-WATCHDOG-GUARD and AVC: a loopback session's idle_time ≈ own_write_age,
+                    # so if own_write_age ≥ 8s any loopback is already excluded by
+                    # _same_name_remote_active (which requires idle ≤ 5s) — no real conflict.
+                    _COMPETING_OWN_WRITE_WINDOW_S = 8  # loopback-candidate window (s)
+                    _own_active_veto_fired = locals().get("_own_active_veto", False)
+                    # Diagnostic fields for the consolidated ATTRIBUTION DECISION log line
+                    # (emitted by the _get_editor_info wrapper).  Captured here at the
+                    # burst/veto decision point; updated to the outcome below.
+                    info["_attrib_net_actor"] = (
+                        f"{_rs_ip}/{_rs.get('machine','').lstrip(chr(92))}/{_rs.get('username') or _rs.get('user','')}"
+                        if _rs_ip else "none"
+                    )
+                    info["_attrib_own_active"] = _own_active_veto_fired
+                    info["_attrib_burst"] = "considered"
+                    # Peek burst age before the gate — a very-fresh burst (< 8s) means the
+                    # remote machine is mid-copy; OWN-ACTIVE idle=0 is noise, not a write
+                    # signal, so the veto should not block BURST-OVERRIDE in this case.
+                    import time as _burst_ov_t
+                    _burst_ov_peek = _get_recent_remote_write(_rs_ip) if _rs_ip else None
+                    _burst_ov_peek_age = (
+                        (_burst_ov_t.time() - _burst_ov_peek[0]) if _burst_ov_peek else None
+                    )
+                    _burst_ov_peek_very_recent = (
+                        _burst_ov_peek_age is not None and _burst_ov_peek_age < 8
+                    )
+                    if _burst_ov_peek_very_recent and _own_active_veto_fired:
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: BURST-OVERRIDE gate — "
+                            f"OWN-ACTIVE VETO fired but burst is very fresh "
+                            f"({_burst_ov_peek_age:.3f}s < 8s tight) — exempting from "
+                            f"OWN-ACTIVE suppression; remote is mid-copy, own idle=0 is noise. "
+                            f"ip={_rs_ip!r} burst_file={_burst_ov_peek[1]!r}"
+                        )
+                    # LOOPBACK-LOCAL is hard positive evidence (fresh SMB session confirms
+                    # local write) — do NOT exempt it from the veto even for very-fresh bursts.
+                    # OWN-ACTIVE VETO (idle=0 passive) IS exempt when burst is very fresh,
+                    # BUT only when the local machine ALSO confirmed its own write within the
+                    # SAME tight loopback window (genuinely concurrent local+remote writing).
+                    #
+                    # Window = 8s (the loopback-candidate window), NOT 30s.  A confirmed remote
+                    # burst sibling that is < 8s fresh is strong positive evidence the remote
+                    # machine is mid-copy RIGHT NOW; a local own-write 10-30s ago is a DIFFERENT,
+                    # earlier burst and must not veto it.  The earlier 30s window caused the
+                    # remote→local misattribution bug: .105 adds two files in a burst, the second
+                    # one's SMB handle closes before NetFileEnum runs, and a genuine local write
+                    # 14.5s earlier wrongly flipped it to the local machine.  Only a sub-8s local
+                    # own-write (truly simultaneous) should keep the local attribution.
+                    # Asserted by TestOwnActiveVetoBurstVeryRecent (own-write 11.4s ago ⇒ no
+                    # conflict ⇒ remote burst wins) and TestBurstConcurrentRemoteAdds.
+                    _BURST_OWN_WRITE_GUARD_S = 8
+                    _burst_ov_pre_own = _get_recent_own_write()
+                    _burst_ov_pre_own_age = (
+                        (_burst_ov_t.time() - _burst_ov_pre_own[0])
+                        if _burst_ov_pre_own else None
+                    )
+                    # Concurrent-write guard: own machine wrote recently AND veto fired → block
+                    # the very-fresh burst exemption so the local write is not erased.
+                    _burst_ov_concurrent_own = (
+                        _burst_ov_peek_very_recent and
+                        _own_active_veto_fired and
+                        not locals().get("_loopback_local_fired", False) and
+                        _burst_ov_pre_own_age is not None and
+                        _burst_ov_pre_own_age < _BURST_OWN_WRITE_GUARD_S
+                    )
+                    if _burst_ov_concurrent_own:
+                        info["_attrib_burst"] = (
+                            f"suppressed:concurrent-own-write (own {_burst_ov_pre_own_age:.3f}s ago)"
+                        )
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: BURST-OVERRIDE gate — "
+                            f"CONCURRENT-OWN-WRITE GUARD: burst is very fresh "
+                            f"({_burst_ov_peek_age:.3f}s < 8s) but local machine also had "
+                            f"a confirmed own-write {_burst_ov_pre_own_age:.3f}s ago "
+                            f"(file={_burst_ov_pre_own[1]!r}) within {_BURST_OWN_WRITE_GUARD_S}s — "
+                            f"both machines writing simultaneously; own-active veto stands. "
+                            f"NOT exempting from OWN-ACTIVE suppression. "
+                            f"ip={_rs_ip!r} burst_file={_burst_ov_peek[1]!r} "
+                            f"[debug: own_write_age={_burst_ov_pre_own_age:.3f}s "
+                            f"guard_window={_BURST_OWN_WRITE_GUARD_S}s "
+                            f"burst_age={_burst_ov_peek_age:.3f}s]"
+                        )
+                    _loopback_local_veto = locals().get("_loopback_local_fired", False)
+                    if _is_persistent_monitor and (not _own_active_veto_fired or ((_burst_ov_peek_very_recent and not _loopback_local_veto) and not _burst_ov_concurrent_own)):
+                        _burst_ov_entry = _burst_ov_peek
                         if _burst_ov_entry:
                             _burst_ov_age = _burst_ov_t.time() - _burst_ov_entry[0]
-                            if _burst_ov_age < _BURST_WINDOW_S:
-                                _is_persistent_monitor = False
-                                _monitor_reason = (
-                                    f"burst-override: sibling of confirmed write by {_rs_ip!r} "
-                                    f"{_burst_ov_age:.3f}s ago (file={_burst_ov_entry[1]!r}) "
-                                    f"within {_BURST_WINDOW_S}s burst window — "
-                                    f"overriding persistent-monitor decision"
+                            # ── CROSS-TYPE GUARD ─────────────────────────────────────────
+                            # BUGFIX: a burst of 'added' writes from .105 (e.g. screenshots)
+                            # must never promote a 'modified' event on a different file as a
+                            # sibling.  Scenario: .105 adds screenshots (confirmed, recorded),
+                            # then .106 modifies test sheet.xlsx locally.  Without this guard,
+                            # BURST-OVERRIDE fires because .105's write is within _BURST_WINDOW_S,
+                            # flipping the NTFS-owner attribution to .105 (wrong).
+                            # Fix: only override when the cached event_type matches the current
+                            # event_type.  An empty cached event_type (legacy entries) is treated
+                            # as a match (backward-compatible).
+                            _burst_ov_cached_etype = _burst_ov_entry[3] if len(_burst_ov_entry) > 3 else ""
+                            _burst_ov_type_mismatch = (
+                                bool(_burst_ov_cached_etype) and
+                                _burst_ov_cached_etype != event_type
+                            )
+                            if _burst_ov_type_mismatch:
+                                _gei.info(
+                                    f"[_get_editor_info] Step1-early: BURST-OVERRIDE SUPPRESSED "
+                                    f"(CROSS-TYPE GUARD) — "
+                                    f"ip={_rs_ip!r} last confirmed write was "
+                                    f"event_type={_burst_ov_cached_etype!r} "
+                                    f"(file={_burst_ov_entry[1]!r} {_burst_ov_age:.1f}s ago) "
+                                    f"but current event_type={event_type!r}. "
+                                    f"A prior 'added' burst cannot promote a 'modified' event "
+                                    f"as its sibling (different operations). "
+                                    f"Keeping persistent-monitor/NTFS-owner decision. "
+                                    f"[debug: prior_idle={_prior_idle!r}s "
+                                    f"snapshots={len(_idle_history)}]"
+                                )
+                            if _burst_ov_age < _BURST_WINDOW_S and not _burst_ov_type_mismatch:
+                                _burst_ov_own_entry = _get_recent_own_write()
+                                _burst_ov_own_age = (
+                                    (_burst_ov_t.time() - _burst_ov_own_entry[0])
+                                    if _burst_ov_own_entry else None
+                                )
+                                _burst_ov_very_recent = _burst_ov_age < 8
+                                # COMPETING-OWN-WRITE: suppress burst-override only when the local
+                                # machine confirmed its own write within the tight 8s loopback
+                                # window — i.e. genuinely concurrent with the remote burst.
+                                # Both very-fresh and non-fresh bursts use the SAME 8s window: a
+                                # local own-write older than 8s belongs to an earlier/different
+                                # burst and must NOT suppress a confirmed remote burst sibling
+                                # (that caused the remote→local misattribution; see the
+                                # CONCURRENT-OWN-WRITE GUARD note above and
+                                # TestOwnActiveVetoBurstVeryRecent / TestBurstConcurrentRemoteAdds).
+                                _COMPETING_OWN_WRITE_WINDOW_WIDE_S = _COMPETING_OWN_WRITE_WINDOW_S  # 8s
+                                _burst_ov_own_conflict = (
+                                    _burst_ov_own_entry is not None and
+                                    _burst_ov_own_age is not None and
+                                    _burst_ov_own_age < _COMPETING_OWN_WRITE_WINDOW_S
                                 )
                                 _gei.info(
-                                    f"[_get_editor_info] Step1-early: BURST-OVERRIDE — "
-                                    f"ip={_rs_ip!r} had a confirmed write {_burst_ov_age:.3f}s ago "
-                                    f"(file={_burst_ov_entry[1]!r}) within burst window "
-                                    f"({_BURST_WINDOW_S}s); overriding is_persistent_monitor=True "
-                                    f"→ treating as same-burst sibling"
+                                    f"[_get_editor_info] Step1-early: BURST-OVERRIDE own-conflict check — "
+                                    f"ip={_rs_ip!r} burst_age={_burst_ov_age:.3f}s "
+                                    f"burst_very_recent={_burst_ov_very_recent} (threshold=8s) "
+                                    f"own_write_age={_burst_ov_own_age!r}s "
+                                    f"(own_file={(_burst_ov_own_entry[1] if _burst_ov_own_entry else None)!r}) "
+                                    f"own_conflict={_burst_ov_own_conflict} "
+                                    f"(competing_own_write_window_tight={_COMPETING_OWN_WRITE_WINDOW_S}s "
+                                    f"competing_own_write_window_wide={_COMPETING_OWN_WRITE_WINDOW_WIDE_S}s) "
+                                    f"BURST_WINDOW_S={_BURST_WINDOW_S}s"
                                 )
+                                if _burst_ov_own_conflict:
+                                    info["_attrib_burst"] = (
+                                        f"suppressed:competing-own-write (own {_burst_ov_own_age:.3f}s ago)"
+                                    )
+                                    _gei.info(
+                                        f"[_get_editor_info] Step1-early: BURST-OVERRIDE SUPPRESSED "
+                                        f"(COMPETING-OWN-WRITE) — "
+                                        f"ip={_rs_ip!r} had confirmed write {_burst_ov_age:.3f}s ago "
+                                        f"(file={_burst_ov_entry[1]!r}) but local machine also had "
+                                        f"confirmed write {_burst_ov_own_age:.3f}s ago "
+                                        f"(file={(_burst_ov_own_entry[1] if _burst_ov_own_entry else None)!r}) "
+                                        f"within {'wide' if _burst_ov_very_recent else 'tight'} window "
+                                        f"({'burst_very_recent' if _burst_ov_very_recent else 'non-fresh burst'}: "
+                                        f"window={'30' if _burst_ov_very_recent else '8'}s); "
+                                        f"concurrent own writes — keeping persistent-monitor decision "
+                                        f"[debug: prior_idle={_prior_idle!r}s "
+                                        f"snapshots={len(_idle_history)} "
+                                        f"burst_very_recent={_burst_ov_very_recent}]"
+                                    )
+                                else:
+                                    _is_persistent_monitor = False
+                                    info["_attrib_burst"] = (
+                                        f"FIRED->remote (sibling {_burst_ov_age:.3f}s ago)"
+                                    )
+                                    _monitor_reason = (
+                                        f"burst-override: sibling of confirmed write by {_rs_ip!r} "
+                                        f"{_burst_ov_age:.3f}s ago (file={_burst_ov_entry[1]!r}) "
+                                        f"within {_BURST_WINDOW_S}s burst window — "
+                                        f"overriding persistent-monitor decision"
+                                    )
+                                    _gei.info(
+                                        f"[_get_editor_info] Step1-early: BURST-OVERRIDE FIRED — "
+                                        f"ip={_rs_ip!r} had a confirmed write {_burst_ov_age:.3f}s ago "
+                                        f"(file={_burst_ov_entry[1]!r}) within burst window "
+                                        f"({_BURST_WINDOW_S}s); overriding is_persistent_monitor=True "
+                                        f"→ treating as same-burst sibling "
+                                        f"[debug: prior_idle={_prior_idle!r}s "
+                                        f"active_time={_rs_active_time}s "
+                                        f"snapshots={len(_idle_history)}]"
+                                    )
                             else:
                                 _gei.info(
                                     f"[_get_editor_info] Step1-early: BURST-OVERRIDE skipped — "
                                     f"ip={_rs_ip!r} last write was {_burst_ov_age:.1f}s ago "
                                     f"(file={_burst_ov_entry[1]!r}) — outside burst window "
-                                    f"({_BURST_WINDOW_S}s); keeping persistent-monitor decision"
+                                    f"({_BURST_WINDOW_S}s); keeping persistent-monitor decision "
+                                    f"[debug: prior_idle={_prior_idle!r}s "
+                                    f"HIGH_IDLE_GENUINE_THRESHOLD={_HIGH_IDLE_GENUINE_THRESHOLD}s "
+                                    f"snapshots={len(_idle_history)}]"
                                 )
                         else:
                             _gei.info(
@@ -7913,6 +9086,37 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                 f"ip={_rs_ip!r} no recent write in cache — "
                                 f"keeping persistent-monitor decision"
                             )
+                    elif _is_persistent_monitor and _own_active_veto_fired and (not _burst_ov_peek_very_recent or _loopback_local_veto):
+                        _veto_own_min_idle  = locals().get("_own_min_idle")
+                        _veto_own_min_active = locals().get("_own_min_at")
+                        _veto_slg_tight     = locals().get("_SHORT_LINGER_TIGHT_S")
+                        _veto_slg_age       = locals().get("_slg_age")
+                        _veto_source = (
+                            f"OWN-ACTIVE (own_min_idle={_veto_own_min_idle!r}s <= 5s)"
+                            if _veto_own_min_idle is not None
+                            else (
+                                f"SHORT-LINGER-GUARD (prior confirmed write by {_rs_ip!r} "
+                                f"was {_veto_slg_age:.1f}s ago > {_veto_slg_tight}s tight threshold; "
+                                f"all prior snapshots CO-TEMPORAL discarded)"
+                                if _veto_slg_tight is not None
+                                else f"LOOPBACK-LOCAL (own_min_active_time={_veto_own_min_active!r}s < 30s, fresh loopback session)"
+                            )
+                        )
+                        _veto_sibling_entry = _get_recent_remote_write(_rs_ip)
+                        _veto_sibling_file = _veto_sibling_entry[1] if _veto_sibling_entry else "n/a"
+                        info["_attrib_burst"] = f"suppressed:own-active-veto ({_veto_source})"
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: BURST-OVERRIDE SUPPRESSED — "
+                            f"veto_source={_veto_source}: local machine was confirmed as the "
+                            f"writer for THIS file; coworker's prior burst write to a DIFFERENT "
+                            f"file {_veto_sibling_file!r} is irrelevant for this event and must "
+                            f"not override it. Keeping NTFS-owner fallback. "
+                            f"ip={_rs_ip!r} filepath={filepath!r} "
+                            f"[debug: own_active_veto=True own_min_idle={_veto_own_min_idle!r}s "
+                            f"own_min_active_time={_veto_own_min_active!r}s "
+                            f"short_linger_tight={_veto_slg_tight!r}s "
+                            f"is_persistent_monitor_before_suppress=True BURST_WINDOW_S={_BURST_WINDOW_S}s]"
+                        )
 
                     if _is_persistent_monitor:
                         # Client was already active before this event; their current
@@ -7923,21 +9127,77 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                         # Enable-PSRemoting -Force as Admin on this PC) for definitive
                         # per-file attribution.
                         info.update(_ntfs_owner_result)
-                        # NOTE: we do NOT call _record_own_write() here.
-                        # This path is reached only when evidence is AMBIGUOUS —
-                        # the file may have been written by the local machine OR by
+                        # Record a confirmed own-write when OWN-ACTIVE VETO fired.
+                        # In the veto path, the NTFS owner IS this machine and
+                        # own_min_idle=0 proves local SMB activity at write time —
+                        # this is NOT an ambiguous case.  Recording the write here
+                        # lets the LOCAL-OWN-WRITE GUARD in ADDED-BURST-GUARD
+                        # suppress a coworker's prior burst from falsely bypassing
+                        # the veto for the next local file in the same session.
+                        # NOTE: only do this for OWN-ACTIVE VETO (own_min_idle≤5s),
+                        # not for generic persistent-monitor fallbacks where the
+                        # writer is genuinely unknown.
+                        if _own_active_veto_fired:
+                            _record_own_write(filepath)
+                            _rw_veto_slg_tight = locals().get("_SHORT_LINGER_TIGHT_S")
+                            _rw_veto_slg_age   = locals().get("_slg_age")
+                            _rw_source = (
+                                f"SHORT-LINGER-GUARD (prior write {_rw_veto_slg_age:.1f}s ago "
+                                f"> {_rw_veto_slg_tight}s tight threshold)"
+                                if _rw_veto_slg_tight is not None
+                                else "OWN-ACTIVE VETO / LOOPBACK-LOCAL"
+                            )
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: {_rw_source} path — "
+                                f"recording confirmed own-write for LOCAL-OWN-WRITE GUARD "
+                                f"(filepath={filepath!r} NTFS owner confirmed as own machine)"
+                            )
+                        else:
+                            pass  # ambiguous — do NOT call _record_own_write() for generic monitor
+                        # NOTE: for the non-veto ambiguous case, we do NOT call _record_own_write().
+                        # The file may have been written by the local machine OR by
                         # a remote user whose session looks like a passive monitor.
                         # Recording this as a "confirmed own write" would poison the
                         # loopback-staleness check for the next event, causing a
                         # genuine remote write that follows to be misattributed to
                         # the local machine.  _record_own_write() is only called in
                         # the LOOPBACK-LOCAL branch where there is positive evidence
-                        # (fresh loopback session) of a local write.
+                        # (fresh loopback session) of a local write, or above when
+                        # OWN-ACTIVE VETO fired (NTFS owner confirmed = own machine).
+                        #
+                        # TAG for retroactive NTFS-fallback burst-patch:
+                        # If a sibling file in the same unc_poll batch gets confirmed
+                        # via Step0 shortly after this, its BURST-PATCH will find this
+                        # entry by matching _ntfs_fallback_candidate_ip and retroactively
+                        # correct the attribution without ever showing the wrong machine.
+                        #
+                        # When OWN-ACTIVE VETO fired (own_min_idle ≤ 5s), we use a
+                        # SEPARATE tag (_veto_ntfs_fallback_candidate_ip) instead of
+                        # _ntfs_fallback_candidate_ip.  BURST-PATCH applies a tight 10s
+                        # time window to veto-fallback tags so it can patch a concurrent
+                        # sibling (e.g. .105 uploads two files simultaneously, one caught
+                        # by NFE and one falling through to OWN-ACTIVE VETO → NTFS) while
+                        # NOT patching a genuine local write from 13s earlier whose
+                        # loopback session is still idle=0 at the time the coworker's
+                        # next batch arrives.
+                        _own_active_veto_fired_pm = locals().get("_own_active_veto", False)
+                        if _rs_ip and not _own_active_veto_fired_pm:
+                            info["_ntfs_fallback_candidate_ip"] = _rs_ip
+                        elif _rs_ip and _own_active_veto_fired_pm:
+                            info["_veto_ntfs_fallback_candidate_ip"] = _rs_ip
+                        _bp_tag_str = (
+                            "SET" if (_rs_ip and not _own_active_veto_fired_pm) else
+                            "VETO-FALLBACK-TAGGED(tight-10s-window)" if _rs_ip else
+                            "NO-CANDIDATE"
+                        )
                         _gei.info(
                             f"[_get_editor_info] Step1-early: persistent monitor — "
                             f"falling back to NTFS owner ({_monitor_reason}). "
                             f"NOTE: own-write cache NOT updated (ambiguous — no positive "
-                            f"local-write evidence). Enable SACL for definitive attribution."
+                            f"local-write evidence). Enable SACL for definitive attribution. "
+                            f"[debug: ntfs_fallback_candidate_ip={_rs_ip!r} "
+                            f"own_active_veto={_own_active_veto_fired_pm} "
+                            f"burst_patch_tag={_bp_tag_str!r}]"
                         )
                         return info
 
@@ -7979,7 +9239,7 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                     info["machine"] = _rs.get("machine", "").lstrip("\\")
                     info["ip"]      = _rs.get("ip", "")
                     # Record this attribution so future events can detect idle linger
-                    _record_remote_write(_rs_ip, filepath)
+                    _record_remote_write(_rs_ip, filepath, event_type)
                     _gei.info(
                         f"[_get_editor_info] Step1-early: single recently-active remote session "
                         f"(idle_time={_rs_idle_now}s <= {_NFE_IDLE_THRESHOLD}s, "
@@ -8041,15 +9301,65 @@ def _get_editor_info(filepath: str, detection_source: str = "",
             )
             if len(_remote_snap_sessions) == 1:
                 _rs = _remote_snap_sessions[0]
-                info["user"]    = _rs.get("username") or _rs.get("user") or ""
-                info["machine"] = _rs.get("machine", "").lstrip("\\")
-                info["ip"]      = _rs.get("ip", "")
-                _gei.info(
-                    f"[_get_editor_info] Step0b-fallback: single remote session → "
-                    f"user={info['user']!r} machine={info['machine']!r} ip={info['ip']!r} "
-                    f"— returning (last resort guess)"
-                )
-                return info
+                _rs0b_ip   = _rs.get("ip", "")
+                _rs0b_idle = _rs.get("idle_time", 999)
+                import time as _rs0b_t
+                _rs0b_now   = _rs0b_t.time()
+                _rs0b_skip  = False
+                # For 'deleted' events: the file is gone so NTFS can't identify
+                # the actor.  The snapshot is unreliable because remote sessions
+                # have idle=0 from the CHANGE_NOTIFY triggered by the deletion
+                # itself.  Never blindly attribute a deletion to a remote session
+                # based solely on the snapshot — this causes local deletions to
+                # be shown as remote.  Skip the fallback for deletions entirely.
+                if event_type == "deleted":
+                    _rs0b_skip = True
+                    _gei.info(
+                        f"[_get_editor_info] Step0b-fallback: SKIP — "
+                        f"'deleted' event: NTFS failed and snapshot is unreliable "
+                        f"(remote session idle={_rs0b_idle}s may be CHANGE_NOTIFY echo). "
+                        f"Returning ambiguous rather than guessing wrong attribution."
+                    )
+                # For other events with idle=0: apply guards
+                if not _rs0b_skip and _rs0b_idle <= 5:
+                    _rs0b_own   = _get_recent_own_write()
+                    _rs0b_rem   = _get_recent_remote_write(_rs0b_ip)
+                    # Watchdog-guard for local writes/adds
+                    if detection_source == "watchdog":
+                        _rs0b_skip = True
+                        _gei.info(
+                            f"[_get_editor_info] Step0b-fallback: SKIP — "
+                            f"watchdog event + NTFS failed → likely local action; "
+                            f"session {_rs0b_ip!r} idle={_rs0b_idle}s is CHANGE_NOTIFY echo."
+                        )
+                    elif _rs0b_own is not None:
+                        _rs0b_own_age = _rs0b_now - _rs0b_own[0]
+                        if _rs0b_own_age <= 90:
+                            _rs0b_skip = True
+                            _gei.info(
+                                f"[_get_editor_info] Step0b-fallback: SKIP — "
+                                f"session {_rs0b_ip!r} idle={_rs0b_idle}s but "
+                                f"own write {_rs0b_own_age:.1f}s ago → CN-POISON echo."
+                            )
+                    elif _rs0b_rem is not None:
+                        _rs0b_rem_age = _rs0b_now - _rs0b_rem[0]
+                        if _rs0b_rem_age <= _RECENT_WRITE_LINGER_S:
+                            _rs0b_skip = True
+                            _gei.info(
+                                f"[_get_editor_info] Step0b-fallback: SKIP — "
+                                f"session {_rs0b_ip!r} idle={_rs0b_idle}s but "
+                                f"confirmed write {_rs0b_rem_age:.1f}s ago → post-write linger."
+                            )
+                if not _rs0b_skip:
+                    info["user"]    = _rs.get("username") or _rs.get("user") or ""
+                    info["machine"] = _rs.get("machine", "").lstrip("\\")
+                    info["ip"]      = _rs.get("ip", "")
+                    _gei.info(
+                        f"[_get_editor_info] Step0b-fallback: single remote session → "
+                        f"user={info['user']!r} machine={info['machine']!r} ip={info['ip']!r} "
+                        f"— returning (last resort guess)"
+                    )
+                    return info
             else:
                 _gei.info(
                     f"[_get_editor_info] Step0b-fallback: "
@@ -8139,7 +9449,12 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                 try:
                     _event_ts = _dt_gei.datetime.fromisoformat(timestamp_iso).timestamp()
                 except Exception:
-                    _event_ts = _dt_gei.datetime.utcnow().timestamp()
+                    # datetime.now().timestamp() (correct absolute epoch) — NOT
+                    # utcnow().timestamp(), which treats the naive UTC value as
+                    # local time and is off by the UTC offset, mismatching the
+                    # session cache (watcher uses time.time()) and the primary
+                    # path above.
+                    _event_ts = _dt_gei.datetime.now().timestamp()
                 _own_h_gei = ""
                 _own_ip_gei = ""
                 try:
@@ -8215,6 +9530,41 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                             (_own_h_gei and _cbest_m == _own_h_gei)
                         )
 
+                        # ── SAME-HOST BYSTANDER CHECK ───────────────────────
+                        # When BackupSys runs ON the same machine that hosts the
+                        # SMB share (e.g. \\192.168.254.106\testshare and this
+                        # machine IS 192.168.254.106), a local write by the share
+                        # owner creates NO SMB session — local file I/O bypasses
+                        # the SMB stack entirely.  The only session NetSessionEnum
+                        # (or the 60s session cache) sees is the coworker who has
+                        # the folder open for browsing/monitoring (.105).  With
+                        # only one cached session, Step0b was incorrectly returning
+                        # that bystander as the actor — so every local add/modify
+                        # on .106 showed up attributed to .105.
+                        #
+                        # Fix: detect this "same-host" scenario by checking whether
+                        # the UNC host IP (remote_host) matches own_ip_gei.  If it
+                        # does, the single cached session is almost certainly a
+                        # passive bystander — DO NOT use it for added/modified events
+                        # unless it was recently active (idle_time <= 5s), which is
+                        # evidence that THAT machine actually wrote the file.
+                        # For deleted events the existing _is_app_machine veto already
+                        # handles this; we extend the guard to added/modified here.
+                        _unc_host_is_own_machine = bool(
+                            _own_ip_gei and _unc_host_ip and _unc_host_ip == _own_ip_gei
+                        ) or bool(
+                            _own_h_gei and remote_host and remote_host.lower() == _own_h_gei
+                        )
+                        # For added/modified on a same-host watch: veto the bystander
+                        # session unless it was genuinely active at event time.
+                        _cbest_idle = _cbest.get("idle_time")
+                        _is_bystander_veto = (
+                            _unc_host_is_own_machine
+                            and event_type in ("added", "modified")
+                            and not _is_app_machine
+                            and (_cbest_idle is None or _cbest_idle > 5)
+                        )
+
                         if _is_app_machine and event_type == "deleted":
                             # The only cached session IS the backup-app machine.
                             # The real actor deleted locally on the UNC host.
@@ -8231,12 +9581,40 @@ def _get_editor_info(filepath: str, detection_source: str = "",
                                 f"Step0b LOCAL_ACTOR flag set — will fall through to Step5 "
                                 f"local-user label."
                             )
+                        elif _is_bystander_veto:
+                            # ── BUG-FIX: same-host bystander veto ─────────────
+                            # This machine IS the UNC share host.  A local write
+                            # on the host produces NO SMB session, so the only
+                            # cached session belongs to a coworker who merely has
+                            # the folder open (a bystander).  The bystander's
+                            # idle_time is above the 5s threshold, confirming it
+                            # was not the one doing the write right now.
+                            # Attributing to it would show the wrong IP in History.
+                            # Fall through to Step5 so the share-host's own local
+                            # identity (user/machine) is used instead.
+                            _step0b_local_actor = True
+                            _gei.info(
+                                f"[_get_editor_info] Step0b: BYSTANDER VETO — "
+                                f"single cached session machine={_cbest_m!r} ip={_cbest_ip!r} "
+                                f"idle_time={_cbest_idle!r}s (>5s threshold). "
+                                f"UNC host {remote_host!r} IS this machine "
+                                f"(own_ip={_own_ip_gei!r} own_host={_own_h_gei!r}). "
+                                f"event_type={event_type!r} — local write on share host "
+                                f"produces no SMB session; coworker at {_cbest_ip!r} is a "
+                                f"passive bystander (folder open, not writing). "
+                                f"NOT attributing to bystander. "
+                                f"Step0b LOCAL_ACTOR flag set — falling through to Step5 "
+                                f"for share-host identity."
+                            )
                         else:
                             _gei.info(
                                 f"[_get_editor_info] Step0b: single session — "
                                 f"actor candidate: user={_cbest.get('username')!r} "
                                 f"machine={_cbest_m!r} ip={_cbest_ip!r} "
-                                f"is_app_machine={_is_app_machine} event_type={event_type!r}"
+                                f"is_app_machine={_is_app_machine} "
+                                f"unc_host_is_own={_unc_host_is_own_machine} "
+                                f"cbest_idle={_cbest_idle!r}s "
+                                f"event_type={event_type!r}"
                             )
                             info["user"]    = _cbest.get("username", "")
                             info["machine"] = _cbest.get("machine", "")
@@ -8556,7 +9934,165 @@ def _get_editor_info(filepath: str, detection_source: str = "",
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Remote Upload Helpers (SFTP / FTPS / FTP / HTTPS) ─────────────────────────
+# ── Per-event-type attribution dispatchers ────────────────────────────────────
+#
+# Each function is the single call-site for attribution of one event type.
+# Keeping them separate means:
+#   • bugs in 'added' logic cannot accidentally affect 'deleted' logic
+#   • each one is independently testable and debuggable
+#   • future heuristics for one action (e.g. rename cross-machine) can be
+#     added here without touching the others
+#
+# All four delegate to _get_editor_info for the heavy lifting.  The value
+# they add is:
+#   1. a clearly-labelled entry-point log line per event type
+#   2. event-type-specific argument overrides or pre/post processing
+#   3. a home for future per-type logic (e.g. rename needs both src + dest)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _attribute_added(filepath: str, detection_source: str = "",
+                     timestamp_iso: str = "", smb_audit_cfg: dict | None = None,
+                     smb_sessions_snapshot: list | None = None,
+                     is_dest_watch: bool = False,
+                     local_smb_host: str = "") -> dict:
+    """
+    Attribution for ADDED events.
+
+    An 'added' event means a brand-new file appeared in the watched folder.
+    Key heuristics used inside _get_editor_info:
+      • NetFileEnum (Step0): checks for an open file handle at write time
+      • NTFS owner lookup (Step1): reliable for same-host watches
+      • OWN-ACTIVE VETO: blocks misattribution when own_min_idle=0 (local write)
+      • BURST-PATCH: retroactively corrects the first sibling when the second
+        resolves first (common when two files are added together)
+    """
+    import logging as _log_add
+    _log_add.getLogger(__name__).debug(
+        f"[_attribute_added] ENTER filepath={filepath!r} "
+        f"detection_source={detection_source!r} "
+        f"has_snapshot={bool(smb_sessions_snapshot)}"
+    )
+    return _get_editor_info(
+        filepath,
+        detection_source=detection_source,
+        timestamp_iso=timestamp_iso,
+        event_type="added",
+        smb_audit_cfg=smb_audit_cfg,
+        smb_sessions_snapshot=smb_sessions_snapshot,
+        is_dest_watch=is_dest_watch,
+        local_smb_host=local_smb_host,
+    )
+
+
+def _attribute_modified(filepath: str, detection_source: str = "",
+                        timestamp_iso: str = "", smb_audit_cfg: dict | None = None,
+                        smb_sessions_snapshot: list | None = None,
+                        is_dest_watch: bool = False,
+                        local_smb_host: str = "") -> dict:
+    """
+    Attribution for MODIFIED events.
+
+    A 'modified' event means an existing file's content or metadata changed.
+    Key differences from 'added':
+      • Spurious MODIFIED events (fired milliseconds after ADDED by Windows SMB)
+        are suppressed upstream in _on_file_change before this is called.
+      • The open handle from NetFileEnum may be a persistent read/lock handle
+        from a viewer (e.g. Excel has the file open) rather than the active
+        write handle — the linger-gate check inside Step0 handles this.
+      • BURST-PATCH is narrower: modified siblings are only patched within
+        10s of each other to avoid stale bursts crossing event boundaries.
+    """
+    import logging as _log_mod
+    _log_mod.getLogger(__name__).debug(
+        f"[_attribute_modified] ENTER filepath={filepath!r} "
+        f"detection_source={detection_source!r} "
+        f"has_snapshot={bool(smb_sessions_snapshot)}"
+    )
+    return _get_editor_info(
+        filepath,
+        detection_source=detection_source,
+        timestamp_iso=timestamp_iso,
+        event_type="modified",
+        smb_audit_cfg=smb_audit_cfg,
+        smb_sessions_snapshot=smb_sessions_snapshot,
+        is_dest_watch=is_dest_watch,
+        local_smb_host=local_smb_host,
+    )
+
+
+def _attribute_renamed(src_filepath: str, dest_filepath: str = "",
+                       detection_source: str = "",
+                       timestamp_iso: str = "", smb_audit_cfg: dict | None = None,
+                       smb_sessions_snapshot: list | None = None,
+                       is_dest_watch: bool = False,
+                       local_smb_host: str = "") -> dict:
+    """
+    Attribution for RENAMED events.
+
+    A 'renamed' event means a file was moved or renamed within the watch root.
+    We attribute using the DESTINATION path (the new name/location) because:
+      • The file now lives at dest — the NFE handle and NTFS owner both refer
+        to the new path after the rename completes.
+      • The source path no longer exists and cannot be queried.
+    src_filepath is logged for debugging but not passed to _get_editor_info.
+    """
+    import logging as _log_ren
+    _log_ren.getLogger(__name__).debug(
+        f"[_attribute_renamed] ENTER src={src_filepath!r} dest={dest_filepath!r} "
+        f"detection_source={detection_source!r} "
+        f"has_snapshot={bool(smb_sessions_snapshot)}"
+    )
+    # Use dest path for attribution; fall back to src if dest is missing
+    _attr_path = dest_filepath if dest_filepath else src_filepath
+    return _get_editor_info(
+        _attr_path,
+        detection_source=detection_source,
+        timestamp_iso=timestamp_iso,
+        event_type="renamed",
+        smb_audit_cfg=smb_audit_cfg,
+        smb_sessions_snapshot=smb_sessions_snapshot,
+        is_dest_watch=is_dest_watch,
+        local_smb_host=local_smb_host,
+    )
+
+
+def _attribute_deleted(filepath: str, detection_source: str = "",
+                       timestamp_iso: str = "", smb_audit_cfg: dict | None = None,
+                       smb_sessions_snapshot: list | None = None,
+                       is_dest_watch: bool = False,
+                       local_smb_host: str = "") -> dict:
+    """
+    Attribution for DELETED events.
+
+    A 'deleted' event is the hardest to attribute because:
+      • The file is gone so NTFS owner lookup (Step1) always fails.
+      • NetSessionEnum may already have closed the session by the time
+        the event fires (SMB session closes ~100-300ms after delete).
+      • The watcher retries NetSessionEnum up to 5× over 2.5s for deletions.
+      • The Step0b session-cache bystander veto applies here too: a lone
+        cached session from a passive coworker must NOT be attributed as
+        the deleter when the share host deleted locally.
+      • The Security Event Log (4663/4660) is the most reliable source
+        for deletion attribution — enable SACL auditing for best results.
+    """
+    import logging as _log_del
+    _log_del.getLogger(__name__).debug(
+        f"[_attribute_deleted] ENTER filepath={filepath!r} "
+        f"detection_source={detection_source!r} "
+        f"has_snapshot={bool(smb_sessions_snapshot)}"
+    )
+    return _get_editor_info(
+        filepath,
+        detection_source=detection_source,
+        timestamp_iso=timestamp_iso,
+        event_type="deleted",
+        smb_audit_cfg=smb_audit_cfg,
+        smb_sessions_snapshot=smb_sessions_snapshot,
+        is_dest_watch=is_dest_watch,
+        local_smb_host=local_smb_host,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 from transport_utils import (
@@ -17119,7 +18655,7 @@ class MainWindow(QMainWindow):
         # completes (robocopy tail-end writes fire modified events after worker exits)
         self._post_backup_finish: dict = {}  # watch_id -> monotonic timestamp of completion
         self._watcher_start_times: dict = {}  # watch_id -> monotonic timestamp when watcher started
-        _WATCHER_START_SUPPRESS_SECS = 60    # suppress non-delete/rename dest events for 60s after start
+        _WATCHER_START_SUPPRESS_SECS = 10    # suppress non-delete/rename dest events for 10s after start
         # 60s is needed for UNC/SMB watchers: the SMB2 CHANGE_NOTIFY buffer
         # overflows on startup fire MODIFIED events for all pre-existing files
         # repeatedly for ~20-30s after the watcher connects.  The old 10s
@@ -18796,6 +20332,29 @@ class MainWindow(QMainWindow):
                     entry["path"] = _dest_fin
                     entry.pop("dest", None)
                     _is_office_temp = False
+                    # ── COALESCE stamp refresh ─────────────────────────────────
+                    # After a confirmed Office atomic-save (temp→real rename), reset
+                    # the _source_added_early stamp to NOW.  The 300s spurious-modified
+                    # window is anchored to the original 'added' stamp; when another
+                    # machine saves the same file seconds after our COALESCE, the
+                    # SOURCE SPURIOUS check sees their 'modified' as only ~30s after
+                    # 'added' (< 300s) and compares against the current fingerprint on
+                    # disk — which happens to be identical (same bytes, Excel saves
+                    # deterministically) — and incorrectly suppresses the event.
+                    # By refreshing the stamp to NOW (the time of the confirmed save),
+                    # we anchor the 300s window to the most recent known-good state,
+                    # so subsequent events are evaluated relative to this save, not
+                    # the original add.
+                    import threading as _coalesce_th, time as _coalesce_t
+                    _coalesce_now = _coalesce_t.monotonic()
+                    _coalesce_key = (watch_id, _dest_fin.lower())
+                    if not hasattr(self, "_source_added_early"):
+                        self._source_added_early = {}
+                        self._source_added_lock  = _coalesce_th.Lock()
+                    with self._source_added_lock:
+                        self._source_added_early[_coalesce_key] = _coalesce_now
+                    _dbg.info(
+                        f"[desktop._on_file_change_inner] COALESCE-STAMP-REFRESH: "                        f"reset _source_added_early for path={_dest_fin!r} "                        f"watch_id={watch_id!r} at mono={_coalesce_now:.3f} "                        f"(anchors 300s spurious window to this save, not original add)"                    )
             if _is_office_temp:
                 # When the ~$ owner lock file is DELETED, the Office save
                 # sequence has completed.  If the watchdog rename events were
@@ -19262,17 +20821,50 @@ class MainWindow(QMainWindow):
             elif _seen_added_at is not None:
                 _added_at = _seen_added_at
             if _added_at is not None and (_now_mono - _added_at) < _SPURIOUS_MOD_WINDOW:
-                _dbg.info(
-                    f"[desktop._on_file_change] SPURIOUS-MODIFIED suppressed: "
-                    f"'modified' arrived {_now_mono - _added_at:.3f}s after 'added' "
-                    f"for the same path — Windows SMB write-notification artifact, not a real edit. "
-                    f"early_stamp={_early_added_at is not None} "
-                    f"seen_stamp={_seen_added_at is not None} "
-                    f"retry_elapsed={_retry_elapsed:.3f}s "
-                    f"watch_id={watch_id!r} path={entry.get('path')!r} "
-                    f"detection_source={entry.get('detection_source')!r}"
-                )
-                return
+                # Before suppressing, check if the file's fingerprint changed
+                # since the 'added' seed.  If size/mtime differ, this is a
+                # genuine edit (e.g. user saved in Excel right after copying
+                # the file in), NOT a spurious write-notification artifact.
+                _spur_fp_key = (watch_id, entry.get("path", "").lower())
+                _spur_fp_bypass = False
+                with self._dest_content_fp_lock:
+                    _spur_seed_fp = self._dest_content_fp.get(_spur_fp_key)
+                if _spur_seed_fp is not None:
+                    try:
+                        _spur_stat = os.stat(entry.get("path", ""))
+                        _spur_cur_size  = _spur_stat.st_size
+                        _spur_cur_mtime = _spur_stat.st_mtime
+                        _spur_changed = not (
+                            _spur_seed_fp[0] == _spur_cur_size and
+                            abs(float(_spur_seed_fp[1]) - _spur_cur_mtime) < 0.001
+                        )
+                        if _spur_changed:
+                            _spur_fp_bypass = True
+                            _dbg.info(
+                                f"[desktop._on_file_change] SPURIOUS-MOD BYPASS — "
+                                f"fingerprint changed since 'added' seed "
+                                f"(seed_size={_spur_seed_fp[0]} "
+                                f"seed_mtime={_spur_seed_fp[1]:.3f} "
+                                f"current_size={_spur_cur_size} "
+                                f"current_mtime={_spur_cur_mtime:.3f}) "
+                                f"→ genuine edit, not a spurious notification. "
+                                f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                                f"detection_source={entry.get('detection_source')!r}"
+                            )
+                    except Exception:
+                        _spur_fp_bypass = True   # stat failed — fail open
+                if not _spur_fp_bypass:
+                    _dbg.info(
+                        f"[desktop._on_file_change] SPURIOUS-MODIFIED suppressed: "
+                        f"'modified' arrived {_now_mono - _added_at:.3f}s after 'added' "
+                        f"for the same path — Windows SMB write-notification artifact, not a real edit. "
+                        f"early_stamp={_early_added_at is not None} "
+                        f"seen_stamp={_seen_added_at is not None} "
+                        f"retry_elapsed={_retry_elapsed:.3f}s "
+                        f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                        f"detection_source={entry.get('detection_source')!r}"
+                    )
+                    return
             else:
                 _dbg.info(
                     f"[desktop._on_file_change] MODIFIED not suppressed by time-window: "
@@ -19845,14 +21437,154 @@ class MainWindow(QMainWindow):
                 # _last_seen was cleared so this event should be appended normally.
                 pass
             else:
-                logger.debug(
-                    f"[desktop._on_file_change] DEDUP dropped dest event "
-                    f"(already seen {_now_mono - _last_seen:.1f}s ago): "
-                    f"watch_id={watch_id!r} type={_etype!r} "
-                    f"path={entry.get('path')!r} "
-                    f"detection_source={entry.get('detection_source')!r}"
-                )
-                return
+                # Before dropping as a duplicate, check if the file's fingerprint
+                # has changed since the first event was recorded.  Two detectors
+                # (watchdog + unc_poll) firing for the SAME write will have the
+                # same fingerprint — safe to drop.  But if a SECOND genuine
+                # modification happened in the meantime (different user, rapid
+                # sequential edits), the fingerprint will differ and we must NOT
+                # suppress it.
+                _dedup_fp_key = (watch_id, entry.get("path", "").lower())
+                _dedup_drop = True
+                if _etype == "modified":
+                    with self._dest_content_fp_lock:
+                        _dedup_stored_fp = self._dest_content_fp.get(_dedup_fp_key)
+                    if _dedup_stored_fp is not None:
+                        try:
+                            _dedup_stat = os.stat(entry.get("path", ""))
+                            _dedup_cur_size  = _dedup_stat.st_size
+                            _dedup_cur_mtime = _dedup_stat.st_mtime
+                            _dedup_size_mtime_match = (
+                                _dedup_stored_fp[0] == _dedup_cur_size and
+                                abs(float(_dedup_stored_fp[1]) - _dedup_cur_mtime) < 0.001
+                            )
+                            _dedup_fp_match = _dedup_size_mtime_match
+                            _dedup_cur_hash = None
+                            if _dedup_size_mtime_match:
+                                # Size+mtime match — need SHA-256 to distinguish two
+                                # different writes that happen to produce the same size
+                                # in the same second (e.g. two users editing the same
+                                # xlsx to a similar result within 1s of each other).
+                                _dedup_stored_hash = (
+                                    _dedup_stored_fp[2]
+                                    if len(_dedup_stored_fp) >= 3
+                                    else None
+                                )
+                                if _dedup_stored_hash is None:
+                                    # No stored hash (hash failed at seed time) —
+                                    # fail open to avoid hiding a genuine second
+                                    # modification, but also compute and store the hash
+                                    # NOW so the watchdog/unc_poll duplicate arriving
+                                    # milliseconds later can compare and be suppressed.
+                                    _dedup_fp_match = False
+                                    try:
+                                        import hashlib as _dd_hl2
+                                        with open(entry.get("path", ""), "rb") as _dd_fh2:
+                                            _dd_now_hash = _dd_hl2.sha256(
+                                                _dd_fh2.read(65536)
+                                            ).hexdigest()
+                                        with self._dest_content_fp_lock:
+                                            if _dedup_fp_key in self._dest_content_fp:
+                                                _dd_old = self._dest_content_fp[_dedup_fp_key]
+                                                self._dest_content_fp[_dedup_fp_key] = (
+                                                    _dd_old[0],   # size
+                                                    _dd_old[1],   # mtime
+                                                    _dd_now_hash, # hash (was None)
+                                                )
+                                        logger.info(
+                                            f"[desktop._on_file_change] DEDUP hash-missing — "
+                                            f"size+mtime match but stored fp had no hash; "
+                                            f"failing open (not suppressing) to avoid hiding "
+                                            f"a genuine second modification. "
+                                            f"Computed hash={_dd_now_hash!r} and stored it "
+                                            f"so the detector-race duplicate can be suppressed. "
+                                            f"stored_fp={_dedup_stored_fp!r} "
+                                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                                        )
+                                    except Exception as _dd_hash2_err:
+                                        logger.info(
+                                            f"[desktop._on_file_change] DEDUP hash-missing — "
+                                            f"size+mtime match but stored fp has no hash; "
+                                            f"failing open (not suppressing). "
+                                            f"Also failed to compute hash for future dedup "
+                                            f"({_dd_hash2_err!r}). "
+                                            f"stored_fp={_dedup_stored_fp!r} "
+                                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                                        )
+                                else:
+                                    # Compute current hash and compare
+                                    try:
+                                        import hashlib as _dd_hl
+                                        with open(entry.get("path", ""), "rb") as _dd_fh:
+                                            _dedup_cur_hash = _dd_hl.sha256(
+                                                _dd_fh.read(65536)
+                                            ).hexdigest()
+                                        _dedup_fp_match = (
+                                            _dedup_cur_hash == _dedup_stored_hash
+                                        )
+                                        if not _dedup_fp_match:
+                                            logger.info(
+                                                f"[desktop._on_file_change] DEDUP hash-diff — "
+                                                f"size+mtime match but SHA-256 differs "
+                                                f"(stored={_dedup_stored_hash!r} "
+                                                f"current={_dedup_cur_hash!r}) → "
+                                                f"genuine second modification. "
+                                                f"watch_id={watch_id!r} "
+                                                f"path={entry.get('path')!r}"
+                                            )
+                                    except Exception as _dd_hash_err:
+                                        # Hash read failed — fail open
+                                        _dedup_fp_match = False
+                                        logger.info(
+                                            f"[desktop._on_file_change] DEDUP hash-read-failed "
+                                            f"({_dd_hash_err!r}) — failing open. "
+                                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                                        )
+                            if not _dedup_fp_match:
+                                # File changed since the first event — this is a
+                                # genuine second modification, not a detector race.
+                                # Clear the dedup slot and let it through.
+                                with self._dest_event_seen_lock:
+                                    self._dest_event_seen.pop(_dedup_key, None)
+                                _last_seen = None
+                                _dedup_drop = False
+                                logger.info(
+                                    f"[desktop._on_file_change] DEDUP BYPASS — "
+                                    f"fingerprint changed since first event "
+                                    f"(stored_size={_dedup_stored_fp[0]} "
+                                    f"stored_mtime={_dedup_stored_fp[1]:.3f} "
+                                    f"stored_hash={(_dedup_stored_fp[2] if len(_dedup_stored_fp)>=3 else None)!r} "
+                                    f"current_size={_dedup_cur_size} "
+                                    f"current_mtime={_dedup_cur_mtime:.3f} "
+                                    f"current_hash={_dedup_cur_hash!r}) "
+                                    f"→ treating as a second genuine modification, "
+                                    f"NOT a watchdog/unc_poll detector race. "
+                                    f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                                    f"detection_source={entry.get('detection_source')!r}"
+                                )
+                        except Exception as _dedup_stat_err:
+                            # Can't stat — fail open (don't suppress)
+                            with self._dest_event_seen_lock:
+                                self._dest_event_seen.pop(_dedup_key, None)
+                            _last_seen = None
+                            _dedup_drop = False
+                            logger.info(
+                                f"[desktop._on_file_change] DEDUP stat-failed — "
+                                f"cannot verify fingerprint ({_dedup_stat_err!r}); "
+                                f"failing open (not suppressing). "
+                                f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                            )
+                if _dedup_drop:
+                    logger.info(
+                        f"[desktop._on_file_change] DEDUP dropped event "
+                        f"(same fingerprint, seen {_now_mono - _last_seen:.1f}s ago): "
+                        f"watch_id={watch_id!r} type={_etype!r} "
+                        f"path={entry.get('path')!r} "
+                        f"detection_source={entry.get('detection_source')!r} "
+                        f"— watchdog/unc_poll detector race for the same write, "
+                        f"not a second edit."
+                    )
+                    return
         self._dest_event_seen[_dedup_key] = _now_mono
         # Prune old dedup entries to avoid unbounded growth
         if len(self._dest_event_seen) > 500:
@@ -19951,14 +21683,114 @@ class MainWindow(QMainWindow):
                         _sdd_time.sleep(0.2)
                     _src_is_dedup_upgrade = True
                 else:
-                    logger.info(
-                        f"[desktop._on_file_change] SOURCE DEDUP dropped "
-                        f"(seen {_src_now - _src_last_seen:.1f}s ago): "
-                        f"watch_id={watch_id!r} type={_src_etype!r} "
-                        f"path={entry.get('path')!r} "
-                        f"detection_source={entry.get('detection_source')!r}"
-                    )
-                    return
+                    # Before dropping as a SOURCE DEDUP, apply the same fingerprint
+                    # check as the dest DEDUP: if the file's fingerprint changed since
+                    # the first event was claimed, it's a genuine second modification
+                    # (different user, rapid sequential edits), NOT a detector race.
+                    _src_dedup_drop = True
+                    if _src_etype == "modified":
+                        _src_fp_key = (_src_wid_norm, entry.get("path", "").lower())
+                        with self._dest_content_fp_lock:
+                            _src_stored_fp = self._dest_content_fp.get(_src_fp_key)
+                        if _src_stored_fp is not None:
+                            try:
+                                _src_dedup_stat = os.stat(entry.get("path", ""))
+                                _src_cur_size  = _src_dedup_stat.st_size
+                                _src_cur_mtime = _src_dedup_stat.st_mtime
+                                _src_size_mtime_match = (
+                                    _src_stored_fp[0] == _src_cur_size and
+                                    abs(float(_src_stored_fp[1]) - _src_cur_mtime) < 0.001
+                                )
+                                _src_dedup_fp_match = _src_size_mtime_match
+                                _src_cur_hash = None
+                                if _src_size_mtime_match:
+                                    _src_stored_hash = (
+                                        _src_stored_fp[2]
+                                        if len(_src_stored_fp) >= 3
+                                        else None
+                                    )
+                                    if _src_stored_hash is None:
+                                        # No stored hash — fail open
+                                        _src_dedup_fp_match = False
+                                        logger.info(
+                                            f"[desktop._on_file_change] SOURCE DEDUP "
+                                            f"hash-missing — size+mtime match but stored "
+                                            f"fp has no hash; failing open (not suppressing) "
+                                            f"to avoid hiding a genuine second modification. "
+                                            f"stored_fp={_src_stored_fp!r} "
+                                            f"watch_id={watch_id!r} "
+                                            f"path={entry.get('path')!r}"
+                                        )
+                                    else:
+                                        try:
+                                            import hashlib as _src_dd_hl
+                                            with open(entry.get("path", ""), "rb") as _src_dd_fh:
+                                                _src_cur_hash = _src_dd_hl.sha256(
+                                                    _src_dd_fh.read(65536)
+                                                ).hexdigest()
+                                            _src_dedup_fp_match = (
+                                                _src_cur_hash == _src_stored_hash
+                                            )
+                                            if not _src_dedup_fp_match:
+                                                logger.info(
+                                                    f"[desktop._on_file_change] SOURCE DEDUP "
+                                                    f"hash-diff — size+mtime match but SHA-256 "
+                                                    f"differs (stored={_src_stored_hash!r} "
+                                                    f"current={_src_cur_hash!r}) → "
+                                                    f"genuine second modification. "
+                                                    f"watch_id={watch_id!r} "
+                                                    f"path={entry.get('path')!r}"
+                                                )
+                                        except Exception as _src_dd_err:
+                                            _src_dedup_fp_match = False
+                                            logger.info(
+                                                f"[desktop._on_file_change] SOURCE DEDUP "
+                                                f"hash-read-failed ({_src_dd_err!r}) — "
+                                                f"failing open. "
+                                                f"watch_id={watch_id!r} "
+                                                f"path={entry.get('path')!r}"
+                                            )
+                                if not _src_dedup_fp_match:
+                                    # Fingerprint changed — genuine second edit
+                                    with self._source_event_seen_lock:
+                                        self._source_event_seen.pop(_src_dedup_key, None)
+                                    _src_is_dupe = False
+                                    _src_dedup_drop = False
+                                    logger.info(
+                                        f"[desktop._on_file_change] SOURCE DEDUP BYPASS — "
+                                        f"fingerprint changed since first event "
+                                        f"(stored_size={_src_stored_fp[0]} "
+                                        f"stored_mtime={_src_stored_fp[1]:.3f} "
+                                        f"stored_hash={(_src_stored_fp[2] if len(_src_stored_fp)>=3 else None)!r} "
+                                        f"current_size={_src_cur_size} "
+                                        f"current_mtime={_src_cur_mtime:.3f} "
+                                        f"current_hash={_src_cur_hash!r}) "
+                                        f"→ treating as a second genuine modification. "
+                                        f"watch_id={watch_id!r} "
+                                        f"path={entry.get('path')!r} "
+                                        f"detection_source={entry.get('detection_source')!r}"
+                                    )
+                            except Exception as _src_stat_err:
+                                with self._source_event_seen_lock:
+                                    self._source_event_seen.pop(_src_dedup_key, None)
+                                _src_is_dupe = False
+                                _src_dedup_drop = False
+                                logger.info(
+                                    f"[desktop._on_file_change] SOURCE DEDUP stat-failed "
+                                    f"({_src_stat_err!r}) — failing open. "
+                                    f"watch_id={watch_id!r} "
+                                    f"path={entry.get('path')!r}"
+                                )
+                    if _src_dedup_drop:
+                        logger.info(
+                            f"[desktop._on_file_change] SOURCE DEDUP dropped "
+                            f"(same fingerprint, seen {_src_now - _src_last_seen:.1f}s ago): "
+                            f"watch_id={watch_id!r} type={_src_etype!r} "
+                            f"path={entry.get('path')!r} "
+                            f"detection_source={entry.get('detection_source')!r} "
+                            f"— watchdog/unc_poll detector race, not a second edit."
+                        )
+                        return
             else:
                 _src_is_dedup_upgrade = False
                 if _src_stale_del_cleared:
@@ -20050,6 +21882,8 @@ class MainWindow(QMainWindow):
                 # unc_poll uses snapshot diff → only real size changes → never suppress
                 _src_is_poll = _src_det_src in ("unc_poll", "poll_reset_recovery")
                 if _src_added_at is not None and (_src_now - _src_added_at) < _SRC_SPURIOUS_WINDOW and not _src_is_poll:
+                    _dbg.info(
+                        f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED check: "                        f"path={entry.get('path')!r} watch_id={watch_id!r} "                        f"elapsed_since_add={_src_now - _src_added_at:.3f}s "                        f"(window={_SRC_SPURIOUS_WINDOW}s) "                        f"src_early_at={_src_early_at!r} src_seen_at={_src_seen_at!r} "                        f"detection_source={entry.get('detection_source')!r} "                        f"— entering fingerprint-override check"                    )
                     # ── Fingerprint override ──────────────────────────────────
                     # Before suppressing, check whether the file's fingerprint
                     # has actually changed since the last accepted add/edit.
@@ -20140,9 +21974,10 @@ class MainWindow(QMainWindow):
                                             f"[desktop._on_file_change] SOURCE SPURIOUS-MODIFIED "
                                             f"fingerprint confirmed unchanged (size+mtime+hash all match) "
                                             f"— suppression confirmed. "
-                                            f"path={_src_fp_path!r} watch_id={watch_id!r} "
-                                            f"sha256_64k={_src_fp_current_hash!r}"
-                                        )
+                                            f"NOTE: if this was a genuine save by a different machine "                                            f"(e.g. coworker opening and saving identical content), "                                            f"the COALESCE-STAMP-REFRESH should have reset the stamp. "                                            f"If stamp was NOT refreshed before this check, the 300s "                                            f"window is still anchored to the original add and this "                                            f"suppression may be hiding a real event. "                                            f"path={_src_fp_path!r} watch_id={watch_id!r} "
+                                            f"sha256_64k={_src_fp_current_hash!r} "
+                                            f"prev_fp={_src_fp_prev!r} "
+                                            f"elapsed_since_add={_src_now - _src_added_at:.3f}s "                                            f"src_early_at_was={_src_early_at!r} "                                            f"src_seen_at_was={_src_seen_at!r}"                                        )
                                 elif _src_fp_prev_hash is None and _src_fp_current_hash is not None:
                                     # No prior hash (legacy/seed-failed entry) — fail open
                                     # to avoid hiding a real change we can't verify.
@@ -20336,7 +22171,10 @@ class MainWindow(QMainWindow):
                                 _snap_log.getLogger(__name__).info(
                                     f"[desktop._on_file_change] UNC_POLL SNAPSHOT BORROW: "
                                     f"no watchdog snapshot found in _pending for {entry.get('path')!r} — "
-                                    f"will rely on session cache / audit log for attribution."
+                                    f"will rely on session cache / audit log for attribution. "
+                                    f"NOTE: if UNC host is this machine (same-host watch), "
+                                    f"Step0b bystander-veto will prevent misattribution to "
+                                    f"a coworker passive session (idle_time > 5s)."
                                 )
                         except Exception as _pcache_err:
                             _snap_log.getLogger(__name__).info(
@@ -20345,19 +22183,61 @@ class MainWindow(QMainWindow):
                             )
                 except Exception as _snap_err:
                     pass
-            editor = _get_editor_info(
-                entry.get("path", ""),
-                entry.get("detection_source", ""),
+            # ── Dispatch to per-event-type attribution function ──────────────
+            # Each dispatcher is a thin wrapper around _get_editor_info that
+            # clearly labels the call site in logs and provides a clean home
+            # for any future per-type pre/post processing.
+            _evt_type_dispatch = entry.get("type", "")
+            _attr_common = dict(
+                detection_source=entry.get("detection_source", ""),
                 timestamp_iso=entry.get("timestamp", ""),
-                event_type=entry.get("type", ""),
                 smb_audit_cfg=_smb_audit_cfg,
                 smb_sessions_snapshot=_snap_for_gei,
                 is_dest_watch=_is_dest,
                 local_smb_host=_local_smb_host,
             )
+            if _evt_type_dispatch == "added":
+                editor = _attribute_added(entry.get("path", ""), **_attr_common)
+            elif _evt_type_dispatch == "modified":
+                editor = _attribute_modified(entry.get("path", ""), **_attr_common)
+            elif _evt_type_dispatch == "renamed":
+                editor = _attribute_renamed(
+                    entry.get("path", ""),
+                    dest_filepath=entry.get("dest", "") or "",
+                    **_attr_common,
+                )
+            elif _evt_type_dispatch == "deleted":
+                editor = _attribute_deleted(entry.get("path", ""), **_attr_common)
+            else:
+                # Unknown/future event type — fall back to _get_editor_info directly
+                editor = _get_editor_info(
+                    entry.get("path", ""),
+                    entry.get("detection_source", ""),
+                    timestamp_iso=entry.get("timestamp", ""),
+                    event_type=_evt_type_dispatch,
+                    smb_audit_cfg=_smb_audit_cfg,
+                    smb_sessions_snapshot=_snap_for_gei,
+                    is_dest_watch=_is_dest,
+                    local_smb_host=_local_smb_host,
+                )
         entry["editor_user"]    = editor["user"]
         entry["editor_machine"] = editor["machine"]
         entry["editor_ip"]      = editor["ip"]
+        # Propagate the NTFS-fallback candidate IP tag (set when persistent-monitor
+        # fell back to NTFS owner but a single remote session was in the snapshot).
+        # BURST-PATCH uses this to retroactively fix the entry when a sibling file
+        # in the same unc_poll batch is confirmed as that remote IP via Step0.
+        if editor.get("_ntfs_fallback_candidate_ip"):
+            entry["_fallback_candidate_ip"] = editor["_ntfs_fallback_candidate_ip"]
+        # OWN-ACTIVE VETO variant: tag with a monotonic timestamp AND the watchdog
+        # detection timestamp so BURST-PATCH can gate on both.  The detection
+        # timestamp is the authoritative discriminator: same-burst siblings are
+        # detected within fractions of a second; separate batches are seconds apart.
+        if editor.get("_veto_ntfs_fallback_candidate_ip"):
+            import time as _vftag_time
+            entry["_veto_fallback_candidate_ip"]  = editor["_veto_ntfs_fallback_candidate_ip"]
+            entry["_veto_fallback_ts"]            = _vftag_time.monotonic()
+            entry["_veto_fallback_detect_ts"]     = entry.get("timestamp", "")
 
         # FIX: If editor_machine looks like a bare IP address, try a reverse-DNS
         # lookup to get the actual hostname.  NetSessionEnum returns client_name
@@ -20769,11 +22649,83 @@ class MainWindow(QMainWindow):
                     pass
                 if _burst_patch_host:
                     _burst_patched_count = 0
+                    import time     as _bp_time_now
+                    import datetime as _bp_dt
+                    _bp_now = _bp_time_now.monotonic()
+                    _VETO_PATCH_WINDOW_S  = 3   # monotonic backstop (append-time)
+                    _VETO_DETECT_WINDOW_S = 3   # detection-time gate (authoritative)
+                    def _bp_ts_diff_s(ts1, ts2):
+                        """Abs diff in seconds between two ISO timestamp strings, or None."""
+                        try:
+                            t1 = _bp_dt.datetime.fromisoformat(ts1.rstrip("Z").replace(" ", "T"))
+                            t2 = _bp_dt.datetime.fromisoformat(ts2.rstrip("Z").replace(" ", "T"))
+                            return abs((t1 - t2).total_seconds())
+                        except Exception:
+                            return None
                     for _burst_older in reversed(self._history_log):
                         if _burst_older is entry:
                             continue
-                        if _burst_older.get("editor_user") not in ("Unknown", ""):
-                            # Only patch Unknown entries
+                        # ── Case A: Unknown entries (original BURST-PATCH) ──
+                        _burst_is_unknown = _burst_older.get("editor_user") in ("Unknown", "")
+                        # ── Case B: NTFS-fallback sibling patch ──────────────
+                        # When unc_poll processes a batch alphabetically, an earlier
+                        # file may fall back to NTFS owner (tagged with
+                        # _fallback_candidate_ip) while a later file in the same batch
+                        # gets confirmed via Step0.  Retroactively fix the earlier entry
+                        # if the confirmed IP matches its candidate and the entry is
+                        # recent (within a tight burst window so we don't mis-patch
+                        # genuine local adds from earlier in the session).
+                        _burst_is_ntfs_fallback_sibling = (
+                            not _burst_is_unknown
+                            and _burst_older.get("_fallback_candidate_ip") == _burst_new_ip
+                            and _burst_older.get("editor_ip") != _burst_new_ip
+                            and _burst_older.get("type") == entry.get("type")
+                        )
+                        # ── Case C: OWN-ACTIVE VETO NTFS-fallback with tight window ──
+                        # OWN-ACTIVE VETO fires when own_min_idle≤5s — normally means
+                        # the local machine is writing.  But if the loopback's idle=0
+                        # is a leftover from a write N seconds ago, a concurrent coworker
+                        # write can be mis-attributed to the local machine via NTFS owner.
+                        # TWO gates distinguish a genuine concurrent sibling from a
+                        # previous-batch local write:
+                        #   1. Detection-timestamp gate (authoritative): watchdog detection
+                        #      times are within 3s for same-burst files (they arrive in the
+                        #      same CHANGE_NOTIFY batch) but are seconds apart for separate
+                        #      batches.
+                        #   2. Monotonic backstop: covers the rare case where timestamps are
+                        #      missing or unparseable (≤3s since entry was appended).
+                        _veto_older_detect_ts  = _burst_older.get("_veto_fallback_detect_ts", "")
+                        _veto_confirm_detect_ts = entry.get("timestamp", "")
+                        _veto_detect_diff = (
+                            _bp_ts_diff_s(_veto_older_detect_ts, _veto_confirm_detect_ts)
+                            if (_veto_older_detect_ts and _veto_confirm_detect_ts) else None
+                        )
+                        _veto_detect_ok = (
+                            _veto_detect_diff is not None and _veto_detect_diff <= _VETO_DETECT_WINDOW_S
+                        )
+                        _veto_age_s = _bp_now - _burst_older.get("_veto_fallback_ts", _bp_now)
+                        _burst_is_veto_fallback_sibling = (
+                            not _burst_is_unknown
+                            and not _burst_is_ntfs_fallback_sibling
+                            and _burst_older.get("_veto_fallback_candidate_ip") == _burst_new_ip
+                            and _burst_older.get("editor_ip") != _burst_new_ip
+                            and _burst_older.get("type") == entry.get("type")
+                            and _veto_age_s < _VETO_PATCH_WINDOW_S
+                            and _veto_detect_ok
+                        )
+                        if _burst_older.get("_veto_fallback_candidate_ip") == _burst_new_ip:
+                            import logging as _rbl_cc
+                            _rbl_cc.getLogger(__name__).info(
+                                f"[desktop._on_file_change] BURST-PATCH Case C eval: "
+                                f"path={_burst_older.get('path', '')!r} "
+                                f"veto_detect_ts={_veto_older_detect_ts!r} "
+                                f"confirm_detect_ts={_veto_confirm_detect_ts!r} "
+                                f"detect_diff={('%.3f' % _veto_detect_diff) + 's' if _veto_detect_diff is not None else 'n/a(no-ts)'} "
+                                f"monotonic_age={_veto_age_s:.3f}s "
+                                f"detect_ok={_veto_detect_ok} "
+                                f"will_patch={_burst_is_veto_fallback_sibling}"
+                            )
+                        if not _burst_is_unknown and not _burst_is_ntfs_fallback_sibling and not _burst_is_veto_fallback_sibling:
                             continue
                         # Check the host matches
                         _burst_op = _burst_older.get("path", "").replace("\\", "/")
@@ -20802,14 +22754,27 @@ class MainWindow(QMainWindow):
                         _burst_older["editor_machine"]      = _burst_pm
                         _burst_older["editor_ip"]           = _burst_pi
                         _burst_older["attribution_unknown"] = False
+                        _burst_fb_cand = _burst_older.pop("_fallback_candidate_ip", None)
+                        _burst_older.pop("_veto_fallback_candidate_ip", None)
+                        _burst_older.pop("_veto_fallback_ts", None)
+                        _burst_older.pop("_veto_fallback_detect_ts", None)
                         _burst_patched_count += 1
-                        import logging as _rbl
-                        _rbl.getLogger(__name__).info(
-                            f"[desktop._on_file_change] BURST-PATCH: retroactively resolved "
-                            f"Unknown entry for path={_burst_older.get('path')!r} "
-                            f"event_type={_burst_patch_etype!r} "
+                        import logging as _rbl_bp
+                        _case_label = (
+                            "OWN-ACTIVE-VETO fallback sibling" if _burst_is_veto_fallback_sibling else
+                            "NTFS-fallback sibling" if _burst_is_ntfs_fallback_sibling else
+                            "Unknown"
+                        )
+                        _burst_fb_info = repr(_burst_fb_cand) if _burst_is_ntfs_fallback_sibling else (
+                            repr(_burst_older.get("_veto_fallback_candidate_ip", _burst_new_ip)) if _burst_is_veto_fallback_sibling else "n/a"
+                        )
+                        _rbl_bp.getLogger(__name__).info(
+                            f"[desktop._on_file_change] BURST-PATCH: "
+                            f"{_case_label} entry retroactively corrected: "
+                            f"path={_burst_older.get('path')!r} "
+                            f"(fallback_candidate_ip={_burst_fb_info}) "
                             f"-> user={_burst_pu!r} machine={_burst_pm!r} ip={_burst_pi!r} "
-                            f"(sibling {entry.get('path')!r} resolved first, "
+                            f"(sibling {entry.get('path')!r} confirmed first, "
                             f"burst_cache_hit={_burst_bc_hit is not None})"
                         )
                         if self._history_window and self._history_window.isVisible():
@@ -20818,37 +22783,86 @@ class MainWindow(QMainWindow):
                         import logging as _rbl
                         _rbl.getLogger(__name__).info(
                             f"[desktop._on_file_change] BURST-PATCH: patched "
-                            f"{_burst_patched_count} Unknown entry(s) for "
+                            f"{_burst_patched_count} sibling entry(s) for "
                             f"host={_burst_patch_host!r} event_type={entry.get('type', '')!r} after sibling resolved."
                         )
                     else:
-                        # No Unknown siblings found yet — they may still be running
-                        # _query_smb_audit and haven't been appended to history_log.
+                        # No Unknown/fallback siblings found yet — they may still be
+                        # running _query_smb_audit and not yet in history_log.
                         # Spawn a delayed retry that re-scans for up to 3 seconds.
                         import logging as _rbl2
                         _rbl2.getLogger(__name__).info(
-                            f"[desktop._on_file_change] BURST-PATCH: 0 Unknown entries "
+                            f"[desktop._on_file_change] BURST-PATCH: 0 Unknown/fallback entries "
                             f"found in history_log for host={_burst_patch_host!r} "
                             f"(siblings may still be in _query_smb_audit). "
                             f"Spawning delayed retry thread (6 × 0.5s)."
                         )
                         import threading as _bp_threading
                         import time    as _bp_time
-                        _bp_host_cap    = _burst_patch_host
-                        _bp_etype_cap   = entry.get("type", "")
-                        _bp_user_cap    = _burst_new_user
-                        _bp_machine_cap = _burst_new_machine
-                        _bp_ip_cap      = _burst_new_ip
-                        _bp_history_ref = self._history_log
-                        _bp_hw_ref      = self._history_window
+                        _bp_host_cap          = _burst_patch_host
+                        _bp_etype_cap         = entry.get("type", "")
+                        _bp_user_cap          = _burst_new_user
+                        _bp_machine_cap       = _burst_new_machine
+                        _bp_ip_cap            = _burst_new_ip
+                        _bp_history_ref       = self._history_log
+                        _bp_hw_ref            = self._history_window
+                        _bp_veto_window_s_cap = _VETO_PATCH_WINDOW_S
+                        _bp_detect_window_cap = _VETO_DETECT_WINDOW_S
+                        _bp_confirm_detect_ts_cap = entry.get("timestamp", "")
                         def _bp_delayed_patch():
                             import logging as _bpd
+                            import time as _bpd_time
                             _bpdl = _bpd.getLogger(__name__)
                             for _bp_attempt in range(20):
                                 _bp_time.sleep(0.5)
                                 _bp_count = 0
+                                _bp_mono_now = _bpd_time.monotonic()
                                 for _bp_r in reversed(_bp_history_ref):
-                                    if _bp_r.get("editor_user") not in ("Unknown", ""):
+                                    _is_unk = _bp_r.get("editor_user") in ("Unknown", "")
+                                    _is_fb  = (
+                                        not _is_unk
+                                        and _bp_r.get("_fallback_candidate_ip") == _bp_ip_cap
+                                        and _bp_r.get("editor_ip") != _bp_ip_cap
+                                    )
+                                    _veto_fb_cand = _bp_r.get("_veto_fallback_candidate_ip")
+                                    if _veto_fb_cand == _bp_ip_cap:
+                                        import datetime as _bpd_dt
+                                        def _bpd_ts_diff(ts1, ts2):
+                                            try:
+                                                t1 = _bpd_dt.datetime.fromisoformat(ts1.rstrip("Z").replace(" ", "T"))
+                                                t2 = _bpd_dt.datetime.fromisoformat(ts2.rstrip("Z").replace(" ", "T"))
+                                                return abs((t1 - t2).total_seconds())
+                                            except Exception:
+                                                return None
+                                        _vfd_ts   = _bp_r.get("_veto_fallback_detect_ts", "")
+                                        _vfd_diff = (
+                                            _bpd_ts_diff(_vfd_ts, _bp_confirm_detect_ts_cap)
+                                            if (_vfd_ts and _bp_confirm_detect_ts_cap) else None
+                                        )
+                                        _vfd_ok   = (_vfd_diff is not None and _vfd_diff <= _bp_detect_window_cap)
+                                        _veto_age = _bp_mono_now - _bp_r.get("_veto_fallback_ts", _bp_mono_now)
+                                        _bpdl.info(
+                                            f"[desktop._on_file_change] BURST-PATCH delayed "
+                                            f"Case C eval (attempt #{_bp_attempt + 1}): "
+                                            f"path={_bp_r.get('path', '')!r} "
+                                            f"veto_detect_ts={_vfd_ts!r} "
+                                            f"confirm_detect_ts={_bp_confirm_detect_ts_cap!r} "
+                                            f"detect_diff={('%.3f' % _vfd_diff) + 's' if _vfd_diff is not None else 'n/a'} "
+                                            f"monotonic_age={_veto_age:.3f}s "
+                                            f"detect_ok={_vfd_ok}"
+                                        )
+                                    else:
+                                        _vfd_ok   = False
+                                        _veto_age = 0.0
+                                    _is_veto_fb = (
+                                        not _is_unk
+                                        and not _is_fb
+                                        and _veto_fb_cand == _bp_ip_cap
+                                        and _bp_r.get("editor_ip") != _bp_ip_cap
+                                        and _veto_age < _bp_veto_window_s_cap
+                                        and _vfd_ok
+                                    )
+                                    if not _is_unk and not _is_fb and not _is_veto_fb:
                                         continue
                                     if _bp_r.get("type") != _bp_etype_cap:
                                         continue
@@ -20873,11 +22887,21 @@ class MainWindow(QMainWindow):
                                     _bp_r["editor_machine"]      = _bp_pm
                                     _bp_r["editor_ip"]           = _bp_pi
                                     _bp_r["attribution_unknown"] = False
+                                    if "_fallback_candidate_ip" in _bp_r:
+                                        del _bp_r["_fallback_candidate_ip"]
+                                    _bp_r.pop("_veto_fallback_candidate_ip", None)
+                                    _bp_r.pop("_veto_fallback_ts", None)
+                                    _bp_r.pop("_veto_fallback_detect_ts", None)
                                     _bp_count += 1
+                                    _bp_case = (
+                                        "OWN-ACTIVE-VETO fallback sibling" if _is_veto_fb else
+                                        "NTFS-fallback sibling" if _is_fb else "Unknown"
+                                    )
                                     _bpdl.info(
                                         f"[desktop._on_file_change] BURST-PATCH delayed "
                                         f"(attempt #{_bp_attempt + 1}): resolved "
-                                        f"Unknown entry path={_bp_r.get('path')!r} "
+                                        f"{_bp_case} "
+                                        f"entry path={_bp_r.get('path')!r} "
                                         f"event_type={_bp_etype_cap!r} "
                                         f"-> user={_bp_pu!r} machine={_bp_pm!r} "
                                         f"burst_cache_hit={_bp_bc is not None}"
@@ -20896,7 +22920,7 @@ class MainWindow(QMainWindow):
                                     return
                             _bpdl.info(
                                 f"[desktop._on_file_change] BURST-PATCH delayed: "
-                                f"gave up after 20 attempts — no Unknown sibling appeared "
+                                f"gave up after 20 attempts — no Unknown/fallback sibling appeared "
                                 f"for host={_bp_host_cap!r}."
                             )
                         _bp_threading.Thread(
@@ -23028,14 +25052,26 @@ class MainWindow(QMainWindow):
                     pre_backup_cmd=v.get("pre_backup_cmd", ""),
                     post_backup_cmd=v.get("post_backup_cmd", ""),
                 )
-                # Save SMB credentials
+                # Persist advanced per-watch fields that update_watch_meta does
+                # NOT handle.  get_values() collects them and the backup worker /
+                # CLI read them (w.get(...)), but without writing them here the
+                # Edit Watch dialog silently dropped every one of these settings
+                # on save (drive triggers, force-full cadence, force_robocopy,
+                # per-watch bandwidth, and notification overrides).
                 for w in self.cfg.get("watches", []):
                     if w["id"] == wid:
+                        w["force_robocopy"]           = bool(v.get("force_robocopy", False))
+                        w["force_full_interval_days"] = int(v.get("force_full_interval_days", 0))
+                        w["drive_trigger_label"]      = v.get("drive_trigger_label", "")
+                        w["drive_trigger_serial"]     = v.get("drive_trigger_serial", "")
+                        w["max_backup_mbps"]          = v.get("max_backup_mbps", 0)
+                        w["bandwidth_schedule"]       = v.get("bandwidth_schedule", [])
+                        w["notify_overrides"]         = v.get("notify_overrides", {})
+                        # Save SMB credentials (who-did-it attribution)
                         if v.get("nas_user"):
                             w["smb_audit_cfg"] = {
                                 "username": v.get("nas_user", ""),
                                 "password": v.get("nas_pass", ""),
-                                
                             }
                         else:
                             w.pop("smb_audit_cfg", None)

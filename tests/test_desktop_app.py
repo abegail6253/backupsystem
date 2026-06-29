@@ -1459,3 +1459,966 @@ class TestSameHostEditorAttributionUsernameCollision:
             f"Genuine remote write was misattributed to the local owner "
             f"instead of the coworker {self.COWORKER_IP!r}: {info!r}"
         )
+
+
+class TestLoopbackLocalBurstOverrideRegression:
+    """Regression test for the reported bug: adding 'test sheet.xlsx' directly
+    on .106 (DESKTOP-0EDUBAP, the share host) got stamped in History as added
+    by .105 (DESKTOP-KGG55PU).
+
+    Sequence reproduced from the user's logs:
+      1. .105 has a long-lived SMB session to the share (active_time=4939s)
+         that merely shows idle_time=0 at event time — CHANGE_NOTIFY noise,
+         not a real write.
+      2. .106 (this machine) writes 'test sheet.xlsx' locally. NetFileEnum's
+         handle has already closed by the time attribution runs. The
+         LOOPBACK-LOCAL check (own_min_active_time=8s < 30s, fresh, not
+         stale) correctly proves this was a LOCAL write and sets
+         is_persistent_monitor=True (i.e. "fall back to NTFS owner").
+      3. .105 had ALSO genuinely written a different file (a screenshot)
+         ~19s earlier, well within the 60s burst window.
+      4. BUG: BURST-OVERRIDE saw step 3's confirmed write and flipped
+         is_persistent_monitor back to False, discarding the correct
+         LOOPBACK-LOCAL verdict from step 2 and misattributing
+         'test sheet.xlsx' to .105's IP/machine instead of the local owner.
+    """
+    OWN_HOST = "desktop-0edubap"
+    OWN_IP = "192.168.254.106"
+    COWORKER_IP = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_local_add_not_misattributed_to_coworker_after_unrelated_burst_write(self):
+        filepath = f"\\\\{self.OWN_IP}\\testshare\\test sheet.xlsx"
+
+        # NetFileEnum has handles, but none match this filename — the local
+        # write already completed and its handle closed before attribution ran.
+        unrelated_handle = {
+            "fi3_username": self.SHARED_USERNAME,
+            "fi3_pathname": "D:\\testshare\\",
+        }
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([unrelated_handle], 1, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner lookup correctly reports the local account — this file
+        # genuinely lives on .106's own disk.
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105's session: idle_time=0 (CHANGE_NOTIFY noise from the new file
+        # appearing), but own_min_active_time=8s proves a FRESH local loopback
+        # session opened for THIS write — the LOOPBACK-LOCAL signal.
+        coworker_snapshot = [{
+            "username": self.SHARED_USERNAME,
+            "machine": self.COWORKER_IP,
+            "ip": self.COWORKER_IP,
+            "idle_time": 0,
+            "active_time": 4939,
+            "own_min_active_time": 8,
+            "own_min_idle_time": 0,
+        }]
+
+        # One prior idle-history snapshot for .105, taken well before the
+        # event (not co-temporal, not within any linger window): idle=205s,
+        # clearly not a near-zero passive monitor reading.
+        single_idle_snapshot = [(time.time() - 70, 205)]
+
+        with patch("socket.gethostname", return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch("watcher.get_recent_idle_history", return_value=single_idle_snapshot), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                       "win32api": mock_win32api,
+                                       "win32security": mock_win32security}):
+            # .105 genuinely wrote a DIFFERENT file moments ago — this is the
+            # unrelated burst sibling that must NOT bleed onto this event.
+            da._record_remote_write(self.COWORKER_IP, "Screenshot 2025-06-19 114804.png")
+
+            info = da._get_editor_info(
+                filepath,
+                detection_source="unc_poll",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] != self.COWORKER_IP, (
+            f"Local add was misattributed to coworker IP {self.COWORKER_IP!r} "
+            f"because of an unrelated burst write to a different file: {info!r}"
+        )
+        assert info["machine"] != self.COWORKER_IP
+        assert info["user"] == self.SHARED_USERNAME
+
+
+class TestShortLingerGuard:
+    """Regression test for the SHORT-LINGER GUARD:
+
+    Scenario reproduced from user logs (2026-06-24):
+      1. .105 (DESKTOP-KGG55PU) connects at 13:33:48 and writes two files
+         (confirmed by Step0 NFE — _record_remote_write is called).
+      2. At 13:34:08 (.105 active_time=38s), .106 (own machine) writes two
+         NEW files detected via unc_poll.
+      3. Only ONE prior snapshot for .105 was taken 1.2s before the event —
+         well within the 2s CO-TEMPORAL grace window — so it is discarded,
+         leaving _unpoisoned_history=[] and _min_prior_idle=None.
+      4. With active_time=38s <= _NFE_NEW_SESSION_THRESHOLD=300s the old
+         code fell into the "recently connected → treating as writer" else-
+         branch and overrode the NTFS owner with .105's IP.  BUG.
+      5. FIX (SHORT-LINGER GUARD): when the short-session else-branch is
+         reached AND the remote IP had a confirmed write > 15s ago, treat
+         idle_time=0 as RESIDUAL and fall back to NTFS owner.
+    """
+
+    OWN_HOST        = "desktop-0edubap"
+    OWN_IP          = "192.168.254.106"
+    COWORKER_IP     = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_own_add_not_misattributed_after_coworker_short_session_write(self):
+        """Local 'added' (unc_poll) must NOT be stamped with coworker's IP
+        when the coworker had a short-session confirmed write 20s ago and
+        is still connected with directory-browsing handles (idle_time=0)
+        but no file-specific handle on the current file.
+        """
+        filepath = (
+            f"\\\\{self.OWN_IP}\\testshare\\"
+            f"Screenshot 2026-06-23 132914.png"
+        )
+
+        # NFE returns only a directory handle for .105 (browsing, not writing)
+        dir_handle = {
+            "fi3_username": self.SHARED_USERNAME,
+            "fi3_pathname": "D:\\testshare\\",
+        }
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([dir_handle], 1, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner = own machine (all files on .106's share show this)
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105's session: active 38s (short, <= 300s threshold), idle_time=0
+        coworker_snapshot = [{
+            "username": self.SHARED_USERNAME,
+            "machine": self.COWORKER_IP,
+            "ip":      self.COWORKER_IP,
+            "idle_time":   0,
+            "active_time": 38,
+        }]
+
+        # Exactly ONE prior snapshot for .105 taken 1.2s before the event —
+        # within the 2s CO-TEMPORAL grace window so it will be discarded,
+        # leaving _unpoisoned_history=[] and _min_prior_idle=None.
+        co_temporal_snapshot = [(time.time() - 1.2, 0)]
+
+        with patch("socket.gethostname",  return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch("watcher.get_recent_idle_history",
+                   return_value=co_temporal_snapshot), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                      "win32api": mock_win32api,
+                                      "win32security": mock_win32security}):
+            # .105 wrote a different file 20s ago (confirmed by Step0 NFE).
+            # _record_remote_write always uses time.time() so we back-date
+            # the entry directly.
+            with da._recent_remote_write_lock:
+                da._recent_remote_write_ts[self.COWORKER_IP] = (
+                    time.time() - 20,
+                    "Screenshot 2026-06-23 133510.png",
+                    None,
+                )
+
+            info = da._get_editor_info(
+                filepath,
+                detection_source="unc_poll",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] != self.COWORKER_IP, (
+            f"Own 'added' file was misattributed to coworker {self.COWORKER_IP!r} "
+            f"(SHORT-LINGER GUARD did not fire): {info!r}"
+        )
+        assert info["machine"] != self.COWORKER_IP
+        assert info["user"] == self.SHARED_USERNAME
+
+
+class TestAddedWatchdogGuardPathD:
+    """Regression: coworker (.105) writes a new batch of files 27s after its
+    previous batch, while the local machine (.106) wrote unrelated files 13s
+    ago.  The ADDED-WATCHDOG-GUARD PATH-C must NOT veto .105's live file
+    handle just because the prior burst was stale (27s > 8s) — the key
+    constraint is own_write_age < 8s (loopback candidate window), not < 30s.
+    If own_write_age=13s the loopback session's idle_time≈13s > 5s is already
+    excluded by _same_name_remote_active, so PATH-D must fire and trust the
+    handle.
+
+    Sequence from user logs (2026-06-24):
+      1. .105 wrote screenshots at 14:04:02 (burst_age≈28s at event time).
+      2. .106 wrote screenshots at 14:04:15 (own_write_age≈13s at event time).
+      3. .105 writes new screenshots at 14:04:28 (current event).
+      4. NFE finds .105's handle on the EXACT target file, idle_time=0.
+      5. BUG: PATH-C fired (stale burst + own_write_age=13s < old 30s window)
+         → veto → Step1 OWN-ACTIVE VETO → attributed to .106.  WRONG.
+      6. FIX: _S0_WG_WIDE_S narrowed to 8s → own_write_age=13s >= 8s →
+         local_recent=False → PATH-D fires → handle trusted → .105 gets credit.
+    """
+
+    OWN_HOST        = "desktop-0edubap"
+    OWN_IP          = "192.168.254.106"
+    COWORKER_IP     = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_coworker_add_not_suppressed_when_own_write_older_than_loopback_window(self):
+        """Coworker's genuine write (new batch, 27s gap) must be attributed to
+        .105, not .106, even though .106 wrote unrelated files 13s ago.
+        """
+        filepath = (
+            f"\\\\{self.OWN_IP}\\testshare\\"
+            f"Screenshot 2025-06-16 090339.png"
+        )
+
+        # NFE finds .105's handle on the EXACT target file (still open for
+        # reading/verification after write completed).
+        file_handle = {
+            "fi3_username": self.SHARED_USERNAME,
+            "fi3_pathname": "D:\\testshare\\Screenshot 2025-06-16 090339.png",
+        }
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([file_handle], 1, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner = own machine (all share files show this).
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105 session: idle_time=0 (actively writing right now).
+        coworker_snapshot = [{
+            "username": self.SHARED_USERNAME,
+            "machine": self.COWORKER_IP,
+            "ip":      self.COWORKER_IP,
+            "idle_time":   0,
+            "active_time": 1858,
+        }]
+
+        with patch("socket.gethostname",  return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                      "win32api": mock_win32api,
+                                      "win32security": mock_win32security}):
+            # .105 wrote a different file 27.5s ago (stale burst).
+            with da._recent_remote_write_lock:
+                da._recent_remote_write_ts[self.COWORKER_IP] = (
+                    time.time() - 27.5,
+                    "Screenshot 2025-06-11 133510.png",
+                    None,
+                )
+            # .106 wrote unrelated files 13s ago (outside 8s loopback window).
+            with da._recent_own_write_lock:
+                da._recent_own_write_ts["__last__"] = (
+                    time.time() - 13,
+                    "Screenshot 2026-06-23 102246.png",
+                )
+
+            info = da._get_editor_info(
+                filepath,
+                detection_source="watchdog",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] == self.COWORKER_IP, (
+            f"Coworker's genuine write was misattributed to local machine "
+            f"instead of coworker {self.COWORKER_IP!r}: {info!r}"
+        )
+
+
+class TestCompetingOwnWriteGuard:
+    """Regression (2026-06-24): .105 writes files at 14:27:14, displayed as .106.
+
+    Sequence from user logs:
+      1. .105 wrote Screenshot 2025-06-16 085818.png 27.5s ago (stale burst).
+      2. .106 wrote Screenshot 2026-06-23 100241.png 11.5s ago (own machine).
+      3. .105 writes Screenshot 2025-06-10 114738.png NOW (detected via unc_poll).
+      4. .105 session: active_time=3224s > 300s, no prior cache → _is_persistent_monitor=True.
+      5. BUG: COMPETING-OWN-WRITE checked own_write_age < 60s (burst_window) → 11.5s < 60s
+         → own_conflict=True → BURST-OVERRIDE suppressed → NTFS owner (.106). WRONG.
+      6. FIX: COMPETING-OWN-WRITE window narrowed to 8s (loopback-candidate window):
+         own_write_age=11.5s >= 8s → own_conflict=False → BURST-OVERRIDE fires → .105. CORRECT.
+    """
+
+    OWN_HOST        = "desktop-0edubap"
+    OWN_IP          = "192.168.254.106"
+    COWORKER_IP     = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_burst_override_not_suppressed_when_own_write_outside_loopback_window(self):
+        """COMPETING-OWN-WRITE must NOT suppress BURST-OVERRIDE when own_write_age >= 8s.
+
+        .105 had a stale burst 27.5s ago. .106 (own machine) wrote 11.5s ago.
+        Since own_write_age=11.5s >= 8s (loopback-candidate window), any loopback
+        session from .106 would have idle_time ≈ 11.5s > 5s — already excluded by
+        _same_name_remote_active. No real conflict. BURST-OVERRIDE must fire → .105.
+        """
+        filepath = (
+            f"\\\\{self.OWN_IP}\\testshare\\"
+            f"Screenshot 2025-06-10 114738.png"
+        )
+
+        # NFE finds no open handles → Step0 skipped.
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([], 0, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner = own machine (conservative fallback before fix).
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105 session: active_time=3224s > 300s, no prior idle cache
+        # → _is_persistent_monitor=True via active_time heuristic.
+        coworker_snapshot = [{
+            "username":    self.SHARED_USERNAME,
+            "machine":     self.COWORKER_IP,
+            "ip":          self.COWORKER_IP,
+            "idle_time":   1,
+            "active_time": 3224,
+        }]
+
+        with patch("socket.gethostname",  return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                      "win32api": mock_win32api,
+                                      "win32security": mock_win32security}):
+            # .105 wrote a different file 27.5s ago (stale burst, age > 8s tight threshold).
+            with da._recent_remote_write_lock:
+                da._recent_remote_write_ts[self.COWORKER_IP] = (
+                    time.time() - 27.5,
+                    "Screenshot 2025-06-16 085818.png",
+                    None,
+                )
+            # .106 wrote 11.5s ago — outside 8s loopback window → no real conflict.
+            with da._recent_own_write_lock:
+                da._recent_own_write_ts["__last__"] = (
+                    time.time() - 11.5,
+                    "Screenshot 2026-06-23 100241.png",
+                )
+
+            info = da._get_editor_info(
+                filepath,
+                detection_source="unc_poll",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] == self.COWORKER_IP, (
+            f"COMPETING-OWN-WRITE incorrectly suppressed BURST-OVERRIDE "
+            f"(own_write_age=11.5s >= 8s loopback window, no real conflict): {info!r}"
+        )
+
+
+class TestOwnActiveVetoBurstVeryRecent:
+    """Regression (2026-06-25): .105 writes 151957.png at 14:42:01 but shows as .106.
+
+    Sibling 152009.png was confirmed as .105's 68ms earlier (very fresh burst).
+    OWN-ACTIVE VETO fires (own_min_idle=0, prior_idle=76s ≤ 120s) and the old
+    guard `if _is_persistent_monitor and not _own_active_veto_fired:` skipped
+    BURST-OVERRIDE entirely — even for a 0.068s-old burst (remote mid-copy).
+
+    FIX: when burst is very fresh (< 8s), enter BURST-OVERRIDE even if
+    OWN-ACTIVE VETO fired. Inside, COMPETING-OWN-WRITE sees burst_very_recent=True
+    → no conflict → BURST-OVERRIDE fires → .105.
+    """
+
+    OWN_HOST        = "desktop-0edubap"
+    OWN_IP          = "192.168.254.106"
+    COWORKER_IP     = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_burst_override_fires_when_burst_very_recent_despite_own_active_veto(self):
+        """OWN-ACTIVE VETO must NOT suppress BURST-OVERRIDE when burst is < 8s old.
+
+        .105 confirmed 152009.png 68ms ago (very fresh burst).
+        .106 own machine has idle_time=0 + prior_idle=76s → OWN-ACTIVE VETO fires.
+        BUG: BURST-OVERRIDE entirely skipped → attributed to .106. WRONG.
+        FIX: burst_age=0.068s < 8s tight → exempt from OWN-ACTIVE suppression → .105.
+        """
+        filepath = (
+            f"\\\\{self.OWN_IP}\\testshare\\"
+            f"Screenshot 2025-05-29 151957.png"
+        )
+
+        # NFE: no open file handles (handle closed after upload completed)
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([], 0, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner = own machine (share-host credential, expected wrong answer pre-fix)
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105 session: idle_time=0 (just finished uploading), active_time=3224s > 300s
+        # → _is_persistent_monitor=True via single-snapshot branch.
+        # own_min_idle_time=0  → OWN-ACTIVE VETO fires (own machine also idle=0).
+        # own_min_active_time=60s > 30s → LOOPBACK-LOCAL does NOT fire (not a fresh
+        # loopback: the session predates the current write by >30s).
+        coworker_snapshot = [{
+            "username":            self.SHARED_USERNAME,
+            "machine":             self.COWORKER_IP,
+            "ip":                  self.COWORKER_IP,
+            "idle_time":           0,
+            "active_time":         3224,
+            "own_min_idle_time":   0,   # own machine idle=0 → OWN-ACTIVE VETO trigger
+            "own_min_active_time": 60,  # loopback 60s old > 30s threshold → not fresh
+        }]
+
+        # One prior idle snapshot 20s before event: .105 idle=76s.
+        # 76s > 20s (_HIGH_IDLE_GENUINE_THRESHOLD) but watchdog-same-host blocks
+        # HIGH-IDLE-GENUINE, so conservative fallback → _is_persistent_monitor=True.
+        # 76s ≤ 120s (_OWN_VETO_MAX_PRIOR_IDLE) → OWN-ACTIVE VETO fires.
+        prior_idle_history = [(time.time() - 20, 76)]
+
+        with patch("socket.gethostname",  return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch("watcher.get_recent_idle_history", return_value=prior_idle_history), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                      "win32api": mock_win32api,
+                                      "win32security": mock_win32security}):
+            # .105 confirmed 152009.png 68ms ago — very fresh burst (< 8s tight threshold)
+            with da._recent_remote_write_lock:
+                da._recent_remote_write_ts[self.COWORKER_IP] = (
+                    time.time() - 0.068,
+                    "Screenshot 2025-05-29 152009.png",
+                    None,
+                )
+            # .106 wrote own file 11.4s ago — outside 8s loopback window, no conflict
+            with da._recent_own_write_lock:
+                da._recent_own_write_ts["__last__"] = (
+                    time.time() - 11.4,
+                    "Screenshot 2026-06-23 100241.png",
+                )
+
+            info = da._get_editor_info(
+                filepath,
+                detection_source="watchdog",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] == self.COWORKER_IP, (
+            f"OWN-ACTIVE VETO incorrectly suppressed BURST-OVERRIDE for very-fresh burst "
+            f"(burst_age=0.068s < 8s tight, remote mid-copy): {info!r}"
+        )
+
+
+class TestBurstConcurrentRemoteAdds:
+    """Regression (2026-06-29): two near-simultaneous adds by remote .105 while
+    the local machine .106 had also written files ~14s earlier.
+
+    Real-world sequence (from user log export):
+      • 08:23:39 — .106 (local) adds two files → recorded as confirmed own-writes.
+      • 08:23:54 — .105 (coworker) adds two files in a burst.
+          - File A's SMB write handle is still open → NetFileEnum confirms .105
+            and records it as a remote burst sibling.
+          - File B's handle has already closed → falls to snapshot attribution.
+
+    BUG: for File B, the remote burst sibling (File A) was 0.087s fresh (< 8s,
+    strong evidence .105 is mid-copy), but the CONCURRENT-OWN-WRITE GUARD used a
+    30s window and saw the *stale* 14.5s-old local own-write → kept OWN-ACTIVE
+    VETO → flipped File B to .106. One of two burst files was misattributed.
+
+    FIX: the own-write conflict window is the tight 8s loopback window; a 14.5s
+    local write is NOT concurrent with a 0.087s remote burst, so the override
+    fires and File B is correctly attributed to .105.  (Pre-fix this asserted
+    .106 and failed.)
+    """
+
+    OWN_HOST        = "desktop-0edubap"
+    OWN_IP          = "192.168.254.106"
+    COWORKER_IP     = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_second_burst_add_attributed_to_remote_not_local(self):
+        """File B (handle closed) must be attributed to .105 via the fresh remote
+        burst sibling, NOT to .106 because of a stale 14.5s-old local own-write."""
+        file_b = (
+            f"\\\\{self.OWN_IP}\\testshare\\Screenshot 2025-06-18 153953.png"
+        )
+
+        # File B's SMB handle already closed → NetFileEnum returns nothing.
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([], 0, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner = own machine (share host) — the wrong answer pre-fix.
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105 session: idle=1 (mid-burst), active_time=147s, own_min_idle=0
+        # (local loopback noise → OWN-ACTIVE VETO trigger),
+        # own_min_active=60s > 30s (loopback predates the write → not a fresh local write).
+        coworker_snapshot = [{
+            "username":            self.SHARED_USERNAME,
+            "machine":             self.COWORKER_IP,
+            "ip":                  self.COWORKER_IP,
+            "idle_time":           1,
+            "active_time":         147,
+            "own_min_idle_time":   0,
+            "own_min_active_time": 60,
+        }]
+        prior_idle_history = [(time.time() - 27, 38)]
+
+        with patch("socket.gethostname",  return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch("watcher.get_recent_idle_history", return_value=prior_idle_history), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                      "win32api": mock_win32api,
+                                      "win32security": mock_win32security}):
+            # File A confirmed .105 0.087s ago and recorded as a remote burst sibling
+            # (tuple layout: ts, filepath, prev, event_type).
+            with da._recent_remote_write_lock:
+                da._recent_remote_write_ts[self.COWORKER_IP] = (
+                    time.time() - 0.087,
+                    "Screenshot 2025-06-19 081833.png",
+                    None,
+                    "added",
+                )
+            # .106 wrote its own files 14.5s ago (the earlier 08:23:39 burst):
+            # within the OLD 30s guard window, but OUTSIDE the correct 8s window.
+            with da._recent_own_write_lock:
+                da._recent_own_write_ts["__last__"] = (
+                    time.time() - 14.5,
+                    "Screenshot 2026-06-26 092651.png",
+                )
+
+            info = da._get_editor_info(
+                file_b,
+                detection_source="watchdog",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] == self.COWORKER_IP, (
+            f"A stale 14.5s-old local own-write must NOT veto a 0.087s-fresh remote "
+            f"burst sibling (8s window): File B should be attributed to .105, got {info!r}"
+        )
+
+
+class TestSingleSnapshotOwnActiveVeto:
+    """Regression (2026-06-25): .106 adds two files but both show as .105.
+
+    Sequence from user logs (08:53:09-08:53:12):
+      1. .106 writes Screenshot 2026-06-24 140439.png and 133422.png.
+      2. SMB CHANGE_NOTIFY fires — resets .105's idle_time to 0.
+      3. NetSessionEnum snapshot: .105 idle=0, active_time=266s, own_min_idle=0.
+      4. Idle history: one prior snapshot 12s ago showing .105 idle=228s.
+      5. CHECK B single-snapshot override: prior_idle=228s > 30s AND
+         active_time=266s ≤ 300s → concludes .105 "recently connected to write".
+      6. BUG: override ignores own_min_idle=0 (own machine writing via watchdog)
+         → attributes files to .105 instead of .106.
+      7. FIX: when detection_source='watchdog' AND own_min_idle ≤ 5s, block the
+         "recently connected" shortcut (CHANGE_NOTIFY makes idle drop unreliable)
+         and set _is_persistent_monitor=True + _own_active_veto=True → NTFS owner
+         (.106).
+    """
+
+    OWN_HOST        = "desktop-0edubap"
+    OWN_IP          = "192.168.254.106"
+    COWORKER_IP     = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_own_add_not_misattributed_when_coworker_has_short_session_high_prior_idle(self):
+        """CHECK B single-snapshot override must be blocked when own machine is writing.
+
+        .105 has active_time=266s (≤ 300s) + prior_idle=228s (> 30s) — normally
+        this fires the "recently connected to write" shortcut.  But own_min_idle=0
+        (watchdog event) proves THIS machine wrote the file via CHANGE_NOTIFY.
+        The shortcut must be blocked so NTFS owner (.106) is used.
+        """
+        filepath = (
+            f"\\\\{self.OWN_IP}\\testshare\\"
+            f"Screenshot 2026-06-24 140439.png"
+        )
+
+        # NFE: no open handles (own-machine write closed before attribution)
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([], 0, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner = own machine (.106) — the correct answer
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105 session: idle_time=0 (CHANGE_NOTIFY reset), active_time=266s (short
+        # session ≤ 300s threshold), own_min_idle=0 (own machine also idle=0).
+        coworker_snapshot = [{
+            "username":            self.SHARED_USERNAME,
+            "machine":             self.COWORKER_IP,
+            "ip":                  self.COWORKER_IP,
+            "idle_time":           0,
+            "active_time":         266,
+            "own_min_idle_time":   0,   # own machine writing → OWN-ACTIVE VETO
+            "own_min_active_time": 12,  # loopback session 12s old < 30s threshold
+        }]
+
+        # One prior idle snapshot 12s before event: .105 idle=228s (high — looks
+        # like it was idle before the write, which normally means it IS the writer,
+        # but here the idle dropped because of CHANGE_NOTIFY from .106's write).
+        prior_idle_history = [(time.time() - 12, 228)]
+
+        with patch("socket.gethostname",  return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch("watcher.get_recent_idle_history", return_value=prior_idle_history), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                      "win32api": mock_win32api,
+                                      "win32security": mock_win32security}):
+            # No prior .105 burst (coworker was just monitoring, not writing)
+            # No prior own write recorded (fresh session)
+
+            info = da._get_editor_info(
+                filepath,
+                detection_source="watchdog",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] == self.OWN_IP, (
+            f"CHECK B single-snapshot 'recently connected' override incorrectly attributed "
+            f"own-machine write to coworker (own_min_idle=0 + watchdog must block the "
+            f"shortcut): {info!r}"
+        )
+
+
+class TestVetoFallbackBurstPatch:
+    """Regression (2026-06-25): .105 adds two files concurrently; one caught by NFE,
+    the other falls through OWN-ACTIVE VETO → NTFS fallback → .106.  After the NFE
+    confirms .105, BURST-PATCH Case C must retroactively fix the NTFS-fallback entry
+    without touching genuine .106 writes from an earlier batch.
+
+    Two scenarios are tested:
+
+    Scenario A (09:04 session — original fix):
+      .106 writes at 09:04:11, .105 writes concurrently at 09:04:24.
+      Detection-time gap = 13s.  Monotonic gap = 0.2s (concurrent sibling fast).
+      → concurrent sibling patched ✓, earlier .106 write spared ✓
+
+    Scenario B (09:19 session — BUG REPORT 2026-06-25):
+      .106 writes at 09:19:19 (2 files).  .105 writes at 09:19:25 (separate batch).
+      Detection-time gap between .106 batch and .105 confirming burst = 6s.
+      OLD code (window=10s, no detection gate): 6s < 10s → WRONGLY patched .106's files.
+      NEW code (3s detection-time gate): 6s > 3s → correctly spared ✓
+
+    Both scenarios use the detection-timestamp gate (_veto_fallback_detect_ts vs
+    confirmed entry's timestamp) as the primary discriminator.
+    """
+
+    OWN_HOST    = "desktop-0edubap"
+    OWN_IP      = "192.168.254.106"
+    COWORKER_IP = "192.168.254.105"
+
+    def _make_veto_fallback_entry(
+        self, path: str, ts_offset: float, detect_ts: str
+    ) -> dict:
+        """Simulate a history entry attributed via OWN-ACTIVE VETO → NTFS → own machine.
+
+        detect_ts: ISO timestamp string representing when watchdog fired for this file
+                   (corresponds to entry["timestamp"] set at detection time, stored in
+                   _veto_fallback_detect_ts when the veto-fallback tag is propagated).
+        ts_offset: seconds ago that _veto_fallback_ts (monotonic) was set (backstop).
+        """
+        import time as _t
+        return {
+            "path":                       path,
+            "type":                       "added",
+            "editor_user":                "user",
+            "editor_machine":             self.OWN_HOST.upper(),
+            "editor_ip":                  self.OWN_IP,
+            "attribution_unknown":        False,
+            "_veto_fallback_candidate_ip":  self.COWORKER_IP,
+            "_veto_fallback_ts":            _t.monotonic() - ts_offset,
+            "_veto_fallback_detect_ts":     detect_ts,
+        }
+
+    def _run_case_c(self, history_log: list, confirmed_entry: dict) -> list:
+        """Inline replication of BURST-PATCH Case C logic from _on_file_change.
+        Returns list of patched paths."""
+        import time     as _t
+        import datetime as _dt
+
+        def _ts_diff_s(ts1, ts2):
+            try:
+                t1 = _dt.datetime.fromisoformat(ts1.rstrip("Z").replace(" ", "T"))
+                t2 = _dt.datetime.fromisoformat(ts2.rstrip("Z").replace(" ", "T"))
+                return abs((t1 - t2).total_seconds())
+            except Exception:
+                return None
+
+        _burst_new_ip     = confirmed_entry["editor_ip"]
+        _burst_new_machine = confirmed_entry["editor_machine"]
+        _bp_now           = _t.monotonic()
+        _VETO_PATCH_WINDOW_S  = 3
+        _VETO_DETECT_WINDOW_S = 3
+        _confirm_ts       = confirmed_entry.get("timestamp", "")
+        patched = []
+
+        for _older in reversed(history_log):
+            if _older is confirmed_entry:
+                continue
+            _is_unk = _older.get("editor_user") in ("Unknown", "")
+            _is_fb  = (
+                not _is_unk
+                and _older.get("_fallback_candidate_ip") == _burst_new_ip
+                and _older.get("editor_ip") != _burst_new_ip
+                and _older.get("type") == confirmed_entry["type"]
+            )
+            _vd_ts   = _older.get("_veto_fallback_detect_ts", "")
+            _vd_diff = _ts_diff_s(_vd_ts, _confirm_ts) if (_vd_ts and _confirm_ts) else None
+            _vd_ok   = (_vd_diff is not None and _vd_diff <= _VETO_DETECT_WINDOW_S)
+            _veto_age = _bp_now - _older.get("_veto_fallback_ts", _bp_now)
+            _is_veto_fb = (
+                not _is_unk
+                and not _is_fb
+                and _older.get("_veto_fallback_candidate_ip") == _burst_new_ip
+                and _older.get("editor_ip") != _burst_new_ip
+                and _older.get("type") == confirmed_entry["type"]
+                and _veto_age < _VETO_PATCH_WINDOW_S
+                and _vd_ok
+            )
+            if not _is_unk and not _is_fb and not _is_veto_fb:
+                continue
+            _oh = _older["path"].replace("\\", "/").lstrip("/").split("/")[0].lower()
+            if _oh != self.OWN_IP:
+                continue
+            _older["editor_ip"]      = _burst_new_ip
+            _older["editor_machine"] = _burst_new_machine
+            patched.append(_older["path"])
+        return patched
+
+    def test_concurrent_sibling_patched_genuine_local_spared(self):
+        """Scenario A: .106 genuine write (13s before .105 burst) spared;
+        .105 concurrent sibling (0.2s, same detection second) patched."""
+        # .106's genuine write detected at 09:04:11 — 13s before .105 burst at 09:04:24
+        genuine_local = self._make_veto_fallback_entry(
+            f"\\\\{self.OWN_IP}\\testshare\\Screenshot 2026-06-24 140439.png",
+            ts_offset=13.2,
+            detect_ts="2026-06-25T09:04:11.000000",
+        )
+        # .105's concurrent write detected at 09:04:24 — same second as confirming burst
+        concurrent_coworker = self._make_veto_fallback_entry(
+            f"\\\\{self.OWN_IP}\\testshare\\Screenshot 2025-06-18 153953.png",
+            ts_offset=0.2,
+            detect_ts="2026-06-25T09:04:24.000000",
+        )
+        confirmed_entry = {
+            "path":           f"\\\\{self.OWN_IP}\\testshare\\Screenshot 2025-06-19 081833.png",
+            "type":           "added",
+            "editor_user":    "user",
+            "editor_machine": "DESKTOP-KGG55PU",
+            "editor_ip":      self.COWORKER_IP,
+            "timestamp":      "2026-06-25T09:04:24.000000",
+        }
+
+        patched_paths = self._run_case_c([genuine_local, concurrent_coworker], confirmed_entry)
+
+        assert len(patched_paths) == 1, (
+            f"Expected exactly 1 entry patched (concurrent sibling), got: {patched_paths!r}"
+        )
+        assert "153953" in patched_paths[0], (
+            f"Wrong entry patched — should be 153953.png (concurrent), got: {patched_paths!r}"
+        )
+        assert concurrent_coworker["editor_ip"] == self.COWORKER_IP, (
+            f"Concurrent sibling not patched to coworker IP: {concurrent_coworker!r}"
+        )
+        assert genuine_local["editor_ip"] == self.OWN_IP, (
+            f"Genuine local write from 13s ago was incorrectly patched: {genuine_local!r}"
+        )
+
+    def test_six_second_gap_genuine_writes_spared(self):
+        """Scenario B (2026-06-25 bug): .106 wrote at 09:19:19; .105 burst confirmed
+        at 09:19:25 (6s later, separate batch).  Old code (10s window, no detect gate)
+        incorrectly patched .106's files.  New code must spare them."""
+        # .106's genuine writes detected at 09:19:19 — 6s before .105 burst
+        genuine_1 = self._make_veto_fallback_entry(
+            f"\\\\{self.OWN_IP}\\testshare\\Screenshot 2026-06-24 144215.png",
+            ts_offset=6.0,
+            detect_ts="2026-06-25T09:19:19.000000",
+        )
+        genuine_2 = self._make_veto_fallback_entry(
+            f"\\\\{self.OWN_IP}\\testshare\\Screenshot 2026-06-24 142723.png",
+            ts_offset=6.0,
+            detect_ts="2026-06-25T09:19:19.000000",
+        )
+        # .105's files confirmed at 09:19:25 (separate watchdog batch)
+        confirmed_entry = {
+            "path":           f"\\\\{self.OWN_IP}\\testshare\\Screenshot 2025-06-19 081833.png",
+            "type":           "added",
+            "editor_user":    "user",
+            "editor_machine": "DESKTOP-KGG55PU",
+            "editor_ip":      self.COWORKER_IP,
+            "timestamp":      "2026-06-25T09:19:25.000000",
+        }
+
+        patched_paths = self._run_case_c([genuine_1, genuine_2], confirmed_entry)
+
+        assert len(patched_paths) == 0, (
+            f".106's genuine writes from 6s earlier must NOT be patched, "
+            f"but were patched: {patched_paths!r}"
+        )
+        assert genuine_1["editor_ip"] == self.OWN_IP, (
+            f"genuine_1 was incorrectly patched: {genuine_1!r}"
+        )
+        assert genuine_2["editor_ip"] == self.OWN_IP, (
+            f"genuine_2 was incorrectly patched: {genuine_2!r}"
+        )
