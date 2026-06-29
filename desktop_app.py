@@ -722,6 +722,53 @@ def make_tray_icon(status: str = "ok") -> QIcon:
 
 
 
+import threading as _sacl_threading_mod
+
+# Single-flight guard: the startup SMB-share SACL batch must run AT MOST ONCE per
+# process. The enclosing watch-startup method can be invoked more than once (e.g.
+# initial start + a config reload), and two concurrent PowerShell batches race
+# each other — colliding UAC prompts and 30s timeouts under the startup file-scan
+# / CHANGE_NOTIFY overflow storm were the observed "SACL auto-config keeps
+# failing" symptom (two 'Launched background thread' + two 'Requesting ONE UAC'
+# lines back-to-back in the logs).
+_SACL_SMB_AUTORUN_LOCK = _sacl_threading_mod.Lock()
+_SACL_SMB_AUTORUN_DONE = False
+
+
+def _sacl_smb_autorun_claim() -> bool:
+    """Atomically claim the once-per-process right to run the startup SACL batch.
+
+    Returns True for the first caller only; every later caller gets False so the
+    batch (and any UAC prompt) is never launched twice concurrently.
+    """
+    global _SACL_SMB_AUTORUN_DONE
+    with _SACL_SMB_AUTORUN_LOCK:
+        if _SACL_SMB_AUTORUN_DONE:
+            return False
+        _SACL_SMB_AUTORUN_DONE = True
+        return True
+
+
+def _is_process_elevated() -> bool:
+    """Return True if the current process holds an elevated (admin) token.
+
+    Reading/writing a SACL requires SeSecurityPrivilege, which a non-elevated
+    process never has, so a non-elevated SACL attempt can only fail. Knowing this
+    up front lets the setup skip the guaranteed-to-fail non-elevated subprocess
+    (and its long timeout) and go straight to a UAC elevation. When the app
+    already auto-elevated at launch (see main()), this is True and the in-process
+    attempt succeeds with no extra UAC prompt at all.
+    """
+    import sys as _el_sys
+    if _el_sys.platform != "win32":
+        return False
+    try:
+        import ctypes as _el_ctypes
+        return bool(_el_ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def _apply_sacl_local(path: str) -> tuple[bool, str]:
     """
     Automatically configure Windows object-auditing (SACL) on a *local* folder
@@ -20070,11 +20117,23 @@ class MainWindow(QMainWindow):
 
                     import os as _os_batch
                     script_lines = []
+                    # De-duplicate Set-Acl targets: when several shares live on the
+                    # same drive (e.g. D:\smb_test + D:\testshare) their common
+                    # parent (D:\) was emitted once per share, so the old script
+                    # ran Get-Acl/Set-Acl on D:\ twice — wasted seconds against the
+                    # 30s cap during the startup I/O storm. Each path is applied once.
+                    _seen_acl_paths = set()
                     for sp in needs_sacl:
-                        script_lines.append(_ps_sacl_block(sp))
+                        _spk = sp.strip().lower()
+                        if _spk not in _seen_acl_paths:
+                            _seen_acl_paths.add(_spk)
+                            script_lines.append(_ps_sacl_block(sp))
                         parent = _os_batch.path.dirname(sp)
                         if parent and parent.lower() != sp.lower():
-                            script_lines.append(_ps_sacl_block(parent))
+                            _pk = parent.strip().lower()
+                            if _pk not in _seen_acl_paths:
+                                _seen_acl_paths.add(_pk)
+                                script_lines.append(_ps_sacl_block(parent))
 
                     script_lines.append(
                         "auditpol /set /subcategory:'File System' /success:enable /failure:enable"
@@ -20083,27 +20142,63 @@ class MainWindow(QMainWindow):
                         "wevtutil sl Security /ms:524288000 /rt:false"
                     )
                     batch_script = " ".join(script_lines)
+                    _elevated = _is_process_elevated()
 
-                    # ── Attempt 1: run non-elevated ───────────────────────────
+                    # ── Attempt 1: run in-process (NO UAC) ────────────────────
+                    # Only useful when the app is ALREADY elevated — the child
+                    # PowerShell inherits the admin token and the SACL ops succeed
+                    # with no extra prompt (the app auto-elevates at launch, so
+                    # this is the normal path). A non-elevated process can never
+                    # set a SACL (needs SeSecurityPrivilege), so when not elevated
+                    # we skip straight to the UAC attempt instead of burning a
+                    # subprocess timeout on a doomed run.
+                    # Timeout raised 30s→120s: at startup this runs alongside the
+                    # initial share scan + CHANGE_NOTIFY overflow storm, and the
+                    # Get-Acl/Set-Acl + wevtutil chain on a busy disk routinely
+                    # needs well over 30s — the old cap fired TimeoutExpired before
+                    # the work could finish, which is why auto-SACL "kept failing".
                     _batch_ok = False
-                    try:
-                        r1 = _sacl_smb_sub.run(
-                            ["powershell", "-NoProfile", "-NonInteractive",
-                             "-Command", batch_script],
-                            capture_output=True, text=True, timeout=30,
-                            creationflags=_WIN_NO_WINDOW,
-                        )
-                        if r1.returncode == 0:
-                            _batch_ok = True
-                            _lg.info(
-                                "[startup_sacl_smb] Batch SACL configured "
-                                "(non-elevated) for all shares."
+                    if _elevated:
+                        try:
+                            r1 = _sacl_smb_sub.run(
+                                ["powershell", "-NoProfile", "-NonInteractive",
+                                 "-Command", batch_script],
+                                capture_output=True, text=True, timeout=120,
+                                creationflags=_WIN_NO_WINDOW,
                             )
-                    except Exception as _b1e:
-                        _lg.info(f"[startup_sacl_smb] Batch attempt 1 exception: {_b1e!r}")
+                            if r1.returncode == 0:
+                                _batch_ok = True
+                                _lg.info(
+                                    "[startup_sacl_smb] Batch SACL configured "
+                                    "in-process (already elevated) for all shares."
+                                )
+                            else:
+                                _lg.warning(
+                                    f"[startup_sacl_smb] Batch in-process attempt "
+                                    f"failed (rc={r1.returncode}): "
+                                    f"{(r1.stderr or r1.stdout)[:300]!r}"
+                                )
+                        except _sacl_smb_sub.TimeoutExpired:
+                            _lg.warning(
+                                "[startup_sacl_smb] Batch in-process attempt timed "
+                                "out after 120s (disk busy at startup) — will retry "
+                                "on next launch."
+                            )
+                        except Exception as _b1e:
+                            _lg.info(f"[startup_sacl_smb] Batch attempt 1 exception: {_b1e!r}")
+                    else:
+                        _lg.info(
+                            "[startup_sacl_smb] Process is not elevated — skipping "
+                            "the guaranteed-to-fail non-elevated SACL attempt and "
+                            "requesting a single UAC elevation instead."
+                        )
 
                     # ── Attempt 2: single UAC elevation for ALL shares ────────
-                    if not _batch_ok:
+                    # Only when not already elevated. If we ARE elevated and the
+                    # in-process attempt still failed, a Start-Process -Verb RunAs
+                    # would add nothing (we already hold the token), so we leave it
+                    # for the next launch rather than throwing a pointless prompt.
+                    if not _batch_ok and not _elevated:
                         _elevate_timeout = 150
                         try:
                             with _sacl_tmp.NamedTemporaryFile(
@@ -20199,15 +20294,24 @@ class MainWindow(QMainWindow):
                         f"for SMB shares: {_outer_err!r}"
                     )
 
-            _sacl_smb_t.Thread(
-                target=_enable_sacl_for_all_smb_shares,
-                daemon=True,
-                name="sacl-auto-smb-shares",
-            ).start()
-            logger.info(
-                "[startup_sacl_smb] Launched background thread to auto-enable "
-                "SACL on all locally-hosted SMB shares."
-            )
+            # Single-flight: this watch-startup method can run more than once
+            # (initial start + config reload); claim the once-per-process right so
+            # two batches never race (colliding UAC prompts / duplicate timeouts).
+            if _sacl_smb_autorun_claim():
+                _sacl_smb_t.Thread(
+                    target=_enable_sacl_for_all_smb_shares,
+                    daemon=True,
+                    name="sacl-auto-smb-shares",
+                ).start()
+                logger.info(
+                    "[startup_sacl_smb] Launched background thread to auto-enable "
+                    "SACL on all locally-hosted SMB shares."
+                )
+            else:
+                logger.info(
+                    "[startup_sacl_smb] Auto-SACL batch already started this "
+                    "process — skipping duplicate launch."
+                )
 
     def _on_file_change(self, watch_id: str, entry: dict):
         """Called from watcher thread when a file changes."""
