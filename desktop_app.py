@@ -7886,7 +7886,8 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                     if (_s0_linger_gate
                             and _nfe_result_ip
                             and _nfe_result_ip == _rs_ip
-                            and not _s0_linger_gate_is_watchdog):
+                            and not _s0_linger_gate_is_watchdog
+                            and not _is_same_host_watch):
                         _gei.info(
                             f"[_get_editor_info] Step1-early: LINGER-GATE-TRUST-HANDLE — "
                             f"Step0 NetFileEnum confirmed write handle from "
@@ -7913,17 +7914,30 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                     elif (_s0_linger_gate
                             and _nfe_result_ip
                             and _nfe_result_ip == _rs_ip
-                            and _s0_linger_gate_is_watchdog):
+                            and (_s0_linger_gate_is_watchdog or _is_same_host_watch)):
+                        # BUGFIX (same-host authority = SACL): never trust the NetFileEnum
+                        # handle as a REMOTE writer on a self-hosted share. The handle's
+                        # username is the generic local account ("user") shared by both
+                        # PCs in the workgroup, so a coworker who merely has the file open
+                        # (e.g. Excel holding 'test sheet.xlsx', or an Office "~$" lock)
+                        # is indistinguishable from the real writer by handle alone — and
+                        # in the common case the open handle actually belongs to THIS
+                        # machine's own Excel editing a file on its own share. Defer to the
+                        # Step1 idle-history heuristics and, decisively, the SACL-AUDIT
+                        # override below (the Security log's 4663→4624 LogonId correlation
+                        # is the only authority that can tell .106-local from .105-remote).
+                        # Previously this only skipped for watchdog events, so a unc_poll
+                        # 'modified' of a locally-edited file was mis-trusted to the
+                        # coworker; now both detection sources defer on same-host.
                         _gei.info(
                             f"[_get_editor_info] Step1-early: LINGER-GATE-TRUST-HANDLE "
-                            f"SKIPPED (bugfix) — ip={_nfe_result_ip!r} (user="
-                            f"{_s0_linger_gate_user!r} machine={_s0_linger_gate_machine!r}) "
-                            f"is the only active remote session, but this event's "
-                            f"detection_source was 'watchdog' on a same-host watch, "
-                            f"which already proves the write happened locally. "
-                            f"NOT trusting the NetFileEnum handle (likely a username "
-                            f"collision / coworker passive reader). Falling through to "
-                            f"full Step1 idle-history + OWN-ACTIVE VETO heuristics below "
+                            f"SKIPPED (same-host SACL authority) — ip={_nfe_result_ip!r} "
+                            f"(user={_s0_linger_gate_user!r} machine={_s0_linger_gate_machine!r}) "
+                            f"is the only active remote session, but on a same-host watch "
+                            f"(detection_source={detection_source!r}, watchdog="
+                            f"{_s0_linger_gate_is_watchdog}) a same-username open handle "
+                            f"does NOT prove the coworker is the writer. NOT trusting it; "
+                            f"falling through to Step1 idle-history + SACL-AUDIT override "
                             f"to attribute correctly. rs_idle_now={_rs_idle_now}s "
                             f"rs_active_time={_rs.get('active_time', 0)}s"
                         )
