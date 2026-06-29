@@ -1965,29 +1965,65 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
             # the SMB credential cache entirely.
             _s1b_handle      = None
             _s1b_wevtutil_ok = False   # True when wevtutil path found matching event
-            if _win_user and _win_pass:
+            # ── Same-host detection ─────────────────────────────────────────────
+            # When the "remote" host is actually THIS machine (a self-hosted share
+            # accessed over loopback UNC), a wevtutil query with /r:<host> goes
+            # through the REMOTE RPC endpoint and fails with "Access is denied"
+            # unless the 'Remote Event Log Management' firewall rule is enabled and
+            # the user is in 'Event Log Readers'. But the app runs elevated, so a
+            # LOCAL wevtutil query (no /r /u /p) reads the Security log directly with
+            # the process token and succeeds — which is what unlocks the 4624
+            # SubjectLogonId→TargetLogonId correlation below (and thus remote-vs-local
+            # attribution). Without this, same-host always fell back to the in-process
+            # OpenEventLog reader, which does not collect 4624 and so always concluded
+            # the actor was LOCAL.
+            _s1b_is_same_host = False
+            try:
+                import socket as _s1b_sock
+                _s1b_own_host = _s1b_sock.gethostname().lower()
+                _s1b_own_ip   = _s1b_sock.gethostbyname(_s1b_own_host)
+                _s1b_is_same_host = bool(
+                    host.lower() == _s1b_own_host or
+                    (_s1b_own_ip and host == _s1b_own_ip)
+                )
+            except Exception:
+                pass
+            # Same-host can query locally with no creds; remote still needs them.
+            if _s1b_is_same_host or (_win_user and _win_pass):
                 try:
                     import subprocess as _s1b_sp, json as _s1b_json
                     _CNW = 0x08000000  # CREATE_NO_WINDOW
-                    # Query Security log on remote host with explicit credentials.
                     # /rd:true = reverse chronological (newest first, faster for recent events)
-                    # /c:200   = cap at 200 events (enough for a ±60s window)
+                    # /c:1000  = cap at 1000 events
                     # /f:xml   = structured output for reliable parsing
-                    _wev_cmd = [
-                        "wevtutil", "qe", "Security",
-                        f"/r:{host}",
-                        f"/u:{_win_user}",
-                        f"/p:{_win_pass}",
-                        "/rd:true",
-                        "/c:1000",
-                        "/f:xml",
-                        # Include 4624 (Network Logon) alongside the file-audit events so that
-                        # Strategy1b-post can correlate SubjectLogonId→TargetLogonId in ONE call
-                        # using the same already-working auth path.  A separate wevtutil /r:
-                        # call for 4624 fails with Access Denied on some Windows configs even
-                        # though 4656/4663 succeed (different RPC endpoint privilege check).
-                        "/q:*[System[(EventID=4663 or EventID=4660 or EventID=4656 or EventID=4624)]]",
-                    ]
+                    # Include 4624 (Network Logon) alongside the file-audit events so that
+                    # Strategy1b-post can correlate SubjectLogonId→TargetLogonId in ONE call.
+                    _wev_query = (
+                        "/q:*[System[(EventID=4663 or EventID=4660 or "
+                        "EventID=4656 or EventID=4624)]]"
+                    )
+                    if _s1b_is_same_host:
+                        # LOCAL query — no /r /u /p; uses the elevated process token,
+                        # avoiding the remote-RPC "Access is denied" seen with /r:self.
+                        _wev_cmd = [
+                            "wevtutil", "qe", "Security",
+                            "/rd:true", "/c:1000", "/f:xml", _wev_query,
+                        ]
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b: same-host ({host!r}) — querying "
+                            f"the LOCAL Security log directly (no /r:), using the elevated "
+                            f"process token (avoids remote-RPC Access Denied; enables 4624 "
+                            f"SubjectLogonId correlation for remote-vs-local attribution)."
+                        )
+                    else:
+                        # Query Security log on the REMOTE host with explicit credentials.
+                        _wev_cmd = [
+                            "wevtutil", "qe", "Security",
+                            f"/r:{host}",
+                            f"/u:{_win_user}",
+                            f"/p:{_win_pass}",
+                            "/rd:true", "/c:1000", "/f:xml", _wev_query,
+                        ]
                     _wev_result = _s1b_sp.run(
                         _wev_cmd,
                         capture_output=True, text=True, timeout=20,
