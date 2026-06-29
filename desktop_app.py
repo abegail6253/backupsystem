@@ -878,8 +878,14 @@ def _apply_sacl_local(path: str) -> tuple[bool, str]:
     ]
     if parent and parent.lower() != path.lower():
         script_lines.append(_ps_sacl_block(parent))
+    # NOTE: each statement MUST end with ';' — the lines are " ".join()'d into a
+    # single PowerShell -Command string. Without the terminator, 'auditpol ...'
+    # and 'wevtutil ...' collapse into ONE line and wevtutil's args get handed to
+    # auditpol, which fails with "Error 0x00000057 ... The parameter is incorrect"
+    # and wevtutil never runs (so the audit policy is never enabled → no 4663/4656
+    # events → SACL produces nothing).
     script_lines.append(
-        "auditpol /set /subcategory:'File System' /success:enable /failure:enable"
+        "auditpol /set /subcategory:'File System' /success:enable /failure:enable;"
     )
     # Ensure the Security event log is large enough so that 4624 Network Logon
     # events are not rotated out before a deletion can be correlated back to them.
@@ -888,7 +894,7 @@ def _apply_sacl_local(path: str) -> tuple[bool, str]:
     # no-op when the log is already big enough, so always safe to run.
     # /rt:false keeps the existing retention policy (overwrite as needed).
     script_lines.append(
-        "wevtutil sl Security /ms:524288000 /rt:false"
+        "wevtutil sl Security /ms:524288000 /rt:false;"
     )
     script = " ".join(script_lines)
 
@@ -20135,14 +20141,38 @@ class MainWindow(QMainWindow):
                                 _seen_acl_paths.add(_pk)
                                 script_lines.append(_ps_sacl_block(parent))
 
+                    # Each statement MUST be ';'-terminated — the lines are
+                    # " ".join()'d into ONE PowerShell -Command string, so a missing
+                    # terminator collapses 'auditpol ...' and 'wevtutil ...' into a
+                    # single line and wevtutil's args get passed to auditpol, which
+                    # fails with "Error 0x00000057 ... The parameter is incorrect"
+                    # and wevtutil never runs → the audit policy is never enabled →
+                    # no 4663/4656 events → SACL produces nothing. Per-step markers
+                    # (AUDITPOL_SET_RC / WEVTUTIL_RC) plus a final 'auditpol /get'
+                    # are emitted so the captured stdout pinpoints exactly which step
+                    # failed if SACL still doesn't work.
+                    script_lines.append("$ErrorActionPreference='Continue';")
                     script_lines.append(
-                        "auditpol /set /subcategory:'File System' /success:enable /failure:enable"
+                        "auditpol /set /subcategory:'File System' "
+                        "/success:enable /failure:enable; "
+                        "Write-Output ('AUDITPOL_SET_RC=' + $LASTEXITCODE);"
                     )
                     script_lines.append(
-                        "wevtutil sl Security /ms:524288000 /rt:false"
+                        "wevtutil sl Security /ms:524288000 /rt:false; "
+                        "Write-Output ('WEVTUTIL_RC=' + $LASTEXITCODE);"
+                    )
+                    # Verification step: prints the resulting policy so the log shows
+                    # whether 'File System' auditing is actually ON afterwards.
+                    script_lines.append(
+                        "auditpol /get /subcategory:'File System';"
                     )
                     batch_script = " ".join(script_lines)
                     _elevated = _is_process_elevated()
+                    _lg.info(
+                        f"[startup_sacl_smb] SACL batch ({len(needs_sacl)} share(s), "
+                        f"elevated={_elevated}) about to run; script="
+                        f"{batch_script!r}"
+                    )
 
                     # ── Attempt 1: run in-process (NO UAC) ────────────────────
                     # Only useful when the app is ALREADY elevated — the child
@@ -20166,17 +20196,43 @@ class MainWindow(QMainWindow):
                                 capture_output=True, text=True, timeout=120,
                                 creationflags=_WIN_NO_WINDOW,
                             )
-                            if r1.returncode == 0:
+                            # Always log the full captured output — it contains the
+                            # AUDITPOL_SET_RC / WEVTUTIL_RC markers and the final
+                            # 'auditpol /get' dump, which tell us exactly why SACL
+                            # did or didn't take effect (rc=0 alone is not proof the
+                            # audit policy enabled — auditpol can print an error yet
+                            # still exit 0 in some cases).
+                            _lg.info(
+                                f"[startup_sacl_smb] Batch in-process result: "
+                                f"rc={r1.returncode} "
+                                f"stdout={(r1.stdout or '').strip()!r} "
+                                f"stderr={(r1.stderr or '').strip()!r}"
+                            )
+                            _out_combined = (r1.stdout or "") + (r1.stderr or "")
+                            _policy_ok = (
+                                "AUDITPOL_SET_RC=0" in _out_combined
+                                and "WEVTUTIL_RC=0" in _out_combined
+                            )
+                            if r1.returncode == 0 and _policy_ok:
                                 _batch_ok = True
                                 _lg.info(
                                     "[startup_sacl_smb] Batch SACL configured "
-                                    "in-process (already elevated) for all shares."
+                                    "in-process (already elevated) for all shares "
+                                    "— audit policy + log size confirmed enabled."
+                                )
+                            elif r1.returncode == 0 and not _policy_ok:
+                                _lg.warning(
+                                    "[startup_sacl_smb] Batch ran (rc=0) but the "
+                                    "AUDITPOL_SET_RC=0/WEVTUTIL_RC=0 markers were NOT "
+                                    "both present — the audit policy or log-size step "
+                                    "did not succeed; SACL will produce no events. "
+                                    "See the full stdout above for which step failed."
                                 )
                             else:
                                 _lg.warning(
                                     f"[startup_sacl_smb] Batch in-process attempt "
-                                    f"failed (rc={r1.returncode}): "
-                                    f"{(r1.stderr or r1.stdout)[:300]!r}"
+                                    f"failed (rc={r1.returncode}) — see full stdout/"
+                                    f"stderr logged above."
                                 )
                         except _sacl_smb_sub.TimeoutExpired:
                             _lg.warning(
