@@ -2682,7 +2682,27 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
             )
             _s1bp_logon_id  = result.get("_s1b_logon_id", "").strip()
             _s1bp_event_id  = result.get("_s1b_event_id", 0)
-            
+
+            # Shared wevtutil connection args for ALL Strategy1b-post 4624 lookups.
+            # For a self-hosted share (host == this machine) query the LOCAL Security
+            # log (no /r /u /p) with the elevated process token — the /r:<self> form
+            # fails with Access Denied unless Remote Event Log Management is enabled.
+            # These 4624/TargetLogonId lookups are what attribute a write to the
+            # remote coworker, so they must work locally for same-host watches.
+            _s1bp_same_host = False
+            try:
+                import socket as _s1bp_sock0
+                _s1bp_oh0 = _s1bp_sock0.gethostname().lower()
+                _s1bp_oi0 = _s1bp_sock0.gethostbyname(_s1bp_oh0)
+                _s1bp_same_host = bool(
+                    host.lower() == _s1bp_oh0 or (_s1bp_oi0 and host == _s1bp_oi0)
+                )
+            except Exception:
+                pass
+            _s1bp_conn = [] if _s1bp_same_host else [
+                f"/r:{host}", f"/u:{_win_user}", f"/p:{_win_pass}",
+            ]
+
             _s1bp_parent_only = result.get("_s1b_parent_only_match", False)
             _s1bp_logon_id_is_reliable = (
                 (_s1bp_event_id == 4663)
@@ -4178,7 +4198,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 )
                                 _lc_cmd = [
                                     "wevtutil", "qe", "Security",
-                                    f"/r:{host}", f"/u:{_win_user}", f"/p:{_win_pass}",
+                                    *_s1bp_conn,
                                     "/rd:true", "/c:2000", "/f:xml", f"/q:{_lc_query}",
                                 ]
                                 _lc_result = _s1bp_sp.run(
@@ -4444,6 +4464,14 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                 raise _S1BPostDone()  # use local sentinel to break out cleanly
 
             # ── Slow path: separate wevtutil query (may fail with Access Denied) ─
+            # Uses the shared _s1bp_conn (local for same-host) computed above so the
+            # exact-TargetLogonId 4624 lookup can run against the LOCAL Security log.
+            if _s1bp_same_host:
+                _qna.info(
+                    f"[_query_smb_audit] Strategy1b-post: same-host ({host!r}) — "
+                    f"running the TargetLogonId/4624 lookup against the LOCAL Security "
+                    f"log (no /r:), elevated token (avoids remote-RPC Access Denied)."
+                )
             if _s1bp_logon_id:
                 _s1bp_query = (
                     f"*[System[EventID=4624] and "
@@ -4451,9 +4479,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                 )
                 _s1bp_cmd = [
                     "wevtutil", "qe", "Security",
-                    f"/r:{host}",
-                    f"/u:{_win_user}",
-                    f"/p:{_win_pass}",
+                    *_s1bp_conn,
                     "/rd:true",
                     "/c:1",
                     "/f:xml",
@@ -4462,9 +4488,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
             else:
                 _s1bp_cmd = [
                     "wevtutil", "qe", "Security",
-                    f"/r:{host}",
-                    f"/u:{_win_user}",
-                    f"/p:{_win_pass}",
+                    *_s1bp_conn,
                     "/rd:true",
                     "/c:2000",
                     "/f:xml",
@@ -4516,9 +4540,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                 )
                 _fb_cmd = [
                     "wevtutil", "qe", "Security",
-                    f"/r:{host}",
-                    f"/u:{_win_user}",
-                    f"/p:{_win_pass}",
+                    *_s1bp_conn,
                     "/rd:true",
                     "/c:50",
                     "/f:xml",
@@ -4649,9 +4671,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                     )
                     _wq_cmd = [
                         "wevtutil", "qe", "Security",
-                        f"/r:{host}",
-                        f"/u:{_win_user}",
-                        f"/p:{_win_pass}",
+                        *_s1bp_conn,
                         "/rd:true",
                         "/c:2000",
                         "/f:xml",
@@ -5272,9 +5292,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 )
                                 _lar_wq_cmd = [
                                     "wevtutil", "qe", "Security",
-                                    f"/r:{host}",
-                                    f"/u:{_win_user}",
-                                    f"/p:{_win_pass}",
+                                    *_s1bp_conn,
                                     "/rd:true",
                                     "/c:2000",
                                     "/f:xml",
