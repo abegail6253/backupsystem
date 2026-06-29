@@ -9278,6 +9278,68 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                             f"own_active_veto={_own_active_veto_fired_pm} "
                             f"burst_patch_tag={_bp_tag_str!r}]"
                         )
+
+                        # ── SACL/AUDIT AUTHORITY (same-host) ─────────────────
+                        # The heuristic above is best-effort and, on a same-host
+                        # share where the coworker uses the same workgroup username
+                        # and keeps the share mapped 24/7, CANNOT distinguish their
+                        # write from a local one — the SMB snapshot is identical.
+                        # Before returning the conservative NTFS-owner (local) guess,
+                        # consult the Windows Security audit log (SACL): the only
+                        # definitive source of the real writer's authenticated IP.
+                        # If it confidently names a REMOTE writer, that OVERRIDES the
+                        # heuristic; otherwise we keep the local fallback. This is a
+                        # no-op when SACL isn't enabled yet or the 4663/4656 event
+                        # isn't queryable — _query_smb_audit returns no identity and
+                        # the original NTFS-owner result is returned unchanged.
+                        try:
+                            _pm_audit = _query_smb_audit(
+                                remote_host, filepath,
+                                event_type or "unknown",
+                                timestamp_iso or __import__("datetime").datetime.now().isoformat(),
+                                smb_audit_cfg=smb_audit_cfg or {},
+                                is_dest_watch=is_dest_watch,
+                            )
+                        except Exception as _pm_ae:
+                            _pm_audit = {}
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
+                                f"query raised {_pm_ae!r} — keeping NTFS-owner fallback"
+                            )
+                        _pm_audit = _pm_audit or {}
+                        _pm_user    = _pm_audit.get("user") or ""
+                        _pm_machine = (_pm_audit.get("machine") or "")
+                        _pm_ip      = _pm_audit.get("ip") or ""
+                        # "Confident remote" = audit produced an identity whose IP and
+                        # machine are NOT this host. own_ip / own_host = local.
+                        _pm_is_remote = bool(
+                            (_pm_user or _pm_machine)
+                            and _pm_ip
+                            and _pm_ip != _own_ip_gei0
+                            and _pm_machine.lower() not in ("", _own_host_gei0)
+                        )
+                        if _pm_is_remote:
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
+                                f"FIRED — the Security audit log definitively attributes "
+                                f"{filepath!r} to a REMOTE writer "
+                                f"(user={_pm_user!r} machine={_pm_machine!r} ip={_pm_ip!r}); "
+                                f"overriding the conservative NTFS-owner (local) "
+                                f"heuristic fallback. [authority=SACL]"
+                            )
+                            info.update(_pm_audit)
+                            info.pop("_ntfs_fallback_candidate_ip", None)
+                            info.pop("_veto_ntfs_fallback_candidate_ip", None)
+                            return info
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
+                            f"not applied — audit log returned no confident remote "
+                            f"writer (user={_pm_user!r} machine={_pm_machine!r} "
+                            f"ip={_pm_ip!r}); keeping NTFS-owner (local) fallback. "
+                            f"If this write was the coworker's, confirm 'File System' "
+                            f"auditing is enabled (auditpol) and the Security log is "
+                            f"not full/rotated."
+                        )
                         return info
 
                     # ── NFE file-handle cross-check (informational only) ─────────────
