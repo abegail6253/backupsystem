@@ -2241,6 +2241,130 @@ class TestSingleSnapshotOwnActiveVeto:
         )
 
 
+class TestSingleSnapshotOwnActiveVetoUncPoll:
+    """Regression (2026-06-29, Bug C): .106 (local) adds two files but both show
+    as .105 (coworker) — the unc_poll / long-lived-session variant of
+    TestSingleSnapshotOwnActiveVeto.
+
+    Sequence from user log export (08:54:02):
+      1. .106 (local) adds Screenshot 2026-06-26 101128.png and 133759.png.
+      2. The watchdog handler is mid buffer-overflow storm, so the 15s UNC poll
+         catches the two adds FIRST → detection_source='unc_poll'
+         (the watchdog duplicates are later DEDUP-dropped).
+      3. The local CREATE fires SMB CHANGE_NOTIFY → .105's idle_time is reset
+         268s → 0.
+      4. NetSessionEnum snapshot: .105 idle=0, active_time=1954s,
+         own_min_idle=0 (the local machine's own session is ACTIVE — it just
+         wrote), own_min_active=1836s (a long-lived "drive mapped all day"
+         loopback, NOT a fresh sub-30s loopback).
+      5. One prior idle snapshot ~10s ago: .105 idle=268s (high).
+
+    BUG: the OWN-ACTIVE VETO / STALE-LOOPBACK / WATCHDOG-GUARD machinery was all
+    gated on `_is_watchdog_same_host = (detection_source == 'watchdog')`, which is
+    FALSE for unc_poll.  So HIGH-IDLE-GENUINE fired via `not _is_watchdog_same_host`
+    (prior_idle=268 > 20 + no recent own-write in cache) and credited the local
+    write to .105 — even though own_min_idle=0 shows the local session is active
+    and the remote's idle=0 is just a CHANGE_NOTIFY echo of the local write.
+    (Even via watchdog this exact signature would have mis-fired through
+    STALE-LOOPBACK-GENUINE, which bypasses the veto for own_min_active > 300s.)
+
+    FIX: an OWN-ACTIVE GUARD applied to ALL detection sources — when the local
+    machine has an active SMB session (own_min_idle ≤ 5s) and there is no positive
+    remote evidence (no open handle, no confirmed burst), HIGH-IDLE-GENUINE is
+    blocked → conservative fallback to the NTFS owner (.106).  own_min_idle=None
+    (local genuinely absent) still allows HIGH-IDLE-GENUINE to fire for real
+    remote writes (see the genuine-remote test above).
+    """
+
+    OWN_HOST        = "desktop-0edubap"
+    OWN_IP          = "192.168.254.106"
+    COWORKER_IP     = "192.168.254.105"
+    SHARED_USERNAME = "user"
+
+    @pytest.fixture(autouse=True)
+    def _reset_module_caches(self):
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+        yield
+        da._same_host_nfe_available = None
+        da._same_host_net_file_available = None
+        da._same_host_nfe_sig = None
+        da._recent_remote_write_ts.clear()
+        da._recent_own_write_ts.clear()
+
+    def test_own_add_via_unc_poll_not_misattributed_to_high_prior_idle_coworker(self):
+        """Local add detected via unc_poll must NOT be credited to a high-prior-idle
+        coworker when the local SMB session is active (own_min_idle=0) and there is
+        no open handle / confirmed burst.  HIGH-IDLE-GENUINE must be blocked for
+        unc_poll the same way it is for watchdog → NTFS owner (.106)."""
+        filepath = (
+            f"\\\\{self.OWN_IP}\\testshare\\"
+            f"Screenshot 2026-06-26 101128.png"
+        )
+
+        # NFE: no open handles (local write closed before attribution).
+        mock_win32net = MagicMock()
+        mock_win32net.NetFileEnum.return_value = ([], 0, 0)
+
+        mock_win32api = MagicMock()
+        mock_win32api.GetUserName.return_value = self.SHARED_USERNAME
+
+        # NTFS owner = own machine (.106) — the correct answer.
+        mock_win32security = MagicMock()
+        mock_win32security.OWNER_SECURITY_INFORMATION = 1
+        mock_sd = MagicMock()
+        mock_sd.GetSecurityDescriptorOwner.return_value = "S-1-5-21-fake-sid"
+        mock_win32security.GetFileSecurity.return_value = mock_sd
+        mock_win32security.LookupAccountSid.return_value = (
+            self.SHARED_USERNAME, self.OWN_HOST.upper(), 1,
+        )
+
+        # .105 session: idle=0 (CHANGE_NOTIFY reset from local write),
+        # active_time=1954s, own_min_idle=0 (local session ACTIVE),
+        # own_min_active=1836s (long-lived loopback, > 300s → STALE-LOOPBACK region,
+        # NOT a fresh sub-30s loopback that LOOPBACK-LOCAL would already catch).
+        coworker_snapshot = [{
+            "username":            self.SHARED_USERNAME,
+            "machine":             self.COWORKER_IP,
+            "ip":                  self.COWORKER_IP,
+            "idle_time":           0,
+            "active_time":         1954,
+            "own_min_idle_time":   0,
+            "own_min_active_time": 1836,
+        }]
+
+        # One prior idle snapshot ~10s before the event: .105 idle=268s (high —
+        # looks like a genuine pre-write idle, but it dropped to 0 only because of
+        # the CHANGE_NOTIFY echo of .106's own write).
+        prior_idle_history = [(time.time() - 10, 268)]
+
+        with patch("socket.gethostname",  return_value=self.OWN_HOST), \
+             patch("socket.gethostbyname", return_value=self.OWN_IP), \
+             patch("watcher.get_recent_idle_history", return_value=prior_idle_history), \
+             patch.dict(sys.modules, {"win32net": mock_win32net,
+                                      "win32api": mock_win32api,
+                                      "win32security": mock_win32security}):
+            # No prior .105 burst (coworker was only monitoring) and no prior own
+            # write recorded in cache — so attribution rests solely on the snapshot.
+            info = da._get_editor_info(
+                filepath,
+                detection_source="unc_poll",
+                event_type="added",
+                smb_sessions_snapshot=coworker_snapshot,
+            )
+
+        assert info["ip"] == self.OWN_IP, (
+            f"Local add detected via unc_poll was misattributed to coworker "
+            f"{self.COWORKER_IP!r}: with own_min_idle=0 (local session active) and "
+            f"no open handle / confirmed burst, HIGH-IDLE-GENUINE must be blocked "
+            f"and NTFS owner (.106) used: {info!r}"
+        )
+        assert info["machine"] != self.COWORKER_IP
+
+
 class TestVetoFallbackBurstPatch:
     """Regression (2026-06-25): .105 adds two files concurrently; one caught by NFE,
     the other falls through OWN-ACTIVE VETO → NTFS fallback → .106.  After the NFE

@@ -8627,14 +8627,40 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                                                     f"own_active_veto={_own_active_veto} "
                                                     f"stale_loopback_genuine={_own_veto_stale_loopback_genuine}]"
                                                 )
+                                            # OWN-ACTIVE GUARD (all detection sources, incl.
+                                            # unc_poll / unc_notify — NOT just 'watchdog'): if the
+                                            # local machine has an ACTIVE SMB session at write time
+                                            # (own_min_idle ≤ 5s), a remote session's idle=0 — even
+                                            # after a very high prior_idle — is explainable as a
+                                            # CHANGE_NOTIFY echo of a LOCAL write (a local file CREATE
+                                            # resets every connected client's idle_time to 0
+                                            # regardless of how long they were idle before). Without
+                                            # POSITIVE remote evidence (an open handle via Step0 or a
+                                            # confirmed burst sibling — both handled elsewhere),
+                                            # HIGH-IDLE-GENUINE must NOT credit the remote here; fall
+                                            # back to the NTFS owner (local) conservatively.
+                                            # own_min_idle is None when the local machine had NO
+                                            # active session (genuine remote-only activity) → guard
+                                            # does NOT apply and HIGH-IDLE-GENUINE still fires.
+                                            # Fixes: local writes (.106) detected via unc_poll being
+                                            # credited to a high-prior-idle coworker (.105) — the old
+                                            # gate only applied OWN-ACTIVE logic to
+                                            # detection_source='watchdog' and STALE-LOOPBACK-GENUINE
+                                            # even bypassed it for long-lived local sessions.
+                                            _own_active_now = (
+                                                _own_min_idle is not None and
+                                                _own_min_idle <= _OWN_ACTIVE_VETO_THRESHOLD
+                                            )
                                             if (
                                                 _min_prior_idle is not None and
                                                 _min_prior_idle > _HIGH_IDLE_GENUINE_THRESHOLD and
                                                 _no_recent_own_write and
+                                                not _own_active_now and
                                                 (not _is_watchdog_same_host or _watchdog_guard_bypassed)
                                             ):
-                                                # High prior idle + no recent local write =
-                                                # genuine remote write signal even with 1 snapshot.
+                                                # High prior idle + no recent local write +
+                                                # local session NOT active = genuine remote write
+                                                # signal even with 1 snapshot.
                                                 _monitor_reason = (
                                                     f"only {len(_idle_history)} prior snapshot(s) — "
                                                     f"but prior_idle={_min_prior_idle}s > "
@@ -8683,7 +8709,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                                                     f"no_recent_own_write={_no_recent_own_write}, "
                                                     f"is_watchdog_same_host={_is_watchdog_same_host}. "
                                                     f"HIGH-IDLE-GENUINE blocked: "
-                                                    f"{'watchdog same-host write (local filesystem write detected)' if _is_watchdog_same_host else 'prior_idle too low or own-write in cache'}. "
+                                                    f"{'local SMB session active (own_min_idle<=%ds) — remote idle=0 is a CHANGE_NOTIFY echo of a local write' % _OWN_ACTIVE_VETO_THRESHOLD if _own_active_now else ('watchdog same-host write (local filesystem write detected)' if _is_watchdog_same_host else 'prior_idle too low or own-write in cache')}. "
                                                     f"Falling back to NTFS owner (conservative). "
                                                     f"[debug: prior_idle={_min_prior_idle!r}s threshold={_HIGH_IDLE_GENUINE_THRESHOLD}s bypass_threshold={_WATCHDOG_GUARD_BYPASS_IDLE}s own_min_idle={_own_min_idle!r}s own_active_veto={_own_active_veto} stale_loopback_genuine={locals().get('_own_veto_stale_loopback_genuine', False)} no_recent_own_write={_no_recent_own_write} is_watchdog_same_host={_is_watchdog_same_host} watchdog_guard_bypassed={_watchdog_guard_bypassed} BURST_WINDOW_S={_BURST_WINDOW_S}s]"
                                                 )
