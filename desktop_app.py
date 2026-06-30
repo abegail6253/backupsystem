@@ -3229,6 +3229,13 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                     result["user"]    = _s1bp_user_full
                     _s1bp_matched = True
                     _match_method = "PreFetched-LogonId" if (_s1bp_logon_id and _pf_lid.lower() == _s1bp_logon_id.lower()) else "PreFetched-Closest"
+                    # Mark whether this REMOTE attribution is backed by a real 4663→4624
+                    # LogonId correlation (cryptographic proof) vs a mere time-window
+                    # guess.  On a same-host watch the SACL-AUDIT-OVERRIDE must only fire
+                    # for LogonId-confirmed remotes — otherwise a NetSessionEnum fallback
+                    # (the coworker's persistent bystander session) wrongly flips a local
+                    # write to the coworker.
+                    result["_sacl_confirmed_remote"] = ("LogonId" in _match_method)
                     _qna.info(
                         f"[_query_smb_audit] Strategy1b-post ({_match_method}): "
                         f"server-local {_old_user!r}/{_old_machine!r}/{_old_ip!r} "
@@ -5151,6 +5158,10 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             result["user"]    = _s1bp_user_full
                             _s1bp_matched = True
                             _match_method = "LogonId" if (_logon_id_match or _xpath_exact_query) else "TimeWindow-Closest"
+                            # Mark LogonId-confirmed remotes (see PreFetched path above) so
+                            # the same-host SACL-AUDIT-OVERRIDE only trusts cryptographically
+                            # proven remote writers, not time-window guesses.
+                            result["_sacl_confirmed_remote"] = ("LogonId" in _match_method)
                             _qna.info(
                                 f"[_query_smb_audit] Strategy1b-post (4624 {_match_method}): "
                                 f"server-local {_old_user!r}/{_old_machine!r}/{_old_ip!r} "
@@ -9395,6 +9406,25 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                             and _pm_ip != _own_ip_gei0
                             and _pm_machine.lower() not in ("", _own_host_gei0)
                         )
+                        # On a SAME-HOST watch the only trustworthy "remote" signal is a
+                        # 4663→4624 LogonId correlation in the Security audit log.  When
+                        # the 4663 event isn't in the log yet, _query_smb_audit falls back
+                        # to NetSessionEnum (Strategy4), which on a self-hosted share always
+                        # returns the coworker's persistent bystander session — that is NOT
+                        # proof they wrote the file.  So for same-host, require the audit
+                        # result to be LogonId-confirmed before firing the override;
+                        # otherwise treat it as inconclusive and keep the local NTFS owner.
+                        if _pm_is_remote and _is_same_host_watch and not _pm_audit.get("_sacl_confirmed_remote"):
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
+                                f"SUPPRESSED (same-host) — audit named a remote identity "
+                                f"(user={_pm_user!r} machine={_pm_machine!r} ip={_pm_ip!r}) "
+                                f"but it is NOT backed by a 4663→4624 LogonId correlation "
+                                f"(likely a NetSessionEnum bystander session for the "
+                                f"coworker who keeps the share mapped). NOT overriding the "
+                                f"local NTFS owner. [authority=SACL]"
+                            )
+                            _pm_is_remote = False
                         if _pm_is_remote:
                             _gei.info(
                                 f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
@@ -9639,6 +9669,10 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                 and _del_ip
                 and _del_ip != _own_ip_gei0
                 and _del_mach.lower() not in ("", _own_host_gei0)
+                # Require a real 4663→4624 LogonId correlation — a NetSessionEnum
+                # fallback (the coworker's persistent bystander session) is NOT proof
+                # they deleted the file on a self-hosted share.
+                and _del_audit.get("_sacl_confirmed_remote")
             )
             if _del_is_remote:
                 info.update(_del_audit)
@@ -9650,9 +9684,11 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                     f"using it (overrides snapshot/cache bystander guess). [authority=SACL]"
                 )
                 return info
-            if _del_user or _del_audit.get("_sacl_confirmed_local"):
+            if _del_audit.get("_sacl_confirmed_local"):
                 # SACL resolved the delete to the LOCAL share owner — display the
                 # local identity instead of the coworker's bystander session.
+                # (Require the explicit confirmed-local flag: a bare user from a
+                # NetSessionEnum fallback would be the coworker's identity, not local.)
                 info.update(_del_audit)
                 info.pop("session_cache_candidates", None)
                 info["_sacl_confirmed_local"] = True
