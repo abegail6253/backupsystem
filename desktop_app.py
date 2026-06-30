@@ -9606,6 +9606,70 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
     if is_unc and remote_host:
         _gei.debug(f"[_get_editor_info] UNC path — SMB host={remote_host!r}")
 
+        # ── Same-host DELETE: SACL is the only authority ─────────────────────
+        # On a self-hosted share a local delete by the share owner produces NO
+        # SMB session — local file I/O bypasses the SMB stack.  So the live
+        # snapshot (Step0) and the 24h session cache (Step0b) only ever see the
+        # coworker's persistent bystander session, and both would blindly return
+        # it as the deleter.  The NTFS owner lookup (Step1) also fails because
+        # the file is already gone.  The Windows Security audit log (4663/4660
+        # DELETE correlated to a 4624 logon) is the ONLY source that can tell a
+        # local delete from a remote one — consult it BEFORE the snapshot/cache
+        # so a local deletion is not misattributed to the coworker.
+        if _is_same_host_watch and event_type == "deleted":
+            try:
+                _del_audit = _query_smb_audit(
+                    remote_host, filepath, event_type,
+                    timestamp_iso or __import__("datetime").datetime.now().isoformat(),
+                    smb_audit_cfg=smb_audit_cfg or {},
+                    is_dest_watch=is_dest_watch,
+                )
+            except Exception as _del_ae:
+                _del_audit = {}
+                _gei.info(
+                    f"[_get_editor_info] same-host DELETE: SACL audit query raised "
+                    f"{_del_ae!r} — falling through to snapshot/cache heuristics."
+                )
+            _del_audit = _del_audit or {}
+            _del_user = _del_audit.get("user") or ""
+            _del_mach = (_del_audit.get("machine") or "")
+            _del_ip   = _del_audit.get("ip") or ""
+            _del_is_remote = bool(
+                (_del_user or _del_mach)
+                and _del_ip
+                and _del_ip != _own_ip_gei0
+                and _del_mach.lower() not in ("", _own_host_gei0)
+            )
+            if _del_is_remote:
+                info.update(_del_audit)
+                info.pop("session_cache_candidates", None)
+                _gei.info(
+                    f"[_get_editor_info] same-host DELETE: SACL audit definitively "
+                    f"attributes {filepath!r} to a REMOTE deleter "
+                    f"(user={_del_user!r} machine={_del_mach!r} ip={_del_ip!r}) — "
+                    f"using it (overrides snapshot/cache bystander guess). [authority=SACL]"
+                )
+                return info
+            if _del_user or _del_audit.get("_sacl_confirmed_local"):
+                # SACL resolved the delete to the LOCAL share owner — display the
+                # local identity instead of the coworker's bystander session.
+                info.update(_del_audit)
+                info.pop("session_cache_candidates", None)
+                info["_sacl_confirmed_local"] = True
+                _gei.info(
+                    f"[_get_editor_info] same-host DELETE: SACL audit DEFINITIVELY "
+                    f"confirmed a LOCAL deleter for {filepath!r} "
+                    f"(user={_del_user!r} machine={_del_mach!r} ip={_del_ip!r}) — "
+                    f"using local identity instead of the coworker's bystander "
+                    f"session. [authority=SACL]"
+                )
+                return info
+            _gei.info(
+                f"[_get_editor_info] same-host DELETE: SACL audit inconclusive "
+                f"(no 4663/4660 match) — falling through to snapshot/cache heuristics. "
+                f"filepath={filepath!r}"
+            )
+
         # Step 0: use pre-captured SMB session snapshot if available.
         # The snapshot is taken at watchdog fire time — before the 2s debounce
         # delay closes the session. This is the only reliable way to identify
