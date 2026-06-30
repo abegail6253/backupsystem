@@ -4424,6 +4424,9 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             )
                             result["machine"] = result.get("machine") or host
                             result["ip"]      = host
+                            # SACL definitively resolved this write to the LOCAL machine —
+                            # protect it from retroactive BURST-PATCH re-attribution.
+                            result["_sacl_confirmed_local"] = True
                             # ── Burst cache: store LOCAL attribution so concurrent PARENT-ONLY
                             # sibling files can reuse it instead of returning Unknown.
                             # CRITICAL: must store with local_actor=True so that the staleness-guard
@@ -5753,6 +5756,12 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                         f"Keeping 4663: user={result.get('user')!r} "
                         f"machine={result.get('machine')!r} ip={result.get('ip')!r}"
                     )
+                    # SACL definitively resolved this write to the LOCAL machine (the
+                    # 4663 object-access event correlated to a loopback/own 4624 logon).
+                    # Mark it so the BURST-PATCH never retroactively re-attributes this
+                    # entry to a coworker just because a *different* file in the same
+                    # burst turned out to be remote.
+                    result["_sacl_confirmed_local"] = True
                     # ── Burst cache: store LOCAL attribution so concurrent
                     # PARENT-ONLY sibling files can reuse it instead of returning Unknown.
                     _la_server_user = result.get("user", "")
@@ -9398,6 +9407,24 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                             info.update(_pm_audit)
                             info.pop("_ntfs_fallback_candidate_ip", None)
                             info.pop("_veto_ntfs_fallback_candidate_ip", None)
+                            return info
+                        if _pm_audit.get("_sacl_confirmed_local"):
+                            # SACL definitively named the LOCAL machine as the writer.
+                            # Drop the NTFS-fallback burst-patch candidate tags and mark
+                            # the entry SACL-confirmed so a later remote sibling in the
+                            # same burst can never retroactively flip this row to a
+                            # coworker.
+                            info.pop("_ntfs_fallback_candidate_ip", None)
+                            info.pop("_veto_ntfs_fallback_candidate_ip", None)
+                            info["_sacl_confirmed_local"] = True
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
+                                f"not applied but audit DEFINITIVELY confirmed a LOCAL "
+                                f"writer for {filepath!r} (user={_pm_user!r} "
+                                f"machine={_pm_machine!r} ip={_pm_ip!r}) — cleared "
+                                f"burst-patch candidate tags so this row is protected "
+                                f"from retroactive remote re-attribution. [authority=SACL]"
+                            )
                             return info
                         _gei.info(
                             f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
@@ -22560,6 +22587,11 @@ class MainWindow(QMainWindow):
         entry["editor_user"]    = editor["user"]
         entry["editor_machine"] = editor["machine"]
         entry["editor_ip"]      = editor["ip"]
+        # SACL definitively confirmed this write as LOCAL — mark the entry so the
+        # BURST-PATCH never re-attributes it to a coworker who happened to write a
+        # DIFFERENT file in the same burst.
+        if editor.get("_sacl_confirmed_local"):
+            entry["_sacl_confirmed_local"] = True
         # Propagate the NTFS-fallback candidate IP tag (set when persistent-monitor
         # fell back to NTFS owner but a single remote session was in the snapshot).
         # BURST-PATCH uses this to retroactively fix the entry when a sibling file
@@ -23014,6 +23046,7 @@ class MainWindow(QMainWindow):
                         # genuine local adds from earlier in the session).
                         _burst_is_ntfs_fallback_sibling = (
                             not _burst_is_unknown
+                            and not _burst_older.get("_sacl_confirmed_local")
                             and _burst_older.get("_fallback_candidate_ip") == _burst_new_ip
                             and _burst_older.get("editor_ip") != _burst_new_ip
                             and _burst_older.get("type") == entry.get("type")
@@ -23043,6 +23076,7 @@ class MainWindow(QMainWindow):
                         _veto_age_s = _bp_now - _burst_older.get("_veto_fallback_ts", _bp_now)
                         _burst_is_veto_fallback_sibling = (
                             not _burst_is_unknown
+                            and not _burst_older.get("_sacl_confirmed_local")
                             and not _burst_is_ntfs_fallback_sibling
                             and _burst_older.get("_veto_fallback_candidate_ip") == _burst_new_ip
                             and _burst_older.get("editor_ip") != _burst_new_ip
@@ -23156,8 +23190,10 @@ class MainWindow(QMainWindow):
                                 _bp_mono_now = _bpd_time.monotonic()
                                 for _bp_r in reversed(_bp_history_ref):
                                     _is_unk = _bp_r.get("editor_user") in ("Unknown", "")
+                                    _is_sacl_local = bool(_bp_r.get("_sacl_confirmed_local"))
                                     _is_fb  = (
                                         not _is_unk
+                                        and not _is_sacl_local
                                         and _bp_r.get("_fallback_candidate_ip") == _bp_ip_cap
                                         and _bp_r.get("editor_ip") != _bp_ip_cap
                                     )
@@ -23193,6 +23229,7 @@ class MainWindow(QMainWindow):
                                         _veto_age = 0.0
                                     _is_veto_fb = (
                                         not _is_unk
+                                        and not _is_sacl_local
                                         and not _is_fb
                                         and _veto_fb_cand == _bp_ip_cap
                                         and _bp_r.get("editor_ip") != _bp_ip_cap
