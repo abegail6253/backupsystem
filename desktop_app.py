@@ -9567,6 +9567,91 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                             f"(file_handles=0 is normal — write handle closes before attribution runs)"
                         )
 
+                    # ── SACL AUTHORITY (same-host burst-override / snapshot trust) ──
+                    # On a self-hosted share this "single recently-active remote
+                    # session overrides NTFS owner" path is reached for a file with
+                    # NO matching NetFileEnum handle — i.e. the snapshot/burst-override
+                    # heuristic is the ONLY evidence.  That heuristic cannot tell the
+                    # coworker's persistent bystander session apart from a local write:
+                    # a genuine remote burst seconds ago makes the share owner's NEXT
+                    # local write look like a "remote burst sibling" (BURST-OVERRIDE
+                    # FIRED).  Unlike the persistent-monitor fallback below, this path
+                    # returns REMOTE without ever consulting the Security audit log.
+                    # Before trusting it, consult SACL — the only definitive source.
+                    # Fire REMOTE only on a 4663→4624 LogonId-confirmed remote; for a
+                    # confirmed-local or inconclusive result keep the local NTFS owner.
+                    if _is_same_host_watch:
+                        try:
+                            _bo_audit = _query_smb_audit(
+                                remote_host, filepath,
+                                event_type or "unknown",
+                                timestamp_iso or __import__("datetime").datetime.now().isoformat(),
+                                smb_audit_cfg=smb_audit_cfg or {},
+                                is_dest_watch=is_dest_watch,
+                            )
+                        except Exception as _bo_ae:
+                            _bo_audit = {}
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: burst-override SACL "
+                                f"check raised {_bo_ae!r} — keeping local NTFS owner"
+                            )
+                        _bo_audit = _bo_audit or {}
+                        _bo_user    = _bo_audit.get("user") or ""
+                        _bo_machine = (_bo_audit.get("machine") or "")
+                        _bo_ip      = _bo_audit.get("ip") or ""
+                        _bo_is_remote = bool(
+                            (_bo_user or _bo_machine)
+                            and _bo_ip
+                            and _bo_ip != _own_ip_gei0
+                            and _bo_machine.lower() not in ("", _own_host_gei0)
+                            and _bo_audit.get("_sacl_confirmed_remote")
+                        )
+                        if _bo_is_remote:
+                            info.update(_bo_audit)
+                            info.pop("_ntfs_fallback_candidate_ip", None)
+                            info.pop("_veto_ntfs_fallback_candidate_ip", None)
+                            _record_remote_write(_bo_ip, filepath, event_type)
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: burst-override remote trust "
+                                f"CONFIRMED by SACL (LogonId) for {filepath!r} -> "
+                                f"user={info.get('user')!r} machine={info.get('machine')!r} "
+                                f"ip={info.get('ip')!r}. [authority=SACL]"
+                            )
+                            return info
+                        if _bo_audit.get("_sacl_confirmed_local"):
+                            # SACL POSITIVELY named the LOCAL machine (4663→loopback).
+                            # The burst-override guess was a bystander artifact: the
+                            # share owner's local write echoing the coworker's recent
+                            # burst.  Keep the LOCAL NTFS owner — this is THE override.
+                            if _ntfs_owner_result:
+                                info.update(_ntfs_owner_result)
+                            info["_sacl_confirmed_local"] = True
+                            info.pop("_ntfs_fallback_candidate_ip", None)
+                            info.pop("_veto_ntfs_fallback_candidate_ip", None)
+                            # Positive local evidence: safe to record so a later
+                            # coworker burst can't retroactively flip this row.
+                            _record_own_write(filepath)
+                            _gei.info(
+                                f"[_get_editor_info] Step1-early: burst-override would have "
+                                f"trusted remote session {_rs_ip!r} for {filepath!r}, but SACL "
+                                f"DEFINITIVELY confirmed a LOCAL writer (4663→loopback) — this is "
+                                f"the share owner's local write echoing the coworker's recent "
+                                f"burst, not a remote sibling. Keeping local NTFS owner "
+                                f"user={info.get('user')!r} machine={info.get('machine')!r} "
+                                f"ip={info.get('ip')!r}. [authority=SACL]"
+                            )
+                            return info
+                        # SACL inconclusive (not enabled yet / 4663 not logged / no
+                        # creds) — do NOT force local; fall through to the original
+                        # burst-override remote trust so a genuine fresh remote burst
+                        # sibling is still attributed to the coworker.
+                        _gei.info(
+                            f"[_get_editor_info] Step1-early: burst-override SACL check "
+                            f"inconclusive for {filepath!r} (audit user={_bo_user!r} "
+                            f"machine={_bo_machine!r} ip={_bo_ip!r}) — keeping the heuristic "
+                            f"remote-burst-sibling attribution. [authority=heuristic]"
+                        )
+
                     info["user"]    = _rs.get("username") or _rs.get("user") or ""
                     info["machine"] = _rs.get("machine", "").lstrip("\\")
                     info["ip"]      = _rs.get("ip", "")
