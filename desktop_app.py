@@ -21944,6 +21944,36 @@ class MainWindow(QMainWindow):
             if not hasattr(self, '_source_event_seen_lock'):
                 import threading as _see_init
                 self._source_event_seen_lock = _see_init.Lock()
+            # ── Last-accepted fingerprint map (source side) ──────────────────
+            # The dedup fingerprint check below must compare the file's current
+            # content against the fingerprint of the LAST ACCEPTED source event
+            # for this key.  We intentionally do NOT reuse self._dest_content_fp
+            # here: the FINGERPRINT-CHECK/ACCEPTED block earlier in this very
+            # pass already overwrote that entry with the CURRENT fingerprint, so
+            # comparing against it always reported "unchanged" and dropped
+            # genuine second edits (e.g. a coworker saving seconds after the
+            # local user).  _source_accepted_fp is written only when we accept an
+            # event, so it is never clobbered mid-pass.
+            if not hasattr(self, '_source_accepted_fp'):
+                self._source_accepted_fp = {}
+            # Compute the current fingerprint ONCE, outside the lock (no file I/O
+            # while holding _source_event_seen_lock).
+            _src_cur_fp = None
+            if _src_etype == "modified":
+                try:
+                    import os as _src_fp_os, hashlib as _src_fp_hl
+                    _src_fp_st = _src_fp_os.stat(entry.get("path", ""))
+                    _src_fp_h = None
+                    try:
+                        with open(entry.get("path", ""), "rb") as _src_fp_fh:
+                            _src_fp_h = _src_fp_hl.sha256(
+                                _src_fp_fh.read(65536)
+                            ).hexdigest()
+                    except Exception:
+                        _src_fp_h = None
+                    _src_cur_fp = (_src_fp_st.st_size, _src_fp_st.st_mtime, _src_fp_h)
+                except Exception:
+                    _src_cur_fp = None
             with self._source_event_seen_lock:
                 _src_last_seen = self._source_event_seen.get(_src_dedup_key)
                 _src_is_dupe = (
@@ -21953,6 +21983,11 @@ class MainWindow(QMainWindow):
                 if not _src_is_dupe:
                     # Claim the slot NOW so a racing thread sees it immediately
                     self._source_event_seen[_src_dedup_key] = _src_now
+                    # Record the accepted fingerprint so the next detector for
+                    # the SAME write is recognised as a race and dropped, while a
+                    # later genuine edit (different content) is recognised as new.
+                    if _src_etype == "modified" and _src_cur_fp is not None:
+                        self._source_accepted_fp[_src_dedup_key] = _src_cur_fp
                     if _src_etype == "added":
                         _stale_del_key = (_src_wid_norm, _src_path, "deleted")
                         if _stale_del_key in self._source_event_seen:
@@ -21967,6 +22002,12 @@ class MainWindow(QMainWindow):
                         self._source_event_seen = {
                             k: v for k, v in self._source_event_seen.items()
                             if v > _src_cutoff_dd
+                        }
+                        # Keep the accepted-fingerprint map bounded too: drop any
+                        # entry whose dedup slot has just been pruned.
+                        self._source_accepted_fp = {
+                            k: v for k, v in self._source_accepted_fp.items()
+                            if k in self._source_event_seen
                         }
 
             if _src_is_dupe:
@@ -21999,103 +22040,83 @@ class MainWindow(QMainWindow):
                         _sdd_time.sleep(0.2)
                     _src_is_dedup_upgrade = True
                 else:
-                    # Before dropping as a SOURCE DEDUP, apply the same fingerprint
-                    # check as the dest DEDUP: if the file's fingerprint changed since
-                    # the first event was claimed, it's a genuine second modification
-                    # (different user, rapid sequential edits), NOT a detector race.
+                    # Before dropping as a SOURCE DEDUP, compare the file's CURRENT
+                    # fingerprint against the fingerprint of the LAST ACCEPTED source
+                    # event for this key.  Two detectors (watchdog + unc_poll) firing
+                    # for the SAME write share the same fingerprint → safe to drop.
+                    # A genuine second modification (different user, rapid sequential
+                    # edits) has a different size/mtime/hash → must NOT be suppressed.
+                    #
+                    # We compare against self._source_accepted_fp (written only when
+                    # we accept an event) — NOT self._dest_content_fp, which the
+                    # FINGERPRINT-CHECK block earlier in this same pass already
+                    # overwrote with the current fingerprint, making the old check
+                    # always report "same fingerprint" and drop genuine edits.
                     _src_dedup_drop = True
                     if _src_etype == "modified":
-                        _src_fp_key = (_src_wid_norm, entry.get("path", "").lower())
-                        with self._dest_content_fp_lock:
-                            _src_stored_fp = self._dest_content_fp.get(_src_fp_key)
-                        if _src_stored_fp is not None:
-                            try:
-                                _src_dedup_stat = os.stat(entry.get("path", ""))
-                                _src_cur_size  = _src_dedup_stat.st_size
-                                _src_cur_mtime = _src_dedup_stat.st_mtime
-                                _src_size_mtime_match = (
-                                    _src_stored_fp[0] == _src_cur_size and
-                                    abs(float(_src_stored_fp[1]) - _src_cur_mtime) < 0.001
+                        with self._source_event_seen_lock:
+                            _src_accepted_fp = self._source_accepted_fp.get(_src_dedup_key)
+                        if _src_cur_fp is None:
+                            # Can't fingerprint the file right now — fail OPEN so we
+                            # never hide a real edit we couldn't verify.
+                            _src_is_dupe = False
+                            _src_dedup_drop = False
+                            logger.info(
+                                f"[desktop._on_file_change] SOURCE DEDUP fingerprint "
+                                f"unavailable (stat/read failed) — failing open "
+                                f"(not suppressing). watch_id={watch_id!r} "
+                                f"path={entry.get('path')!r}"
+                            )
+                        elif _src_accepted_fp is None:
+                            # No recorded accepted fingerprint to compare against —
+                            # fail OPEN rather than guess this is a detector race.
+                            _src_is_dupe = False
+                            _src_dedup_drop = False
+                            logger.info(
+                                f"[desktop._on_file_change] SOURCE DEDUP no accepted "
+                                f"fingerprint on record — failing open (not "
+                                f"suppressing). watch_id={watch_id!r} "
+                                f"path={entry.get('path')!r}"
+                            )
+                        else:
+                            _src_same = (
+                                _src_accepted_fp[0] == _src_cur_fp[0]
+                                and abs(float(_src_accepted_fp[1])
+                                        - float(_src_cur_fp[1])) < 0.001
+                            )
+                            if _src_same:
+                                _src_acc_h = (
+                                    _src_accepted_fp[2]
+                                    if len(_src_accepted_fp) >= 3 else None
                                 )
-                                _src_dedup_fp_match = _src_size_mtime_match
-                                _src_cur_hash = None
-                                if _src_size_mtime_match:
-                                    _src_stored_hash = (
-                                        _src_stored_fp[2]
-                                        if len(_src_stored_fp) >= 3
-                                        else None
-                                    )
-                                    if _src_stored_hash is None:
-                                        # No stored hash — fail open
-                                        _src_dedup_fp_match = False
-                                        logger.info(
-                                            f"[desktop._on_file_change] SOURCE DEDUP "
-                                            f"hash-missing — size+mtime match but stored "
-                                            f"fp has no hash; failing open (not suppressing) "
-                                            f"to avoid hiding a genuine second modification. "
-                                            f"stored_fp={_src_stored_fp!r} "
-                                            f"watch_id={watch_id!r} "
-                                            f"path={entry.get('path')!r}"
-                                        )
-                                    else:
-                                        try:
-                                            import hashlib as _src_dd_hl
-                                            with open(entry.get("path", ""), "rb") as _src_dd_fh:
-                                                _src_cur_hash = _src_dd_hl.sha256(
-                                                    _src_dd_fh.read(65536)
-                                                ).hexdigest()
-                                            _src_dedup_fp_match = (
-                                                _src_cur_hash == _src_stored_hash
-                                            )
-                                            if not _src_dedup_fp_match:
-                                                logger.info(
-                                                    f"[desktop._on_file_change] SOURCE DEDUP "
-                                                    f"hash-diff — size+mtime match but SHA-256 "
-                                                    f"differs (stored={_src_stored_hash!r} "
-                                                    f"current={_src_cur_hash!r}) → "
-                                                    f"genuine second modification. "
-                                                    f"watch_id={watch_id!r} "
-                                                    f"path={entry.get('path')!r}"
-                                                )
-                                        except Exception as _src_dd_err:
-                                            _src_dedup_fp_match = False
-                                            logger.info(
-                                                f"[desktop._on_file_change] SOURCE DEDUP "
-                                                f"hash-read-failed ({_src_dd_err!r}) — "
-                                                f"failing open. "
-                                                f"watch_id={watch_id!r} "
-                                                f"path={entry.get('path')!r}"
-                                            )
-                                if not _src_dedup_fp_match:
-                                    # Fingerprint changed — genuine second edit
-                                    with self._source_event_seen_lock:
-                                        self._source_event_seen.pop(_src_dedup_key, None)
-                                    _src_is_dupe = False
-                                    _src_dedup_drop = False
-                                    logger.info(
-                                        f"[desktop._on_file_change] SOURCE DEDUP BYPASS — "
-                                        f"fingerprint changed since first event "
-                                        f"(stored_size={_src_stored_fp[0]} "
-                                        f"stored_mtime={_src_stored_fp[1]:.3f} "
-                                        f"stored_hash={(_src_stored_fp[2] if len(_src_stored_fp)>=3 else None)!r} "
-                                        f"current_size={_src_cur_size} "
-                                        f"current_mtime={_src_cur_mtime:.3f} "
-                                        f"current_hash={_src_cur_hash!r}) "
-                                        f"→ treating as a second genuine modification. "
-                                        f"watch_id={watch_id!r} "
-                                        f"path={entry.get('path')!r} "
-                                        f"detection_source={entry.get('detection_source')!r}"
-                                    )
-                            except Exception as _src_stat_err:
+                                _src_cur_h = _src_cur_fp[2]
+                                if (_src_acc_h is not None and _src_cur_h is not None
+                                        and _src_acc_h != _src_cur_h):
+                                    # Size+mtime matched but content hash differs →
+                                    # genuine edit masked by mtime granularity.
+                                    _src_same = False
+                            if not _src_same:
+                                # Fingerprint changed — genuine second edit.  Refresh
+                                # the seen timestamp and accepted fingerprint so the
+                                # race partner of THIS edit is recognised and dropped.
                                 with self._source_event_seen_lock:
-                                    self._source_event_seen.pop(_src_dedup_key, None)
+                                    self._source_event_seen[_src_dedup_key] = _src_now
+                                    self._source_accepted_fp[_src_dedup_key] = _src_cur_fp
                                 _src_is_dupe = False
                                 _src_dedup_drop = False
                                 logger.info(
-                                    f"[desktop._on_file_change] SOURCE DEDUP stat-failed "
-                                    f"({_src_stat_err!r}) — failing open. "
+                                    f"[desktop._on_file_change] SOURCE DEDUP BYPASS — "
+                                    f"fingerprint changed since last accepted event "
+                                    f"(accepted_size={_src_accepted_fp[0]} "
+                                    f"accepted_mtime={float(_src_accepted_fp[1]):.3f} "
+                                    f"accepted_hash={(_src_accepted_fp[2] if len(_src_accepted_fp)>=3 else None)!r} "
+                                    f"current_size={_src_cur_fp[0]} "
+                                    f"current_mtime={float(_src_cur_fp[1]):.3f} "
+                                    f"current_hash={_src_cur_fp[2]!r}) "
+                                    f"→ treating as a second genuine modification. "
                                     f"watch_id={watch_id!r} "
-                                    f"path={entry.get('path')!r}"
+                                    f"path={entry.get('path')!r} "
+                                    f"detection_source={entry.get('detection_source')!r}"
                                 )
                     if _src_dedup_drop:
                         logger.info(
