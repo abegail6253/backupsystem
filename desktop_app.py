@@ -2808,17 +2808,83 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                     # (older Windows where SubjectLogonId is absent from 4663 XML).
                     if _s1bp_logon_id and _s1bp_logon_id_is_reliable:
                         # Event 4663: SubjectLogonId is the primary session ID.
-                        # No matching 4624 Network Logon means the session is LOCAL
-                        # (interactive/console) — treat as LOCAL actor (Scenario 3).
-                        _qna.info(
-                            f"[_query_smb_audit] Strategy1b-post: SubjectLogonId={_s1bp_logon_id!r} "
-                            f"from EventID={_s1bp_event_id} had NO matching 4624 Network Logon in "
-                            f"pre-fetched events ({len(_s1bp_prefetched)} event(s) checked) — "
-                            f"session is a LOCAL (interactive/console) logon, NOT a remote SMB "
-                            f"session. Skipping time-window fallback to avoid picking stale remote "
-                            f"sessions from earlier backup jobs. Actor is LOCAL: user={result.get('user')!r}"
-                        )
-                        # Leave _s1bp_exact = None → falls through to local-actor handling below
+                        # A miss in the pre-fetched ±900s window does NOT prove LOCAL:
+                        # a coworker who keeps the share mapped 24/7 has a 4624 Network
+                        # Logon that is HOURS old — far outside any time window.  Worse,
+                        # a fresh burst of that coworker's NEW logons can fill the
+                        # pre-fetch window without carrying the SubjectLogonId actually
+                        # referenced by this 4663, so "present but no match" is exactly
+                        # the situation where a genuine remote write looks local.
+                        # Before concluding LOCAL, run the SAME direct, time-window-FREE
+                        # TargetLogonId query the empty-pre-fetch slow path uses, to see
+                        # whether a remote 4624 with this EXACT LogonId exists anywhere in
+                        # the log.  Only a genuine no-match (or loopback/own/server) is LOCAL.
+                        _ffl_remote = None
+                        try:
+                            import xml.etree.ElementTree as _ffl_et
+                            _ffl_query = (
+                                f"*[System[EventID=4624] and "
+                                f"EventData[Data[@Name='TargetLogonId']='{_s1bp_logon_id}']]"
+                            )
+                            _ffl_cmd = [
+                                "wevtutil", "qe", "Security",
+                                *_s1bp_conn,
+                                "/rd:true", "/c:1", "/f:xml", f"/q:{_ffl_query}",
+                            ]
+                            _ffl_res = _s1bp_sp.run(
+                                _ffl_cmd, capture_output=True, text=True, timeout=15,
+                                creationflags=_CNW_1BP,
+                            )
+                            if _ffl_res.returncode == 0 and _ffl_res.stdout.strip():
+                                _ffl_root = _ffl_et.fromstring("<root>" + _ffl_res.stdout + "</root>")
+                                _ffl_ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                                for _ffl_ev in _ffl_root:
+                                    _ffl_ed = _ffl_ev.find("e:EventData", _ffl_ns)
+                                    if _ffl_ed is None:
+                                        continue
+                                    _ffl_map = {d.get("Name", ""): (d.text or "") for d in _ffl_ed if d.get("Name")}
+                                    if _ffl_map.get("LogonType", "") != "3":
+                                        continue  # not a network logon → not a remote SMB actor
+                                    _ffl_ws = _ffl_map.get("WorkstationName", "").strip("-").strip()
+                                    _ffl_ip = _ffl_map.get("IpAddress", "").strip()
+                                    if (_ffl_ip in ("127.0.0.1", "::1", "", host)
+                                            or _ffl_ws.lower() == host.lower()):
+                                        continue  # loopback / file-server itself → LOCAL
+                                    _ffl_is_own = (
+                                        (bool(_s1bp_own_ip_resolved) and _ffl_ip == _s1bp_own_ip_resolved)
+                                        or (bool(_s1bp_own_host_resolved) and _ffl_ws.lower() == _s1bp_own_host_resolved)
+                                    )
+                                    if _ffl_is_own:
+                                        continue  # backup-app's own session, not a third party
+                                    _ffl_remote = (0.0, _ffl_ws, _ffl_ip, _s1bp_logon_id)
+                                    break
+                        except Exception as _ffl_e:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: direct TargetLogonId "
+                                f"verification raised {_ffl_e!r} — treating as no-match (LOCAL)."
+                            )
+                        if _ffl_remote is not None:
+                            # LogonId-exact match to a remote 4624 → cryptographic proof
+                            # this write came from the coworker's persistent session.
+                            _s1bp_exact = _ffl_remote
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: SubjectLogonId={_s1bp_logon_id!r} "
+                                f"absent from pre-fetched ±900s window BUT a direct (time-window-free) "
+                                f"TargetLogonId query found a REMOTE 4624 "
+                                f"(WorkstationName={_ffl_remote[1]!r} IpAddress={_ffl_remote[2]!r}) — "
+                                f"persistent coworker session opened hours ago. Attributing REMOTE "
+                                f"(LogonId-confirmed), NOT local. [authority=SACL]"
+                            )
+                        else:
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: SubjectLogonId={_s1bp_logon_id!r} "
+                                f"from EventID={_s1bp_event_id} had NO matching 4624 Network Logon in "
+                                f"pre-fetched events ({len(_s1bp_prefetched)} checked) AND a direct "
+                                f"time-window-free TargetLogonId query found no remote 4624 — session "
+                                f"is a LOCAL (interactive/console) logon. Actor is LOCAL: "
+                                f"user={result.get('user')!r}"
+                            )
+                            # Leave _s1bp_exact = None → falls through to local-actor handling below
                     else:
                         # Either: no LogonId at all (older Windows/SACL configs), OR
                         # the matched event was 4656 whose SubjectLogonId is an impersonation
