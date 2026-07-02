@@ -22464,6 +22464,24 @@ class MainWindow(QMainWindow):
             if not hasattr(self, "_source_added_early"):
                 self._source_added_early = {}
                 self._source_added_lock  = _src_threading.Lock()
+            # ── Add-baseline fingerprint (race-immune) ───────────────────────
+            # The SOURCE SPURIOUS-MODIFIED check below must decide whether a
+            # 'modified' event reflects a genuine content change or is just an
+            # SMB re-notification of an unchanged file.  It USED to compare
+            # against self._dest_content_fp, but that cell is overwritten
+            # mid-pass by the stage-1 FINGERPRINT-ACCEPTED block AND by a
+            # concurrent racing sibling event (DEST dedup hash-fill).  When two
+            # 'modified' events fire for the SAME genuine edit (Office temp→real
+            # finalize rename coalesced into 'modified' racing the direct
+            # watchdog 'modified'), the sibling seeds the NEW fingerprint into
+            # _dest_content_fp, so this block read it back as "unchanged" and
+            # wrongly suppressed the genuine edit — dropping the coworker's save
+            # from history entirely.  _source_added_fp is written ONLY by 'added'
+            # events and by the single surviving accepted edit, so no in-flight
+            # sibling can poison it.
+            if not hasattr(self, "_source_added_fp"):
+                self._source_added_fp = {}
+                self._source_added_fp_lock = _src_threading.Lock()
             if _src_etype == "added":
                 # Refresh stamp (primary stamp was set pre-attribution in outer wrapper)
                 _src_early_key = (watch_id, _src_path)
@@ -22475,6 +22493,31 @@ class MainWindow(QMainWindow):
                             k: v for k, v in self._source_added_early.items()
                             if v > _src_cutoff_e
                         }
+                # Seed the add-baseline fingerprint so a later spurious 'modified'
+                # re-fire (unchanged content) is recognised and suppressed, while a
+                # genuine edit (different size/mtime/hash) is let through.
+                try:
+                    import os as _sab_os, hashlib as _sab_hl
+                    _sab_path = entry.get("path", "")
+                    _sab_st = _sab_os.stat(_sab_path)
+                    _sab_h = None
+                    try:
+                        with open(_sab_path, "rb") as _sab_fh:
+                            _sab_h = _sab_hl.sha256(_sab_fh.read(65536)).hexdigest()
+                    except Exception:
+                        _sab_h = None
+                    with self._source_added_fp_lock:
+                        self._source_added_fp[(watch_id, _src_path)] = (
+                            _sab_st.st_size, _sab_st.st_mtime, _sab_h
+                        )
+                        if len(self._source_added_fp) > 500:
+                            _sab_cutoff_keys = set(self._source_added_early.keys())
+                            self._source_added_fp = {
+                                k: v for k, v in self._source_added_fp.items()
+                                if k in _sab_cutoff_keys
+                            }
+                except Exception:
+                    pass
                 _dbg.info(
                     f"[desktop._on_file_change] SOURCE EARLY-STAMP added (inner refresh): "
                     f"path={entry.get('path')!r} at mono={_src_now:.3f} "
@@ -22554,8 +22597,17 @@ class MainWindow(QMainWindow):
                         import os as _src_os
                         _src_fp_stat = _src_os.stat(_src_fp_path)
                         _src_fp_current = (_src_fp_stat.st_size, _src_fp_stat.st_mtime)
-                        with self._dest_content_fp_lock:
-                            _src_fp_prev = self._dest_content_fp.get(_src_fp_key)
+                        # Compare against the race-immune add-baseline fingerprint,
+                        # NOT _dest_content_fp.  _dest_content_fp is overwritten
+                        # mid-pass (stage-1 FINGERPRINT-ACCEPTED) and by a concurrent
+                        # racing sibling event, so for two 'modified' events firing
+                        # for the SAME genuine edit (temp→real COALESCE racing the
+                        # direct watchdog 'modified') it reads back the NEW fingerprint
+                        # as "unchanged" and wrongly suppresses the real edit.
+                        # _source_added_fp is written only by 'added' events and by
+                        # the single surviving accepted edit → never clobbered here.
+                        with self._source_added_fp_lock:
+                            _src_fp_prev = self._source_added_fp.get(_src_fp_key)
                         _src_fp_prev_size  = _src_fp_prev[0] if _src_fp_prev and len(_src_fp_prev) >= 1 else None
                         _src_fp_prev_mtime = _src_fp_prev[1] if _src_fp_prev and len(_src_fp_prev) >= 2 else None
                         _src_fp_prev_hash  = _src_fp_prev[2] if _src_fp_prev and len(_src_fp_prev) >= 3 else None
@@ -22578,9 +22630,10 @@ class MainWindow(QMainWindow):
                                 f"watch_id={watch_id!r} "
                                 f"elapsed_since_add={_src_now - _src_added_at:.3f}s"
                             )
-                            # Record new fingerprint
-                            with self._dest_content_fp_lock:
-                                self._dest_content_fp[_src_fp_key] = (
+                            # Advance the add-baseline so a later spurious re-fire of
+                            # THIS edited content is recognised and suppressed.
+                            with self._source_added_fp_lock:
+                                self._source_added_fp[_src_fp_key] = (
                                     _src_fp_current[0], _src_fp_current[1], None
                                 )
                         else:
@@ -22615,8 +22668,8 @@ class MainWindow(QMainWindow):
                                             f"watch_id={watch_id!r} "
                                             f"elapsed_since_add={_src_now - _src_added_at:.3f}s"
                                         )
-                                        with self._dest_content_fp_lock:
-                                            self._dest_content_fp[_src_fp_key] = (
+                                        with self._source_added_fp_lock:
+                                            self._source_added_fp[_src_fp_key] = (
                                                 _src_fp_current[0], _src_fp_current[1], _src_fp_current_hash
                                             )
                                     else:
