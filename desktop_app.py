@@ -1965,6 +1965,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
             # the SMB credential cache entirely.
             _s1b_handle      = None
             _s1b_wevtutil_ok = False   # True when wevtutil path found matching event
+            _s1b_best_diff   = None    # |time_diff| of the currently-recorded match (staleness guard)
             # ── Same-host detection ─────────────────────────────────────────────
             # When the "remote" host is actually THIS machine (a self-hosted share
             # accessed over loopback UNC), a wevtutil query with /r:<host> goes
@@ -2216,6 +2217,39 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                             f"(closer match already recorded — keeping first/closest 4656)"
                                         )
                                         continue  # keep scanning for a potential 4663 upgrade
+                                    # STALE-4663 GUARD: a 4663 normally UPGRADES an earlier 4656
+                                    # (it is the authoritative access record for the SAME operation).
+                                    # But a 4663 that is much OLDER than the already-recorded match is
+                                    # a leftover from a PRIOR operation on the same file, not this
+                                    # event.  Example: the local user saves 'test sheet.xlsx' at T-37s
+                                    # (Office rename emits a DELETE-access 4663 with the LOCAL
+                                    # SubjectLogonId), then the coworker deletes the file at T-0s
+                                    # (fresh 4656 with the REMOTE SubjectLogonId).  Letting the stale
+                                    # T-37s 4663 overwrite the fresh T-0s 4656 attributes the delete to
+                                    # the local saver instead of the real remote deleter.  Only allow a
+                                    # 4663 to replace an existing match when it is not materially staler
+                                    # than that match (within a small tolerance).
+                                    _S1B_UPGRADE_TOL = 5.0  # seconds
+                                    if (_s1b_wevtutil_ok and _evid == 4663
+                                            and _s1b_best_diff is not None
+                                            and abs(_diff) > _s1b_best_diff + _S1B_UPGRADE_TOL):
+                                        # Still collect this 4663's SubjectLogonId for ±30s handle
+                                        # correlation, but do NOT overwrite the closer match.
+                                        _s1b_stale_logon = _edata_map.get("SubjectLogonId", "")
+                                        if _s1b_stale_logon and abs(_diff) <= 30 and not _s1b_this_is_parent_only:
+                                            if _s1b_stale_logon not in _s1b_handle_logon_ids:
+                                                _s1b_handle_logon_ids.append(_s1b_stale_logon)
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b (wevtutil): SKIP-STALE-4663 "
+                                            f"EventID={_evid} user={_s1b_user_full!r} object={_obj!r} "
+                                            f"mask={_access_mask} time_diff={_diff:+.1f}s — this 4663 is "
+                                            f"{abs(_diff):.1f}s away but a closer match at "
+                                            f"{_s1b_best_diff:.1f}s is already recorded (tol={_S1B_UPGRADE_TOL}s); "
+                                            f"it is a leftover from a prior operation on this file "
+                                            f"(e.g. a local save), NOT this {event_type!r} event — "
+                                            f"keeping the closer match so SACL attributes the real actor."
+                                        )
+                                        continue
                                     result["user"]    = _s1b_user_full
                                     result["machine"] = _s1b_machine
                                     result["ip"]      = host  # temporary; upgraded by Strategy1b-post via Event 4624
@@ -2276,6 +2310,9 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                         f"mask={_access_mask} time_diff={_diff:+.1f}s"
                                     )
                                     _s1b_wevtutil_ok = True
+                                    # Record how close this match is (used by the STALE-4663
+                                    # guard above to reject a much-older 4663 from a prior op).
+                                    _s1b_best_diff = abs(_diff)
                                     # Don't break immediately — keep scanning to see if a
                                     # 4663 exists for the same file.  4663 has a reliable
                                     # SubjectLogonId that allows exact 4624 correlation;
