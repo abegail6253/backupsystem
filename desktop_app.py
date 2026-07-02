@@ -9310,7 +9310,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                                     f"(file={_burst_ov_entry[1]!r}) — outside burst window "
                                     f"({_BURST_WINDOW_S}s); keeping persistent-monitor decision "
                                     f"[debug: prior_idle={_prior_idle!r}s "
-                                    f"HIGH_IDLE_GENUINE_THRESHOLD={_HIGH_IDLE_GENUINE_THRESHOLD}s "
+                                    f"HIGH_IDLE_GENUINE_THRESHOLD={locals().get('_HIGH_IDLE_GENUINE_THRESHOLD', 20)}s "
                                     f"snapshots={len(_idle_history)}]"
                                 )
                         else:
@@ -22212,6 +22212,41 @@ class MainWindow(QMainWindow):
             # Strip __unc_poll/__unc_notify suffix: watchdog uses 'w_xxx', unc_poll
             # uses 'w_xxx__unc_poll' — same logical watch must share the same dedup slot.
             _src_wid_norm   = watch_id.partition("__")[0]
+
+            # ── Rename correlation: one rename is ONE user action ──────────────
+            # The watchdog emits a real-time 'renamed' event carrying both the old
+            # (path) and new (dest) names, which becomes a single 'renamed' row.
+            # The 15s unc_poll detector, however, only sees the directory diff and
+            # reports the SAME rename as 'deleted' (old name) + 'added' (new name),
+            # and the watchdog also fires CHANGE_NOTIFY 'modified' churn on the new
+            # name. Record both endpoints of every rename and drop those correlated
+            # delete/add/modify events so only the 'renamed' row remains.
+            if not hasattr(self, "_recent_rename_paths"):
+                self._recent_rename_paths = {}
+            _RENAME_CORR_WINDOW = 30  # seconds
+            if _src_etype == "renamed":
+                _rn_dest_lower = (entry.get("dest") or "").lower()
+                self._recent_rename_paths[(_src_wid_norm, _src_path)] = _src_now       # old name → 'deleted'
+                if _rn_dest_lower:
+                    self._recent_rename_paths[(_src_wid_norm, _rn_dest_lower)] = _src_now  # new name → 'added'/'modified'
+                if len(self._recent_rename_paths) > 500:
+                    _rn_cutoff = _src_now - _RENAME_CORR_WINDOW
+                    self._recent_rename_paths = {
+                        _k: _v for _k, _v in self._recent_rename_paths.items()
+                        if _v > _rn_cutoff
+                    }
+            elif _src_etype in ("deleted", "added", "modified"):
+                _rn_seen_ts = self._recent_rename_paths.get((_src_wid_norm, _src_path))
+                if _rn_seen_ts is not None and (_src_now - _rn_seen_ts) < _RENAME_CORR_WINDOW:
+                    logger.info(
+                        f"[desktop._on_file_change] RENAME-CORRELATION suppressed: "
+                        f"'{_src_etype}' for path={entry.get('path')!r} is the "
+                        f"delete-of-old / add-of-new side of a rename already recorded "
+                        f"as a single 'renamed' row {(_src_now - _rn_seen_ts):.1f}s ago "
+                        f"(watch={_src_wid_norm!r}) — dropping duplicate."
+                    )
+                    return
+
             _src_dedup_key  = (_src_wid_norm, _src_path, _src_etype)
             # ── Atomic check-and-claim under lock ────────────────────────────
             # Without this lock, watchdog and unc_poll threads can BOTH read
@@ -22909,6 +22944,29 @@ class MainWindow(QMainWindow):
         # the same UNC host — this avoids treating Office-finalize as a rename.
         try:
             if entry.get("type") == "renamed":
+                # Only coalesce when the rename is an Office atomic-save FINALIZE,
+                # i.e. one endpoint is an Office temp artifact:
+                #   • temp write   ~tmp<digits>.TMP  →  real name   (finalize)
+                #   • real name    →  name~XXXX.tmp / <hex>.tmp     (backup step)
+                # A genuine user rename (real → real, e.g. 'test sheet.xlsx' →
+                # 'sheet111.xlsx') has NO temp endpoint and must stay a 'renamed'
+                # row — collapsing it to 'modified' loses the rename semantics and,
+                # combined with the poll's delete-of-old, shows a bogus modify+delete
+                # pair instead of one rename.
+                import os as _rn_os, re as _rn_re
+                def _rn_is_office_temp(_bn):
+                    _low = (_bn or "").lower()
+                    _stem = _rn_os.path.splitext(_low)[0]
+                    return (
+                        (_bn or "").startswith("~$")
+                        or _low.startswith("~tmp")
+                        or (_low.endswith(".tmp") and "~" in _stem)
+                        or bool(_rn_re.fullmatch(r"[0-9a-f]{5,16}", _stem) and _low.endswith(".tmp"))
+                        or bool(_rn_re.fullmatch(r"[0-9a-f]{5,16}", _low))
+                    )
+                _rn_src_bn  = _rn_os.path.basename(entry.get("path", "") or "")
+                _rn_dest_bn = _rn_os.path.basename(entry.get("dest", "") or "")
+                _rn_office_finalize = _rn_is_office_temp(_rn_src_bn) or _rn_is_office_temp(_rn_dest_bn)
                 _host_try = ""
                 try:
                     _p = entry.get("path", "").replace("\\", "/")
@@ -22916,7 +22974,7 @@ class MainWindow(QMainWindow):
                         _host_try = _p.lstrip("/").split("/")[0].lower()
                 except Exception:
                     _host_try = ""
-                if _host_try:
+                if _host_try and _rn_office_finalize:
                     # Check for any recent 'added' or 'modified' burst for this host
                     _bc_added = _burst_cache_any_for_host(_host_try, event_type="added")
                     _bc_mod   = _burst_cache_any_for_host(_host_try, event_type="modified")
@@ -22924,10 +22982,18 @@ class MainWindow(QMainWindow):
                         import logging as _rl
                         _rl.getLogger(__name__).info(
                             f"[desktop._on_file_change] COALESCE: treating 'renamed' as 'modified' "
+                            f"(Office atomic-save finalize: src={_rn_src_bn!r} dest={_rn_dest_bn!r}) "
                             f"because recent added/modified burst exists for host={_host_try!r} "
                             f"path={entry.get('path')!r}"
                         )
                         entry["type"] = "modified"
+                elif _host_try and not _rn_office_finalize:
+                    import logging as _rl
+                    _rl.getLogger(__name__).info(
+                        f"[desktop._on_file_change] COALESCE SKIPPED: 'renamed' kept as a "
+                        f"genuine rename (real→real, no Office temp endpoint) "
+                        f"src={_rn_src_bn!r} dest={_rn_dest_bn!r} host={_host_try!r}"
+                    )
         except Exception:
             # Non-fatal — leave event type unchanged on error
             pass
