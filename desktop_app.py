@@ -22288,6 +22288,53 @@ class MainWindow(QMainWindow):
             self._dest_event_seen = {
                 k: v for k, v in self._dest_event_seen.items() if v > _cutoff
             }
+
+        # ── Rename correlation: one rename is ONE user action (SOURCE + DEST) ──
+        # A rename becomes a single 'renamed' row (watchdog on_moved carries old
+        # path + new dest).  The 15s unc_poll detector reports the SAME rename as
+        # 'deleted'(old) + 'added'(new), and watchdog fires CHANGE_NOTIFY
+        # 'modified' churn on the new name.  Record both rename endpoints and drop
+        # the correlated delete/add/modify so only the 'renamed' row remains.
+        #
+        # This runs for BOTH the source watch AND the destination (backup) watch
+        # so a rename inside the destination folder is also shown as one row.
+        # The key uses the detector-normalised watch id (partition('__')[0] merges
+        # watchdog 'w_x' with unc_poll 'w_x__unc_poll') plus the full lowercased
+        # path.  Source and destination paths are disjoint — the source watcher
+        # auto-excludes the destination subfolder — so source/dest never collide.
+        # (Forward guard; the retroactive purge in _apply_file_change covers the
+        # race where the delete-of-old is appended before the 'renamed' event.)
+        import time as _rc_time
+        _rc_now   = _rc_time.monotonic()
+        _rc_etype = entry.get("type", "")
+        _rc_path  = entry.get("path", "").lower()
+        _rc_wid   = watch_id.partition("__")[0]
+        if not hasattr(self, "_recent_rename_paths"):
+            self._recent_rename_paths = {}
+        _RENAME_CORR_WINDOW = 30  # seconds
+        if _rc_etype == "renamed":
+            _rc_dest_lower = (entry.get("dest") or "").lower()
+            self._recent_rename_paths[(_rc_wid, _rc_path)] = _rc_now       # old name → 'deleted'
+            if _rc_dest_lower:
+                self._recent_rename_paths[(_rc_wid, _rc_dest_lower)] = _rc_now  # new name → 'added'/'modified'
+            if len(self._recent_rename_paths) > 500:
+                _rc_cutoff = _rc_now - _RENAME_CORR_WINDOW
+                self._recent_rename_paths = {
+                    _k: _v for _k, _v in self._recent_rename_paths.items()
+                    if _v > _rc_cutoff
+                }
+        elif _rc_etype in ("deleted", "added", "modified"):
+            _rc_seen_ts = self._recent_rename_paths.get((_rc_wid, _rc_path))
+            if _rc_seen_ts is not None and (_rc_now - _rc_seen_ts) < _RENAME_CORR_WINDOW:
+                logger.info(
+                    f"[desktop._on_file_change] RENAME-CORRELATION suppressed "
+                    f"({'dest' if _is_dest else 'source'}): '{_rc_etype}' for "
+                    f"path={entry.get('path')!r} is the delete-of-old / add-of-new "
+                    f"side of a rename already recorded as a single 'renamed' row "
+                    f"{(_rc_now - _rc_seen_ts):.1f}s ago (watch={_rc_wid!r}) — dropping duplicate."
+                )
+                return
+
         # ── Source-watcher: spurious-modified suppression ────────────────────
         # Same Windows SMB artifact as on the destination: a remote file-create
         # fires both ADDED and MODIFIED nearly simultaneously on separate threads.
@@ -22315,39 +22362,9 @@ class MainWindow(QMainWindow):
             # uses 'w_xxx__unc_poll' — same logical watch must share the same dedup slot.
             _src_wid_norm   = watch_id.partition("__")[0]
 
-            # ── Rename correlation: one rename is ONE user action ──────────────
-            # The watchdog emits a real-time 'renamed' event carrying both the old
-            # (path) and new (dest) names, which becomes a single 'renamed' row.
-            # The 15s unc_poll detector, however, only sees the directory diff and
-            # reports the SAME rename as 'deleted' (old name) + 'added' (new name),
-            # and the watchdog also fires CHANGE_NOTIFY 'modified' churn on the new
-            # name. Record both endpoints of every rename and drop those correlated
-            # delete/add/modify events so only the 'renamed' row remains.
-            if not hasattr(self, "_recent_rename_paths"):
-                self._recent_rename_paths = {}
-            _RENAME_CORR_WINDOW = 30  # seconds
-            if _src_etype == "renamed":
-                _rn_dest_lower = (entry.get("dest") or "").lower()
-                self._recent_rename_paths[(_src_wid_norm, _src_path)] = _src_now       # old name → 'deleted'
-                if _rn_dest_lower:
-                    self._recent_rename_paths[(_src_wid_norm, _rn_dest_lower)] = _src_now  # new name → 'added'/'modified'
-                if len(self._recent_rename_paths) > 500:
-                    _rn_cutoff = _src_now - _RENAME_CORR_WINDOW
-                    self._recent_rename_paths = {
-                        _k: _v for _k, _v in self._recent_rename_paths.items()
-                        if _v > _rn_cutoff
-                    }
-            elif _src_etype in ("deleted", "added", "modified"):
-                _rn_seen_ts = self._recent_rename_paths.get((_src_wid_norm, _src_path))
-                if _rn_seen_ts is not None and (_src_now - _rn_seen_ts) < _RENAME_CORR_WINDOW:
-                    logger.info(
-                        f"[desktop._on_file_change] RENAME-CORRELATION suppressed: "
-                        f"'{_src_etype}' for path={entry.get('path')!r} is the "
-                        f"delete-of-old / add-of-new side of a rename already recorded "
-                        f"as a single 'renamed' row {(_src_now - _rn_seen_ts):.1f}s ago "
-                        f"(watch={_src_wid_norm!r}) — dropping duplicate."
-                    )
-                    return
+            # (Rename correlation now runs for both source and destination watches
+            # in the shared block above — see "Rename correlation: one rename is
+            # ONE user action (SOURCE + DEST)".)
 
             _src_dedup_key  = (_src_wid_norm, _src_path, _src_etype)
             # ── Atomic check-and-claim under lock ────────────────────────────
