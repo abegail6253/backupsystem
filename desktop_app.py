@@ -7215,6 +7215,40 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                                     f"workgroup same-username: treating as remote SMB handle "
                                     f"(falling through to remote attribution)"
                                 )
+                                # ── SACL-ONLY guard for same-host non-added events ───────
+                                # On a same-host watch the local machine and the coworker
+                                # share the SAME Windows username ('user' in a workgroup),
+                                # so a NetFileEnum handle with handle_user == own_user is
+                                # AMBIGUOUS: it may be the local writer's own handle or the
+                                # coworker's SMB handle — NetFileEnum cannot tell them apart.
+                                # For 'added' events the ADDED-WATCHDOG-GUARD below applies
+                                # nuanced loopback heuristics.  For 'modified'/'deleted'/
+                                # 'renamed' there is no such guard, so trusting this handle
+                                # as "remote" is a GUESS that misattributes the local user's
+                                # own save to the coworker (observed: .106's save shown as
+                                # .105).  Only SACL (Event 4663 -> 4624 LogonId correlation)
+                                # can authoritatively distinguish local vs remote here.
+                                # Veto the ambiguous handle so the flow falls through to
+                                # Step1 -> _query_smb_audit (SACL); NTFS-owner is the
+                                # last-resort local fallback if SACL is unavailable.
+                                if _is_same_host_watch and event_type != "added":
+                                    _gei.info(
+                                        f"[_get_editor_info] Step0-priority NetFileEnum: "
+                                        f"SACL-ONLY GUARD (same-host, event_type={event_type!r}) — "
+                                        f"NetFileEnum handle_user={_nfe_eu!r} is a workgroup "
+                                        f"same-username match and CANNOT distinguish the local "
+                                        f"writer from the coworker's SMB handle. Refusing to "
+                                        f"guess 'remote' from the handle; vetoing and deferring "
+                                        f"to SACL (4663->4624 LogonId) for authoritative "
+                                        f"attribution. remote_session_ip={_rs0.get('ip')!r} "
+                                        f"idle={_rs0.get('idle_time')!r}s "
+                                        f"detection_source={detection_source!r} "
+                                        f"target={_nfe_filename!r}"
+                                    )
+                                    _nfe_result_user    = ""
+                                    _nfe_result_ip      = ""
+                                    _nfe_result_machine = ""
+                                    break
                                 # ── Step0 watchdog-guard for 'added' events ──────────────
                                 # A watchdog event on a same-host watch means the NTFS
                                 # kernel driver on THIS machine fired — remote SMB clients
