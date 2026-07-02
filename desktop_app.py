@@ -26998,7 +26998,7 @@ class HistoryWindow(QDialog):
             type_item = _item(f"{icon}  {etype}", color)
             type_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
             self.table.setItem(i, 2, type_item)
-            self.table.setItem(i, 3, _item(path))
+            self.table.setItem(i, 3, _item(self._display_path(e)))
             # Use amber for Unknown, orange for Local user, blue for identified
             _is_local_pop   = (user == "Local user")
             _is_unknown_pop = _unknown and not _is_local_pop
@@ -27065,6 +27065,7 @@ class HistoryWindow(QDialog):
                 continue
             searchable = " ".join([
                 e.get("path", ""),
+                e.get("dest", ""),  # new name for renamed events
                 e.get("editor_user", ""),
                 e.get("editor_machine", ""),
                 e.get("editor_ip", ""),
@@ -27167,6 +27168,22 @@ class HistoryWindow(QDialog):
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
 
+    @staticmethod
+    def _display_path(entry: dict) -> str:
+        """FILE/PATH cell text.
+
+        For a 'renamed' event the row's path is the OLD name; the new name lives
+        in entry['dest'].  Showing only the old name hid the rename result from
+        the user, so render 'old  ->  <new basename>' when a dest is present.
+        """
+        _p = entry.get("path", "") or ""
+        if entry.get("type") == "renamed":
+            _d = entry.get("dest", "") or ""
+            if _d:
+                import os as _dp_os
+                return f"{_p}  →  {_dp_os.path.basename(_d)}"
+        return _p
+
     def append_entry(self, entry: dict):
         """Live-add a new entry to the top without full reload.
 
@@ -27191,6 +27208,7 @@ class HistoryWindow(QDialog):
         if text:
             searchable = " ".join([
                 entry.get("path", ""),
+                entry.get("dest", ""),  # new name for renamed events
                 entry.get("editor_user", ""),
                 entry.get("editor_machine", ""),
                 entry.get("editor_ip", ""),
@@ -27231,7 +27249,7 @@ class HistoryWindow(QDialog):
         type_item = _item(f"{icon}  {etype}", color)
         type_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.table.setItem(0, 2, type_item)
-        self.table.setItem(0, 3, _item(entry.get("path", "")))
+        self.table.setItem(0, 3, _item(self._display_path(entry)))
 
         # ── Attribution column: colour Unknown/Local user distinctly and add tooltip ────
         _user_text    = entry.get("editor_user", "")
