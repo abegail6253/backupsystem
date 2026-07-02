@@ -1743,7 +1743,8 @@ def _burst_cache_get_logon_confirmed(host: str, server_local_user: str,
 def _query_smb_audit(host: str, filepath: str, event_type: str,
                      timestamp_iso: str,
                      smb_audit_cfg: dict | None = None,
-                     is_dest_watch: bool = False) -> dict:
+                     is_dest_watch: bool = False,
+                     rename_src_filepath: str = "") -> dict:
     """
     Identify who performed a file operation on a Windows/Mac SMB share.
 
@@ -1949,8 +1950,24 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
             # Normalise filepath to a bare filename + parent for matching
             # (the event log stores the full local path on the PC, not the UNC path)
             import os as _s1b_os
-            _s1b_fname  = _s1b_os.path.basename(filepath).lower()
-            _s1b_parent = _s1b_os.path.basename(_s1b_os.path.dirname(filepath)).lower()
+            # RENAME SACL-NAME FIX: a rename/move audits as a DELETE-access 4663 on
+            # the SOURCE (old) name — Windows logs the rename operation against the
+            # name that is going away, NOT the new name.  The destination name has
+            # no write/delete audit record, so searching it finds nothing and the
+            # caller wrongly falls back to NTFS-owner (the file's owner, i.e. local).
+            # For 'renamed' events, search the OLD name when the caller provides it.
+            _s1b_search_path = filepath
+            if event_type == "renamed" and rename_src_filepath:
+                _s1b_search_path = rename_src_filepath
+            _s1b_fname  = _s1b_os.path.basename(_s1b_search_path).lower()
+            _s1b_parent = _s1b_os.path.basename(_s1b_os.path.dirname(_s1b_search_path)).lower()
+            if event_type == "renamed" and rename_src_filepath:
+                _qna.info(
+                    f"[_query_smb_audit] RENAME SACL-NAME: searching Security log for the "
+                    f"SOURCE name {_s1b_fname!r} (rename audits as DELETE-access 4663 on the "
+                    f"old name; dest name {_s1b_os.path.basename(filepath).lower()!r} has no "
+                    f"audit record). host={host!r}"
+                )
 
             # ── Strategy 1b auth: try wevtutil subprocess first (bypasses SMB  ──
             # session cache), then fall back to in-process OpenEventLog.
@@ -6821,6 +6838,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                      force_local: bool = False,
                      is_dest_watch: bool = False,
                      local_smb_host: str = "",
+                     rename_src_filepath: str = "",
                      _skip_owner_lookup: bool = False) -> dict:
     """
     Return the user + machine + IP that performed a file operation.
@@ -9527,6 +9545,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                                 timestamp_iso or __import__("datetime").datetime.now().isoformat(),
                                 smb_audit_cfg=smb_audit_cfg or {},
                                 is_dest_watch=is_dest_watch,
+                                rename_src_filepath=rename_src_filepath,
                             )
                         except Exception as _pm_ae:
                             _pm_audit = {}
@@ -9662,6 +9681,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                                 timestamp_iso or __import__("datetime").datetime.now().isoformat(),
                                 smb_audit_cfg=smb_audit_cfg or {},
                                 is_dest_watch=is_dest_watch,
+                                rename_src_filepath=rename_src_filepath,
                             )
                         except Exception as _bo_ae:
                             _bo_audit = {}
@@ -9878,6 +9898,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                     timestamp_iso or __import__("datetime").datetime.now().isoformat(),
                     smb_audit_cfg=smb_audit_cfg or {},
                     is_dest_watch=is_dest_watch,
+                    rename_src_filepath=rename_src_filepath,
                 )
             except Exception as _del_ae:
                 _del_audit = {}
@@ -10278,6 +10299,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
             timestamp_iso or __import__("datetime").datetime.now().isoformat(),
             smb_audit_cfg=smb_audit_cfg or {},
             is_dest_watch=is_dest_watch,
+            rename_src_filepath=rename_src_filepath,
         )
         _gei.info(
             f"[_get_editor_info] Steps2-4: _query_smb_audit returned "
@@ -10591,11 +10613,15 @@ def _attribute_renamed(src_filepath: str, dest_filepath: str = "",
     Attribution for RENAMED events.
 
     A 'renamed' event means a file was moved or renamed within the watch root.
-    We attribute using the DESTINATION path (the new name/location) because:
-      • The file now lives at dest — the NFE handle and NTFS owner both refer
-        to the new path after the rename completes.
-      • The source path no longer exists and cannot be queried.
-    src_filepath is logged for debugging but not passed to _get_editor_info.
+    We attribute using the DESTINATION path for the live-file steps (NFE handle
+    and NTFS owner both refer to the new path after the rename completes, and the
+    source path no longer exists), BUT the SACL Security-log search must use the
+    SOURCE (old) name: Windows audits a rename as a DELETE-access Event 4663 on
+    the name that is going away, not on the new name.  If SACL searches the new
+    name it finds no record and the same-host pipeline wrongly falls back to the
+    NTFS owner (the file's owner, i.e. the local machine) — mis-attributing a
+    coworker's rename to the local user.  So we pass src_filepath through as
+    rename_src_filepath for the authoritative 4663->4624 LogonId correlation.
     """
     import logging as _log_ren
     _log_ren.getLogger(__name__).debug(
@@ -10603,7 +10629,8 @@ def _attribute_renamed(src_filepath: str, dest_filepath: str = "",
         f"detection_source={detection_source!r} "
         f"has_snapshot={bool(smb_sessions_snapshot)}"
     )
-    # Use dest path for attribution; fall back to src if dest is missing
+    # Use dest path for the live-file steps (NFE/NTFS); fall back to src if dest
+    # is missing.  SACL searches the SOURCE name via rename_src_filepath.
     _attr_path = dest_filepath if dest_filepath else src_filepath
     return _get_editor_info(
         _attr_path,
@@ -10614,6 +10641,7 @@ def _attribute_renamed(src_filepath: str, dest_filepath: str = "",
         smb_sessions_snapshot=smb_sessions_snapshot,
         is_dest_watch=is_dest_watch,
         local_smb_host=local_smb_host,
+        rename_src_filepath=src_filepath,
     )
 
 
