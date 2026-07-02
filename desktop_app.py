@@ -23785,6 +23785,75 @@ class MainWindow(QMainWindow):
                 f"Total in-memory entries: {len(self._history_log)}"
             )
 
+    def _purge_rename_phantom_rows(self, rename_entry: dict):
+        """Retroactively drop a rename's phantom delete-of-old / add-of-new rows.
+
+        A rename is ONE user action, shown as a single 'renamed' row. The 15s
+        unc_poll detector reports the same rename as a 'deleted' (old name) plus
+        an 'added' (new name); the forward-looking RENAME-CORRELATION guard in
+        _on_file_change drops those WHEN the 'renamed' event was recorded first.
+        But watchdog can also fire a concurrent 'deleted' of the old name on a
+        separate thread that finishes — and appends its row — BEFORE the rename
+        thread records the correlation tracker, so forward-suppression misses it
+        and a phantom 'deleted' row leaks (observed: 5 deletes shown when the
+        coworker deleted only 4 files).
+
+        This runs on the MAIN thread as the 'renamed' row is applied, so it can
+        safely prune both the in-memory history_log and the open History window.
+        Matching is conservative: only 'deleted' of the exact old name and
+        'added' of the exact new name, within a 30s window of the rename.
+        """
+        _old = (rename_entry.get("path") or "").lower()
+        _new = (rename_entry.get("dest") or "").lower()
+        if not _old:
+            return
+        _WINDOW = 30.0
+
+        def _ts(e):
+            try:
+                return datetime.fromisoformat(e.get("timestamp", "")).timestamp()
+            except Exception:
+                return None
+        _rn_ts = _ts(rename_entry)
+
+        def _is_phantom(e):
+            if e is rename_entry:
+                return False
+            _et = e.get("type")
+            _ep = (e.get("path") or "").lower()
+            if _et == "deleted" and _ep == _old:
+                pass
+            elif _et == "added" and _new and _ep == _new:
+                pass
+            else:
+                return False
+            _e_ts = _ts(e)
+            if _rn_ts is not None and _e_ts is not None and abs(_rn_ts - _e_ts) > _WINDOW:
+                return False
+            return True
+
+        _removed = [e for e in self._history_log if _is_phantom(e)]
+        if not _removed:
+            return
+        _removed_ids = {id(e) for e in _removed}
+        self._history_log = [e for e in self._history_log if id(e) not in _removed_ids]
+        import logging as _plog
+        _plog.getLogger(__name__).info(
+            f"[desktop._apply_file_change] RENAME-CORRELATION retroactive purge: removed "
+            f"{len(_removed)} phantom row(s) "
+            f"({[e.get('type') + ':' + (e.get('path') or '') for e in _removed]!r}) "
+            f"— the rename old={_old!r} new={_new!r} is ONE row, not delete+add+rename."
+        )
+        try:
+            config_manager.save_history(self._history_log)
+        except Exception:
+            pass
+        if self._history_window and self._history_window.isVisible():
+            try:
+                self._history_window.remove_entries(_removed)
+            except Exception:
+                pass
+
     def _apply_file_change(self, watch_id: str, entry: dict):
         """Update card badge + tray toast on main thread."""
         import logging as _logging
@@ -23793,6 +23862,13 @@ class MainWindow(QMainWindow):
             f"type={entry.get('type')!r} path={entry.get('path')!r} "
             f"detection_source={entry.get('detection_source')!r}"
         )
+        # A rename is ONE row — retroactively drop any phantom delete-of-old /
+        # add-of-new rows that raced ahead of the 'renamed' event.
+        if entry.get("type") == "renamed":
+            try:
+                self._purge_rename_phantom_rows(entry)
+            except Exception:
+                pass
         # Update card
         if watch_id in self._cards:
             self._cards[watch_id].add_change(entry)
@@ -27303,6 +27379,27 @@ class HistoryWindow(QDialog):
         self._update_stats([e for e in self._all_history
                             if not type_sel or type_sel == "All Types"
                             or e.get("type") == type_sel])
+
+    def remove_entries(self, entries: list):
+        """Remove the given entry objects from the Change-History view.
+
+        Used by the retroactive rename-correlation purge: when a 'renamed' row
+        arrives, any phantom delete-of-old / add-of-new rows that were appended
+        before the rename (a detector/thread race that forward-suppression could
+        not catch) are removed so a rename shows as exactly ONE row. Matching is
+        by object identity — the same dict objects live in both the caller's
+        history_log and this window's _all_history.
+        """
+        if not entries:
+            return
+        _ids = {id(e) for e in entries}
+        before = len(self._all_history)
+        self._all_history = [e for e in self._all_history if id(e) not in _ids]
+        if len(self._all_history) == before:
+            return  # nothing matched — table already correct
+        # Rebuild the table + stats from the pruned list (respects active filters).
+        self._filter_changes()
+        self._update_stats(self._all_history)
 
     def update_entry(self, entry: dict):
         """Patch user/machine/IP cells for an already-displayed row in-place.
