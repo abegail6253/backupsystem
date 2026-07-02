@@ -14578,6 +14578,30 @@ class AdminPanel(QDialog):
                                   # the C++ QGroupBox (and all children, including dest_type_combo)
                                   # as soon as _build_ui() returned, making _load_values() crash
                                   # with "wrapped C/C++ object of type QComboBox has been deleted"
+        # ── Destinations are per-watch now (no global destination) ───────────
+        # The global "Backup Destination" selector is retired: every watch
+        # defines its OWN destination(s) in Edit Watch — the local folder
+        # ("Destination") plus any number of typed targets under "Additional
+        # Destinations" (SFTP / FTPS / FTP / HTTPS / WebDAV / rclone / Google
+        # Drive).  We keep the group's widgets constructed (so _load_values /
+        # _save_general and the Test buttons keep working and any legacy global
+        # config is preserved on disk) but HIDE the group and show a pointer to
+        # the per-watch controls instead.
+        dest_group.setVisible(False)
+        _dest_perwatch_note = QLabel(
+            "Backup destinations are configured <b>per-watch</b>.  Open "
+            "<b>Watches → Edit</b> → <b>Destination</b> (local / mapped-drive folder) "
+            "and <b>Advanced → Additional Destinations</b> to add SFTP, FTPS, FTP, "
+            "HTTPS, WebDAV, rclone or Google Drive targets for that watch."
+        )
+        _dest_perwatch_note.setTextFormat(Qt.TextFormat.RichText)
+        _dest_perwatch_note.setWordWrap(True)
+        _dest_perwatch_note.setStyleSheet("color:#94a3b8; font-size:12px;")
+        _dest_perwatch_group = QGroupBox("Backup Destination")
+        _dpw_layout = QVBoxLayout(_dest_perwatch_group)
+        _dpw_layout.setContentsMargins(12, 8, 12, 8)
+        _dpw_layout.addWidget(_dest_perwatch_note)
+        gl.addWidget(_dest_perwatch_group)
 
         sched_group = QGroupBox("Schedule & Limits")
         sg = QFormLayout(sched_group)
