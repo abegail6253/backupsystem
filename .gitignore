@@ -35,13 +35,8 @@ build/
 *.spec
 *.exe
 
-# ── Dev & scratch scripts ─────────────────────────────────────────────────────
-sftp_repro.py
-tmp_patch_add_watch.py
-regenerate_manifests.py
-clear_admin.py
-live_dest_tests.py
-setup_cloud_dev.py
+# ── Temporary / auto-generated files ─────────────────────────────────────────
+*.tmp
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
@@ -54,7 +49,7 @@ venv/
 # ── OS noise ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-Desktop.iniconfig.backup.*.json
+Desktop.ini
 config.backup.json
 config.backup.*.json
 icon.ico

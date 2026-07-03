@@ -1351,6 +1351,66 @@ def _format_net_use_error(out_txt: str) -> str:
     return "❌  Auth failed — wrong username or password."
 
 
+def _verify_smb_login(host: str, user: str, password: str) -> "tuple[bool, str]":
+    """Authenticate to \\\\host\\IPC$ with the given credentials in an isolated
+    logon session (subprocess `net use`), returning (ok, message).
+
+    Uses a separate process so Windows cannot silently reuse a cached session
+    token for the host (which would validate a wrong password).  Exit code 0 =
+    credentials accepted; non-zero = rejected/unreachable.  The temporary IPC$
+    connection is always deleted afterward.  Blocking; call off the UI thread.
+    """
+    import subprocess
+    if not host or not user or not password:
+        return False, "❌  Enter host, username and password first."
+    _ipc = f"\\\\{host}\\IPC$"
+    _CREATE_NO_WINDOW = 0x08000000
+    _cmd_add = ["net", "use", _ipc, password, f"/user:{user}", "/persistent:no"]
+    _cmd_del = ["net", "use", _ipc, "/delete", "/yes"]
+
+    def _cleanup():
+        try:
+            subprocess.run(_cmd_del, capture_output=True, timeout=5,
+                           creationflags=_CREATE_NO_WINDOW)
+        except Exception:
+            pass
+
+    def _run_net_use():
+        try:
+            return subprocess.run(_cmd_add, capture_output=True, text=True,
+                                  timeout=15, creationflags=_CREATE_NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            return None
+
+    try:
+        _result = _run_net_use()
+    except Exception as _e:
+        return False, f"❌  Could not run credential check: {_e}"
+    finally:
+        _cleanup()
+
+    # Retry once on timeout / existing-session conflict (error 1219).
+    for _ in range(2):
+        _out_txt = (_result.stderr or _result.stdout or "").strip() if _result else ""
+        if _result is not None and not (_result.returncode != 0 and "1219" in _out_txt):
+            break
+        _cleanup()
+        try:
+            _result = _run_net_use()
+        except Exception as _e:
+            return False, f"❌  Could not run credential check: {_e}"
+        finally:
+            _cleanup()
+        if _result is None:
+            return False, "❌  Timed out — server unreachable."
+
+    if _result is None:
+        return False, "❌  Timed out — server unreachable."
+    if _result.returncode == 0:
+        return True, "✅  Connected — credentials verified."
+    return False, _format_net_use_error((_result.stderr or _result.stdout or "").strip())
+
+
 import threading as _burst_threading
 _BURST_CACHE_TTL   = 30.0   # seconds — reuse confirmed attribution within this window
                              # (increased from 10s: bulk-delete bursts can span ~20s when
@@ -1983,6 +2043,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
             _s1b_handle      = None
             _s1b_wevtutil_ok = False   # True when wevtutil path found matching event
             _s1b_best_diff   = None    # |time_diff| of the currently-recorded match (staleness guard)
+            _S1B_EXACT_OVER_PARENT_TOL = 30.0  # s: how much staler an exact match may be and still override a parent-only match
             # ── Same-host detection ─────────────────────────────────────────────
             # When the "remote" host is actually THIS machine (a self-hosted share
             # accessed over loopback UNC), a wevtutil query with /r:<host> goes
@@ -2220,7 +2281,26 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                     # 4656 at T-8s with mask=0x10080.  Without this guard the staler
                                     # T-42s event (with .107's SubjectLogonId) overwrites the T-8s
                                     # event (with .104's SubjectLogonId), causing wrong attribution.
-                                    if _s1b_wevtutil_ok and _evid == 4656:
+                                    # EXACT-OVER-PARENT-STALE: an EXACT-filename match must win over an
+                                    # already-recorded PARENT-ONLY match (a DIFFERENT file in the same
+                                    # folder), even though the parent-only was seen first in the
+                                    # newest-first scan.  Otherwise the target file's own event — which
+                                    # carries the real actor's SubjectLogonId — is discarded, and the
+                                    # parent-only's LogonId is thrown away by the PARENT-ONLY GUARD
+                                    # below, collapsing attribution to LOCAL.  Observed: coworker deletes
+                                    # 4 files at once; each screenshot's exact 4656 was skip-staled in
+                                    # favour of a parent-only 4656 for the sibling .xlsx, so 3 of 4
+                                    # deletions were misattributed to the local owner instead of .105.
+                                    # Bound by the same upgrade tolerance so we don't grab an ancient
+                                    # exact match from a prior operation on this file.
+                                    _s1b_exact_over_parent = (
+                                        _s1b_wevtutil_ok
+                                        and not _s1b_this_is_parent_only
+                                        and bool(result.get("_s1b_parent_only_match"))
+                                        and (_s1b_best_diff is None
+                                             or abs(_diff) <= _s1b_best_diff + _S1B_EXACT_OVER_PARENT_TOL)
+                                    )
+                                    if _s1b_wevtutil_ok and _evid == 4656 and not _s1b_exact_over_parent:
                                         # Already have a match (closer one); only continue collecting
                                         # SubjectLogonIds and 4624 events — don't overwrite the result.
                                         _s1b_logon_id_extra = _edata_map.get("SubjectLogonId", "")
@@ -2234,6 +2314,16 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                             f"(closer match already recorded — keeping first/closest 4656)"
                                         )
                                         continue  # keep scanning for a potential 4663 upgrade
+                                    if _s1b_exact_over_parent:
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b (wevtutil): "
+                                            f"EXACT-OVER-PARENT-STALE EventID={_evid} object={_obj!r} "
+                                            f"time_diff={_diff:+.1f}s — this is the target file's own "
+                                            f"exact-filename match; it OVERRIDES the parent-only "
+                                            f"(different-file) match recorded earlier so the real actor's "
+                                            f"SubjectLogonId is used, not discarded (fixes coworker deletions "
+                                            f"collapsing to LOCAL)."
+                                        )
                                     # STALE-4663 GUARD: a 4663 normally UPGRADES an earlier 4656
                                     # (it is the authoritative access record for the SAME operation).
                                     # But a 4663 that is much OLDER than the already-recorded match is
@@ -2265,6 +2355,28 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                             f"it is a leftover from a prior operation on this file "
                                             f"(e.g. a local save), NOT this {event_type!r} event — "
                                             f"keeping the closer match so SACL attributes the real actor."
+                                        )
+                                        continue
+                                    # EXACT-OVER-PARENT GUARD: a PARENT-ONLY match (matched via the
+                                    # folder name, i.e. a DIFFERENT file in the same dir) must never
+                                    # overwrite an already-recorded EXACT-filename match.  Office's
+                                    # atomic save writes the real bytes to a temp file (e.g.
+                                    # 'FF0BF629.tmp') and renames it onto 'test sheet.xlsx', so the
+                                    # temp's 4663 matches parent-only while the real file's 4656 (which
+                                    # carries the remote actor's SubjectLogonId) matched exactly.  Letting
+                                    # the parent-only temp 4663 win discards that SubjectLogonId (PARENT-
+                                    # ONLY GUARD below) and collapses attribution to LOCAL — showing the
+                                    # server owner instead of the coworker who actually saved.  The scan
+                                    # is newest-first, so the recorded exact match is never staler.
+                                    if (_s1b_wevtutil_ok and _s1b_this_is_parent_only
+                                            and not result.get("_s1b_parent_only_match")):
+                                        _qna.info(
+                                            f"[_query_smb_audit] Strategy1b (wevtutil): "
+                                            f"SKIP-PARENT-ONLY-OVER-EXACT EventID={_evid} object={_obj!r} "
+                                            f"time_diff={_diff:+.1f}s — a folder-name (parent-only) match "
+                                            f"must not overwrite the exact-filename match already recorded; "
+                                            f"keeping the real actor's SubjectLogonId (prevents Office "
+                                            f"atomic-save temp-file 4663 from collapsing attribution to LOCAL)."
                                         )
                                         continue
                                     result["user"]    = _s1b_user_full
@@ -2790,6 +2902,25 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                     f"a usable audit LogonId. Falling through to 24h rescue / UNKNOWN."
                 )
             _s1bp_matched   = False
+            # _s1bp_server_local_user/_machine/_ip are only *assigned* much further
+            # down (in the "not _s1bp_matched" / _s1bp_skipped_own slow path), but
+            # the rescue-decision debug log below (and the fast/pre-fetched path
+            # that runs before the slow path) reads _s1bp_server_local_user
+            # unconditionally. Because the name is assigned somewhere in this
+            # function, Python treats it as local to the whole block, so reading
+            # it here before the slow path runs raises UnboundLocalError — same
+            # class of bug already fixed above for _s1bp_own_host_resolved/
+            # _s1bp_own_ip_resolved. That crash was silently swallowed by the
+            # outer "except Exception" a few hundred lines down, which aborted
+            # the SACL 24h-rescue query mid-flight and left the earlier
+            # server-local (i.e. this machine, NOT the real remote writer)
+            # attribution in place — the "guessed" NTFS-owner fallback instead
+            # of the pure SACL-confirmed remote actor. Initializing it here
+            # lets the rescue logic run to completion so the real 4624-confirmed
+            # remote machine/user is used instead.
+            _s1bp_server_local_user    = ""
+            _s1bp_server_local_machine = ""
+            _s1bp_server_local_ip      = ""
             if _s1bp_parent_only:
                 _qna.info(
                     f"[_query_smb_audit] Strategy1b-post: PARENT-ONLY 4663 match — "
@@ -3356,6 +3487,11 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                     # (the coworker's persistent bystander session) wrongly flips a local
                     # write to the coworker.
                     result["_sacl_confirmed_remote"] = ("LogonId" in _match_method)
+                    # This REMOTE identity came from the Security audit log (4663+4624),
+                    # NOT a NetSessionEnum bystander session.  Dest-watch attribution trusts
+                    # any audit-log remote (LogonId-exact OR time-window) so the destination
+                    # shows pure SACL data; source-watch keeps requiring LogonId-exact.
+                    result["_sacl_remote_via_auditlog"] = True
                     _qna.info(
                         f"[_query_smb_audit] Strategy1b-post ({_match_method}): "
                         f"server-local {_old_user!r}/{_old_machine!r}/{_old_ip!r} "
@@ -5131,16 +5267,21 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 # Leave _s1bp_candidates empty -> 24h rescue path below.
                             elif event_type == "deleted" and is_dest_watch:
                                 # Dest-watch deletion: the server owner / another LAN PC could have
-                                # deleted locally on the server (no remote 4624 would appear).
-                                # Do NOT blame own-machine — report UNKNOWN so UI is accurate.
+                                # deleted locally on the server (no remote 4624 would appear), OR a
+                                # coworker deleted from the destination folder over a persistent SMB
+                                # session that is outside the ±120s window.  Leave _s1bp_candidates
+                                # empty (same as source-watch deletions) so the SACL burst-cache
+                                # host-scan and 24h 4624 rescue below can find the real remote actor
+                                # before any own-machine fallback — pure SACL, no bystander guess.
                                 _qna.info(
                                     f"[_query_smb_audit] Strategy1b-post: 4656 match + "
                                     f"event_type='deleted' + is_dest_watch=True — dest deletion may "
-                                    f"be server-local actor; cannot confirm own-machine without 4624. "
-                                    f"Reporting UNKNOWN. own-machine candidates (suppressed): "
+                                    f"be server-local actor OR a coworker with a stale SMB session. "
+                                    f"Reporting UNKNOWN for now; SACL rescue below will determine the "
+                                    f"real actor. own-machine candidates (suppressed): "
                                     f"{[(ws, ip, f'{d:+.1f}s') for (d, ws, ip) in _s1bp_skipped_own]}"
                                 )
-                                # Leave _s1bp_candidates empty → UNKNOWN
+                                # Leave _s1bp_candidates empty → SACL rescue (host-scan / 24h 4624)
                             else:
                                 _qna.info(
                                     f"[_query_smb_audit] Strategy1b-post: 4656 match + "
@@ -5247,6 +5388,8 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 result["user"]    = _slb_bc_user
                                 _s1bp_matched = True
                                 _slb_bc_overridden = True
+                                # Burst-cache remote came from a prior audit-log resolution.
+                                result["_sacl_remote_via_auditlog"] = True
                                 _match_method = f"TimeWindow-BurstCacheOverride"
                                 _qna.info(
                                     f"[_query_smb_audit] Strategy1b-post ({_match_method}): "
@@ -5282,6 +5425,8 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             # the same-host SACL-AUDIT-OVERRIDE only trusts cryptographically
                             # proven remote writers, not time-window guesses.
                             result["_sacl_confirmed_remote"] = ("LogonId" in _match_method)
+                            # Remote identity derived from the Security audit log (4663+4624).
+                            result["_sacl_remote_via_auditlog"] = True
                             _qna.info(
                                 f"[_query_smb_audit] Strategy1b-post (4624 {_match_method}): "
                                 f"server-local {_old_user!r}/{_old_machine!r}/{_old_ip!r} "
@@ -5362,7 +5507,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 f"sluser={_s1bp_server_local_user!r} "
                                 f"host={host!r}"
                             )
-                        if not _lar_burst_hit and not _lar_confirmed_local and not is_dest_watch and event_type == "deleted":
+                        if not _lar_burst_hit and not _lar_confirmed_local and event_type == "deleted":
                             # Host-scan fallback: the burst cache may be keyed under a
                             # different server_local_user (e.g. "DESKTOP-FAGSHTO\\User" from
                             # the add event vs "DESKTOP-KGG55PU\\User" from the delete 4663).
@@ -5402,9 +5547,21 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             result["user"]    = _lar_bc_user
                             result["machine"] = _lar_bc_machine
                             result["ip"]      = _lar_bc_ip
+                            # This attribution is INHERITED from a sibling in the same burst,
+                            # NOT this file's own 4663→4624 proof.  Only mark it as pure-SACL
+                            # for destructive events (deleted/renamed): the backup never deletes
+                            # or renames, so such a burst is a single real actor.  For
+                            # added/modified on a same-host share the local owner (.106) and a
+                            # remote coworker (.105) both write under the same server-local
+                            # identity, so the burst-cache key collides — a local add would
+                            # wrongly inherit a concurrent remote add.  Leaving the flag unset
+                            # lets the same-host gate fall back to the local NTFS owner (pure
+                            # SACL: no own remote evidence → local owner), which is correct.
+                            if event_type in ("deleted", "renamed"):
+                                result["_sacl_remote_via_auditlog"] = True
                             _s1bp_matched = True
-                        elif not is_dest_watch and event_type == "deleted":
-                            
+                        elif event_type == "deleted":
+
                             _qna.info(
                                 f"[_query_smb_audit] Strategy1b-post (local-actor rescue 24h): "
                                 f"no burst cache hit; burst cache was empty (first deletion in burst). "
@@ -5587,6 +5744,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                             result["user"]    = _lar_user_full
                                             result["machine"] = _lar_best_machine
                                             result["ip"]      = _lar_best[2] if _lar_best[2] else _s1bp_server_local_ip
+                                            result["_sacl_remote_via_auditlog"] = True
                                             _s1bp_matched = True
                                             _lar_resolved = True
                                             
@@ -5881,39 +6039,81 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                         result["machine"] = ""
                         result["ip"]      = ""
                 else:
-                    _qna.info(
-                        f"[_query_smb_audit] Strategy1b-post: no remote 4624 match "
-                        f"(logon_id={_s1bp_logon_id!r}) on {host!r} -- actor was LOCAL. "
-                        f"Keeping 4663: user={result.get('user')!r} "
-                        f"machine={result.get('machine')!r} ip={result.get('ip')!r}"
-                    )
-                    # SACL definitively resolved this write to the LOCAL machine (the
-                    # 4663 object-access event correlated to a loopback/own 4624 logon).
-                    # Mark it so the BURST-PATCH never retroactively re-attributes this
-                    # entry to a coworker just because a *different* file in the same
-                    # burst turned out to be remote.
-                    result["_sacl_confirmed_local"] = True
-                    # ── Burst cache: store LOCAL attribution so concurrent
-                    # PARENT-ONLY sibling files can reuse it instead of returning Unknown.
-                    _la_server_user = result.get("user", "")
-                    _la_server_machine = result.get("machine", "")
-                    _la_burst_key = locals().get("_s1bp_server_local_user_burst_key", "") or _la_server_user
-                    if _la_burst_key and _la_server_machine:
-                        _burst_cache_put(
-                            host, _la_burst_key,
-                            _la_server_machine,
-                            result.get("ip", "") or host,
-                            _la_server_user,
-                            local_actor=True,
-                            event_type=event_type,
-                        )
+                    # ── Weak-evidence dest deletion guard (PURE SACL) ──────────────
+                    # A PARENT-ONLY match with an EMPTY SubjectLogonId is NOT positive
+                    # local evidence — it just means this file had no usable per-file
+                    # audit event, so the scan fell back to a sibling's folder-name 4656
+                    # whose LogonId was discarded.  On a DEST watch the local owner is
+                    # never the real actor for a coworker's write, so "no remote 4624 ->
+                    # LOCAL" here is a GUESS, not a confirmation.  When a coworker deletes
+                    # several files at once, one file can race ahead and reach this branch
+                    # BEFORE a sibling's LogonId-exact query has populated the remote burst
+                    # cache — so it wrongly shows local.  Wait briefly for a sibling in the
+                    # same burst to confirm a REMOTE actor (LogonId-confirmed) and reuse it.
+                    _la_burst_key = locals().get("_s1bp_server_local_user_burst_key", "") or result.get("user", "")
+                    _dw_remote = None
+                    if (is_dest_watch and event_type in ("deleted", "renamed")
+                            and not _s1bp_logon_id and _s1bp_parent_only and _la_burst_key):
+                        import time as _dw_time
+                        _dw_own_host = (locals().get("_s1bp_own_host_resolved", "") or "").lower()
+                        _dw_own_ip   = (locals().get("_s1bp_own_ip_resolved", "") or "").lower()
+                        _dw_deadline = _dw_time.monotonic() + 6.0
+                        while _dw_time.monotonic() < _dw_deadline:
+                            _dw_hit = _burst_cache_get_logon_confirmed(host, _la_burst_key, event_type=event_type)
+                            if _dw_hit:
+                                _dw_m, _dw_ip, _dw_u = _dw_hit
+                                # Only trust a REMOTE sibling confirmation (never own machine).
+                                if (_dw_m or "").lower() != _dw_own_host and (_dw_ip or "").lower() != _dw_own_ip:
+                                    _dw_remote = _dw_hit
+                                    break
+                            _dw_time.sleep(0.5)
+                    if _dw_remote:
+                        _dw_m, _dw_ip, _dw_u = _dw_remote
                         _qna.info(
-                            f"[_query_smb_audit] Strategy1b-post (local-actor burst-cache): "
-                            f"stored LOCAL attribution for host={host!r} "
-                            f"server_local_user_key={_la_burst_key!r} event_type={event_type!r} -> "
-                            f"machine={_la_server_machine!r} ip={result.get('ip', '')!r} "
-                            f"(TTL={_BURST_CACHE_TTL:.0f}s, local_actor=True)"
+                            f"[_query_smb_audit] Strategy1b-post: WEAK-LOCAL OVERRIDDEN by burst "
+                            f"sibling — parent-only match with empty LogonId on a dest {event_type!r} "
+                            f"is not positive local evidence; a sibling in the same burst confirmed a "
+                            f"REMOTE actor via LogonId-exact SACL. Using it (pure SACL, no local guess). "
+                            f"host={host!r} -> user={_dw_u!r} machine={_dw_m!r} ip={_dw_ip!r}"
                         )
+                        result["user"]    = _dw_u
+                        result["machine"] = _dw_m
+                        result["ip"]      = _dw_ip
+                        result["_sacl_remote_via_auditlog"] = True
+                        result.pop("_sacl_confirmed_local", None)
+                    else:
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post: no remote 4624 match "
+                            f"(logon_id={_s1bp_logon_id!r}) on {host!r} -- actor was LOCAL. "
+                            f"Keeping 4663: user={result.get('user')!r} "
+                            f"machine={result.get('machine')!r} ip={result.get('ip')!r}"
+                        )
+                        # SACL definitively resolved this write to the LOCAL machine (the
+                        # 4663 object-access event correlated to a loopback/own 4624 logon).
+                        # Mark it so the BURST-PATCH never retroactively re-attributes this
+                        # entry to a coworker just because a *different* file in the same
+                        # burst turned out to be remote.
+                        result["_sacl_confirmed_local"] = True
+                        # ── Burst cache: store LOCAL attribution so concurrent
+                        # PARENT-ONLY sibling files can reuse it instead of returning Unknown.
+                        _la_server_user = result.get("user", "")
+                        _la_server_machine = result.get("machine", "")
+                        if _la_burst_key and _la_server_machine:
+                            _burst_cache_put(
+                                host, _la_burst_key,
+                                _la_server_machine,
+                                result.get("ip", "") or host,
+                                _la_server_user,
+                                local_actor=True,
+                                event_type=event_type,
+                            )
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post (local-actor burst-cache): "
+                                f"stored LOCAL attribution for host={host!r} "
+                                f"server_local_user_key={_la_burst_key!r} event_type={event_type!r} -> "
+                                f"machine={_la_server_machine!r} ip={result.get('ip', '')!r} "
+                                f"(TTL={_BURST_CACHE_TTL:.0f}s, local_actor=True)"
+                            )
         except _S1BPostDone:
             pass  # pre-fetched path handled everything cleanly
         except Exception as _s1bp_err:
@@ -9573,7 +9773,19 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                         # proof they wrote the file.  So for same-host, require the audit
                         # result to be LogonId-confirmed before firing the override;
                         # otherwise treat it as inconclusive and keep the local NTFS owner.
-                        if _pm_is_remote and _is_same_host_watch and not _pm_audit.get("_sacl_confirmed_remote"):
+                        # Trust the audit result when it is LogonId-confirmed, OR — for a
+                        # DESTINATION watch — when it came from the Security audit log at all
+                        # (time-window 4663+4624 correlation or delete rescue).  The dest
+                        # folder's local NTFS owner is never the real actor (backup writes are
+                        # grace-suppressed; real writes are coworkers over SMB), so the
+                        # destination must display pure SACL data, not the local-owner guess.
+                        # A NetSessionEnum bystander session carries neither flag and is still
+                        # rejected.  Source-watch behavior is unchanged (LogonId required).
+                        _pm_remote_trusted = bool(
+                            _pm_audit.get("_sacl_confirmed_remote")
+                            or (is_dest_watch and _pm_audit.get("_sacl_remote_via_auditlog"))
+                        )
+                        if _pm_is_remote and _is_same_host_watch and not _pm_remote_trusted:
                             _gei.info(
                                 f"[_get_editor_info] Step1-early: SACL-AUDIT-OVERRIDE "
                                 f"SUPPRESSED (same-host) — audit named a remote identity "
@@ -9698,7 +9910,13 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                             and _bo_ip
                             and _bo_ip != _own_ip_gei0
                             and _bo_machine.lower() not in ("", _own_host_gei0)
-                            and _bo_audit.get("_sacl_confirmed_remote")
+                            # Source: require LogonId-exact.  Destination: any audit-log
+                            # remote (pure SACL) is trusted; NetSessionEnum bystanders (no
+                            # flag) are still rejected.
+                            and (
+                                _bo_audit.get("_sacl_confirmed_remote")
+                                or (is_dest_watch and _bo_audit.get("_sacl_remote_via_auditlog"))
+                            )
                         )
                         if _bo_is_remote:
                             info.update(_bo_audit)
@@ -9915,10 +10133,15 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                 and _del_ip
                 and _del_ip != _own_ip_gei0
                 and _del_mach.lower() not in ("", _own_host_gei0)
-                # Require a real 4663→4624 LogonId correlation — a NetSessionEnum
-                # fallback (the coworker's persistent bystander session) is NOT proof
-                # they deleted the file on a self-hosted share.
-                and _del_audit.get("_sacl_confirmed_remote")
+                # Source: require a real 4663→4624 LogonId correlation — a NetSessionEnum
+                # fallback (the coworker's persistent bystander session) is NOT proof they
+                # deleted the file on a self-hosted share.  Destination: trust any remote the
+                # Security audit log named (LogonId-exact, time-window, or 24h delete rescue)
+                # so the dest shows pure SACL; NetSessionEnum bystanders (no flag) still fail.
+                and (
+                    _del_audit.get("_sacl_confirmed_remote")
+                    or (is_dest_watch and _del_audit.get("_sacl_remote_via_auditlog"))
+                )
             )
             if _del_is_remote:
                 info.update(_del_audit)
@@ -11093,6 +11316,44 @@ class BackupWorker(QThread):
         self.verify_remote_uploads = bool(cfg.get("verify_remote_uploads", False))
         self.verify_after          = bool(cfg.get("verify_after", False))
 
+    def _build_gdrive_cloud_cfg(self, w: dict):
+        """Build a GDrive cloud_config for this watch using the FRESHEST token.
+
+        The Cloud tab snapshots the access token onto the watch, but Google
+        access tokens expire (~1 h).  A backup run later than that would upload
+        with a dead token and silently put nothing in Drive.  Overlay the live
+        token (and refresh token) from QSettings so uploads keep working, and
+        keep the client_id/client_secret already stored on the watch so
+        google-auth can refresh on its own if needed.  Returns None when there's
+        no usable GDrive assignment (so the caller skips the cloud upload).
+        """
+        _wc = dict(w.get("cloud_config") or {})
+        if not _wc or _wc.get("provider", "gdrive") != "gdrive":
+            return None
+        try:
+            from PyQt6.QtCore import QSettings as _QS
+            _s = _QS(SETTINGS_ORG, SETTINGS_APP)
+            _tok = _s.value("gdrive_access_token", "") or ""
+            _ref = _s.value("gdrive_refresh_token", "") or ""
+            if _tok:
+                _wc["access_token"] = _tok
+            if _ref:
+                _wc["refresh_token"] = _ref
+        except Exception:
+            pass
+        if not _wc.get("access_token"):
+            return None
+        _wc["provider"] = "gdrive"
+        _wc["_dest_type"] = "gdrive"
+        # Namespace this watch's upload under a folder named after the WATCH, so
+        # multiple watches assigned to the same Drive folder never collide into a
+        # shared subfolder (the default is the destination's last-folder name,
+        # which is often generic like "1" or "backups" and would merge/overwrite).
+        _wn = (w.get("name") or "").strip()
+        if _wn:
+            _wc["gdrive_folder_name"] = _wn
+        return _wc
+
     def request_stop(self):
         """Signal the worker to abort at the next opportunity (retry sleep or between attempts)."""
         self._stop_event.set()
@@ -11334,23 +11595,27 @@ class BackupWorker(QThread):
                     elif _dest_type == "rclone":
                         _cloud_cfg = {**cfg.get("dest_rclone", {}), "_dest_type": "rclone"}
                     elif _dest_type == "gdrive":
-                        _w_cloud = w.get("cloud_config") or {}
-                        if _w_cloud:
-                            _cloud_cfg = {**_w_cloud, "_dest_type": "gdrive"}
+                        _cloud_cfg = self._build_gdrive_cloud_cfg(w)
 
-                    # BUG FIX: Per-watch cloud_config should ALWAYS apply, even when
-                    # the global dest_type is "local". Previously, GDrive assignments
-                    # saved in the GDrive tab were silently ignored unless the user also
-                    # changed the global dest_type to "gdrive".
+                    # Per-watch GDrive assignment (Cloud tab) must ALWAYS apply,
+                    # even when the global dest_type is "local".  Rebuilt here with
+                    # the FRESH access token so an expired snapshot can't make the
+                    # upload silently fail.
                     if _cloud_cfg is None:
-                        _w_cloud = w.get("cloud_config") or {}
-                        if _w_cloud and _w_cloud.get("access_token"):
-                            _cloud_cfg = {**_w_cloud, "_dest_type": "gdrive"}
+                        _cloud_cfg = self._build_gdrive_cloud_cfg(w)
 
-                    _destinations = None  # Use legacy gdrive_config
+                    _destinations = None  # Use legacy single-destination path
                 else:
-                    _dest_type = "local"  # For legacy compatibility
+                    # Multi-destination watch: keep its destination list, but ALSO
+                    # append the per-watch GDrive assignment so the cloud upload is
+                    # not dropped (previously this branch discarded cloud_config).
+                    _dest_type = "local"
                     _cloud_cfg = None
+                    _gd_cfg = self._build_gdrive_cloud_cfg(w)
+                    if _gd_cfg:
+                        _destinations = list(_destinations) + [
+                            {"dest_type": "gdrive", "config": _gd_cfg}
+                        ]
 
                 # ── Resolve source type and credentials ───────────────────────
                 _src_type = w.get("type", "local")
@@ -13591,6 +13856,47 @@ class AddWatchDialog(QDialog):
 
         QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self._on_submit)
 
+        # ── "Ready to submit" attention glow ───────────────────────────────────
+        # Once the user has typed both a Source path and a Destination, gently
+        # pulse a green glow behind the Add Watch button so it's obvious the next
+        # step is to click it.  The glow is OFF until both required fields are
+        # filled, and switches off again if either is cleared.
+        from PyQt6.QtWidgets import QGraphicsDropShadowEffect as _QGlow
+        from PyQt6.QtCore import QPropertyAnimation as _QAnim, QEasingCurve as _QEase
+        from PyQt6.QtGui import QColor as _QColor
+        self._submit_glow = _QGlow(self._submit_btn)
+        self._submit_glow.setOffset(0, 0)
+        self._submit_glow.setBlurRadius(0.0)
+        self._submit_glow.setColor(_QColor(34, 197, 94))   # #22c55e — success green
+        self._submit_btn.setGraphicsEffect(self._submit_glow)
+        self._submit_glow_anim = _QAnim(self._submit_glow, b"blurRadius", self)
+        self._submit_glow_anim.setDuration(950)
+        self._submit_glow_anim.setStartValue(6.0)
+        self._submit_glow_anim.setKeyValueAt(0.5, 26.0)   # pulse peak
+        self._submit_glow_anim.setEndValue(6.0)
+        self._submit_glow_anim.setEasingCurve(_QEase.Type.InOutSine)
+        self._submit_glow_anim.setLoopCount(-1)            # loop forever while ready
+        self._submit_glow_on = False
+        # Credential-verification memo: the (host, user, pass) last proven to work
+        # (via Test Connection or an on-submit verify).  Lets a later Add Watch skip
+        # re-verifying identical creds; any change invalidates by signature mismatch.
+        self._verified_cred_sig = None
+        self._pending_test_sig = None
+        # Re-check readiness whenever a source/destination field or the source
+        # type changes.
+        for _glow_fld in (self.name_input, self.path_input, self.webdav_url_input,
+                          self.sftp_host_input, self.ftp_host_input, self.dest_input,
+                          self.nas_user_input, self.nas_pass_input):
+            try:
+                _glow_fld.textChanged.connect(self._update_submit_glow)
+            except Exception:
+                pass
+        try:
+            self.source_type.currentIndexChanged.connect(lambda *_: self._update_submit_glow())
+        except Exception:
+            pass
+        self._update_submit_glow()
+
         # ── Tab order: top-to-bottom, logical groups ───────────────────────────
         # Qt automatically skips hidden widgets when cycling focus, so we can
         # include all source-type-specific fields here; the wrong-type fields
@@ -13632,6 +13938,55 @@ class AddWatchDialog(QDialog):
         self._ftp_widget.setVisible(src == "ftp")
         # SMB credentials panel only makes sense for local/UNC paths
         self._nas_audit_frame.setVisible(src == "local")
+
+    def _current_source_path_text(self) -> str:
+        """Return the text of the source-path field for the selected source type."""
+        try:
+            _src = self._SOURCE_TYPES[self.source_type.currentIndex()][1]
+        except Exception:
+            _src = "local"
+        _field = {
+            "local":  self.path_input,
+            "webdav": self.webdav_url_input,
+            "sftp":   self.sftp_host_input,
+            "ftp":    self.ftp_host_input,
+        }.get(_src, self.path_input)
+        try:
+            return _field.text().strip()
+        except Exception:
+            return ""
+
+    def _update_submit_glow(self, *args):
+        """Pulse the Add Watch button once all required fields are filled.
+
+        Required = Name + the source path for the selected type + Destination —
+        i.e. exactly what _on_submit validates — so the glow is a reliable
+        'you're ready, click me' cue rather than a glow-then-error trap.
+        """
+        try:
+            import re as _glow_re
+            _gsrc = self._current_source_path_text()
+            _gdst = self.dest_input.text().strip()
+            _ready = (
+                bool(self.name_input.text().strip())
+                and bool(_gsrc)
+                and bool(_gdst)
+            )
+            # UNC source/destination also needs SMB username + password (matches
+            # the _on_submit requirement) — don't glow until those are entered.
+            def _g_is_unc(p):
+                return bool(_glow_re.match(r"^[/\\]{2}[^/\\]+[/\\]", (p or "").strip()))
+            if _ready and (_g_is_unc(_gsrc) or _g_is_unc(_gdst)):
+                _ready = bool(self.nas_user_input.text().strip()) and bool(self.nas_pass_input.text())
+        except Exception:
+            _ready = False
+        if _ready and not self._submit_glow_on:
+            self._submit_glow_on = True
+            self._submit_glow_anim.start()
+        elif not _ready and self._submit_glow_on:
+            self._submit_glow_on = False
+            self._submit_glow_anim.stop()
+            self._submit_glow.setBlurRadius(0.0)
 
     def _on_nas_creds_toggled(self, checked: bool):
         # Legacy slot kept for EditWatchSettingsWidget compatibility
@@ -13788,6 +14143,9 @@ class AddWatchDialog(QDialog):
                 Q_ARG(str, _msg),
             )
 
+        # Remember what we're testing so a successful result lets the user skip
+        # re-verification when they click Add Watch with these same creds.
+        self._pending_test_sig = (_host.lower(), _user, _pass)
         threading.Thread(target=_run, daemon=True).start()
 
     from PyQt6.QtCore import pyqtSlot as _pyqtSlot
@@ -13796,6 +14154,8 @@ class AddWatchDialog(QDialog):
         self._nas_test_btn.setEnabled(True)
         if ok:
             self._nas_test_lbl.setStyleSheet("color:#22c55e; font-size:11px;")
+            # Trust these exact creds for a subsequent Add Watch (no re-verify).
+            self._verified_cred_sig = getattr(self, "_pending_test_sig", None)
         else:
             self._nas_test_lbl.setStyleSheet("color:#ef4444; font-size:11px;")
         self._nas_test_lbl.setText(msg)
@@ -13945,26 +14305,119 @@ class AddWatchDialog(QDialog):
         _src_path  = self.path_input.text().strip() if src == "local" else ""
         _needs_creds = _is_unc(_src_path) or _is_unc(_dest_path)
 
-        # Temporarily disabled — credentials are optional for now
-        # if _needs_creds:
-        #     _cred_user = self.nas_user_input.text().strip()
-        #     _cred_pass = self.nas_pass_input.text().strip()
-        #     if not _cred_user or not _cred_pass:
-        #         # Auto-expand the credentials section so the user sees it
-        #         self._nas_creds_toggle.setChecked(True)
-        #         self._nas_creds_widget.setVisible(True)
-        #         self._err_label.setText(
-        #             "\u26a0\ufe0f  PC Credentials are required when the source or destination "
-        #             "is a network path (\\\\host\\...).\n"
-        #             "Enter the admin username and password for that Windows PC below."
-        #         )
-        #         self._err_label.show()
-        #         self.nas_user_input.setFocus()
-        #         return
+        # ── UNC path: SMB username + password are REQUIRED ───────────
+        # A network path can only be tracked (who-did-it) and backed up if
+        # BackupSys has credentials to connect to it. Block submit until both
+        # are entered.
+        if _needs_creds:
+            _cred_user = self.nas_user_input.text().strip()
+            _cred_pass = self.nas_pass_input.text()
+            if not _cred_user or not _cred_pass:
+                # Ensure the credentials panel is visible even when the source
+                # type is not local (e.g. SFTP source + UNC destination).
+                try:
+                    self._nas_audit_frame.setVisible(True)
+                except Exception:
+                    pass
+                self._err_label.setText('⚠️  SMB username and password are required when the source or destination is a network path. Enter the credentials BackupSys uses to connect to this share.')
+                self._err_label.show()
+                (self.nas_user_input if not _cred_user else self.nas_pass_input).setFocus()
+                return
+            # Credentials must be CORRECT, not merely present.  If the user already
+            # ran Test Connection successfully with these EXACT creds+host, trust it;
+            # otherwise verify now and block the submit until it passes.  This
+            # covers the case where the user types creds and clicks Add Watch
+            # directly without testing.
+            import re as _sub_hre
+            def _sub_unc_host(p):
+                _m = _sub_hre.match(r"^[/\\]+([^/\\]+)", (p or "").strip())
+                return _m.group(1) if _m else ""
+            _cred_host = _sub_unc_host(_src_path) or _sub_unc_host(_dest_path)
+            _cur_sig = (_cred_host.lower(), _cred_user, _cred_pass)
+            if getattr(self, "_verified_cred_sig", None) == _cur_sig:
+                self._finalize_accept()
+                return
+            self._verify_and_accept(_cred_host, _cred_user, _cred_pass)
+            return
 
+        self._finalize_accept()
+
+    def _finalize_accept(self):
+        """Commit the dialog (called only after all validation/verification passes)."""
         self._err_label.hide()
         self._is_dirty = False
         self.accept()
+
+    def _verify_and_accept(self, host: str, user: str, password: str):
+        """Verify SMB creds off the UI thread; accept the dialog only if they work."""
+        import threading
+        if getattr(self, "_verifying", False):
+            return  # a verification is already in flight (e.g. repeated Ctrl+Enter)
+        self._verifying = True
+        self._err_label.hide()
+        try:
+            self._nas_audit_frame.setVisible(True)
+        except Exception:
+            pass
+        self._submit_btn.setEnabled(False)
+        self._submit_btn.setText("Verifying…")
+        try:
+            self._nas_test_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
+            self._nas_test_lbl.setText("Verifying credentials…")
+        except Exception:
+            pass
+        # Pause the ready-glow while a verification is in flight.
+        try:
+            if getattr(self, "_submit_glow_on", False):
+                self._submit_glow_anim.stop()
+                self._submit_glow.setBlurRadius(0.0)
+                self._submit_glow_on = False
+        except Exception:
+            pass
+
+        def _worker():
+            _ok, _msg = _verify_smb_login(host, user, password)
+            from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(
+                self, "_on_verify_before_accept",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(bool, _ok), Q_ARG(str, _msg),
+                Q_ARG(str, host), Q_ARG(str, user), Q_ARG(str, password),
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @_pyqtSlot(bool, str, str, str, str)
+    def _on_verify_before_accept(self, ok: bool, msg: str, host: str, user: str, password: str):
+        self._verifying = False
+        self._submit_btn.setEnabled(True)
+        self._submit_btn.setText("Add Watch")
+        if ok:
+            # Remember this exact (host,user,pass) so a later submit is instant.
+            self._verified_cred_sig = (host.lower(), user, password)
+            try:
+                self._nas_test_lbl.setStyleSheet("color:#22c55e; font-size:11px;")
+                self._nas_test_lbl.setText(msg)
+            except Exception:
+                pass
+            self._finalize_accept()
+        else:
+            self._err_label.setText(
+                "❌  Cannot add watch — the SMB credentials were rejected.\n"
+                f"{msg}\n"
+                "Fix the username/password (or use Test Connection) and try again."
+            )
+            self._err_label.show()
+            try:
+                self._nas_test_lbl.setStyleSheet("color:#ef4444; font-size:11px;")
+                self._nas_test_lbl.setText(msg)
+            except Exception:
+                pass
+            self.nas_pass_input.setFocus()
+            try:
+                self._update_submit_glow()
+            except Exception:
+                pass
     # ── Data extraction ───────────────────────────────────────────────────────
 
     def get_values(self) -> dict:
@@ -17020,6 +17473,20 @@ class AdminPanel(QDialog):
                             ok, msg = _apply_sacl_remote(host, path, cfg)
                             import logging; logging.getLogger(__name__).info(
                                 f"[_add_watch] SACL auto-config: ok={ok} msg={msg!r}")
+                            # Surface a warning if remote auditing couldn't be enabled —
+                            # otherwise who-did-it tracking silently won't work for this
+                            # network watch and changes will show as "Unknown".
+                            try:
+                                from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+                                QMetaObject.invokeMethod(
+                                    self, "_on_remote_sacl_result",
+                                    Qt.ConnectionType.QueuedConnection,
+                                    Q_ARG(bool, bool(ok)),
+                                    Q_ARG(str, str(host)),
+                                    Q_ARG(str, str(msg)),
+                                )
+                            except Exception:
+                                pass
                         _sacl_th.Thread(target=_sacl_bg, daemon=True).start()
                     elif not _sacl_host and src_type == "local":
                         # Local path on *this* PC — apply SACL without WinRM/SMB.
@@ -17030,6 +17497,38 @@ class AdminPanel(QDialog):
                 self.watches_changed.emit()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
+
+    from PyQt6.QtCore import pyqtSlot as _pyqtSlot_sacl
+    @_pyqtSlot_sacl(bool, str, str)
+    def _on_remote_sacl_result(self, ok: bool, host: str, msg: str):
+        """Warn the user when who-did-it auditing couldn't be enabled on a
+        remote (coworker's) PC when adding a network watch.  Runs on the main
+        thread (invoked from the background SACL-setup thread)."""
+        if ok:
+            return  # auditing enabled — nothing to warn about
+        from PyQt6.QtWidgets import QMessageBox
+        _low = (msg or "").lower()
+        if any(k in _low for k in ("denied", "unauthorized", "0x5", "not an admin", "administrator")):
+            _hint = (f"The username/password you entered must belong to an account in the "
+                     f"Administrators group on {host} (a correct password for a standard "
+                     f"user isn't enough to read that PC's audit log).")
+        elif any(k in _low for k in ("winrm", "wsman", "rpc", "connect", "refused",
+                                     "timed out", "unreachable", "cannot", "0x")):
+            _hint = (f"{host} isn't reachable for remote management. On {host}, run "
+                     f"'Enable-PSRemoting -Force' in an elevated PowerShell (or allow "
+                     f"WinRM/WMI through its firewall), and make sure its network is set "
+                     f"to Private.")
+        else:
+            _hint = (f"Use an administrator account for {host} and make sure remote "
+                     f"management (WinRM/WMI) is allowed on it.")
+        QMessageBox.warning(
+            self, "Who-did-it tracking not enabled",
+            f"Couldn't turn on change-attribution auditing on {host}.\n\n"
+            f"Reason: {msg}\n\n"
+            f"{_hint}\n\n"
+            f"Backups will still run normally — but changes on this folder will show as "
+            f"“Unknown” (rather than a possibly-wrong name) until this is fixed."
+        )
 
     def _remove_watch(self):
         btn = self.sender()
@@ -19223,7 +19722,13 @@ class MainWindow(QMainWindow):
     # thread to the Qt main thread.  QTimer.singleShot() called from a plain
     # threading.Thread has no Qt event loop and silently drops the callback —
     # a queued signal is the only safe way to cross the thread boundary.
-    _file_change_signal = pyqtSignal(str, dict)   # watch_id, entry
+    _file_change_signal = pyqtSignal(str, object)   # watch_id, entry
+    # NOTE: must be 'object', not 'dict'. This signal is emitted from background
+    # watcher threads and delivered to the main thread via a queued connection.
+    # PyQt marshals built-in 'dict' args through QVariant for that hop, which
+    # hands the slot a COPY, not the original object — silently breaking any
+    # code (e.g. _purge_rename_phantom_rows / HistoryWindow.remove_entries)
+    # that matches entries by id(). 'object' preserves the original reference.
 
     # so _start_all_groups runs safely on the Qt main thread.
     # QTimer.singleShot() is NOT safe to call from a background thread
@@ -19282,6 +19787,12 @@ class MainWindow(QMainWindow):
         # Key: (watch_id, norm_path, event_type)  Value: monotonic time last seen
         import threading as _threading_init
         self._dest_event_seen: dict   = {}   # (watch_id, path, type) -> monotonic time
+        # Fingerprint the FIRST detector observed for a claimed dedup slot, so a
+        # racing second detector compares against what the first one actually saw
+        # (same size/mtime/hash = same write = drop) rather than against the
+        # pre-edit baseline in _dest_content_fp, which is stale for 'modified'
+        # events that took the early-stamp spurious-mod path.
+        self._dest_event_seen_fp: dict = {}  # (watch_id, path, type) -> (size, mtime, hash)
         self._source_event_seen: dict = {}   # same structure for source-watcher events
         self._dest_event_seen_lock    = _threading_init.Lock()
         self._source_event_seen_lock  = _threading_init.Lock()
@@ -20903,6 +21414,39 @@ class MainWindow(QMainWindow):
                     "process — skipping duplicate launch."
                 )
 
+    def _event_host_is_remote(self, path: str) -> bool:
+        """True when the file's path is hosted on ANOTHER machine (a UNC host that
+        is not this PC).  Used to gate the pure-SACL 'Unknown' fallback: on a
+        remote-hosted share we can only trust the owner PC's audit log, so an
+        unconfirmed guess must not name the owner.  Local drives and this PC's own
+        self-hosted shares return False (their attribution is trusted as-is)."""
+        import re as _rh_re, socket as _rh_sock
+        _m = _rh_re.match(r"^[\\/]{2}([^\\/]+)", (path or "").strip())
+        if not _m:
+            return False  # local drive path (C:\…) — this PC
+        _host = (_m.group(1) or "").strip().lower()
+        if not _host or _host in ("127.0.0.1", "localhost", "::1"):
+            return False
+        _own = getattr(self, "_own_hostset_cache", None)
+        if _own is None:
+            _own = set()
+            try:
+                _oh = _rh_sock.gethostname().lower()
+                _own.add(_oh)
+                try:
+                    _own.add(_rh_sock.gethostbyname(_oh).lower())
+                except Exception:
+                    pass
+                try:
+                    for _ai in _rh_sock.getaddrinfo(_oh, None):
+                        _own.add(str(_ai[4][0]).lower())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self._own_hostset_cache = _own
+        return _host not in _own
+
     def _on_file_change(self, watch_id: str, entry: dict):
         """Called from watcher thread when a file changes."""
         import logging as _logging
@@ -20964,6 +21508,64 @@ class MainWindow(QMainWindow):
                     f"[desktop._on_file_change] PRE-STAMP source added: "
                     f"path={entry.get('path')!r} mono={_ofc_now:.3f} "
                     f"watch_id={watch_id!r} — early-stamp set before attribution"
+                )
+
+        # ── PRE-STAMP rename endpoints (before attribution) ──────────────────
+        # A rename is ONE row.  The forward RENAME-CORRELATION guard in
+        # _on_file_change_inner suppresses the delete-of-old / add-of-new sides,
+        # but it only registers the endpoints AFTER the 'renamed' event's own
+        # ~4s SACL attribution completes.  On a same-host share the delete-of-old
+        # runs its OWN slow attribution in parallel and can finish (and append)
+        # FIRST — so the tracker isn't set yet, forward-suppression misses it,
+        # and a phantom 'deleted' row leaks (the retroactive purge then had to
+        # clean it up, which cannot reliably reach an already-open History view).
+        # Registering the endpoints HERE, at detection time, closes that race:
+        # the old name is trackable the instant the rename is detected, well
+        # before the sibling 'deleted' finishes attributing.
+        if _ofc_etype == "renamed":
+            import os as _rce_os
+            import re as _rce_re
+
+            def _rce_is_office_temp(_bn: str) -> bool:
+                # Mirror _on_file_change_inner's _check_office_temp: an Office
+                # atomic-save renames real→temp then temp→real. We must NOT treat
+                # those temp endpoints as a user rename, or the real file's genuine
+                # 'modified'/'deleted' gets wrongly suppressed as a "rename side".
+                low  = _bn.lower()
+                stem = _rce_os.path.splitext(low)[0]
+                return (
+                    _bn.startswith("~$")
+                    or low.startswith("~tmp")
+                    or (low.endswith(".tmp") and "~" in stem)
+                    or bool(_rce_re.fullmatch(r"[0-9a-f]{5,16}", stem) and low.endswith(".tmp"))
+                    or bool(_rce_re.fullmatch(r"[0-9a-f]{5,16}", low))
+                )
+
+            _rce_old_bn = _rce_os.path.basename(entry.get("path", "") or "")
+            _rce_new_bn = _rce_os.path.basename(entry.get("dest", "") or "")
+            if _rce_is_office_temp(_rce_old_bn) or _rce_is_office_temp(_rce_new_bn):
+                # Office atomic-save temp rename — NOT a user rename.  Registering
+                # its endpoints would poison _recent_rename_paths and suppress the
+                # real file's genuine save.  Skip (the inner handler coalesces it).
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-STAMP renamed endpoints SKIPPED "
+                    f"(Office-temp rename, not a user rename): old={entry.get('path')!r} "
+                    f"new={entry.get('dest')!r} watch_id={watch_id!r}"
+                )
+            else:
+                import threading as _rce_threading
+                if not hasattr(self, "_recent_rename_paths"):
+                    self._recent_rename_paths = {}
+                _rce_wid  = watch_id.partition("__")[0]
+                _rce_dest = (entry.get("dest") or "").lower()
+                self._recent_rename_paths[(_rce_wid, _ofc_path)] = _ofc_now  # old → 'deleted'
+                if _rce_dest:
+                    self._recent_rename_paths[(_rce_wid, _rce_dest)] = _ofc_now  # new → 'added'/'modified'
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-STAMP renamed endpoints: "
+                    f"old={entry.get('path')!r} new={entry.get('dest')!r} mono={_ofc_now:.3f} "
+                    f"watch_id={watch_id!r} — rename-correlation set before attribution "
+                    f"so a racing delete-of-old is forward-suppressed, not leaked as a phantom row"
                 )
 
         try:
@@ -21837,11 +22439,36 @@ class MainWindow(QMainWindow):
         if not hasattr(self, '_dest_event_seen_lock'):
             import threading as _dee_init
             self._dest_event_seen_lock = _dee_init.Lock()
+        if not hasattr(self, '_dest_event_seen_fp'):
+            self._dest_event_seen_fp = {}
+        # Compute the fingerprint THIS detector sees BEFORE taking the lock, so a
+        # network os.stat / 64KB read never blocks the dedup lock.  Only needed for
+        # 'modified' (add/delete/rename dedup is time-based).
+        _claim_fp = None
+        if _etype == "modified":
+            try:
+                import hashlib as _claim_hl
+                _claim_stat = os.stat(entry.get("path", ""))
+                _claim_hash = None
+                try:
+                    with open(entry.get("path", ""), "rb") as _claim_fh:
+                        _claim_hash = _claim_hl.sha256(_claim_fh.read(65536)).hexdigest()
+                except Exception:
+                    _claim_hash = None
+                _claim_fp = (_claim_stat.st_size, _claim_stat.st_mtime, _claim_hash)
+            except Exception:
+                _claim_fp = None
         with self._dest_event_seen_lock:
             _last_seen = self._dest_event_seen.get(_dedup_key)
             _dest_is_dupe = _last_seen is not None and (_now_mono - _last_seen) < _DEDUP_WINDOW
             if not _dest_is_dupe:
                 self._dest_event_seen[_dedup_key] = _now_mono  # claim slot
+                # Record what the first detector saw so a racing second detector
+                # can compare against it (not against the stale pre-edit baseline).
+                if _claim_fp is not None:
+                    self._dest_event_seen_fp[_dedup_key] = _claim_fp
+                else:
+                    self._dest_event_seen_fp.pop(_dedup_key, None)
         if _dest_is_dupe:
             # For deleted events: whichever detector fires second gets a chance
             # to improve attribution on the already-stored entry.
@@ -22164,135 +22791,71 @@ class MainWindow(QMainWindow):
                 # modification happened in the meantime (different user, rapid
                 # sequential edits), the fingerprint will differ and we must NOT
                 # suppress it.
-                _dedup_fp_key = (watch_id, entry.get("path", "").lower())
                 _dedup_drop = True
                 if _etype == "modified":
-                    with self._dest_content_fp_lock:
-                        _dedup_stored_fp = self._dest_content_fp.get(_dedup_fp_key)
-                    if _dedup_stored_fp is not None:
-                        try:
-                            _dedup_stat = os.stat(entry.get("path", ""))
-                            _dedup_cur_size  = _dedup_stat.st_size
-                            _dedup_cur_mtime = _dedup_stat.st_mtime
-                            _dedup_size_mtime_match = (
-                                _dedup_stored_fp[0] == _dedup_cur_size and
-                                abs(float(_dedup_stored_fp[1]) - _dedup_cur_mtime) < 0.001
-                            )
-                            _dedup_fp_match = _dedup_size_mtime_match
-                            _dedup_cur_hash = None
-                            if _dedup_size_mtime_match:
-                                # Size+mtime match — need SHA-256 to distinguish two
-                                # different writes that happen to produce the same size
-                                # in the same second (e.g. two users editing the same
-                                # xlsx to a similar result within 1s of each other).
-                                _dedup_stored_hash = (
-                                    _dedup_stored_fp[2]
-                                    if len(_dedup_stored_fp) >= 3
-                                    else None
-                                )
-                                if _dedup_stored_hash is None:
-                                    # No stored hash (hash failed at seed time) —
-                                    # fail open to avoid hiding a genuine second
-                                    # modification, but also compute and store the hash
-                                    # NOW so the watchdog/unc_poll duplicate arriving
-                                    # milliseconds later can compare and be suppressed.
-                                    _dedup_fp_match = False
-                                    try:
-                                        import hashlib as _dd_hl2
-                                        with open(entry.get("path", ""), "rb") as _dd_fh2:
-                                            _dd_now_hash = _dd_hl2.sha256(
-                                                _dd_fh2.read(65536)
-                                            ).hexdigest()
-                                        with self._dest_content_fp_lock:
-                                            if _dedup_fp_key in self._dest_content_fp:
-                                                _dd_old = self._dest_content_fp[_dedup_fp_key]
-                                                self._dest_content_fp[_dedup_fp_key] = (
-                                                    _dd_old[0],   # size
-                                                    _dd_old[1],   # mtime
-                                                    _dd_now_hash, # hash (was None)
-                                                )
-                                        logger.info(
-                                            f"[desktop._on_file_change] DEDUP hash-missing — "
-                                            f"size+mtime match but stored fp had no hash; "
-                                            f"failing open (not suppressing) to avoid hiding "
-                                            f"a genuine second modification. "
-                                            f"Computed hash={_dd_now_hash!r} and stored it "
-                                            f"so the detector-race duplicate can be suppressed. "
-                                            f"stored_fp={_dedup_stored_fp!r} "
-                                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
-                                        )
-                                    except Exception as _dd_hash2_err:
-                                        logger.info(
-                                            f"[desktop._on_file_change] DEDUP hash-missing — "
-                                            f"size+mtime match but stored fp has no hash; "
-                                            f"failing open (not suppressing). "
-                                            f"Also failed to compute hash for future dedup "
-                                            f"({_dd_hash2_err!r}). "
-                                            f"stored_fp={_dedup_stored_fp!r} "
-                                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
-                                        )
-                                else:
-                                    # Compute current hash and compare
-                                    try:
-                                        import hashlib as _dd_hl
-                                        with open(entry.get("path", ""), "rb") as _dd_fh:
-                                            _dedup_cur_hash = _dd_hl.sha256(
-                                                _dd_fh.read(65536)
-                                            ).hexdigest()
-                                        _dedup_fp_match = (
-                                            _dedup_cur_hash == _dedup_stored_hash
-                                        )
-                                        if not _dedup_fp_match:
-                                            logger.info(
-                                                f"[desktop._on_file_change] DEDUP hash-diff — "
-                                                f"size+mtime match but SHA-256 differs "
-                                                f"(stored={_dedup_stored_hash!r} "
-                                                f"current={_dedup_cur_hash!r}) → "
-                                                f"genuine second modification. "
-                                                f"watch_id={watch_id!r} "
-                                                f"path={entry.get('path')!r}"
-                                            )
-                                    except Exception as _dd_hash_err:
-                                        # Hash read failed — fail open
-                                        _dedup_fp_match = False
-                                        logger.info(
-                                            f"[desktop._on_file_change] DEDUP hash-read-failed "
-                                            f"({_dd_hash_err!r}) — failing open. "
-                                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
-                                        )
-                            if not _dedup_fp_match:
-                                # File changed since the first event — this is a
-                                # genuine second modification, not a detector race.
-                                # Clear the dedup slot and let it through.
-                                with self._dest_event_seen_lock:
-                                    self._dest_event_seen.pop(_dedup_key, None)
-                                _last_seen = None
-                                _dedup_drop = False
-                                logger.info(
-                                    f"[desktop._on_file_change] DEDUP BYPASS — "
-                                    f"fingerprint changed since first event "
-                                    f"(stored_size={_dedup_stored_fp[0]} "
-                                    f"stored_mtime={_dedup_stored_fp[1]:.3f} "
-                                    f"stored_hash={(_dedup_stored_fp[2] if len(_dedup_stored_fp)>=3 else None)!r} "
-                                    f"current_size={_dedup_cur_size} "
-                                    f"current_mtime={_dedup_cur_mtime:.3f} "
-                                    f"current_hash={_dedup_cur_hash!r}) "
-                                    f"→ treating as a second genuine modification, "
-                                    f"NOT a watchdog/unc_poll detector race. "
-                                    f"watch_id={watch_id!r} path={entry.get('path')!r} "
-                                    f"detection_source={entry.get('detection_source')!r}"
-                                )
-                        except Exception as _dedup_stat_err:
-                            # Can't stat — fail open (don't suppress)
+                    # Compare THIS event's fingerprint against the one the FIRST
+                    # detector observed (recorded at claim time), NOT against the
+                    # pre-edit baseline in _dest_content_fp.  That baseline is stale
+                    # for files that took the early-stamp spurious-mod path (it keeps
+                    # the original 'added' size), which made every real 'modified'
+                    # look "changed since baseline" and bypass dedup → duplicate rows.
+                    with self._dest_event_seen_lock:
+                        _dedup_stored_fp = self._dest_event_seen_fp.get(_dedup_key)
+                    if _dedup_stored_fp is None and _claim_fp is not None:
+                        # No fingerprint recorded for the slot yet (first detector's stat
+                        # failed).  Accept this event but make ITS fingerprint the new
+                        # reference so the racing sibling for the same state is recognised
+                        # and dropped instead of also failing open (→ duplicate row).
+                        with self._dest_event_seen_lock:
+                            self._dest_event_seen[_dedup_key] = _now_mono
+                            self._dest_event_seen_fp[_dedup_key] = _claim_fp
+                        _dedup_drop = False
+                        logger.info(
+                            f"[desktop._on_file_change] DEDUP no-first-fp — recorded this "
+                            f"detector's fingerprint as the new reference; appending. "
+                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                        )
+                    elif _dedup_stored_fp is None or _claim_fp is None:
+                        # This detector couldn't stat the file — fail open.
+                        with self._dest_event_seen_lock:
+                            self._dest_event_seen.pop(_dedup_key, None)
+                        _last_seen = None
+                        _dedup_drop = False
+                        logger.info(
+                            f"[desktop._on_file_change] DEDUP stat-failed — cannot verify "
+                            f"fingerprint; failing open (not suppressing). "
+                            f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                        )
+                    else:
+                        # Same size AND mtime (within 1ms) AND — when both hashes are
+                        # present — same 64KB SHA-256 ⇒ the two detectors saw the SAME
+                        # write ⇒ drop the duplicate.  Any difference ⇒ a genuine second
+                        # edit landed between the two detections ⇒ let it through.
+                        _dedup_fp_match = (
+                            _dedup_stored_fp[0] == _claim_fp[0] and
+                            abs(float(_dedup_stored_fp[1]) - float(_claim_fp[1])) < 0.001
+                        )
+                        if (_dedup_fp_match
+                                and len(_dedup_stored_fp) >= 3 and _dedup_stored_fp[2] is not None
+                                and len(_claim_fp) >= 3 and _claim_fp[2] is not None):
+                            _dedup_fp_match = (_dedup_stored_fp[2] == _claim_fp[2])
+                        if not _dedup_fp_match:
+                            # Genuine new content state.  THIS event becomes the new
+                            # reference: record ITS fingerprint (do NOT clear it) so the
+                            # other detector firing for this SAME new state is recognised
+                            # as a race and dropped — otherwise it would find no stored fp
+                            # and fail open, producing a duplicate row.
                             with self._dest_event_seen_lock:
-                                self._dest_event_seen.pop(_dedup_key, None)
-                            _last_seen = None
+                                self._dest_event_seen[_dedup_key] = _now_mono
+                                self._dest_event_seen_fp[_dedup_key] = _claim_fp
                             _dedup_drop = False
                             logger.info(
-                                f"[desktop._on_file_change] DEDUP stat-failed — "
-                                f"cannot verify fingerprint ({_dedup_stat_err!r}); "
-                                f"failing open (not suppressing). "
-                                f"watch_id={watch_id!r} path={entry.get('path')!r}"
+                                f"[desktop._on_file_change] DEDUP BYPASS — fingerprint "
+                                f"changed since first event (first_fp={_dedup_stored_fp!r} "
+                                f"current_fp={_claim_fp!r}) → genuine second modification, "
+                                f"NOT a watchdog/unc_poll detector race. "
+                                f"watch_id={watch_id!r} path={entry.get('path')!r} "
+                                f"detection_source={entry.get('detection_source')!r}"
                             )
                 if _dedup_drop:
                     logger.info(
@@ -22311,6 +22874,12 @@ class MainWindow(QMainWindow):
             _cutoff = _now_mono - _DEDUP_WINDOW
             self._dest_event_seen = {
                 k: v for k, v in self._dest_event_seen.items() if v > _cutoff
+            }
+            # Keep the parallel first-detector fingerprint map in sync — drop any
+            # entry whose dedup slot was just pruned.
+            self._dest_event_seen_fp = {
+                k: v for k, v in self._dest_event_seen_fp.items()
+                if k in self._dest_event_seen
             }
 
         # ── Rename correlation: one rename is ONE user action (SOURCE + DEST) ──
@@ -23069,6 +23638,37 @@ class MainWindow(QMainWindow):
         entry["editor_user"]    = editor["user"]
         entry["editor_machine"] = editor["machine"]
         entry["editor_ip"]      = editor["ip"]
+        # ── PURE-SACL gate for REMOTE-hosted shares ─────────────────────────────
+        # When the watched folder lives on ANOTHER machine (a coworker's PC, not
+        # this one), the only trustworthy actor identity comes from THAT machine's
+        # Security audit log (SACL 4663/4656 → 4624 LogonId).  If SACL did not
+        # positively confirm the actor — because auditing isn't enabled on the
+        # owner's PC, or the app can't read its log (no admin creds / remote
+        # management blocked) — do NOT fall back to the share owner or an SMB-session
+        # guess: that would blame the wrong person.  Show "Unknown" instead.  This
+        # applies to add / modify / delete / rename, on source AND destination.
+        # (Same-host self-hosted shares and any SACL-confirmed actor are untouched.)
+        _sacl_confirmed = bool(
+            editor.get("_sacl_confirmed_remote")
+            or editor.get("_sacl_confirmed_local")
+            or editor.get("_sacl_remote_via_auditlog")
+        )
+        if (not _sacl_confirmed
+                and (entry.get("editor_user") or entry.get("editor_machine") or entry.get("editor_ip"))
+                and self._event_host_is_remote(entry.get("path", ""))):
+            import logging as _pslog
+            _pslog.getLogger(__name__).info(
+                f"[desktop._on_file_change] PURE-SACL: remote-hosted share and NO "
+                f"confirmed SACL actor for {entry.get('path')!r} — showing 'Unknown' "
+                f"instead of an owner/session guess "
+                f"(was user={entry.get('editor_user')!r} machine={entry.get('editor_machine')!r} "
+                f"ip={entry.get('editor_ip')!r}). Enable auditing + admin creds on the "
+                f"owner's PC for who-did-it tracking."
+            )
+            entry["editor_user"]    = "Unknown"
+            entry["editor_machine"] = ""
+            entry["editor_ip"]      = ""
+            entry["attribution_unknown"] = True
         # SACL definitively confirmed this write as LOCAL — mark the entry so the
         # BURST-PATCH never re-attributes it to a coworker who happened to write a
         # DIFFERENT file in the same burst.
@@ -23472,6 +24072,31 @@ class MainWindow(QMainWindow):
                             f"MISS — no burst cache entry for host={_fwd_host!r} event_type={_fwd_etype!r} "
                             f"path={entry.get('path')!r} — entry stays Unknown"
                         )
+
+            # ── Rename-correlation RE-CHECK (post-attribution) ───────────────
+            # The forward guard near the top ran BEFORE this event's ~4s SACL
+            # attribution.  On a same-host share the sibling 'renamed' is
+            # attributing in parallel and may have registered its endpoints
+            # (old→'deleted', new→'added') only AFTER our first check passed.
+            # Re-check here, right before appending, so a delete-of-old / add-of-new
+            # that raced its rename is dropped up-front instead of leaking a phantom
+            # row that the retroactive purge must chase into an open History view.
+            _rcc_etype = entry.get("type", "")
+            if _rcc_etype in ("deleted", "added", "modified") and hasattr(self, "_recent_rename_paths"):
+                import time as _rcc_time
+                _rcc_wid  = watch_id.partition("__")[0]
+                _rcc_path = (entry.get("path", "") or "").lower()
+                _rcc_seen = self._recent_rename_paths.get((_rcc_wid, _rcc_path))
+                if _rcc_seen is not None and (_rcc_time.monotonic() - _rcc_seen) < 30:
+                    import logging as _rccl
+                    _rccl.getLogger(__name__).info(
+                        f"[desktop._on_file_change] RENAME-CORRELATION suppressed (post-attribution "
+                        f"re-check): '{_rcc_etype}' for path={entry.get('path')!r} is the "
+                        f"delete-of-old / add-of-new side of a rename whose endpoints were "
+                        f"registered while this event was attributing (watch={_rcc_wid!r}) — "
+                        f"dropping duplicate before append."
+                    )
+                    return
 
             self._history_log.append(entry)
             if len(self._history_log) > 5000:
@@ -27427,15 +28052,25 @@ class HistoryWindow(QDialog):
         Used by the retroactive rename-correlation purge: when a 'renamed' row
         arrives, any phantom delete-of-old / add-of-new rows that were appended
         before the rename (a detector/thread race that forward-suppression could
-        not catch) are removed so a rename shows as exactly ONE row. Matching is
-        by object identity — the same dict objects live in both the caller's
-        history_log and this window's _all_history.
+        not catch) are removed so a rename shows as exactly ONE row.
+
+        Matching is by VALUE (type + path + dest + timestamp), not object
+        identity. Entries reach this window via a queued pyqtSignal hop from a
+        background thread; depending on the signal's declared argument type,
+        Qt may hand the slot a marshaled copy rather than the original dict,
+        which would make id()-based matching silently fail. Value-matching is
+        correct regardless of whether the object survived that hop intact.
         """
         if not entries:
             return
-        _ids = {id(e) for e in entries}
+
+        def _key(e):
+            return (e.get("type"), (e.get("path") or "").lower(),
+                    (e.get("dest") or "").lower(), e.get("timestamp"))
+
+        _keys = {_key(e) for e in entries}
         before = len(self._all_history)
-        self._all_history = [e for e in self._all_history if id(e) not in _ids]
+        self._all_history = [e for e in self._all_history if _key(e) not in _keys]
         if len(self._all_history) == before:
             return  # nothing matched — table already correct
         # Rebuild the table + stats from the pruned list (respects active filters).

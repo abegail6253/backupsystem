@@ -2226,9 +2226,14 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Opti
                 meta = {"name": name, "parents": [parent_id]}
                 service.files().create(body=meta, media_body=media, fields="id").execute()
 
-        # Resolve the top-level watch folder (reuse if exists)
+        # Resolve the top-level watch folder (reuse if exists).
+        # Prefer an explicit per-watch folder name (set by the desktop app to the
+        # WATCH name) so multiple watches sharing one Drive folder each get their
+        # own subfolder instead of colliding on a generic destination basename
+        # (e.g. "1").  Falls back to the backup dir's name for other callers.
         top_parent    = folder_id if folder_id else "root"
-        run_folder_id = _find_or_create_folder(ld.name, top_parent)
+        _top_name     = (cloud_config.get("gdrive_folder_name") or "").strip() or ld.name
+        run_folder_id = _find_or_create_folder(_top_name, top_parent)
 
         _folder_cache: dict = {"": run_folder_id}
 

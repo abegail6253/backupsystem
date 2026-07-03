@@ -246,6 +246,50 @@ class TestWatcherManager(unittest.TestCase):
         self.assertEqual(result, [])
 
     @unittest.skipUnless(watcher.WATCHDOG_AVAILABLE, "watchdog not installed")
+    def test_unc_notify_started_with_base_id_and_stopped(self):
+        """Regression: start() must call _start_unc_notify with the BASE watch_id.
+
+        It previously passed watch_id + '__unc_notify', and _start_unc_notify
+        appends '__unc_notify' again, registering the thread under
+        '<id>__unc_notify__unc_notify' — while stop() -> _stop_unc_notify('<id>')
+        looks for '<id>__unc_notify'.  The real-time UNC notify thread (and its
+        open SMB directory handle) was therefore never stopped on stop()/restart().
+        """
+        import tempfile, shutil
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            mgr = watcher.WatcherManager()
+            started_ids = []
+
+            def _fake_start_unc(watch_id, path, on_change, exclude_patterns=None):
+                # Mimic the real _start_unc_notify's registration key.
+                started_ids.append(watch_id)
+                key = watch_id + "__unc_notify"
+                mgr._unc_notify_stop_events[key] = threading.Event()
+                mgr._unc_notify_threads[key] = MagicMock()
+                return True
+
+            with patch("watcher.Observer") as mock_obs_cls, \
+                 patch.object(watcher.WatcherManager, "_is_unc_path",
+                              staticmethod(lambda p: True)), \
+                 patch.object(mgr, "_start_unc_notify", side_effect=_fake_start_unc), \
+                 patch.object(mgr, "_start_polling"):
+                mock_obs_cls.return_value = MagicMock()
+                mgr.start("w_unc", str(tmp))
+
+            # start() must pass the base id, not a pre-suffixed one.
+            self.assertEqual(started_ids, ["w_unc"])
+            key = "w_unc__unc_notify"
+            self.assertIn(key, mgr._unc_notify_threads)
+
+            # stop() must clear exactly that key (no leaked notify thread).
+            mgr.stop("w_unc")
+            self.assertNotIn(key, mgr._unc_notify_threads)
+            self.assertNotIn(key, mgr._unc_notify_stop_events)
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    @unittest.skipUnless(watcher.WATCHDOG_AVAILABLE, "watchdog not installed")
     def test_stop_all_does_not_raise(self):
         mgr = watcher.WatcherManager()
         with patch("watcher.Observer") as mock_obs_cls:

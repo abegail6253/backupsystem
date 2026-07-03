@@ -1,1 +1,0 @@
-[{"type": "added", "path": "/watch/file3324.txt", "dest": null, "timestamp": "2026-06-18T15:26:18.301344", "size": 0, "detection_source": "watchdog", "watch_id": "w_cap"}, {"type": "added", "path": "/watch/file3325.txt", "dest": null, "timestamp": "2026-06-18T15:26:18.307857", "size": 0, "detection_source": "watchdog", "watch_id": "w_cap"}]
