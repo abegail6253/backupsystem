@@ -128,11 +128,11 @@ from PyQt6.QtWidgets import (
     QHeaderView, QSizePolicy, QStackedWidget, QProgressBar, QTextEdit,
     QSplitter, QComboBox, QGroupBox, QTabWidget, QToolButton, QStyle,
     QRadioButton, QTimeEdit, QListWidget, QListWidgetItem, QAbstractItemView,
-    QPlainTextEdit, QDateEdit
+    QPlainTextEdit, QDateEdit, QAbstractSpinBox, QAbstractScrollArea
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QObject, pyqtSignal, QSize, QSettings, QPoint, QRectF, QTime,
-    QDate
+    QDate, QEvent
 )
 from PyQt6.QtGui import (
     QIcon, QFont, QColor, QPalette, QPixmap, QPainter, QBrush,
@@ -140,6 +140,10 @@ from PyQt6.QtGui import (
 )
 
 # ── Local imports ──────────────────────────────────────────────────────────────
+# i18n first, and outside the backend try/except: it has no heavy deps, and tr()
+# must always exist because it wraps user-facing strings throughout the UI.
+from i18n import tr, set_language, get_language, available_languages
+
 try:
     import config_manager
     import backup_engine
@@ -487,6 +491,47 @@ QMenu::item {
 }
 QMenu::item:selected { background-color: #2563eb; }
 QMenu::separator { background-color: #2e3340; height: 1px; margin: 4px 8px; }
+QMenu::item:disabled { color: #565c6b; }
+/* ── Polish pass: styles for widgets that otherwise fall back to OS defaults ── */
+QToolTip {
+    background-color: #22262f;
+    color: #e8eaf0;
+    border: 1px solid #3d4455;
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 12px;
+}
+QPushButton:focus            { border: 1px solid #60a5fa; }
+QPushButton:disabled         { background-color: #2e3340; color: #6b7280; }
+QPushButton#secondary:disabled { background-color: #23262e; color: #565c6b; border-color: #2e3340; }
+QPushButton#success:disabled { background-color: #2e3340; color: #6b7280; }
+QPushButton#danger:disabled  { background-color: #2e3340; color: #6b7280; }
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover { border-color: #4b5366; }
+QLineEdit, QSpinBox, QComboBox { selection-background-color: #2563eb; selection-color: #ffffff; }
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox QAbstractItemView {
+    background-color: #22262f;
+    border: 1px solid #3d4455;
+    border-radius: 6px;
+    color: #e8eaf0;
+    padding: 4px;
+    outline: none;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+}
+QScrollBar::handle:vertical:hover { background: #4b5366; }
+QScrollBar:horizontal { background: #1a1d23; height: 8px; border-radius: 4px; }
+QScrollBar::handle:horizontal { background: #3d4455; border-radius: 4px; min-width: 20px; }
+QScrollBar::handle:horizontal:hover { background: #4b5366; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QRadioButton { color: #d1d5db; spacing: 8px; }
+QRadioButton::indicator {
+    width: 16px; height: 16px;
+    border-radius: 8px;
+    border: 1px solid #3d4455;
+    background: #2e3340;
+}
+QRadioButton::indicator:checked { background-color: #2563eb; border-color: #2563eb; }
 """
 
 LIGHT_STYLE = """
@@ -609,6 +654,70 @@ QProgressBar::chunk {
         stop:0 #2563eb, stop:1 #7c3aed);
     /* border-radius removed: see dark-theme comment above — same fix applies. */
 }
+/* ── Polish pass: parity with dark theme + gap fills ──────────────────────── */
+QLabel[objectName="heading"]    { font-size: 18px; font-weight: 700; color: #111827; }
+QLabel[objectName="subheading"] { font-size: 13px; color: #6b7280; }
+QPushButton:pressed { background-color: #1e40af; }
+QPushButton:focus   { border: 1px solid #2563eb; }
+QPushButton[objectName="secondary"]:disabled { background-color: #f3f4f6; color: #b0b6c0; border-color: #e5e7eb; }
+QPushButton[objectName="danger"]:disabled    { background-color: #f3f4f6; color: #b0b6c0; }
+QPushButton[objectName="success"]            { background-color: #16a34a; color: #ffffff; }
+QPushButton[objectName="success"]:hover      { background-color: #15803d; }
+QPushButton[objectName="success"]:disabled   { background-color: #f3f4f6; color: #b0b6c0; }
+QComboBox:focus, QSpinBox:focus { border: 1px solid #2563eb; }
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover { border-color: #9ca3af; }
+QLineEdit, QSpinBox, QComboBox { selection-background-color: #2563eb; selection-color: #ffffff; }
+QToolTip {
+    background-color: #111827;
+    color: #f9fafb;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 12px;
+}
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox QAbstractItemView {
+    background-color: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    color: #111827;
+    padding: 4px;
+    outline: none;
+    selection-background-color: #eff6ff;
+    selection-color: #1e40af;
+}
+QScrollBar:horizontal { background: #f3f4f6; height: 8px; border-radius: 4px; }
+QScrollBar::handle:horizontal { background: #d1d5db; border-radius: 4px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: #9ca3af; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QTableWidget::item { padding: 6px 10px; }
+QCheckBox { color: #374151; spacing: 8px; }
+QCheckBox::indicator {
+    width: 16px; height: 16px;
+    border-radius: 4px;
+    border: 1px solid #d1d5db;
+    background: #ffffff;
+}
+QCheckBox::indicator:checked { background-color: #2563eb; border-color: #2563eb; }
+QRadioButton { color: #374151; spacing: 8px; }
+QRadioButton::indicator {
+    width: 16px; height: 16px;
+    border-radius: 8px;
+    border: 1px solid #d1d5db;
+    background: #ffffff;
+}
+QRadioButton::indicator:checked { background-color: #2563eb; border-color: #2563eb; }
+QGroupBox {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    margin-top: 14px;
+    padding-top: 10px;
+    color: #6b7280;
+    font-weight: 600;
+    font-size: 11px;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
+QMenu::item:disabled { color: #b0b6c0; }
 """
 
 
@@ -896,6 +1005,13 @@ def _apply_sacl_local(path: str) -> tuple[bool, str]:
     script_lines.append(
         "wevtutil sl Security /ms:524288000 /rt:false;"
     )
+    # Open the firewall so a watching PC can READ this machine's Security log
+    # remotely (Event 4663).  Auditing writes the events; without this rule no
+    # remote reader can fetch them and attribution stays 'Unknown' on the watcher.
+    script_lines.append(
+        "Enable-NetFirewallRule -DisplayGroup 'Remote Event Log Management' "
+        "-ErrorAction SilentlyContinue;"
+    )
     script = " ".join(script_lines)
 
     # ── Attempt 1: run in the current process ────────────────────────────────
@@ -990,6 +1106,217 @@ def _apply_sacl_local(path: str) -> tuple[bool, str]:
         return False, f"Local SACL setup error for '{path}': {_e2}"
 
 
+def _host_is_local_machine(host: str) -> bool:
+    """True if *host* (a hostname or IP taken from a UNC path) refers to THIS PC.
+
+    Used to detect a *self-hosted* share — e.g. the app runs on the same machine
+    that hosts ``\\\\<own-ip>\\share`` and the user watches it via its UNC path.
+    In that case a remote WinRM/WMI setup is both pointless and impossible (WMI
+    refuses credential-based connections to the local machine), so we route to
+    the local SACL path instead.  Never raises.
+    """
+    if not host:
+        return False
+    import socket as _sk
+    _h = host.strip().lower().rstrip(".")
+    if _h in ("localhost", "127.0.0.1", "::1", "."):
+        return True
+    try:
+        _own_host = _sk.gethostname().lower()
+    except Exception:
+        _own_host = ""
+    if _own_host and _h in (_own_host, _own_host.split(".")[0]):
+        return True
+    # Compare resolved IPs on both sides — covers the "watch \\<own-ip>\share"
+    # case where host is this PC's LAN IP (e.g. 192.168.254.106).
+    try:
+        _own_ips = set()
+        try:
+            _own_ips.update(_sk.gethostbyname_ex(_sk.gethostname())[2])
+        except Exception:
+            pass
+        try:
+            for _info in _sk.getaddrinfo(_sk.gethostname(), None):
+                _own_ips.add(_info[4][0])
+        except Exception:
+            pass
+        _host_ips = set()
+        for _info in _sk.getaddrinfo(host, None):
+            _host_ips.add(_info[4][0])
+        if any(ip.startswith("127.") for ip in _host_ips):
+            return True
+        if _host_ips & _own_ips:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_local_share_path(share_name: str, sub_path: str = "") -> str:
+    """Resolve a *local* SMB share name to its backing folder path on this PC.
+
+    Returns e.g. ``D:\\testshare`` for share ``testshare``, with *sub_path*
+    appended when given.  Returns "" if the share can't be resolved.  Never raises.
+    """
+    import subprocess as _sp, logging as _lg
+    _l = _lg.getLogger(__name__)
+    _CNW = 0x08000000  # CREATE_NO_WINDOW
+    _cmd = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        f"$p=(Get-SmbShare -Name '{share_name}').Path;"
+        f"if(-not $p){{$p=(Get-WmiObject Win32_Share -Filter \"Name='{share_name}'\").Path}};"
+        "Write-Output $p"
+    )
+    try:
+        _r = _sp.run(
+            ["powershell", "-NonInteractive", "-NoProfile", "-Command", _cmd],
+            capture_output=True, text=True, timeout=20, creationflags=_CNW,
+        )
+        _lines = [ln.strip() for ln in (_r.stdout or "").splitlines() if ln.strip()]
+        _root = _lines[0] if _lines else ""
+    except Exception as _e:
+        _l.warning(f"[_resolve_local_share_path] failed for {share_name!r}: {_e!r}")
+        return ""
+    if not _root:
+        return ""
+    _root = _root.rstrip("\\")
+    _sub = (sub_path or "").strip("\\")
+    return f"{_root}\\{_sub}" if _sub else _root
+
+
+def _build_remote_audit_ps1(share_name: str, sub_path: str) -> str:
+    """PowerShell run on the remote host to (1) set the folder SACL, (2) enable
+    File System audit policy + a large Security log, and (3) open the firewall so
+    this PC can READ the resulting Event 4663 records remotely.  Written to a
+    file on the target (not an inline command) so there is no shell-quoting to
+    get wrong."""
+    _sh = share_name.replace("'", "''")
+    _sub = sub_path.replace("'", "''")
+    return (
+        "$ErrorActionPreference='SilentlyContinue';\n"
+        f"$s = Get-WmiObject Win32_Share -Filter \"Name='{_sh}'\";\n"
+        "$root = $s.Path.TrimEnd('\\');\n"
+        f"$sub = '{_sub}';\n"
+        "$lp = if ($sub) { $root + '\\' + $sub } else { $root };\n"
+        "if (Test-Path $lp) {\n"
+        "  $acl = Get-Acl -Audit $lp;\n"
+        "  $rule = New-Object System.Security.AccessControl.FileSystemAuditRule("
+        "'Everyone',"
+        "'Delete,DeleteSubdirectoriesAndFiles,WriteData,AppendData,WriteAttributes,WriteExtendedAttributes',"
+        "'ContainerInherit,ObjectInherit','None','Success');\n"
+        "  $acl.AddAuditRule($rule); Set-Acl $lp $acl;\n"
+        "}\n"
+        "auditpol /set /subcategory:'File System' /success:enable /failure:enable;\n"
+        "wevtutil sl Security /ms:524288000 /rt:false;\n"
+        "Enable-NetFirewallRule -DisplayGroup 'Remote Event Log Management';\n"
+    )
+
+
+def _enable_remote_audit_via_smb(host: str, share_name: str, sub_path: str,
+                                 user: str, password: str) -> tuple[bool, str]:
+    """
+    Bootstrap remote audit setup over SMB (port 445) when WinRM AND WMI/DCOM are
+    both blocked — the exact situation where those two fail with "RPC server is
+    unavailable".  This is the PsExec technique: authenticate to the host, drop a
+    one-shot PowerShell script on its ADMIN$ share, and run it via a temporary
+    Windows service (Service Control Manager travels over the same SMB session,
+    so it works when RPC/135 is firewalled).  Requires admin credentials.
+
+    GATED by the 'remote_setup_smb_fallback' config flag (default OFF) because
+    creating a remote service is the classic lateral-movement pattern and some
+    antivirus/EDR flags it.  Never raises.
+    """
+    import logging as _l, subprocess as _sp, uuid as _uuid, time as _time
+    _lg = _l.getLogger(__name__)
+    try:
+        import win32service as _w32svc, pywintypes as _pwt
+    except ImportError:
+        return False, "pywin32 win32service unavailable — cannot use SMB fallback."
+
+    _token   = _uuid.uuid4().hex[:8]
+    _svc_name = f"BackupSysAudit_{_token}"
+    _ipc     = rf"\\{host}\IPC$"
+    _remote_ps1_unc   = rf"\\{host}\ADMIN$\Temp\_bsaudit_{_token}.ps1"
+    _remote_ps1_local = rf"C:\Windows\Temp\_bsaudit_{_token}.ps1"
+    _CNW = 0x08000000
+
+    _net_used = False
+    _scm = None
+    _svc = None
+    try:
+        # 1) Authenticate to the host (IPC$).  Other shares (ADMIN$) reuse it.
+        _r = _sp.run(["net", "use", _ipc, f"/user:{user}", password],
+                     capture_output=True, text=True, timeout=25, creationflags=_CNW)
+        _net_used = (_r.returncode == 0)
+        if not _net_used:
+            _lg.info(f"[_enable_remote_audit_via_smb] net use {_ipc} failed rc={_r.returncode} "
+                     f"err={(_r.stderr or '').strip()[:150]!r}")
+            return False, f"SMB authentication to {host} failed: {(_r.stderr or '').strip()[:150]}"
+
+        # 2) Drop the setup script onto the target's ADMIN$ (C:\Windows\Temp).
+        try:
+            with open(_remote_ps1_unc, "w", encoding="utf-8") as _f:
+                _f.write(_build_remote_audit_ps1(share_name, sub_path))
+        except OSError as _we:
+            return False, (f"Could not write to {host} ADMIN$ (need admin rights on {host}): {_we}")
+
+        # 3) Create + start a one-shot service that runs the script.  The process
+        #    launches even though it never reports to the SCM, so StartService
+        #    raises ERROR_SERVICE_REQUEST_TIMEOUT (1053) — expected, not a failure.
+        _bin = (f'powershell -NoProfile -ExecutionPolicy Bypass '
+                f'-WindowStyle Hidden -File "{_remote_ps1_local}"')
+        _scm = _w32svc.OpenSCManager(rf"\\{host}", None, _w32svc.SC_MANAGER_CREATE_SERVICE)
+        _svc = _w32svc.CreateService(
+            _scm, _svc_name, "BackupSys one-shot audit setup",
+            _w32svc.SERVICE_ALL_ACCESS, _w32svc.SERVICE_WIN32_OWN_PROCESS,
+            _w32svc.SERVICE_DEMAND_START, _w32svc.SERVICE_ERROR_IGNORE,
+            _bin, None, 0, None, None, None,
+        )
+        try:
+            _w32svc.StartService(_svc, None)
+        except _pwt.error as _se:
+            # 1053 = ERROR_SERVICE_REQUEST_TIMEOUT (the command ran; it just isn't
+            # a real service).  Anything else is a genuine start failure.
+            if getattr(_se, "winerror", None) not in (1053,):
+                _lg.info(f"[_enable_remote_audit_via_smb] StartService winerror={_se}")
+        _time.sleep(4)   # let the PowerShell finish applying SACL/firewall
+        _lg.info(f"[_enable_remote_audit_via_smb] ran audit setup on {host!r} via SMB service "
+                 f"(share={share_name!r} sub={sub_path!r})")
+        return True, (f"Configured SACL + opened Security-log firewall on {host} over SMB "
+                      f"(WinRM/WMI were unavailable).")
+    except _pwt.error as _pe:
+        return False, f"SMB service setup failed on {host}: {_pe}"
+    except Exception as _e:
+        return False, f"SMB fallback error on {host}: {_e!r}"
+    finally:
+        # Best-effort cleanup: delete the service, the dropped script, and the session.
+        try:
+            if _svc is not None:
+                try:
+                    _w32svc.ControlService(_svc, _w32svc.SERVICE_CONTROL_STOP)
+                except Exception:
+                    pass
+                try:
+                    _w32svc.DeleteService(_svc)
+                except Exception:
+                    pass
+                _w32svc.CloseServiceHandle(_svc)
+            if _scm is not None:
+                _w32svc.CloseServiceHandle(_scm)
+        except Exception:
+            pass
+        try:
+            os.remove(_remote_ps1_unc)
+        except OSError:
+            pass
+        if _net_used:
+            try:
+                _sp.run(["net", "use", _ipc, "/delete", "/y"],
+                        capture_output=True, text=True, timeout=15, creationflags=_CNW)
+            except Exception:
+                pass
+
+
 def _apply_sacl_remote(host: str, unc_path: str, smb_audit_cfg: dict) -> tuple[bool, str]:
     """
     Automatically configure Windows object-auditing (SACL) on the shared folder
@@ -1025,6 +1352,26 @@ def _apply_sacl_remote(host: str, unc_path: str, smb_audit_cfg: dict) -> tuple[b
     _share_name = _unc_m.group(2)
     _sub_path   = (_unc_m.group(3) or "").strip("\\")
 
+    # ── Local-machine short-circuit ───────────────────────────────────────
+    # If the UNC host is THIS PC (a self-hosted share the user watches via its
+    # own \\<own-ip>\share path), do NOT attempt a remote WinRM/WMI setup: WMI
+    # explicitly refuses credential-based connections to the local machine
+    # ("User credentials cannot be used for local connections", the exact error
+    # the user hit).  Resolve the share to its local folder and configure the
+    # SACL locally instead — same auditing result, no network round-trip, and
+    # no false "auto-setup didn't complete" popup.
+    if _host_is_local_machine(host):
+        _sa.info(f"[_apply_sacl_remote] host {host!r} is the LOCAL machine — "
+                 f"routing to local SACL setup instead of WinRM/WMI "
+                 f"(share={_share_name!r} sub={_sub_path!r}).")
+        _local_dir = _resolve_local_share_path(_share_name, _sub_path)
+        if not _local_dir:
+            return False, (
+                f"'{host}' is this PC, but share {_share_name!r} could not be "
+                f"resolved to a local folder — is the share still present?"
+            )
+        return _apply_sacl_local(_local_dir)
+
     _CNW = 0x08000000  # CREATE_NO_WINDOW
 
     # ── PowerShell script that runs ON the remote PC ──────────────────────
@@ -1044,6 +1391,10 @@ def _apply_sacl_remote(host: str, unc_path: str, smb_audit_cfg: dict) -> tuple[b
         "  $acl.AddAuditRule($rule);Set-Acl $lp $acl;"
         "  auditpol /set /subcategory:'File System' /success:enable /failure:enable | Out-Null;"
         "  wevtutil sl Security /ms:524288000 /rt:false | Out-Null;"
+        # Open the firewall so the watching PC can actually READ this Security log
+        # remotely (Event 4663).  Without this the SACL records events but no
+        # remote reader can fetch them, so attribution silently stays 'Unknown'.
+        "  Enable-NetFirewallRule -DisplayGroup 'Remote Event Log Management' -EA SilentlyContinue;"
         "  Write-Output \"OK:$lp\""
         "} catch { Write-Output \"ERR:$($_.Exception.Message)\" }"
     )
@@ -1151,10 +1502,33 @@ def _apply_sacl_remote(host: str, unc_path: str, smb_audit_cfg: dict) -> tuple[b
                      f"attempting auto-enable")
             _ok_wmi, _wmi_msg = _enable_winrm_via_wmi()
             if not _ok_wmi:
+                # WinRM off AND WMI/DCOM (RPC) unavailable — the "RPC server is
+                # unavailable" case.  SMB (445) is still open (we authenticate to
+                # it for attribution), so fall back to the SMB Service-Control
+                # bootstrap IF the user opted in.  This configures the SACL AND
+                # opens the Security-log firewall with no action on the owner's PC.
+                _smb_fallback_on = False
+                try:
+                    _smb_fallback_on = bool(config_manager.load().get("remote_setup_smb_fallback", False))
+                except Exception:
+                    _smb_fallback_on = False
+                if _smb_fallback_on:
+                    _sa.info(f"[_apply_sacl_remote] WinRM+WMI unavailable on {host!r} — "
+                             f"trying SMB Service-Control fallback (opt-in flag on)")
+                    _ok_smb, _smb_msg = _enable_remote_audit_via_smb(
+                        host, _share_name, _sub_path, _sa_user, _sa_pass)
+                    if _ok_smb:
+                        return True, _smb_msg
+                    _sa.info(f"[_apply_sacl_remote] SMB fallback failed on {host!r}: {_smb_msg}")
+                    return False, (
+                        f"WinRM and WMI are both blocked on {host}, and the SMB fallback "
+                        f"also failed: {_smb_msg}"
+                    )
                 return False, (
                     f"WinRM is disabled on {host} and auto-enable failed: {_wmi_msg}. "
-                    f"Ask the PC owner to run once as Admin: "
-                    f"Enable-PSRemoting -Force"
+                    f"Enable the 'remote_setup_smb_fallback' option to let BackupSys "
+                    f"configure it over SMB instead, or ask the PC owner to run once as "
+                    f"Admin: Enable-PSRemoting -Force"
                 )
 
             # ── Attempt 2: retry Invoke-Command after WinRM bootstrap ────
@@ -1323,9 +1697,11 @@ def _verify_sacl_propagation(host: str, unc_path: str, smb_audit_cfg: dict) -> N
 # the known codes to a message that tells the person what to actually do,
 # instead of sending them on a wild goose chase re-typing a correct password.
 _NET_USE_ERROR_MESSAGES = {
-    "1219": ("❌  Another connection to this PC already exists with different "
-             "credentials. Close any open File Explorer windows or mapped "
-             "network drives to this PC (or restart your computer), then try again."),
+    "1219": ("❌  Windows refused a second set of credentials for this PC — another "
+             "connection to it is already open under a different username. This does "
+             "NOT mean your password is wrong. Close any File Explorer windows or "
+             "mapped network drives pointing at this PC (or restart your computer), "
+             "then try again."),
     "1326": "❌  Auth failed — wrong username or password.",
     "1909": "❌  This account is locked out on that PC. Unlock it there, then try again.",
     "1907": "❌  This account's password has expired and must be changed on that PC first.",
@@ -1335,80 +1711,196 @@ _NET_USE_ERROR_MESSAGES = {
 }
 
 
+def _net_use_error_code(txt: str) -> str:
+    """Extract the Windows error number from `net use` output, in ANY UI language.
+
+    `net use` prints in the OS display language, so the English-only "System
+    error 1219 has occurred" is just one of many forms ("システム エラー 1219 が
+    発生しました", "Systemfehler 1219", …). The number itself is locale-invariant,
+    so match on that rather than on the words around it.
+    """
+    import re as _fnue_re
+    # Prefer a number that sits next to an "error"-ish word in some language.
+    labelled = _fnue_re.search(
+        r"(?:error|erreur|fehler|errore|erro|エラー|错误|錯誤|오류|ошибка)\D{0,8}(\d{1,5})",
+        txt, _fnue_re.IGNORECASE,
+    )
+    if labelled:
+        return labelled.group(1)
+    # Otherwise take any bare number that we have a known message for.
+    for _n in _fnue_re.findall(r"\d{1,5}", txt):
+        if _n in _NET_USE_ERROR_MESSAGES:
+            return _n
+    return ""
+
+
 def _format_net_use_error(out_txt: str) -> str:
     """Translate a raw `net use` failure (stderr/stdout text) into a clear,
-    actionable message. Falls back to showing the raw Windows error text
-    rather than guessing, so we never claim "wrong password" when we don't
-    actually know that's true."""
-    import re as _fnue_re
-    txt = out_txt or ""
-    m = _fnue_re.search(r"error\s+(\d+)", txt, _fnue_re.IGNORECASE)
-    code = m.group(1) if m else None
+    actionable message in the user's chosen app language.
+
+    We never guess ("wrong password") when we don't actually know that's true —
+    but we also never paste the OS's raw localised text into the UI, since that
+    puts e.g. Japanese Windows error strings in front of an English user.
+    """
+    txt = (out_txt or "").strip()
+    code = _net_use_error_code(txt)
     if code and code in _NET_USE_ERROR_MESSAGES:
-        return _NET_USE_ERROR_MESSAGES[code]
+        return tr(_NET_USE_ERROR_MESSAGES[code])
+    if code:
+        return tr("❌  Connection failed — Windows error {code}.", code=code)
+    if txt and txt.isascii():
+        # Unrecognised, but at least it's readable — show it rather than hide it.
+        return tr("❌  Connection failed: {detail}", detail=txt[:160])
     if txt:
-        return f"❌  Connection failed: {txt[:160]}"
-    return "❌  Auth failed — wrong username or password."
+        # Localised OS text in a language the user may not read — drop it from the
+        # UI (the raw text is still in the log for support).
+        _lg = logging.getLogger("backupsys.desktop")
+        _lg.info("[_format_net_use_error] unrecognised net use output: %r", txt[:300])
+        return tr("❌  Connection failed. See the log for the raw Windows error.")
+    return tr("❌  Auth failed — wrong username or password.")
 
 
-def _verify_smb_login(host: str, user: str, password: str) -> "tuple[bool, str]":
-    """Authenticate to \\\\host\\IPC$ with the given credentials in an isolated
-    logon session (subprocess `net use`), returning (ok, message).
+def _smb_alt_hostnames(host: str) -> "list[str]":
+    """Other spellings of the same server: IP → hostname, or hostname → IP.
 
-    Uses a separate process so Windows cannot silently reuse a cached session
-    token for the host (which would validate a wrong password).  Exit code 0 =
-    credentials accepted; non-zero = rejected/unreachable.  The temporary IPC$
-    connection is always deleted afterward.  Blocking; call off the UI thread.
+    Windows keys an SMB session by the server-name *string*, so \\\\192.168.1.26
+    and \\\\FILESERVER are two independent sessions that may each carry their own
+    credentials.  That is the only way to authenticate as user B while a session
+    to the same box as user A is still open (see _verify_smb_login).
+    """
+    import re as _ahre, socket, subprocess
+    h = (host or "").strip()
+    if not h:
+        return []
+    out: list[str] = []
+
+    def _add(cand: str):
+        cand = (cand or "").strip().rstrip(".")
+        if cand and cand.lower() != h.lower() and cand not in out:
+            out.append(cand)
+
+    if _ahre.match(r"^\d{1,3}(\.\d{1,3}){3}$", h):
+        try:                                    # reverse DNS
+            _name = socket.gethostbyaddr(h)[0]
+            _add(_name)
+            _add(_name.split(".")[0])
+        except Exception:
+            pass
+        if not out:
+            # Workgroup LANs usually have no reverse DNS, so ask NetBIOS instead.
+            # nbtstat probes every local interface, which is slow — only pay for
+            # it when reverse DNS gave us nothing.
+            try:
+                _r = subprocess.run(["nbtstat", "-A", h], capture_output=True, text=True,
+                                    timeout=12, creationflags=0x08000000)
+                # Match on the <20> suffix (the File Server service) alone: it is
+                # locale-invariant, whereas the UNIQUE / Registered columns next to
+                # it are translated on a localised Windows.
+                for _m in _ahre.finditer(r"^\s*(\S+)\s*<20>",
+                                         _r.stdout or "", _ahre.MULTILINE):
+                    _add(_m.group(1))
+            except Exception:
+                pass
+    else:
+        try:
+            _add(socket.gethostbyname(h))
+        except Exception:
+            pass
+    return out
+
+
+def _net_use_probe(host: str, user: str, password: str) -> "tuple[int | None, str]":
+    """One `net use \\\\host\\IPC$` credential probe.
+
+    Returns (returncode, output-text); returncode None == timed out.  Always
+    removes the connection afterward so nothing lingers.  Blocking.
     """
     import subprocess
-    if not host or not user or not password:
-        return False, "❌  Enter host, username and password first."
     _ipc = f"\\\\{host}\\IPC$"
     _CREATE_NO_WINDOW = 0x08000000
     _cmd_add = ["net", "use", _ipc, password, f"/user:{user}", "/persistent:no"]
     _cmd_del = ["net", "use", _ipc, "/delete", "/yes"]
 
-    def _cleanup():
+    def _drop():
         try:
             subprocess.run(_cmd_del, capture_output=True, timeout=5,
                            creationflags=_CREATE_NO_WINDOW)
         except Exception:
             pass
 
-    def _run_net_use():
-        try:
-            return subprocess.run(_cmd_add, capture_output=True, text=True,
-                                  timeout=15, creationflags=_CREATE_NO_WINDOW)
-        except subprocess.TimeoutExpired:
-            return None
+    _drop()                       # clear a stale IPC$ from an earlier probe
+    try:
+        _r = subprocess.run(_cmd_add, capture_output=True, text=True,
+                            timeout=15, creationflags=_CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        _drop()
+        return None, ""
+    if _r.returncode == 0:
+        _drop()                   # authenticated; don't leave the session behind
+    return _r.returncode, (_r.stderr or _r.stdout or "").strip()
+
+
+def _smb_verified_message(host: str) -> str:
+    """Success text for a verified login, with a share count when we can get one."""
+    try:
+        import win32net
+        _n = len(win32net.NetShareEnum(host, 0)[0])
+    except Exception:
+        _n = 0
+    if _n:
+        return tr("✅  Connected — credentials verified ({n} share(s) visible)", n=_n)
+    return tr("✅  Connected — credentials verified.")
+
+
+def _verify_smb_login(host: str, user: str, password: str) -> "tuple[bool, str]":
+    """Authenticate to \\\\host\\IPC$ with the given credentials, returning (ok, message).
+
+    Runs `net use` in a subprocess rather than win32net so Windows cannot quietly
+    reuse a cached session token for the host (which would "verify" a wrong
+    password).  Blocking; call off the UI thread.
+
+    The subprocess does NOT get its own logon session, though — it inherits ours.
+    So if anything on this PC already holds a session to that server under a
+    different username (our own backup/watch connection to the source or
+    destination share, an Explorer window, a mapped drive), Windows refuses the
+    second credential set with error 1219 and the check fails even when the typed
+    password is perfectly correct.  Windows scopes those sessions by server-name
+    string, so we retry under an equivalent spelling of the same server
+    (IP <-> hostname), which is a distinct session key and can carry its own
+    credentials.
+    """
+    if not host or not user or not password:
+        return False, tr("❌  Enter host, username and password first.")
 
     try:
-        _result = _run_net_use()
+        _rc, _txt = _net_use_probe(host, user, password)
     except Exception as _e:
-        return False, f"❌  Could not run credential check: {_e}"
-    finally:
-        _cleanup()
+        return False, tr("❌  Could not run credential check: {err}", err=_e)
 
-    # Retry once on timeout / existing-session conflict (error 1219).
-    for _ in range(2):
-        _out_txt = (_result.stderr or _result.stdout or "").strip() if _result else ""
-        if _result is not None and not (_result.returncode != 0 and "1219" in _out_txt):
-            break
-        _cleanup()
-        try:
-            _result = _run_net_use()
-        except Exception as _e:
-            return False, f"❌  Could not run credential check: {_e}"
-        finally:
-            _cleanup()
-        if _result is None:
-            return False, "❌  Timed out — server unreachable."
+    if _rc == 0:
+        return True, _smb_verified_message(host)
 
-    if _result is None:
-        return False, "❌  Timed out — server unreachable."
-    if _result.returncode == 0:
-        return True, "✅  Connected — credentials verified."
-    return False, _format_net_use_error((_result.stderr or _result.stdout or "").strip())
+    if _rc is None:
+        return False, tr("❌  Timed out — server unreachable.")
+
+    if _net_use_error_code(_txt) == "1219":
+        _lg = logging.getLogger("backupsys.desktop")
+        for _alt in _smb_alt_hostnames(host):
+            _lg.info("[_verify_smb_login] %s: error 1219 (existing session) — "
+                     "re-probing as %r", host, _alt)
+            try:
+                _rc2, _txt2 = _net_use_probe(_alt, user, password)
+            except Exception:
+                continue
+            if _rc2 == 0:
+                return True, _smb_verified_message(_alt)
+            if _rc2 is None:
+                continue
+            if _net_use_error_code(_txt2) != "1219":
+                # The server actually answered this time — that verdict is real.
+                return False, _format_net_use_error(_txt2)
+
+    return False, _format_net_use_error(_txt)
 
 
 import threading as _burst_threading
@@ -1421,6 +1913,16 @@ _BURST_INTER_BURST_GAP = 10.0  # seconds — if the existing entry is older than
                                 # entry from blocking .105's local 'added' attribution
                                 # when two distinct actors copy files to the same share
                                 # within the same 30s TTL window but >10s apart.
+_BURST_SAME_BURST_SECS = 10.0  # seconds — tight "same-burst" window for INHERITING a
+                                # sibling's attribution onto an Unknown file (forward /
+                                # delayed BURST-PATCH).  Much shorter than the 30s TTL:
+                                # inheritance is a heuristic (guessing the same actor did
+                                # a nearby file), so it must only borrow from a genuinely
+                                # concurrent sibling (cache entry a few seconds old), NEVER
+                                # from a PRIOR actor's leftover entry.  Fixes: .105 confirms
+                                # a local add, ~15s later .106 adds files that can't self-
+                                # confirm and were wrongly shown as .105 by inheriting the
+                                # stale (but within-TTL) .105 entry. See [[remote-host-unknown-gate]].
 _burst_cache: dict = {}     # (host, server_local_user_lower) → (machine, ip, user, mono_ts, local_actor, event_type, logon_id_confirmed)
 
 # ── Last-modified-actor cache ─────────────────────────────────────────────
@@ -1461,6 +1963,61 @@ _burst_cache_lock  = _burst_threading.Lock()
 import logging as _burst_log
 _bcl = _burst_log.getLogger(__name__)
 
+_own_host_identity_cache = None  # set[str]: this PC's hostname + all own IPs (lowercased)
+
+
+def _own_host_identity() -> set:
+    """This machine's own hostname + all of its IP addresses (lowercased).
+
+    Used to recognise when an audit-log attribution actually points at THIS PC
+    (the backup app's own SMB session) rather than at a real remote actor.
+    Cached for the process lifetime."""
+    global _own_host_identity_cache
+    if _own_host_identity_cache is not None:
+        return _own_host_identity_cache
+    import socket as _oh_sock
+    _own = set()
+    try:
+        _oh = _oh_sock.gethostname().lower()
+        _own.add(_oh)
+        try:
+            _own.add(_oh_sock.gethostbyname(_oh).lower())
+        except Exception:
+            pass
+        try:
+            for _ai in _oh_sock.getaddrinfo(_oh, None):
+                _own.add(str(_ai[4][0]).lower())
+        except Exception:
+            pass
+    except Exception:
+        pass
+    _own.discard("")
+    _own_host_identity_cache = _own
+    return _own
+
+
+def _attribution_is_own_machine(machine: str, ip: str, user: str) -> bool:
+    """True when a resolved attribution points at THIS PC (hostname or IP match).
+    On a REMOTE-hosted share this always means the backup app's own SMB session —
+    never a trustworthy 'who did it' — so such attributions must never be cached
+    or inherited by sibling files."""
+    _own = _own_host_identity()
+    if not _own:
+        return False
+    _m = (machine or "").strip().lower().lstrip("\\")
+    _i = (ip or "").strip().lower()
+    _u = (user or "").strip().lower()
+    if _m and _m in _own:
+        return True
+    if _i and _i in _own:
+        return True
+    # user may be 'DESKTOP-0EDUBAP\\User' — check the machine portion
+    if _u:
+        _u_machine = _u.split("\\", 1)[0]
+        if _u_machine and _u_machine in _own:
+            return True
+    return False
+
 
 def _burst_cache_put(host: str, server_local_user: str, machine: str, ip: str, user: str,
                      local_actor: bool = False, event_type: str = "",
@@ -1480,6 +2037,22 @@ def _burst_cache_put(host: str, server_local_user: str, machine: str, ip: str, u
     files earlier while .105 deleted them now).
     """
     key = (host.lower(), server_local_user.lower())
+    # ── PURE-SACL guard: never cache an OWN-MACHINE attribution for a REMOTE share ──
+    # When the share host is another PC (a coworker's, e.g. .105) but the resolved
+    # actor is THIS machine (.106), the match is the backup app's own ambient SMB
+    # session polluting the LogonId/4624 correlation window — NOT a real edit by us.
+    # Caching it lets a sibling file with no audit evidence (correctly "Unknown")
+    # inherit our name via the forward/delayed burst-patch, blaming us for a
+    # coworker's local action.  Refuse the store so those files stay "Unknown".
+    _host_is_remote = host.strip().lower() not in _own_host_identity()
+    if _host_is_remote and _attribution_is_own_machine(machine, ip, user):
+        _bcl.info(
+            f"[burst_cache_put] SKIP store host={host!r} sluser={server_local_user!r} "
+            f"machine={machine!r} ip={ip!r} user={user!r} — attribution points at THIS PC "
+            f"on a REMOTE-hosted share (backup app's own SMB session, not a real actor). "
+            f"Not caching so sibling files without SACL evidence stay 'Unknown' (pure-SACL)."
+        )
+        return
     _bcl.debug(
         f"[burst_cache_put] host={host!r} sluser={server_local_user!r} "
         f"machine={machine!r} ip={ip!r} user={user!r} "
@@ -1616,7 +2189,9 @@ def _burst_cache_get(host: str, server_local_user: str,
 
 def _burst_cache_any_for_host(host: str,
                                require_remote: bool = False,
-                               event_type: str = "") -> "tuple[str, str, str] | None":
+                               event_type: str = "",
+                               max_age_secs: float = 0.0,
+                               require_logon_confirmed: bool = False) -> "tuple[str, str, str] | None":
     """
     Return (machine, ip, user) for ANY non-expired entry whose host matches,
     regardless of server_local_user key.  Used for retroactive Unknown patching
@@ -1630,6 +2205,22 @@ def _burst_cache_any_for_host(host: str,
     matches (or is empty).  Critical: prevents 'added' burst cache entries
     (e.g. from .106) being used to patch 'deleted' entries from a different
     actor (.105).
+
+    max_age_secs: when >0, only consider entries stored within this many seconds
+    (a tight *same-burst* window, much shorter than the 30s TTL).  CRITICAL for
+    cross-actor safety: .105 confirms a LOCAL add and its attribution is cached;
+    ~10-15s later .106 adds different files that can't self-confirm.  Without an
+    age gate the still-cached (but stale, different-burst) .105 entry would be
+    inherited onto .106's files — showing the WRONG person.  A tight window lets
+    a genuine same-burst sibling (cache entry ~1s old) inherit while rejecting a
+    prior actor's leftover (entry many seconds old).
+
+    require_logon_confirmed=True skips entries that were NOT resolved via a
+    LogonId-exact 4663→4624 correlation (i.e. time-window / session guesses).
+    Callers pass this on REMOTE-hosted shares so that a sibling can only inherit
+    a PURE-SACL identity — matching the central pure-SACL display gate.  Without
+    it, a weak time-window remote guess (e.g. a stale third-party session) could
+    be propagated onto an Unknown sibling and shown as a confirmed name.
     """
     host_lower = host.lower()
     now = _time_mod.monotonic()
@@ -1644,6 +2235,14 @@ def _burst_cache_any_for_host(host: str,
                 stale_keys.append((h, _sluser))
                 continue
             if h == host_lower:
+                if max_age_secs > 0 and (now - ts) > max_age_secs:
+                    _bcl.info(
+                        f"[burst_cache_any_for_host] SKIP host={host!r} sluser={_sluser!r} "
+                        f"reason=max_age_exceeded age={now - ts:.1f}s max_age={max_age_secs:.0f}s "
+                        f"machine={machine!r} — entry is from a PRIOR burst (different actor); "
+                        f"not inheriting onto this file (pure-SACL: leave Unknown)"
+                    )
+                    continue
                 if event_type and cached_etype and event_type != cached_etype:
                     # Same safe exception as _burst_cache_get: allow a 'renamed'
                     # lookup to match a cached 'added' or 'modified' attribution
@@ -1659,6 +2258,17 @@ def _burst_cache_any_for_host(host: str,
                             f"(e.g. 'added' by .106 must not be reused for 'deleted' by .105)"
                         )
                         continue
+                # PURE-SACL: on a remote share the caller requires a LogonId-exact
+                # confirmation — skip time-window / session guesses so they can
+                # never be inherited onto an Unknown sibling.
+                if require_logon_confirmed and not cached_logon_id_confirmed:
+                    _bcl.info(
+                        f"[burst_cache_any_for_host] SKIP host={host!r} sluser={_sluser!r} "
+                        f"reason=not_logon_confirmed machine={machine!r} user={user!r} — "
+                        f"entry is a time-window/session guess, not a LogonId-exact SACL match; "
+                        f"not inheriting on a remote-hosted share (pure-SACL: leave Unknown)"
+                    )
+                    continue
                 # Track best local-actor and best remote candidates separately.
                 if local_actor:
                     if ts > best_local_ts:
@@ -1747,9 +2357,18 @@ def _burst_cache_lookup(host: str, server_local_user: str,
 
 
 def _burst_cache_get_logon_confirmed(host: str, server_local_user: str,
-                                     event_type: str = "") -> "tuple[str,str,str] | None":
+                                     event_type: str = "",
+                                     max_age: float | None = None) -> "tuple[str,str,str] | None":
     """
     Like _burst_cache_get but ONLY returns entries where logon_id_confirmed=True.
+
+    max_age (seconds) tightens the TTL for callers that must only accept a
+    confirmation from the SAME burst — pass _BURST_INTER_BURST_GAP there.  The
+    30s TTL alone is too loose for sibling-borrowing: an entry from a PRIOR
+    burst (e.g. the coworker's copy 17s ago) is still live and would be handed
+    to a file the local user wrote afterwards, attributing it to the coworker.
+    _burst_cache_put already treats an entry older than _BURST_INTER_BURST_GAP
+    as a different burst; borrowers must use the same rule.
 
     This is used by the source-watch-deletion burst-cache fast-path to ensure
     only LogonId-exact-confirmed attributions skip the per-file 24h rescue.
@@ -1773,8 +2392,18 @@ def _burst_cache_get_logon_confirmed(host: str, server_local_user: str,
         if entry is None:
             return None
         machine, ip, user, ts, local_actor, cached_etype, cached_logon_id_confirmed = entry
-        if (_time_mod.monotonic() - ts) > _BURST_CACHE_TTL:
+        _age = _time_mod.monotonic() - ts
+        if _age > _BURST_CACHE_TTL:
             del _burst_cache[key]
+            return None
+        if max_age is not None and _age > max_age:
+            _bcl.info(
+                f"[burst_cache_get_logon_confirmed] SKIP host={host!r} sluser={server_local_user!r} "
+                f"reason=stale_prior_burst age={_age:.1f}s max_age={max_age:.0f}s "
+                f"machine={machine!r} cached_etype={cached_etype!r} — this confirmation predates "
+                f"the current burst, so it is NOT a sibling of the file being resolved; borrowing it "
+                f"would blame a coworker's earlier write for a file someone else wrote afterwards"
+            )
             return None
         if event_type and cached_etype and event_type != cached_etype:
             _bcl.info(
@@ -2447,12 +3076,25 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                     # SubjectLogonId that allows exact 4624 correlation;
                                     # for 4656, the SubjectLogonId is the SMB network session
                                     # LogonId (reliable for remote operations — see fix above).
-                                    # If we already have a 4663, stop — it's the best we
-                                    # can get.  If we only have a 4656 so far, keep going to
-                                    # find a potential 4663, but the closest-match guard above
-                                    # ensures we never overwrite a closer 4656 with a staler one.
-                                    if _evid == 4663:
-                                        break  # 4663 is authoritative — stop scanning
+                                    # If we only have a 4656 so far, keep going to find a
+                                    # potential 4663, but the closest-match guard above ensures
+                                    # we never overwrite a closer 4656 with a staler one.
+                                    #
+                                    # A 4663 is only authoritative if it actually carries a
+                                    # SubjectLogonId — that Logon ID is the ONLY thing that lets
+                                    # Strategy1b-post correlate to a 4624 and read the actor's
+                                    # MACHINE / IP (local keyboard session vs a network write from
+                                    # us).  Windows emits several 4663s per file create (WriteData,
+                                    # WriteAttributes, …) and only some carry the LogonId; a
+                                    # newest-first scan can land on a bare attribute-write 4663
+                                    # (mask=0x100, no LogonId) first.  Breaking there throws away
+                                    # the chance to find the sibling 4663 that HAS the LogonId, and
+                                    # the actor collapses to "LOCAL/Unknown" for want of a machine.
+                                    # So: stop only once we hold a 4663 WITH a LogonId; otherwise
+                                    # keep scanning for a better one (falls back to the bare 4663 if
+                                    # none is found — same as before, never worse).
+                                    if _evid == 4663 and result.get("_s1b_logon_id"):
+                                        break  # authoritative 4663 with a Logon ID — best we can get
                                 except Exception as _wev_ev_err:
                                     continue
                         # Post-loop: flush any handle_logon_ids collected via the skip-stale
@@ -3005,6 +3647,9 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                         # whether a remote 4624 with this EXACT LogonId exists anywhere in
                         # the log.  Only a genuine no-match (or loopback/own/server) is LOCAL.
                         _ffl_remote = None
+                        _ffl_own = None   # LogonId-exact match to THIS PC's own session
+                        _ffl_verify_failed = False  # True if the verification query could NOT run (timeout/error) → cannot prove LOCAL
+                        _ffl_console = False  # LogonId-exact match to a HOST console/keyboard 4624 (positive local proof)
                         try:
                             import xml.etree.ElementTree as _ffl_et
                             _ffl_query = (
@@ -3017,7 +3662,7 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 "/rd:true", "/c:1", "/f:xml", f"/q:{_ffl_query}",
                             ]
                             _ffl_res = _s1bp_sp.run(
-                                _ffl_cmd, capture_output=True, text=True, timeout=15,
+                                _ffl_cmd, capture_output=True, text=True, timeout=30,
                                 creationflags=_CNW_1BP,
                             )
                             if _ffl_res.returncode == 0 and _ffl_res.stdout.strip():
@@ -3028,25 +3673,74 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                     if _ffl_ed is None:
                                         continue
                                     _ffl_map = {d.get("Name", ""): (d.text or "") for d in _ffl_ed if d.get("Name")}
-                                    if _ffl_map.get("LogonType", "") != "3":
-                                        continue  # not a network logon → not a remote SMB actor
+                                    _ffl_lt = _ffl_map.get("LogonType", "").strip()
                                     _ffl_ws = _ffl_map.get("WorkstationName", "").strip("-").strip()
                                     _ffl_ip = _ffl_map.get("IpAddress", "").strip()
+                                    if _ffl_lt != "3":
+                                        # Not a network logon.  This query is keyed on the EXACT
+                                        # TargetLogonId from the 4663, so an Interactive (2) /
+                                        # Unlock (7) / RemoteInteractive (10) / CachedInteractive (11)
+                                        # hit is positive audit-log proof that the writer was sitting
+                                        # at the HOST's own session — i.e. the coworker who owns the
+                                        # share typed at their keyboard.  The slow/XML path already
+                                        # records this (via its loopback branch) and the display gate
+                                        # needs it to show the host user on a remote-hosted share;
+                                        # without it, siblings of the SAME LogonId resolved by this
+                                        # faster path fell through to "no confirmed SACL actor" and
+                                        # displayed Unknown.
+                                        if _ffl_lt in ("2", "7", "10", "11"):
+                                            _ffl_console = True
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (pre-fetched): direct "
+                                                f"TargetLogonId={_s1bp_logon_id!r} query matched a NON-network "
+                                                f"4624 LogonType={_ffl_lt!r} WorkstationName={_ffl_ws!r} "
+                                                f"IpAddress={_ffl_ip!r} — LogonId-exact host console/keyboard "
+                                                f"actor confirmed (LOCAL)."
+                                            )
+                                        continue  # not a network logon → not a remote SMB actor
                                     if (_ffl_ip in ("127.0.0.1", "::1", "", host)
                                             or _ffl_ws.lower() == host.lower()):
+                                        # LogonId-EXACT match to a loopback 4624 is the same console
+                                        # proof the slow/XML path records at its "SKIP loopback" branch.
+                                        if _ffl_ip in ("127.0.0.1", "::1"):
+                                            _ffl_console = True
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (pre-fetched): SKIP loopback "
+                                                f"WorkstationName={_ffl_ws!r} IpAddress={_ffl_ip!r} "
+                                                f"(LogonId-exact -> host console/keyboard actor confirmed)"
+                                            )
                                         continue  # loopback / file-server itself → LOCAL
                                     _ffl_is_own = (
                                         (bool(_s1bp_own_ip_resolved) and _ffl_ip == _s1bp_own_ip_resolved)
                                         or (bool(_s1bp_own_host_resolved) and _ffl_ws.lower() == _s1bp_own_host_resolved)
                                     )
                                     if _ffl_is_own:
-                                        continue  # backup-app's own session, not a third party
+                                        # LogonId-EXACT match to OUR OWN 4624 network session:
+                                        # this write came from THIS PC (e.g. .106), NOT a local
+                                        # action on the host.  Record it (prefer a third-party if
+                                        # one also exists), so our own writes resolve to us instead
+                                        # of collapsing to the host owner — and so sibling files in
+                                        # the same session attribute consistently.
+                                        if _ffl_own is None:
+                                            _ffl_own = (0.0, _ffl_ws, _ffl_ip, _s1bp_logon_id)
+                                        continue
                                     _ffl_remote = (0.0, _ffl_ws, _ffl_ip, _s1bp_logon_id)
                                     break
                         except Exception as _ffl_e:
+                            # The verification query could NOT complete (usually a
+                            # TimeoutExpired scanning a huge Security log for this exact
+                            # TargetLogonId).  A FAILED query is NOT evidence of a local
+                            # actor — we simply could not determine remote-vs-local.  Do
+                            # NOT treat it as LOCAL (that would wrongly blame this PC's own
+                            # console user for a coworker's remote SMB write when the
+                            # SubjectLogonId's 4624 is outside the pre-fetch window).
+                            # Flag it so the finalizer reports UNKNOWN instead of guessing.
+                            _ffl_verify_failed = True
                             _qna.info(
                                 f"[_query_smb_audit] Strategy1b-post: direct TargetLogonId "
-                                f"verification raised {_ffl_e!r} — treating as no-match (LOCAL)."
+                                f"verification raised {_ffl_e!r} — could NOT determine "
+                                f"remote-vs-local; will report UNKNOWN (pure-SACL, no guess) "
+                                f"rather than defaulting to LOCAL."
                             )
                         if _ffl_remote is not None:
                             # LogonId-exact match to a remote 4624 → cryptographic proof
@@ -3059,6 +3753,22 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 f"(WorkstationName={_ffl_remote[1]!r} IpAddress={_ffl_remote[2]!r}) — "
                                 f"persistent coworker session opened hours ago. Attributing REMOTE "
                                 f"(LogonId-confirmed), NOT local. [authority=SACL]"
+                            )
+                        elif _ffl_own is not None:
+                            # No third-party remote, but the SubjectLogonId LogonId-EXACTLY
+                            # matches OUR OWN 4624 network session (persistent, hours old, so
+                            # outside the ±900s pre-fetch window).  That is cryptographic proof
+                            # THIS PC wrote the file — attribute it to us, not to the host owner.
+                            # Fixes sibling files in the same session resolving inconsistently
+                            # (one → this PC, one → Unknown) when our logon is old.
+                            _s1bp_exact = _ffl_own
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: SubjectLogonId={_s1bp_logon_id!r} "
+                                f"absent from pre-fetched ±900s window; direct TargetLogonId query found "
+                                f"NO third-party remote but a LogonId-EXACT match to OUR OWN session "
+                                f"(WorkstationName={_ffl_own[1]!r} IpAddress={_ffl_own[2]!r}) — this write "
+                                f"is THIS PC's own (persistent session opened earlier), NOT a host-local "
+                                f"action. Attributing to own machine. [authority=SACL]"
                             )
                         else:
                             _qna.info(
@@ -3567,6 +4277,11 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             # have no SubjectLogonId (PARENT-ONLY 4656 match) → without this
                             # fast-path they fall through to the 24h rescue which may return
                             # nothing or be slowed by the XPath query.
+                            # Always bind this — a dest-watch deletion skips the block below
+                            # but the debug log at the end of Strategy1b-post references it,
+                            # so leaving it unset raised UnboundLocalError and aborted the
+                            # whole attribution (falling back to a raw PC1 → Unknown).
+                            _src_del_confirmed_local = False
                             if not is_dest_watch and (event_type == "deleted" or _pf_src_parent_add or _pf_src_exact_add):
                                 _src_del_local_user = result.get("user", "")
                                 # GUARD: if we have a reliable 4663 SubjectLogonId that found
@@ -3978,10 +4693,17 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                                 and bool(_dwr_own_logon_ids)
                                                 and _dwr_subj_logon_id in _dwr_own_logon_ids
                                             )
+                                            # NOTE: parent-only source-watch adds are intentionally
+                                            # EXCLUDED here (was `event_type == "deleted" or _pf_src_parent_add`).
+                                            # A parent-only match (SACL hit the folder / a DIFFERENT file,
+                                            # not this exact filename) gives us no proof that the sole
+                                            # third-party wrote THIS file, so it must NOT bypass the
+                                            # staleness guard. Pure-SACL policy: unconfirmed → Unknown
+                                            # (enforced by the PARENT-ONLY GUARD in the decision below).
                                             _dwr_sole_third_party_bypass = (
                                                 not is_dest_watch
-                                                
-                                                and (event_type == "deleted" or _pf_src_parent_add)
+
+                                                and event_type == "deleted"
                                                 and not _dwr_best_logon_id_exact
                                                 and not _dwr_subj_matches_own   # own-machine LogonId match → own-machine is actor
                                                 and not _dwr_sole_tp_window_empty  # all sessions >2h old → cannot confirm sole actor
@@ -4086,8 +4808,36 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                                         f"staleness={_dwr_best_staleness:.0f}s). "
                                                         f"STALENESS GUARD WILL FIRE if own-machine has fresh narrow sessions."
                                                     )
-                                            if _dwr_stale_override:
-                                                
+                                            if _pf_src_parent_add and not _dwr_best_logon_id_exact:
+                                                # ── PARENT-ONLY GUARD (dest-watch-rescue 24h) ──────────
+                                                # Source-watch parent-only add/modify with NO LogonId-exact
+                                                # proof: the 4656/4663 SACL matched the parent folder or a
+                                                # DIFFERENT file — not this exact filename. Every third-party
+                                                # candidate here is only a time-window guess, and own-machine
+                                                # sessions always look fresh (the backup app re-auths every
+                                                # few minutes), so neither can be trusted for THIS file.
+                                                # Pure-SACL policy (same as the parent-only burst-cache MISS
+                                                # path above): do NOT promote any guessed actor and do NOT
+                                                # keep the server-local (share-host) identity either — clear
+                                                # to Unknown. The downstream pure-SACL gate keeps it Unknown
+                                                # on a remote-hosted share (NetSessionEnum bystanders without
+                                                # a confirmed-remote flag are filtered out).
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                    f"PARENT-ONLY GUARD — source-watch parent-only {event_type!r} "
+                                                    f"with no LogonId-exact proof. Best third-party "
+                                                    f"WorkstationName={_dwr_best[1]!r} IpAddress={_dwr_best[2]!r} "
+                                                    f"staleness={_dwr_best_staleness:.0f}s is only a time-window guess "
+                                                    f"— NOT promoting (pure-SACL policy). Clearing to Unknown "
+                                                    f"(no owner/session guess). Rejected third-party candidates: "
+                                                    f"{[(_ws2, _ip2, f'{_d2:+.1f}s') for (_d2, _ws2, _ip2, _lid2) in _dwr_remote]}"
+                                                )
+                                                result["user"]    = ""
+                                                result["machine"] = ""
+                                                result["ip"]      = ""
+                                                _dwr_resolved = True
+                                            elif _dwr_stale_override:
+
                                                 _s1bp_local_user_raw = result.get("user", "")
                                                 
                                                 _burst_hit = _burst_cache_get(host, _s1bp_local_user_raw, require_remote=True, event_type=event_type)
@@ -4269,11 +5019,112 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                                     f"(TTL={_BURST_CACHE_TTL:.0f}s)"
                                                 )
                                         else:
-                                            _qna.info(
-                                                f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
-                                                f"no third-party candidates found (own={len(_dwr_own)}); "
-                                                f"actor is likely server-local. Keeping server-local identity."
-                                            )
+                                            # No third-party 4624 anywhere in the 24h scan.  That does NOT
+                                            # prove the actor was sitting at the file server: an SMB session
+                                            # this PC opened long ago (mapped share, Explorer window kept
+                                            # open) has a 4624 that is classified "own-machine" here and is
+                                            # therefore deferred, so a burst of deletions WE made from this
+                                            # PC collapsed to the server-local 4663 identity and then to
+                                            # 'Unknown' at the display gate.
+                                            #
+                                            # The 4663 carries the SubjectLogonId of the session that did
+                                            # the delete.  Query that LogonId directly (time-window-free):
+                                            # if its 4624 is a Network logon from THIS machine, the audit
+                                            # log has proven we are the actor — that is evidence, not a
+                                            # guess, so it is safe under the pure-SACL rule.
+                                            _dwx_own_hit = None
+                                            if _dwr_subj_logon_id:
+                                                try:
+                                                    _dwx_query = (
+                                                        f"*[System[EventID=4624] and "
+                                                        f"EventData[Data[@Name='TargetLogonId']='{_s1bp_logon_id}']]"
+                                                    )
+                                                    _dwx_cmd = [
+                                                        "wevtutil", "qe", "Security",
+                                                        f"/r:{host}",
+                                                        f"/u:{_win_user}",
+                                                        f"/p:{_win_pass}",
+                                                        "/rd:true", "/c:1", "/f:xml",
+                                                        f"/q:{_dwx_query}",
+                                                    ]
+                                                    _dwx_res = _s1bp_sp.run(
+                                                        _dwx_cmd, capture_output=True, text=True, timeout=30,
+                                                        creationflags=_CNW_1BP,
+                                                    )
+                                                    if _dwx_res.returncode == 0 and _dwx_res.stdout.strip():
+                                                        _dwx_root = _dwr_et.fromstring(
+                                                            "<root>" + _dwx_res.stdout + "</root>"
+                                                        )
+                                                        _dwx_ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+                                                        for _dwx_ev in _dwx_root:
+                                                            _dwx_ed = _dwx_ev.find("e:EventData", _dwx_ns)
+                                                            if _dwx_ed is None:
+                                                                continue
+                                                            _dwx_map = {
+                                                                d.get("Name", ""): (d.text or "")
+                                                                for d in _dwx_ed if d.get("Name")
+                                                            }
+                                                            if _dwx_map.get("LogonType", "").strip() != "3":
+                                                                continue  # console/interactive → host keyboard actor, not us
+                                                            _dwx_ws = _dwx_map.get("WorkstationName", "").strip("-").strip()
+                                                            _dwx_ip = _dwx_map.get("IpAddress", "").strip()
+                                                            if (bool(_s1bp_own_ip_resolved) and _dwx_ip == _s1bp_own_ip_resolved) or (
+                                                                bool(_s1bp_own_host_resolved)
+                                                                and _dwx_ws.lower() == _s1bp_own_host_resolved
+                                                            ):
+                                                                _dwx_own_hit = (_dwx_ws, _dwx_ip)
+                                                            break
+                                                except Exception as _dwx_ex:
+                                                    _qna.info(
+                                                        f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                        f"direct TargetLogonId={_dwr_subj_logon_id!r} query failed: "
+                                                        f"{_dwx_ex!r} — cannot confirm own-machine; keeping server-local."
+                                                    )
+                                            if _dwx_own_hit:
+                                                _dwx_ws, _dwx_ip = _dwx_own_hit
+                                                _dwx_machine = _dwx_ws if _dwx_ws else _dwx_ip
+                                                _old_user_dwr    = result.get("user", "")
+                                                _old_machine_dwr = result.get("machine", "")
+                                                _old_ip_dwr      = result.get("ip", "")
+                                                result["machine"] = _dwx_machine
+                                                result["ip"]      = _dwx_ip or _old_ip_dwr
+                                                result["user"]    = (
+                                                    f"{_dwx_machine}\\{_s1bp_4663_uname}"
+                                                    if _dwx_machine and _s1bp_4663_uname
+                                                    else _old_user_dwr
+                                                )
+                                                # LogonId-exact 4663→4624 correlation: audit-log proof, so the
+                                                # display gate may name the actor on a remote-hosted share.
+                                                result["_sacl_confirmed_remote"]  = True
+                                                result["_sacl_remote_via_auditlog"] = True
+                                                _s1bp_matched = True
+                                                _dwr_resolved = True
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h own-machine "
+                                                    f"LogonId-exact): no third-party 4624 in 24h, but the 4663's "
+                                                    f"SubjectLogonId={_dwr_subj_logon_id!r} resolves via a direct "
+                                                    f"time-window-free query to OUR OWN network session "
+                                                    f"(WorkstationName={_dwx_ws!r} IpAddress={_dwx_ip!r}) — the delete came "
+                                                    f"from this PC over SMB (long-lived session, 4624 far outside ±120s). "
+                                                    f"server-local {_old_user_dwr!r}/{_old_machine_dwr!r}/{_old_ip_dwr!r} "
+                                                    f"-> own-machine {result['user']!r}/{result['machine']!r}/{result['ip']!r}"
+                                                )
+                                                if _old_user_dwr and result.get("machine"):
+                                                    _burst_cache_put(
+                                                        host, _old_user_dwr,
+                                                        result["machine"],
+                                                        result["ip"] or host,
+                                                        result["user"],
+                                                        event_type=event_type,
+                                                        logon_id_confirmed=True,
+                                                    )
+                                            else:
+                                                _qna.info(
+                                                    f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
+                                                    f"no third-party candidates found (own={len(_dwr_own)}) and the 4663's "
+                                                    f"SubjectLogonId={_dwr_subj_logon_id!r} did not resolve to an own-machine "
+                                                    f"network logon; actor is likely server-local. Keeping server-local identity."
+                                                )
                                     except Exception as _dwr_ex:
                                         _qna.info(
                                             f"[_query_smb_audit] Strategy1b-post (dest-watch-rescue 24h): "
@@ -4679,6 +5530,25 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                     f"[_query_smb_audit] Strategy1b-post (dest-watch local-fallback 24h): "
                                     f"query failed: {_lc_ex!r}; keeping server-local identity."
                                 )
+                        if not _lc_resolved and locals().get("_ffl_verify_failed", False):
+                            # The direct TargetLogonId verification query could not complete
+                            # (timeout/error) so we never proved this was a local actor.  A
+                            # coworker's remote SMB write whose 4624 sits outside the pre-fetch
+                            # window looks identical to a local write here — the ONLY thing that
+                            # distinguishes them is the LogonId→4624 lookup that just failed.
+                            # Per pure-SACL "no guessing", report UNKNOWN instead of blaming this
+                            # PC's own console user.  Do NOT cache anything (no confirmed actor).
+                            _qna.info(
+                                f"[_query_smb_audit] Strategy1b-post: LogonId={_s1bp_logon_id!r} "
+                                f"had no match in the pre-fetched window AND the direct verification "
+                                f"query FAILED (timeout/error) — cannot confirm remote-vs-local. "
+                                f"Reporting UNKNOWN (pure-SACL, no guess) instead of defaulting to "
+                                f"LOCAL/{result.get('user')!r}."
+                            )
+                            result["user"]    = ""
+                            result["machine"] = ""
+                            result["ip"]      = ""
+                            _lc_resolved = True   # handled — skip the LOCAL keep-4663 branch below
                         if not _lc_resolved:
                             _qna.info(
                                 f"[_query_smb_audit] Strategy1b-post: pre-fetched 4624 events had "
@@ -4690,6 +5560,20 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             # SACL definitively resolved this write to the LOCAL machine —
                             # protect it from retroactive BURST-PATCH re-attribution.
                             result["_sacl_confirmed_local"] = True
+                            # The direct, time-window-FREE TargetLogonId query found the 4663's
+                            # own 4624 and it was a console/loopback logon on the host.  That is
+                            # audit-log PROOF (not a guess) that the writer was at the host's
+                            # keyboard, so the display gate may name them even on a remote-hosted
+                            # share.  The slow/XML path sets this flag too; without it here,
+                            # sibling files of the SAME LogonId displayed inconsistently — one
+                            # named the host user, the rest showed Unknown.
+                            if locals().get("_ffl_console", False):
+                                result["_sacl_local_console"] = True
+                                _qna.info(
+                                    f"[_query_smb_audit] Strategy1b-post (pre-fetched): "
+                                    f"_sacl_local_console=True (LogonId={_s1bp_logon_id!r} resolved to a "
+                                    f"host console/loopback 4624) — host keyboard actor may be displayed."
+                                )
                             # ── Burst cache: store LOCAL attribution so concurrent PARENT-ONLY
                             # sibling files can reuse it instead of returning Unknown.
                             # CRITICAL: must store with local_actor=True so that the staleness-guard
@@ -5161,9 +6045,22 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             )
                             # Skip loopback IPs
                             if _s1bp_ip in ("127.0.0.1", "::1", ""):
+                                # A LogonId-EXACT match to a genuine loopback (127.0.0.1/::1)
+                                # 4624 is positive proof the actor was on the HOST's own
+                                # console/keyboard — NOT a network client.  This is the ONLY
+                                # signal that safely separates a keyboard-user of the share
+                                # from THIS PC's own SMB writes: our writes (backup or manual
+                                # from .106) always correlate to a NETWORK 4624 carrying our
+                                # own IP, never a loopback session.  Record it so the
+                                # host-console display gate can show the host keyboard
+                                # actor while NEVER mislabeling our own writes.
+                                if _logon_id_match and _s1bp_ip in ("127.0.0.1", "::1"):
+                                    result["_sacl_local_console"] = True
                                 _qna.info(
                                     f"[_query_smb_audit] Strategy1b-post: SKIP loopback "
                                     f"WorkstationName={_s1bp_ws!r} IpAddress={_s1bp_ip!r}"
+                                    + ("  (LogonId-exact -> host console/keyboard actor confirmed)"
+                                       if (_logon_id_match and _s1bp_ip in ("127.0.0.1", "::1")) else "")
                                 )
                                 continue
                             # Skip the file-server itself (local NTLM loopback).
@@ -5496,7 +6393,19 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                             # saves the same file shortly after.  The inter-burst gap
                             # ensures only entries from the *current* save burst are reused.
                             _lar_max_age = _BURST_INTER_BURST_GAP if event_type == "modified" else 0.0
-                            _lar_burst_hit = _burst_cache_lookup(host, _s1bp_server_local_user, event_type=event_type, max_age_secs=_lar_max_age)
+                            # require_remote=True: the ENTIRE point of this rescue is to
+                            # override a server-local result with a genuine REMOTE actor a
+                            # sibling confirmed.  A `local_actor` (server-local, e.g. the
+                            # share host `.105` itself) entry must NEVER be inherited here —
+                            # doing so, then marking it `_sacl_remote_via_auditlog=True`
+                            # below, is exactly the server-local guess pure-SACL forbids
+                            # (it made a coworker's OWN delete-burst show as the share host).
+                            _lar_burst_hit = _burst_cache_get(
+                                host, _s1bp_server_local_user,
+                                require_remote=True,
+                                event_type=event_type,
+                                max_age_secs=_lar_max_age,
+                            )
                             _lar_last_mod = _last_mod_actor_get(host, _s1bp_server_local_user)
                             _qna.info(
                                 f"[_query_smb_audit] Strategy1b-post (local-actor-rescue debug): "
@@ -5518,6 +6427,19 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                                 _lar_now = _time_mod.monotonic()
                                 for (_bc_host, _bc_sluser), (_bc_machine, _bc_ip, _bc_user, _bc_ts, _bc_la, _bc_etype, _bc_lid_conf) in list(_burst_cache.items()):
                                     if _bc_host == host.lower() and (_lar_now - _bc_ts) < _BURST_CACHE_TTL:
+                                        # NEVER inherit a server-local (`local_actor`) sibling
+                                        # entry: it is the share host itself (e.g. `.105`), not a
+                                        # remote third party.  Marking it remote below would blame
+                                        # the owner for a coworker's own delete burst (pure-SACL
+                                        # violation — the reason 4 self-deletes showed as `.105`).
+                                        if _bc_la:
+                                            _qna.info(
+                                                f"[_query_smb_audit] Strategy1b-post (local-actor rescue burst-cache host-scan): "
+                                                f"SKIP host={host!r} sluser={_bc_sluser!r} — entry is server-local "
+                                                f"(local_actor=True, machine={_bc_machine!r}); it is the share host itself, "
+                                                f"not a confirmed remote actor. Will not inherit it as pure-SACL remote."
+                                            )
+                                            continue
                                         # Skip if event_type mismatch (e.g. 'added' by .106 vs 'deleted' by .105)
                                         if _bc_etype and _bc_etype != event_type:
                                             _qna.info(
@@ -6039,27 +6961,44 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                         result["machine"] = ""
                         result["ip"]      = ""
                 else:
-                    # ── Weak-evidence dest deletion guard (PURE SACL) ──────────────
+                    # ── Weak-evidence dest guard (PURE SACL) ───────────────────────
                     # A PARENT-ONLY match with an EMPTY SubjectLogonId is NOT positive
                     # local evidence — it just means this file had no usable per-file
                     # audit event, so the scan fell back to a sibling's folder-name 4656
                     # whose LogonId was discarded.  On a DEST watch the local owner is
                     # never the real actor for a coworker's write, so "no remote 4624 ->
-                    # LOCAL" here is a GUESS, not a confirmation.  When a coworker deletes
+                    # LOCAL" here is a GUESS, not a confirmation.  When a coworker touches
                     # several files at once, one file can race ahead and reach this branch
-                    # BEFORE a sibling's LogonId-exact query has populated the remote burst
-                    # cache — so it wrongly shows local.  Wait briefly for a sibling in the
-                    # same burst to confirm a REMOTE actor (LogonId-confirmed) and reuse it.
+                    # BEFORE its own exact-filename 4663 has been flushed to the Security
+                    # log — so it falls back to a parent-only match and wrongly shows local
+                    # while its siblings (queried a second later, with their exact 4663
+                    # present) correctly resolve to the coworker.  Wait briefly for a
+                    # sibling in the same burst to confirm a REMOTE actor (LogonId-exact)
+                    # and reuse it.  This applies to EVERY event type: a coworker COPYING
+                    # files in races exactly the same way a coworker deleting them does —
+                    # restricting the guard to deleted/renamed left added/modified files
+                    # blaming this PC's own user.
                     _la_burst_key = locals().get("_s1bp_server_local_user_burst_key", "") or result.get("user", "")
                     _dw_remote = None
-                    if (is_dest_watch and event_type in ("deleted", "renamed")
+                    if (is_dest_watch
                             and not _s1bp_logon_id and _s1bp_parent_only and _la_burst_key):
                         import time as _dw_time
                         _dw_own_host = (locals().get("_s1bp_own_host_resolved", "") or "").lower()
                         _dw_own_ip   = (locals().get("_s1bp_own_ip_resolved", "") or "").lower()
                         _dw_deadline = _dw_time.monotonic() + 6.0
                         while _dw_time.monotonic() < _dw_deadline:
-                            _dw_hit = _burst_cache_get_logon_confirmed(host, _la_burst_key, event_type=event_type)
+                            # max_age: only a confirmation from the CURRENT burst may be
+                            # borrowed.  A logon-confirmed REMOTE entry from a prior burst
+                            # (still inside the 30s TTL) is not a sibling of this file — it
+                            # belongs to an operation that finished seconds ago, possibly by
+                            # a different actor.  Observed: the coworker copied 3 files at
+                            # 08:13:38, then the local user copied 3 more at 08:13:56; the
+                            # 17s-old PC1 entry was handed to the local user's file and it
+                            # showed the coworker.
+                            _dw_hit = _burst_cache_get_logon_confirmed(
+                                host, _la_burst_key, event_type=event_type,
+                                max_age=_BURST_INTER_BURST_GAP,
+                            )
                             if _dw_hit:
                                 _dw_m, _dw_ip, _dw_u = _dw_hit
                                 # Only trust a REMOTE sibling confirmation (never own machine).
@@ -6080,6 +7019,32 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
                         result["machine"] = _dw_m
                         result["ip"]      = _dw_ip
                         result["_sacl_remote_via_auditlog"] = True
+                        result.pop("_sacl_confirmed_local", None)
+                    elif _s1bp_parent_only and not _s1bp_logon_id:
+                        # PURE-SACL: the ONLY audit evidence for this file was a PARENT-ONLY
+                        # match — a 4663/4656 belonging to a DIFFERENT file that merely shares
+                        # this file's parent folder — and its SubjectLogonId was discarded as
+                        # unreliable (logon_id='').  We therefore have NO per-file proof of who
+                        # wrote it: the exact-filename 4663 simply had not been flushed to the
+                        # Security log yet when we queried (a real-time detection race — the
+                        # same file's siblings, queried a second later, DO get their exact 4663).
+                        # "No remote 4624 for an empty LogonId" is vacuously true and proves
+                        # nothing, so concluding LOCAL here would blame this PC's own user for
+                        # what may well be a coworker's remote write.  Report UNKNOWN instead,
+                        # and store NOTHING in the burst cache (a bogus LOCAL entry would poison
+                        # the sibling files that are still resolving).
+                        _qna.info(
+                            f"[_query_smb_audit] Strategy1b-post: PARENT-ONLY match with EMPTY "
+                            f"LogonId and no burst-sibling confirmation on {host!r} — the "
+                            f"exact-filename 4663 for this file is absent from the Security log, "
+                            f"so there is NO per-file evidence of the actor. Cannot confirm "
+                            f"remote-vs-local. Reporting UNKNOWN (pure-SACL, no guess) instead of "
+                            f"defaulting to LOCAL/{result.get('user')!r}. event_type={event_type!r} "
+                            f"is_dest_watch={is_dest_watch}"
+                        )
+                        result["user"]    = ""
+                        result["machine"] = ""
+                        result["ip"]      = ""
                         result.pop("_sacl_confirmed_local", None)
                     else:
                         _qna.info(
@@ -6945,12 +7910,18 @@ def _query_smb_audit(host: str, filepath: str, event_type: str,
         _final_burst_hit = None
         while True:
             # Strategy A: exact key match (fastest, most precise)
-            _final_burst_hit = _burst_cache_lookup(host, _final_sluser, event_type=event_type) if _final_sluser else None
+            # Tight same-burst age gate: only inherit from a genuinely concurrent
+            # sibling, never from a PRIOR actor's stale-but-within-TTL entry (that
+            # cross-actor leak wrongly showed .106's files as .105).
+            _final_burst_hit = _burst_cache_lookup(
+                host, _final_sluser, event_type=event_type,
+                max_age_secs=_BURST_SAME_BURST_SECS) if _final_sluser else None
             # Strategy B: any entry for this host (handles cases where the sibling
             # resolved with a different server_local_user key, or the key was not
             # recorded because the parent-only path was not taken)
             if not _final_burst_hit:
-                _final_burst_hit = _burst_cache_any_for_host(host, event_type=event_type)
+                _final_burst_hit = _burst_cache_any_for_host(
+                    host, event_type=event_type, max_age_secs=_BURST_SAME_BURST_SECS)
             if _final_burst_hit:
                 break
             if _fb_retry_elapsed >= _fb_retry_max:
@@ -7094,10 +8065,22 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
         import re as _lsh_re
         _lsh_path_stripped = _lsh_re.sub(r'^[A-Za-z]:\\', '', filepath)
         _lsh_unc = f"\\\\{local_smb_host}\\{_lsh_path_stripped}"
+        # RENAME SACL-NAME FIX: a rename on a same-host share also audits as a
+        # DELETE-access 4663 on the OLD name (see _query_smb_audit).  The loopback
+        # redirect must carry rename_src_filepath through — otherwise the source
+        # name is lost, SACL searches only the new name (which has no audit
+        # record), and the actor comes back Unknown even though it's in the log.
+        # Redirect it to the same synthetic UNC form so the whole pipeline is
+        # consistent (basename extraction would work either way, but keep it uniform).
+        _lsh_rename_src_unc = rename_src_filepath
+        if rename_src_filepath and not rename_src_filepath.startswith("\\\\"):
+            _lsh_rename_src_stripped = _lsh_re.sub(r'^[A-Za-z]:\\', '', rename_src_filepath)
+            _lsh_rename_src_unc = f"\\\\{local_smb_host}\\{_lsh_rename_src_stripped}"
         _gei.info(
             f"[_get_editor_info] local_smb_host={local_smb_host!r} — redirecting "
             f"local path {filepath!r} through UNC SMB audit as {_lsh_unc!r} "
             f"with _skip_owner_lookup=True (see Step1 below for why)"
+            + (f" [rename src → {_lsh_rename_src_unc!r}]" if _lsh_rename_src_unc else "")
         )
         return _get_editor_info_impl(
             _lsh_unc,
@@ -7109,6 +8092,7 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
             force_local=False,
             is_dest_watch=is_dest_watch,
             local_smb_host="",   # prevent infinite recursion (and avoid double-logging)
+            rename_src_filepath=_lsh_rename_src_unc,
             # BUG-FIX: the UNC host here (local_smb_host) IS this machine — it's
             # a loopback redirect, not a real remote server. win32security.
             # GetFileSecurity() on \\<own-ip>\share\file resolves to the exact
@@ -7322,6 +8306,12 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                     ("(3,0)",            lambda: _w32nfe_gei.NetFileEnum(3, 0)),
                     ("(3,)",             lambda: _w32nfe_gei.NetFileEnum(3)),
                 ]
+                # Once a signature has worked in this process, try it first so we
+                # don't re-probe (and log) every failing pywin32 arity on every
+                # single file event.  Stable sort keeps the rest as a fallback in
+                # case the cached signature ever stops working.
+                if _same_host_nfe_sig:
+                    _nfe_variants.sort(key=lambda _v: _v[0] != _same_host_nfe_sig)
                 _nfe_entries = []
                 _nfe_sig_used = ""
                 for _nfe_sig, _nfe_call in _nfe_variants:
@@ -7332,6 +8322,8 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                         else:
                             _nfe_entries = list(_nfe_raw)
                         _nfe_sig_used = _nfe_sig
+                        if _same_host_nfe_sig != _nfe_sig:
+                            _same_host_nfe_sig = _nfe_sig  # cache for subsequent events
                         _gei.info(
                             f"[_get_editor_info] Step0-priority NetFileEnum: "
                             f"signature {_nfe_sig!r} accepted — "
@@ -10204,16 +11196,40 @@ def _get_editor_info_impl(filepath: str, detection_source: str = "",
                 f"user={info['user']!r} machine={info['machine']!r} "
                 f"ip={info['ip']!r} source={_snap_src!r}"
             )
-            if info["user"]:
+            # On a REMOTE-hosted share, a NetSessionEnum snapshot is only a
+            # bystander/session GUESS (often the share host's OWN self-session,
+            # e.g. machine==ip==the host, when the owner edits locally).  The
+            # pure-SACL display gate rejects any non-LogonId-confirmed actor on a
+            # remote share, so returning it here does NOT help — worse, it
+            # SHORT-CIRCUITS the SACL/wevtutil path (Steps 2-4) that CAN identify
+            # the real actor via a console/network LogonId (e.g. the host's own
+            # keyboard user → the host machine name).  So on a remote share, do
+            # NOT short-circuit on the snapshot; fall through to the SACL path.
+            # Same-host self-hosted watches still use the snapshot as a legit last
+            # resort (Step1 already ran above), so their behavior is unchanged.
+            _snap_is_remote_share = bool(
+                is_unc and remote_host and not _is_same_host_watch
+            )
+            if info["user"] and not _snap_is_remote_share:
                 _gei.info(
                     f"[_get_editor_info] Step0 SUCCESS — returning early "
                     f"(source={_snap_src!r} user={info['user']!r})"
                 )
                 return info
-            _gei.info(
-                f"[_get_editor_info] Step0: snapshot entry had empty username — "
-                f"continuing to Step1. full entry={_snap!r}"
-            )
+            if info["user"] and _snap_is_remote_share:
+                _gei.info(
+                    f"[_get_editor_info] Step0: remote-hosted share — NOT short-"
+                    f"circuiting on the NetSessionEnum snapshot "
+                    f"(user={info['user']!r} machine={info['machine']!r} "
+                    f"ip={info['ip']!r}); deferring to the SACL/wevtutil path "
+                    f"(Steps 2-4) which can confirm the real actor via LogonId. "
+                    f"detection_source={detection_source!r}"
+                )
+            else:
+                _gei.info(
+                    f"[_get_editor_info] Step0: snapshot entry had empty username — "
+                    f"continuing to Step1. full entry={_snap!r}"
+                )
         else:
             _gei.info(
                 f"[_get_editor_info] Step0: no SMB snapshot available "
@@ -11074,7 +12090,7 @@ class ScheduleTableWidget(QWidget):
         # Table: Time | Mon | Tue | Wed | Thu | Fri | Sat | Sun | Remove
         self._table = QTableWidget(0, 9)
         self._table.setHorizontalHeaderLabels(
-            ["Time (HH:MM)"] + self._DAY_LABELS + [""]
+            [tr("Time (HH:MM)")] + [tr(d) for d in self._DAY_LABELS] + [""]
         )
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -11087,7 +12103,7 @@ class ScheduleTableWidget(QWidget):
         self._table.setMaximumHeight(160)
         layout.addWidget(self._table)
 
-        add_btn = QPushButton("＋ Add time")
+        add_btn = QPushButton(tr("＋ Add time"))
         add_btn.setObjectName("secondary")
         add_btn.setFixedWidth(110)
         add_btn.clicked.connect(lambda: self._add_row())
@@ -11099,7 +12115,7 @@ class ScheduleTableWidget(QWidget):
 
         # Time cell — editable QLineEdit inside the cell
         time_edit = QLineEdit(time_str)
-        time_edit.setPlaceholderText("HH:MM")
+        time_edit.setPlaceholderText(tr("HH:MM"))
         time_edit.setMaxLength(5)
         time_edit.setFixedWidth(70)
         time_edit.setStyleSheet("background: #1e2128; color: #e8eaf0; border: 1px solid #374151; padding: 2px 4px;")
@@ -11328,6 +12344,23 @@ class BackupWorker(QThread):
         no usable GDrive assignment (so the caller skips the cloud upload).
         """
         _wc = dict(w.get("cloud_config") or {})
+        # Fallback: if this in-memory watch has no GDrive assignment but one was
+        # SAVED to disk (e.g. assigned in the Cloud tab after this watch object
+        # was captured into memory / passed to the backup worker), read the
+        # freshest cloud_config from config.json by watch id.  Without this, a
+        # stale in-memory watch silently skips the Drive upload even though the
+        # assignment exists on disk — which left Drive empty after a backup.
+        if not _wc or _wc.get("provider", "gdrive") != "gdrive":
+            try:
+                _disk_cfg = config_manager.load()
+                _dw = next(
+                    (x for x in _disk_cfg.get("watches", []) if x.get("id") == w.get("id")),
+                    None,
+                )
+                if _dw:
+                    _wc = dict(_dw.get("cloud_config") or {})
+            except Exception:
+                pass
         if not _wc or _wc.get("provider", "gdrive") != "gdrive":
             return None
         try:
@@ -11375,10 +12408,10 @@ class BackupWorker(QThread):
         _is_network_src = _src_path.startswith("\\\\") or _src_path.startswith("//")
         if _is_network_src:
             self.log_message.emit(
-                f"Starting backup: {w['name']} … (network source — scanning files over SMB)"
+                tr("Starting backup: {p0} … (network source — scanning files over SMB)", p0=w['name'])
             )
         else:
-            self.log_message.emit(f"Starting backup: {w['name']} …")
+            self.log_message.emit(tr("Starting backup: {p0} …", p0=w['name']))
 
         # Determine the primary destination type for snapshot keying.
         # Each destination (sftp, gdrive, local …) maintains its own
@@ -11575,7 +12608,7 @@ class BackupWorker(QThread):
                 _w_dest = w.get("destination", "").strip()
                 if not _w_dest:
                     _watch_label = w.get("name", w.get("id", "unknown"))
-                    self._append_log(f"⚠ Watch '{_watch_label}' has no destination set — skipping backup.")
+                    self._append_log(tr("\u26a0 Watch '{p0}' has no destination set \u2014 skipping backup.", p0=_watch_label))
                     result = {"status": "failure", "error": "No destination configured", "watch_id": w["id"], "files_copied": 0, "total_size_bytes": 0}
                     break
                 # Build destinations list for multi-destination support
@@ -11702,14 +12735,14 @@ class BackupWorker(QThread):
         try:
             self._do_submit()
         except Exception as e:
-            self.error_lbl.setText(f"Unexpected error: {e}")
+            self.error_lbl.setText(tr("Unexpected error: {err}", err=e))
 
     def _do_submit(self):
         name = self.name_input.text().strip()
 
         # Name: required
         if not name:
-            self.error_lbl.setText("Name is required.")
+            self.error_lbl.setText(tr("Name is required."))
             return
 
         src_idx   = self.source_type.currentIndex()
@@ -11721,34 +12754,34 @@ class BackupWorker(QThread):
         if is_webdav:
             path_str = self.webdav_url.text().strip()
             if not path_str:
-                self.error_lbl.setText("WebDAV URL is required.")
+                self.error_lbl.setText(tr("WebDAV URL is required."))
                 return
             if not path_str.startswith(("http://", "https://")):
-                self.error_lbl.setText("WebDAV URL must start with http:// or https://")
+                self.error_lbl.setText(tr("WebDAV URL must start with http:// or https://"))
                 return
             if not self.webdav_user.text().strip():
-                self.error_lbl.setText("WebDAV username is required.")
+                self.error_lbl.setText(tr("WebDAV username is required."))
                 return
         elif is_sftp:
             if not self.src_sftp_host.text().strip():
-                self.error_lbl.setText("SFTP host is required.")
+                self.error_lbl.setText(tr("SFTP host is required."))
                 return
             if not self.src_sftp_user.text().strip():
-                self.error_lbl.setText("SFTP username is required.")
+                self.error_lbl.setText(tr("SFTP username is required."))
                 return
             if not self.src_sftp_path.text().strip():
-                self.error_lbl.setText("SFTP remote path is required.")
+                self.error_lbl.setText(tr("SFTP remote path is required."))
                 return
             path_str = self.src_sftp_path.text().strip()
         elif is_ftp:
             if not self.src_ftp_host.text().strip():
-                self.error_lbl.setText("FTP host is required.")
+                self.error_lbl.setText(tr("FTP host is required."))
                 return
             if not self.src_ftp_user.text().strip():
-                self.error_lbl.setText("FTP username is required.")
+                self.error_lbl.setText(tr("FTP username is required."))
                 return
             if not self.src_ftp_path.text().strip():
-                self.error_lbl.setText("FTP remote path is required.")
+                self.error_lbl.setText(tr("FTP remote path is required."))
                 return
             path_str = self.src_ftp_path.text().strip()
         else:
@@ -11834,20 +12867,36 @@ class BackupWorker(QThread):
 class _DestinationEntryDialog(QDialog):
     """Small dialog to configure one extra backup destination for the multi-dest list."""
 
+    # Destination types offered to the user.  WebDAV is deliberately absent:
+    # the backend still implements it end-to-end (transport_utils.upload_to_webdav,
+    # test_webdav_connection, credential_store.*_webdav_password) and every WebDAV
+    # widget below is still built — it is simply not offered as a NEW choice.
+    # To bring it back, move the entry out of _HIDDEN_TYPE_LABELS and back here.
     _TYPE_LABELS = [
         ("sftp",   "SFTP"),
         ("ftps",   "FTPS"),
         ("ftp",    "FTP (plain)"),
         ("https",  "HTTPS API"),
-        ("webdav", "WebDAV / Nextcloud"),
         ("rclone", "rclone"),
     ]
 
+    # Types hidden from the dropdown but still honoured when already configured.
+    _HIDDEN_TYPE_LABELS = {
+        "webdav": "WebDAV / Nextcloud",
+    }
+
     def __init__(self, parent=None, existing: dict = None):
         super().__init__(parent)
-        self.setWindowTitle("Configure Destination")
+        self.setWindowTitle(tr("Configure Destination"))
         self.setMinimumWidth(460)
         self._existing = existing or {}
+        # A destination that ALREADY uses a hidden type stays selectable in this
+        # one dialog, so opening and re-saving it round-trips instead of being
+        # silently rewritten to the first type in the list (SFTP).
+        self._type_labels = list(self._TYPE_LABELS)
+        _cur = self._existing.get("dest_type", "")
+        if _cur in self._HIDDEN_TYPE_LABELS:
+            self._type_labels.append((_cur, self._HIDDEN_TYPE_LABELS[_cur]))
         self._build_ui()
         if existing:
             self._populate(existing)
@@ -11861,27 +12910,27 @@ class _DestinationEntryDialog(QDialog):
         form.setSpacing(8)
 
         self._type_combo = QComboBox()
-        for _, label in self._TYPE_LABELS:
-            self._type_combo.addItem(label)
+        for _, label in self._type_labels:
+            self._type_combo.addItem(tr(label))   # display only; read via currentIndex()
         self._type_combo.currentIndexChanged.connect(self._on_type_changed)
-        form.addRow("Type:", self._type_combo)
+        form.addRow(tr("Type:"), self._type_combo)
 
         # ── SFTP / FTPS ─────────────────────────────────────────────────────
         self._sftp_widget = QWidget()
         sl = QFormLayout(self._sftp_widget)
         sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(4)
-        self._sftp_host = QLineEdit(); self._sftp_host.setPlaceholderText("hostname or IP")
+        self._sftp_host = QLineEdit(); self._sftp_host.setPlaceholderText(tr("hostname or IP"))
         self._sftp_port = QSpinBox(); self._sftp_port.setRange(1, 65535); self._sftp_port.setValue(22)
-        self._sftp_user = QLineEdit(); self._sftp_user.setPlaceholderText("username")
-        self._sftp_pass = QLineEdit(); self._sftp_pass.setPlaceholderText("password")
+        self._sftp_user = QLineEdit(); self._sftp_user.setPlaceholderText(tr("username"))
+        self._sftp_pass = QLineEdit(); self._sftp_pass.setPlaceholderText(tr("password"))
         self._sftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._sftp_path = QLineEdit(); self._sftp_path.setPlaceholderText("/remote/backup/path")
-        sl.addRow("Host:", self._sftp_host); sl.addRow("Port:", self._sftp_port)
-        sl.addRow("User:", self._sftp_user); sl.addRow("Password:", self._sftp_pass)
-        sl.addRow("Remote Path:", self._sftp_path)
+        self._sftp_path = QLineEdit(); self._sftp_path.setPlaceholderText(tr("/remote/backup/path"))
+        sl.addRow(tr("Host:"), self._sftp_host); sl.addRow(tr("Port:"), self._sftp_port)
+        sl.addRow(tr("User:"), self._sftp_user); sl.addRow(tr("Password:"), self._sftp_pass)
+        sl.addRow(tr("Remote Path:"), self._sftp_path)
         
         # Test button for SFTP
-        self._sftp_test_btn = QPushButton("Test Connection")
+        self._sftp_test_btn = QPushButton(tr("Test Connection"))
         self._sftp_test_btn.clicked.connect(self._test_sftp_connection)
         sl.addRow("", self._sftp_test_btn)
         
@@ -11891,21 +12940,21 @@ class _DestinationEntryDialog(QDialog):
         self._ftp_widget = QWidget()
         fl = QFormLayout(self._ftp_widget)
         fl.setContentsMargins(0, 0, 0, 0); fl.setSpacing(4)
-        self._ftp_host = QLineEdit(); self._ftp_host.setPlaceholderText("hostname or IP")
+        self._ftp_host = QLineEdit(); self._ftp_host.setPlaceholderText(tr("hostname or IP"))
         self._ftp_port = QSpinBox(); self._ftp_port.setRange(1, 65535); self._ftp_port.setValue(21)
-        self._ftp_user = QLineEdit(); self._ftp_user.setPlaceholderText("username")
-        self._ftp_pass = QLineEdit(); self._ftp_pass.setPlaceholderText("password")
+        self._ftp_user = QLineEdit(); self._ftp_user.setPlaceholderText(tr("username"))
+        self._ftp_pass = QLineEdit(); self._ftp_pass.setPlaceholderText(tr("password"))
         self._ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._ftp_path = QLineEdit(); self._ftp_path.setPlaceholderText("/remote/path")
-        _ftp_warn = QLabel("⚠ FTP sends credentials in plaintext — use FTPS/SFTP when possible.")
+        self._ftp_path = QLineEdit(); self._ftp_path.setPlaceholderText(tr("/remote/path"))
+        _ftp_warn = QLabel(tr("⚠ FTP sends credentials in plaintext — use FTPS/SFTP when possible."))
         _ftp_warn.setWordWrap(True)
         _ftp_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
-        fl.addRow("Host:", self._ftp_host); fl.addRow("Port:", self._ftp_port)
-        fl.addRow("User:", self._ftp_user); fl.addRow("Password:", self._ftp_pass)
-        fl.addRow("Remote Path:", self._ftp_path)
+        fl.addRow(tr("Host:"), self._ftp_host); fl.addRow(tr("Port:"), self._ftp_port)
+        fl.addRow(tr("User:"), self._ftp_user); fl.addRow(tr("Password:"), self._ftp_pass)
+        fl.addRow(tr("Remote Path:"), self._ftp_path)
         
         # Test button for FTP
-        self._ftp_test_btn = QPushButton("Test Connection")
+        self._ftp_test_btn = QPushButton(tr("Test Connection"))
         self._ftp_test_btn.clicked.connect(self._test_ftp_connection)
         fl.addRow("", self._ftp_test_btn)
         
@@ -11918,15 +12967,15 @@ class _DestinationEntryDialog(QDialog):
         self._https_widget = QWidget()
         hl2 = QFormLayout(self._https_widget)
         hl2.setContentsMargins(0, 0, 0, 0); hl2.setSpacing(4)
-        self._https_url   = QLineEdit(); self._https_url.setPlaceholderText("https://api.example.com/backup")
-        self._https_token = QLineEdit(); self._https_token.setPlaceholderText("Bearer token (optional)")
+        self._https_url   = QLineEdit(); self._https_url.setPlaceholderText(tr("https://api.example.com/backup"))
+        self._https_token = QLineEdit(); self._https_token.setPlaceholderText(tr("Bearer token (optional)"))
         self._https_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self._https_ssl   = QCheckBox("Verify SSL certificate"); self._https_ssl.setChecked(True)
-        hl2.addRow("URL:", self._https_url); hl2.addRow("Auth Token:", self._https_token)
+        self._https_ssl   = QCheckBox(tr("Verify SSL certificate")); self._https_ssl.setChecked(True)
+        hl2.addRow(tr("URL:"), self._https_url); hl2.addRow(tr("Auth Token:"), self._https_token)
         hl2.addRow("", self._https_ssl)
         
         # Test button for HTTPS
-        self._https_test_btn = QPushButton("Test Connection")
+        self._https_test_btn = QPushButton(tr("Test Connection"))
         self._https_test_btn.clicked.connect(self._test_https_connection)
         hl2.addRow("", self._https_test_btn)
         
@@ -11937,19 +12986,19 @@ class _DestinationEntryDialog(QDialog):
         self._webdav_widget = QWidget()
         wl2 = QFormLayout(self._webdav_widget)
         wl2.setContentsMargins(0, 0, 0, 0); wl2.setSpacing(4)
-        self._wdav_url  = QLineEdit(); self._wdav_url.setPlaceholderText("https://nextcloud.example.com")
-        self._wdav_user = QLineEdit(); self._wdav_user.setPlaceholderText("username")
-        self._wdav_pass = QLineEdit(); self._wdav_pass.setPlaceholderText("password")
+        self._wdav_url  = QLineEdit(); self._wdav_url.setPlaceholderText(tr("https://nextcloud.example.com"))
+        self._wdav_user = QLineEdit(); self._wdav_user.setPlaceholderText(tr("username"))
+        self._wdav_pass = QLineEdit(); self._wdav_pass.setPlaceholderText(tr("password"))
         self._wdav_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._wdav_path = QLineEdit(); self._wdav_path.setPlaceholderText("/backups")
-        self._wdav_root = QLineEdit(); self._wdav_root.setPlaceholderText("/remote.php/dav/files/username/")
-        self._wdav_ssl  = QCheckBox("Verify SSL certificate"); self._wdav_ssl.setChecked(True)
-        wl2.addRow("URL:", self._wdav_url);       wl2.addRow("User:", self._wdav_user)
-        wl2.addRow("Password:", self._wdav_pass); wl2.addRow("Remote Path:", self._wdav_path)
-        wl2.addRow("DAV Root:", self._wdav_root); wl2.addRow("", self._wdav_ssl)
+        self._wdav_path = QLineEdit(); self._wdav_path.setPlaceholderText(tr("/backups"))
+        self._wdav_root = QLineEdit(); self._wdav_root.setPlaceholderText(tr("/remote.php/dav/files/username/"))
+        self._wdav_ssl  = QCheckBox(tr("Verify SSL certificate")); self._wdav_ssl.setChecked(True)
+        wl2.addRow(tr("URL:"), self._wdav_url);       wl2.addRow(tr("User:"), self._wdav_user)
+        wl2.addRow(tr("Password:"), self._wdav_pass); wl2.addRow(tr("Remote Path:"), self._wdav_path)
+        wl2.addRow(tr("DAV Root:"), self._wdav_root); wl2.addRow("", self._wdav_ssl)
         
         # Test button for WebDAV
-        self._webdav_test_btn = QPushButton("Test Connection")
+        self._webdav_test_btn = QPushButton(tr("Test Connection"))
         self._webdav_test_btn.clicked.connect(self._test_webdav_connection)
         wl2.addRow("", self._webdav_test_btn)
         
@@ -11964,36 +13013,36 @@ class _DestinationEntryDialog(QDialog):
         # Remote picker (populated by Detect Remotes)
         _rclone_picker_row = QHBoxLayout()
         self._rclone_picker_combo = QComboBox()
-        self._rclone_picker_combo.setPlaceholderText("— detect remotes first —")
+        self._rclone_picker_combo.setPlaceholderText(tr("— detect remotes first —"))
         self._rclone_picker_combo.setMinimumWidth(140)
         self._rclone_picker_combo.currentTextChanged.connect(self._on_rclone_picker_changed)
-        _rclone_detect_btn = QPushButton("🔍 Detect Remotes")
+        _rclone_detect_btn = QPushButton(tr("🔍 Detect Remotes"))
         _rclone_detect_btn.setObjectName("secondary")
-        _rclone_detect_btn.setToolTip("Run 'rclone listremotes' to find configured remotes")
+        _rclone_detect_btn.setToolTip(tr("Run 'rclone listremotes' to find configured remotes"))
         _rclone_detect_btn.clicked.connect(self._detect_rclone_remotes)
-        _rclone_config_btn = QPushButton("⚙ rclone config…")
+        _rclone_config_btn = QPushButton(tr("⚙ rclone config…"))
         _rclone_config_btn.setObjectName("secondary")
-        _rclone_config_btn.setToolTip("Open a terminal running 'rclone config' to add / edit remotes")
+        _rclone_config_btn.setToolTip(tr("Open a terminal running 'rclone config' to add / edit remotes"))
         _rclone_config_btn.clicked.connect(self._launch_rclone_config)
         _rclone_picker_row.addWidget(self._rclone_picker_combo, stretch=1)
         _rclone_picker_row.addWidget(_rclone_detect_btn)
         _rclone_picker_row.addWidget(_rclone_config_btn)
-        rl2.addRow("Pick remote:", _rclone_picker_row)
+        rl2.addRow(tr("Pick remote:"), _rclone_picker_row)
 
-        self._rclone_remote = QLineEdit(); self._rclone_remote.setPlaceholderText("myremote")
-        self._rclone_path   = QLineEdit(); self._rclone_path.setPlaceholderText("/backups")
-        rl2.addRow("Remote name:", self._rclone_remote)
-        rl2.addRow("Remote path:", self._rclone_path)
+        self._rclone_remote = QLineEdit(); self._rclone_remote.setPlaceholderText(tr("myremote"))
+        self._rclone_path   = QLineEdit(); self._rclone_path.setPlaceholderText(tr("/backups"))
+        rl2.addRow(tr("Remote name:"), self._rclone_remote)
+        rl2.addRow(tr("Remote path:"), self._rclone_path)
 
         _rclone_note = QLabel(
-            "Click 'Detect Remotes' to list remotes from your rclone config, or type a name "
-            "manually. Use 'rclone config…' to add a new provider (70+ supported)."
+            tr("Click 'Detect Remotes' to list remotes from your rclone config, or type a name "
+            "manually. Use 'rclone config…' to add a new provider (70+ supported).")
         )
         _rclone_note.setWordWrap(True)
         _rclone_note.setStyleSheet("color:#94a3b8; font-size:11px;")
         rl2.addRow("", _rclone_note)
 
-        _rclone_test_btn = QPushButton("Test Connection")
+        _rclone_test_btn = QPushButton(tr("Test Connection"))
         _rclone_test_btn.setObjectName("secondary")
         _rclone_test_btn.clicked.connect(self._test_rclone_dest)
         rl2.addRow("", _rclone_test_btn)
@@ -12008,10 +13057,10 @@ class _DestinationEntryDialog(QDialog):
         layout.addWidget(self._err_lbl)
 
         btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("Cancel")
+        cancel_btn = QPushButton(tr("Cancel"))
         cancel_btn.setObjectName("secondary")
         cancel_btn.clicked.connect(self.reject)
-        ok_btn = QPushButton("Save")
+        ok_btn = QPushButton(tr("Save"))
         ok_btn.setObjectName("success")
         ok_btn.clicked.connect(self._submit)
         btn_row.addWidget(cancel_btn)
@@ -12019,7 +13068,7 @@ class _DestinationEntryDialog(QDialog):
         layout.addLayout(btn_row)
 
     def _on_type_changed(self, idx):
-        type_key = self._TYPE_LABELS[idx][0]
+        type_key = self._type_labels[idx][0]
         self._sftp_widget.setVisible(type_key in ("sftp", "ftps"))
         self._ftp_widget.setVisible(type_key == "ftp")
         self._https_widget.setVisible(type_key == "https")
@@ -12030,11 +13079,12 @@ class _DestinationEntryDialog(QDialog):
         elif type_key == "ftps":
             self._sftp_port.setValue(990)
         self.adjustSize()
+        _fit_dialog_to_screen(self)
 
     def _populate(self, dest: dict):
         """Pre-fill fields when editing an existing destination."""
         type_key = dest.get("dest_type", "sftp")
-        for i, (k, _) in enumerate(self._TYPE_LABELS):
+        for i, (k, _) in enumerate(self._type_labels):
             if k == type_key:
                 self._type_combo.setCurrentIndex(i)
                 break
@@ -12069,14 +13119,14 @@ class _DestinationEntryDialog(QDialog):
     def _submit(self):
         dest = self.get_dest()
         if not dest:
-            self._err_lbl.setText("Please fill in the required fields.")
+            self._err_lbl.setText(tr("Please fill in the required fields."))
             return
         self.accept()
 
     def get_dest(self) -> dict:
         """Return a destination dict {dest_type, config} or {} if validation fails."""
         idx      = self._type_combo.currentIndex()
-        type_key = self._TYPE_LABELS[idx][0]
+        type_key = self._type_labels[idx][0]
 
         if type_key in ("sftp", "ftps"):
             host = self._sftp_host.text().strip()
@@ -12162,20 +13212,20 @@ class _DestinationEntryDialog(QDialog):
             "path":     self._sftp_path.text().strip(),
         }
         if not cfg["host"]:
-            QMessageBox.warning(self, "Missing", "Please enter an SFTP host first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an SFTP host first."))
             return
         try:
             from transport_utils import test_sftp_connection
             result = test_sftp_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "SFTP Test Failed", str(e))
+            QMessageBox.critical(self, tr("SFTP Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "SFTP  ·  Connected ✓",
-                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+            QMessageBox.information(self, tr("SFTP  ·  Connected ✓"),
+                tr("Successfully connected to:\n{p0}:{p1}", p0=cfg['host'], p1=cfg['port']))
         else:
-            QMessageBox.critical(self, "SFTP  ·  Failed",
-                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
+            QMessageBox.critical(self, tr("SFTP  ·  Failed"),
+                tr("Could not connect:\n\n{p0}", p0=result.get('error', 'Unknown error')))
 
     def _test_ftp_connection(self):
         cfg = {
@@ -12186,20 +13236,20 @@ class _DestinationEntryDialog(QDialog):
             "path": self._ftp_path.text().strip(),
         }
         if not cfg["host"]:
-            QMessageBox.warning(self, "Missing", "Please enter an FTP host first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an FTP host first."))
             return
         try:
             from transport_utils import test_ftp_connection
             result = test_ftp_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "FTP Test Failed", str(e))
+            QMessageBox.critical(self, tr("FTP Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "FTP  ·  Connected ✓",
-                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+            QMessageBox.information(self, tr("FTP  ·  Connected ✓"),
+                tr("Successfully connected to:\n{p0}:{p1}", p0=cfg['host'], p1=cfg['port']))
         else:
-            QMessageBox.critical(self, "FTP  ·  Failed",
-                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
+            QMessageBox.critical(self, tr("FTP  ·  Failed"),
+                tr("Could not connect:\n\n{p0}", p0=result.get('error', 'Unknown error')))
 
     def _test_https_connection(self):
         cfg = {
@@ -12208,20 +13258,20 @@ class _DestinationEntryDialog(QDialog):
             "verify_ssl": self._https_ssl.isChecked(),
         }
         if not cfg["url"]:
-            QMessageBox.warning(self, "Missing", "Please enter an endpoint URL first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an endpoint URL first."))
             return
         try:
             from transport_utils import test_https_connection
             result = test_https_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "HTTPS Test Failed", str(e))
+            QMessageBox.critical(self, tr("HTTPS Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "HTTPS  ·  Connected ✓",
-                f"Endpoint reachable:\n{cfg['url']}\n\nHTTP status: {result.get('status_code', 'n/a')}")
+            QMessageBox.information(self, tr("HTTPS  ·  Connected ✓"),
+                tr("Endpoint reachable:\n{p0}\n\nHTTP status: {p1}", p0=cfg['url'], p1=result.get('status_code', 'n/a')))
         else:
-            QMessageBox.critical(self, "HTTPS  ·  Failed",
-                f'Could not reach endpoint:\n\n{result.get("error", "Unknown error")}')
+            QMessageBox.critical(self, tr("HTTPS  ·  Failed"),
+                tr("Could not reach endpoint:\n\n{p0}", p0=result.get('error', 'Unknown error')))
 
     def _test_webdav_connection(self):
         cfg = {
@@ -12232,25 +13282,20 @@ class _DestinationEntryDialog(QDialog):
             "verify_ssl":  self._wdav_ssl.isChecked(),
         }
         if not cfg["url"]:
-            QMessageBox.warning(self, "Missing", "Please enter the WebDAV URL first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter the WebDAV URL first."))
             return
         try:
             from transport_utils import test_webdav_connection
             result = test_webdav_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "WebDAV Test Failed", str(e))
+            QMessageBox.critical(self, tr("WebDAV Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "WebDAV  ·  Connected ✓",
-                f"WebDAV server reachable:\n{cfg['url']}\n\n"
-                "PROPFIND succeeded — credentials and URL are correct.")
+            QMessageBox.information(self, tr("WebDAV  ·  Connected ✓"),
+                tr("WebDAV server reachable:\n{p0}\n\nPROPFIND succeeded \u2014 credentials and URL are correct.", p0=cfg['url']))
         else:
-            QMessageBox.critical(self, "WebDAV  ·  Failed",
-                f'Could not connect:\n\n{result.get("error", "Unknown error")}\n\n'
-                "Tips:\n"
-                "• Nextcloud DAV root: /remote.php/dav/files/<USERNAME>/\n"
-                "• ownCloud DAV root: /remote.php/webdav/\n"
-                "• Plain WebDAV: leave DAV root empty")
+            QMessageBox.critical(self, tr("WebDAV  ·  Failed"),
+                tr("Could not connect:\n\n{p0}\n\nTips:\n\u2022 Nextcloud DAV root: /remote.php/dav/files/<USERNAME>/\n\u2022 ownCloud DAV root: /remote.php/webdav/\n\u2022 Plain WebDAV: leave DAV root empty", p0=result.get('error', 'Unknown error')))
 
     # ── rclone helpers ─────────────────────────────────────────────────────
 
@@ -12265,24 +13310,24 @@ class _DestinationEntryDialog(QDialog):
             )
         except FileNotFoundError:
             QMessageBox.critical(
-                self, "rclone not found",
-                "rclone is not installed or not on PATH.\n\n"
-                "Download it from https://rclone.org/downloads/ and re-try.",
+                self, tr("rclone not found"),
+                tr("rclone is not installed or not on PATH.\n\n"
+                "Download it from https://rclone.org/downloads/ and re-try."),
             )
             return
         except subprocess.TimeoutExpired:
-            QMessageBox.warning(self, "Timeout", "rclone listremotes timed out after 10 s.")
+            QMessageBox.warning(self, tr("Timeout"), tr("rclone listremotes timed out after 10 s."))
             return
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            QMessageBox.critical(self, tr("Error"), str(exc))
             return
 
         remotes = [r.rstrip(":").strip() for r in proc.stdout.splitlines() if r.strip()]
         if not remotes:
             QMessageBox.information(
-                self, "No remotes found",
-                "rclone reported no configured remotes.\n\n"
-                "Click '⚙ rclone config…' to add one.",
+                self, tr("No remotes found"),
+                tr("rclone reported no configured remotes.\n\n"
+                "Click '⚙ rclone config…' to add one."),
             )
             return
 
@@ -12320,8 +13365,8 @@ class _DestinationEntryDialog(QDialog):
                         continue
         except Exception as exc:
             QMessageBox.warning(
-                self, "Could not open terminal",
-                f"Please open a terminal manually and run:\n    rclone config\n\nError: {exc}",
+                self, tr("Could not open terminal"),
+                tr("Please open a terminal manually and run:\n    rclone config\n\nError: {p0}", p0=exc),
             )
 
     def _test_rclone_dest(self):
@@ -12330,20 +13375,20 @@ class _DestinationEntryDialog(QDialog):
             "path":   self._rclone_path.text().strip(),
         }
         if not cfg["remote"]:
-            QMessageBox.warning(self, "Missing", "Please enter an rclone remote name first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an rclone remote name first."))
             return
         try:
             from transport_utils import test_rclone_connection
             result = test_rclone_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "rclone Test Failed", str(e))
+            QMessageBox.critical(self, tr("rclone Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "rclone  ·  Connected ✓",
+            QMessageBox.information(self, tr("rclone  ·  Connected ✓"),
                 f"{result.get('message', 'rclone can access the remote')}")
         else:
-            QMessageBox.critical(self, "rclone  ·  Failed",
-                f"Could not connect:\n\n{result.get('message', 'Unknown error')}")
+            QMessageBox.critical(self, tr("rclone  ·  Failed"),
+                tr("Could not connect:\n\n{p0}", p0=result.get('message', 'Unknown error')))
 
     @staticmethod
     def dest_label(dest: dict) -> str:
@@ -12359,6 +13404,72 @@ class _DestinationEntryDialog(QDialog):
 # ── Edit Watch Dialog ──────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+class _NoWheelEditFilter(QObject):
+    """Stop the mouse wheel from silently editing spin-box and combo values.
+
+    Hovering a spin box while scrolling a settings page would otherwise change the
+    value under the cursor — e.g. nudging "Storage quota" from 0 (no limit) to a
+    real limit, or flipping Compression — with no visible sign that anything was
+    edited. The wheel is for scrolling; values are changed by typing, by the
+    up/down arrows, or with the keyboard once the field has focus.
+
+    Installed on the QApplication so it covers every spin box and combo in the app,
+    including any added later. The event is forwarded to the enclosing scroll area
+    so the page still scrolls normally under the cursor.
+    """
+
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, (QAbstractSpinBox, QComboBox)):
+                return False
+            # An open combo dropdown is a real list — let the wheel scroll it.
+            if isinstance(obj, QComboBox) and obj.view() and obj.view().isVisible():
+                return False
+
+            _w = obj.parentWidget()
+            while _w is not None:
+                if isinstance(_w, QAbstractScrollArea):
+                    QApplication.sendEvent(_w.viewport(), ev)
+                    return True                    # handled: page scrolled, value untouched
+                _w = _w.parentWidget()
+            return True                            # nothing to scroll — just swallow it
+        except Exception:
+            return False
+
+
+def _fit_dialog_to_screen(dlg: QDialog, *, width_frac: float = 0.95,
+                          height_frac: float = 0.90) -> None:
+    """Clamp a dialog to the available screen area and keep it fully on-screen.
+
+    Dialogs whose content grows (collapsible sections) can otherwise end up taller
+    than the display, pushing the button row off the bottom edge where it cannot be
+    clicked.
+    """
+    try:
+        scr = dlg.screen() or QApplication.primaryScreen()
+        if scr is None:
+            return
+        avail = scr.availableGeometry()
+    except Exception:
+        return
+
+    max_w = int(avail.width()  * width_frac)
+    max_h = int(avail.height() * height_frac)
+    dlg.setMaximumHeight(max_h)
+
+    new_w = min(max(dlg.width(), dlg.minimumWidth()), max_w)
+    new_h = min(dlg.height(), max_h)
+    if (new_w, new_h) != (dlg.width(), dlg.height()):
+        dlg.resize(new_w, new_h)
+
+    frame = dlg.frameGeometry()
+    if not avail.contains(frame):
+        frame.moveCenter(avail.center())
+        dlg.move(frame.topLeft())
+
+
 class EditWatchDialog(QDialog):
     """Edit per-watch settings: name, interval, compression, exclusions."""
 
@@ -12366,18 +13477,35 @@ class EditWatchDialog(QDialog):
         super().__init__(parent)
         self.watch     = watch
         self.dest_type = dest_type
-        self.setWindowTitle(f"Edit Watch  · {watch.get('name', '')}")
+        self.setWindowTitle(tr("Edit Watch  · {name}", name=watch.get('name', '')))
         self.setMinimumWidth(500)
         self._is_dirty = False
         self._build_ui()
         self._connect_dirty_signals()
+        # Roomy default; _fit_dialog_to_screen shrinks it on smaller displays.
+        self.resize(760, 820)
+        _fit_dialog_to_screen(self)
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
-        layout.setContentsMargins(24, 24, 24, 24)
+        # Everything except the button row lives in a scroll area, so the Save /
+        # Cancel row stays pinned to the bottom of the dialog no matter how tall
+        # the expanded Advanced section gets.
+        root = QVBoxLayout(self)
+        root.setSpacing(0)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        title = QLabel("Edit Watch Settings")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        body_widget = QWidget()
+        scroll.setWidget(body_widget)
+        root.addWidget(scroll, 1)
+
+        layout = QVBoxLayout(body_widget)
+        layout.setSpacing(14)
+        layout.setContentsMargins(24, 24, 24, 8)
+
+        title = QLabel(tr("Edit Watch Settings"))
         title.setObjectName("heading")
         layout.addWidget(title)
 
@@ -12386,23 +13514,23 @@ class EditWatchDialog(QDialog):
         form.setSpacing(10)
 
         self.name_input = QLineEdit(self.watch.get("name", ""))
-        form.addRow("Name:", self.name_input)
+        form.addRow(tr("Name:"), self.name_input)
 
         path_lbl = QLabel(self.watch.get("path", ""))
         path_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
-        form.addRow("Path:", path_lbl)
+        form.addRow(tr("Path:"), path_lbl)
 
         edit_dest_widget = QWidget()
         edit_dest_row = QHBoxLayout(edit_dest_widget)
         edit_dest_row.setContentsMargins(0, 0, 0, 0)
         self.dest_input = QLineEdit(self.watch.get("destination", ""))
         self.dest_input.setPlaceholderText(
-            "Required — enter backup destination folder  ·  e.g. \\\\server\\share\\folder"
+            tr("Required — enter backup destination folder  ·  e.g. \\\\server\\share\\folder")
         )
-        edit_dest_browse = QPushButton("Browse")
+        edit_dest_browse = QPushButton(tr("Browse"))
         edit_dest_browse.setObjectName("secondary")
         edit_dest_browse.setMaximumWidth(80)
-        self._dest_ok_lbl = QLabel("✓ Folder selected")
+        self._dest_ok_lbl = QLabel(tr("✓ Folder selected"))
         self._dest_ok_lbl.setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;")
         self._dest_ok_lbl.hide()
         def _on_dest_browse():
@@ -12414,23 +13542,23 @@ class EditWatchDialog(QDialog):
         edit_dest_row.addWidget(self.dest_input)
         edit_dest_row.addWidget(edit_dest_browse)
         edit_dest_row.addWidget(self._dest_ok_lbl)
-        form.addRow("Destination:", edit_dest_widget)
+        form.addRow(tr("Destination:"), edit_dest_widget)
 
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(0, 1440)
         self.interval_spin.setValue(self.watch.get("interval_min", 0))
-        self.interval_spin.setSuffix(" min  (0 = use global)")
-        form.addRow("Interval:", self.interval_spin)
+        self.interval_spin.setSuffix(tr(" min  (0 = use global)"))
+        form.addRow(tr("Interval:"), self.interval_spin)
 
         self.watch_schedule_widget = ScheduleTableWidget()
         self.watch_schedule_widget.set_entries(self.watch.get("schedule_times", []))
-        form.addRow("Schedule times:", self.watch_schedule_widget)
+        form.addRow(tr("Schedule times:"), self.watch_schedule_widget)
 
         self.compress_combo = QComboBox()
-        self.compress_combo.addItem("Off", 0)
-        self.compress_combo.addItem("Fast (level 1)", 1)
-        self.compress_combo.addItem("Balanced (level 6)", 6)
-        self.compress_combo.addItem("Best (level 9)", 9)
+        self.compress_combo.addItem(tr("Off"), 0)
+        self.compress_combo.addItem(tr("Fast (level 1)"), 1)
+        self.compress_combo.addItem(tr("Balanced (level 6)"), 6)
+        self.compress_combo.addItem(tr("Best (level 9)"), 9)
         current_compression = self.watch.get("compression", False)
         if current_compression is True or current_compression == 6:
             self.compress_combo.setCurrentIndex(2)
@@ -12440,12 +13568,12 @@ class EditWatchDialog(QDialog):
             self.compress_combo.setCurrentIndex(3)
         else:
             self.compress_combo.setCurrentIndex(0)
-        form.addRow("Compression:", self.compress_combo)
+        form.addRow(tr("Compression:"), self.compress_combo)
 
         layout.addLayout(form)
 
         # ── Advanced settings toggle ──────────────────────────────────────────
-        self._adv_toggle = QPushButton("▶  Advanced settings")
+        self._adv_toggle = QPushButton(tr("▶  Advanced settings"))
         self._adv_toggle.setObjectName("secondary")
         self._adv_toggle.setStyleSheet(
             "text-align:left; padding:6px 10px; font-size:12px; "
@@ -12468,37 +13596,37 @@ class EditWatchDialog(QDialog):
         self.force_full_interval_spin = QSpinBox()
         self.force_full_interval_spin.setRange(0, 3650)
         self.force_full_interval_spin.setValue(int(self.watch.get("force_full_interval_days", 0)))
-        self.force_full_interval_spin.setSuffix(" days  (0 = use global / disabled)")
+        self.force_full_interval_spin.setSuffix(tr(" days  (0 = use global / disabled)"))
         self.force_full_interval_spin.setToolTip(
-            "Force a full backup every N days for this watch, regardless of the "
+            tr("Force a full backup every N days for this watch, regardless of the "
             "incremental chain length.  0 = inherit the global setting (or disabled "
             "if the global setting is also 0).  -1 disables forced-full even when "
-            "the global setting is active."
+            "the global setting is active.")
         )
-        adv_form.addRow("Force full every:", self.force_full_interval_spin)
+        adv_form.addRow(tr("Force full every:"), self.force_full_interval_spin)
 
         self.drive_trigger_label_input = QLineEdit()
         self.drive_trigger_label_input.setText(self.watch.get("drive_trigger_label", ""))
-        self.drive_trigger_label_input.setPlaceholderText("MY_BACKUP  (case-insensitive volume label)")
+        self.drive_trigger_label_input.setPlaceholderText(tr("MY_BACKUP  (case-insensitive volume label)"))
         self.drive_trigger_label_input.setToolTip(
-            "Back up this watch automatically when a drive with this volume label "
-            "is connected.  Leave blank to disable.  Case-insensitive."
+            tr("Back up this watch automatically when a drive with this volume label "
+            "is connected.  Leave blank to disable.  Case-insensitive.")
         )
-        adv_form.addRow("Drive trigger (label):", self.drive_trigger_label_input)
+        adv_form.addRow(tr("Drive trigger (label):"), self.drive_trigger_label_input)
 
         self.drive_trigger_serial_input = QLineEdit()
         self.drive_trigger_serial_input.setText(self.watch.get("drive_trigger_serial", ""))
-        self.drive_trigger_serial_input.setPlaceholderText("ABCD1234  (8-char hex serial — Windows only)")
+        self.drive_trigger_serial_input.setPlaceholderText(tr("ABCD1234  (8-char hex serial — Windows only)"))
         self.drive_trigger_serial_input.setToolTip(
-            "Back up this watch automatically when a drive with this volume serial "
+            tr("Back up this watch automatically when a drive with this volume serial "
             "is connected.  Find the serial with:  vol C:  (or the drive letter) "
-            "in CMD.  Either label OR serial match triggers the backup."
+            "in CMD.  Either label OR serial match triggers the backup.")
         )
-        adv_form.addRow("Drive trigger (serial):", self.drive_trigger_serial_input)
+        adv_form.addRow(tr("Drive trigger (serial):"), self.drive_trigger_serial_input)
 
         _dt_note = QLabel(
-            "💡 Tip: use volume label for portability across machines; use serial "
-            "to distinguish two drives with the same label."
+            tr("💡 Tip: use volume label for portability across machines; use serial "
+            "to distinguish two drives with the same label.")
         )
         _dt_note.setStyleSheet("color: #94a3b8; font-size: 11px;")
         _dt_note.setWordWrap(True)
@@ -12508,43 +13636,43 @@ class EditWatchDialog(QDialog):
         self.max_file_size_spin.setRange(0, 100000)
         self.max_file_size_spin.setDecimals(0)
         self.max_file_size_spin.setValue(self.watch.get("max_file_size_mb", 0))
-        self.max_file_size_spin.setSuffix(" MB  (0 = no limit)")
+        self.max_file_size_spin.setSuffix(tr(" MB  (0 = no limit)"))
         self.max_file_size_spin.setToolTip(
-            "Skip any single file larger than this size. "
-            "Useful to avoid accidentally backing up video files or database dumps."
+            tr("Skip any single file larger than this size. "
+            "Useful to avoid accidentally backing up video files or database dumps.")
         )
-        adv_form.addRow("Skip files over:", self.max_file_size_spin)
+        adv_form.addRow(tr("Skip files over:"), self.max_file_size_spin)
 
         self.max_backup_bytes_spin = QDoubleSpinBox()
         self.max_backup_bytes_spin.setRange(0, 1_000_000)
         self.max_backup_bytes_spin.setDecimals(0)
         _cur_quota_mb = round(self.watch.get("max_backup_bytes", 0) / (1024 * 1024))
         self.max_backup_bytes_spin.setValue(_cur_quota_mb)
-        self.max_backup_bytes_spin.setSuffix(" MB  (0 = no limit)")
+        self.max_backup_bytes_spin.setSuffix(tr(" MB  (0 = no limit)"))
         self.max_backup_bytes_spin.setToolTip(
-            "Stop new backups for this watch once total backup storage exceeds this limit. "
-            "Old backups must be deleted to free space."
+            tr("Stop new backups for this watch once total backup storage exceeds this limit. "
+            "Old backups must be deleted to free space.")
         )
-        adv_form.addRow("Storage quota:", self.max_backup_bytes_spin)
+        adv_form.addRow(tr("Storage quota:"), self.max_backup_bytes_spin)
 
         self.force_robocopy_check = QCheckBox(
-            "Force robocopy for same-host UNC  "
-            "(tick when source & dest are on the same Windows host and transfers are slow)"
+            tr("Force robocopy for same-host UNC  "
+            "(tick when source & dest are on the same Windows host and transfers are slow)")
         )
         self.force_robocopy_check.setChecked(self.watch.get("force_robocopy", False))
         self.force_robocopy_check.setToolTip(
-            "When source and destination are on the same Windows host, BackupSys normally\n"
+            tr("When source and destination are on the same Windows host, BackupSys normally\n"
             ""
             "Enable this if same-host UNC transfers are slow (ODX not supported).\n"
             "robocopy /MT:8 /J will be used instead — routes bytes through your PC but\n"
             "runs 8 parallel threads and is much faster when ODX is unavailable.\n\n"
             "Note: robocopy requires Compression = Off. Ticking this will set compression\n"
-            "to Off automatically."
+            "to Off automatically.")
         )
         adv_form.addRow("", self.force_robocopy_check)
 
         self._sync_mode = True
-        self.skip_auto_check = QCheckBox("Skip auto backup  (manual only)")
+        self.skip_auto_check = QCheckBox(tr("Skip auto backup  (manual only)"))
         self.skip_auto_check.setChecked(self.watch.get("skip_auto_backup", False))
         adv_form.addRow("", self.skip_auto_check)
 
@@ -12552,13 +13680,13 @@ class EditWatchDialog(QDialog):
         enc_row = QHBoxLayout()
         self.encrypt_input = QLineEdit(self.watch.get("encrypt_key", ""))
         self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.encrypt_input.setPlaceholderText("44-char encryption key  (leave blank to disable)")
+        self.encrypt_input.setPlaceholderText(tr("44-char encryption key  (leave blank to disable)"))
         self.encrypt_input.setToolTip(
-            "AES encryption key for this watch.\n"
+            tr("AES encryption key for this watch.\n"
             "Generate one: python -c \"from backup_engine import generate_encryption_key; print(generate_encryption_key())\"\n"
-            "⚠ Store your key safely  · without it backups cannot be restored!"
+            "⚠ Store your key safely  · without it backups cannot be restored!")
         )
-        gen_key_btn = QPushButton("Generate")
+        gen_key_btn = QPushButton(tr("Generate"))
         gen_key_btn.setObjectName("secondary")
         gen_key_btn.setFixedWidth(80)
         gen_key_btn.clicked.connect(self._generate_key)
@@ -12571,11 +13699,11 @@ class EditWatchDialog(QDialog):
                 QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
             )
         )
-        rotate_key_btn = QPushButton("🔄 Rotate…")
+        rotate_key_btn = QPushButton(tr("🔄 Rotate…"))
         rotate_key_btn.setObjectName("secondary")
         rotate_key_btn.setToolTip(
-            "Re-encrypt all existing backups for this watch with a new key.\n"
-            "The old key must match what was used when the backups were created."
+            tr("Re-encrypt all existing backups for this watch with a new key.\n"
+            "The old key must match what was used when the backups were created.")
         )
         rotate_key_btn.clicked.connect(self._rotate_key)
         enc_row.addWidget(self.encrypt_input)
@@ -12584,7 +13712,7 @@ class EditWatchDialog(QDialog):
         copy_key_btn = QPushButton("📋")
         copy_key_btn.setObjectName("secondary")
         copy_key_btn.setFixedWidth(36)
-        copy_key_btn.setToolTip("Copy key to clipboard")
+        copy_key_btn.setToolTip(tr("Copy key to clipboard"))
         copy_key_btn.clicked.connect(
             lambda: QApplication.clipboard().setText(self.encrypt_input.text().strip())
             if self.encrypt_input.text().strip()
@@ -12592,17 +13720,17 @@ class EditWatchDialog(QDialog):
         )
         enc_row.addWidget(copy_key_btn)
         enc_row.addWidget(rotate_key_btn)
-        adv_form.addRow("Encrypt key:", enc_row)
+        adv_form.addRow(tr("Encrypt key:"), enc_row)
 
         self.color_input = QLineEdit(self.watch.get("color", ""))
-        self.color_input.setPlaceholderText("#2563eb  (optional color label)")
+        self.color_input.setPlaceholderText(tr("#2563eb  (optional color label)"))
         color_row = QHBoxLayout()
         color_row.setContentsMargins(0, 0, 0, 0)
         color_row.addWidget(self.color_input)
         pick_color_btn = QPushButton("🎨")
         pick_color_btn.setObjectName("secondary")
         pick_color_btn.setFixedWidth(36)
-        pick_color_btn.setToolTip("Open color picker")
+        pick_color_btn.setToolTip(tr("Open color picker"))
         def _pick_color():
             from PyQt6.QtWidgets import QColorDialog
             from PyQt6.QtGui import QColor
@@ -12615,17 +13743,17 @@ class EditWatchDialog(QDialog):
         color_row.addWidget(pick_color_btn)
         color_widget = QWidget()
         color_widget.setLayout(color_row)
-        adv_form.addRow("Color:", color_widget)
+        adv_form.addRow(tr("Color:"), color_widget)
 
         self.notes_input = QLineEdit(self.watch.get("notes", ""))
-        self.notes_input.setPlaceholderText("Optional notes")
-        adv_form.addRow("Notes:", self.notes_input)
+        self.notes_input.setPlaceholderText(tr("Optional notes"))
+        adv_form.addRow(tr("Notes:"), self.notes_input)
 
         self.tags_input = QLineEdit(", ".join(self.watch.get("tags", [])))
-        self.tags_input.setPlaceholderText("e.g. work, important, daily  (comma-separated)")
-        adv_form.addRow("Tags:", self.tags_input)
+        self.tags_input.setPlaceholderText(tr("e.g. work, important, daily  (comma-separated)"))
+        adv_form.addRow(tr("Tags:"), self.tags_input)
 
-        excl_label = QLabel("Exclude patterns  (one per line):")
+        excl_label = QLabel(tr("Exclude patterns  (one per line):"))
         excl_label.setStyleSheet("color:#9ca3af;")
         adv_form.addRow("", excl_label)
         _raw_excl = [p for p in self.watch.get("exclude_patterns", []) if not p.startswith("!")]
@@ -12634,13 +13762,13 @@ class EditWatchDialog(QDialog):
         self.excl_edit.setMaximumHeight(100)
         self.excl_edit.setPlainText("\n".join(_raw_excl))
         self.excl_edit.setTabChangesFocus(True)
-        adv_form.addRow("Exclusions:", self.excl_edit)
+        adv_form.addRow(tr("Exclusions:"), self.excl_edit)
 
         incl_label = QLabel(
-            "Include-only patterns  (one per line, e.g. <code>*.docx</code>):<br>"
+            tr("Include-only patterns  (one per line, e.g. <code>*.docx</code>):<br>"
             "<span style='color:#6b7280; font-size:11px;'>"
             "When set, <b>only</b> files matching these patterns are backed up. "
-            "Leave blank to back up everything (minus exclusions).</span>"
+            "Leave blank to back up everything (minus exclusions).</span>")
         )
         incl_label.setTextFormat(Qt.TextFormat.RichText)
         incl_label.setWordWrap(True)
@@ -12648,21 +13776,21 @@ class EditWatchDialog(QDialog):
         adv_form.addRow("", incl_label)
         self.incl_edit = QTextEdit()
         self.incl_edit.setMaximumHeight(80)
-        self.incl_edit.setPlaceholderText("e.g.\n*.docx\n*.xlsx\n*.pdf")
+        self.incl_edit.setPlaceholderText(tr("e.g.\n*.docx\n*.xlsx\n*.pdf"))
         self.incl_edit.setPlainText("\n".join(_raw_incl))
         self.incl_edit.setTabChangesFocus(True)
-        adv_form.addRow("Include only:", self.incl_edit)
+        adv_form.addRow(tr("Include only:"), self.incl_edit)
 
         adv_layout.addLayout(adv_form)
 
         # Additional Destinations
         from PyQt6.QtWidgets import QListWidget, QListWidgetItem
-        dest_list_group = QGroupBox("Additional Destinations")
+        dest_list_group = QGroupBox(tr("Additional Destinations"))
         dest_list_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
         dest_list_outer = QVBoxLayout(dest_list_group)
         dest_list_outer.setSpacing(6)
         dest_list_outer.setContentsMargins(8, 8, 8, 8)
-        _dest_note = QLabel("Backups are copied to every destination listed here after each run.")
+        _dest_note = QLabel(tr("Backups are copied to every destination listed here after each run."))
         _dest_note.setStyleSheet("color:#6b7280; font-size:10px;")
         _dest_note.setWordWrap(True)
         dest_list_outer.addWidget(_dest_note)
@@ -12675,13 +13803,13 @@ class EditWatchDialog(QDialog):
             self._dest_list_widget.addItem(_item)
         dest_list_outer.addWidget(self._dest_list_widget)
         dest_btn_row = QHBoxLayout()
-        _add_dest_btn = QPushButton("➕ Add Destination")
+        _add_dest_btn = QPushButton(tr("➕ Add Destination"))
         _add_dest_btn.setObjectName("secondary")
         _add_dest_btn.clicked.connect(self._add_destination)
-        _edit_dest_btn = QPushButton("✏ Edit")
+        _edit_dest_btn = QPushButton(tr("✏ Edit"))
         _edit_dest_btn.setObjectName("secondary")
         _edit_dest_btn.clicked.connect(self._edit_destination)
-        _remove_dest_btn = QPushButton("🗑 Remove")
+        _remove_dest_btn = QPushButton(tr("🗑 Remove"))
         _remove_dest_btn.setObjectName("danger")
         _remove_dest_btn.clicked.connect(self._remove_destination)
         dest_btn_row.addWidget(_add_dest_btn)
@@ -12692,59 +13820,59 @@ class EditWatchDialog(QDialog):
         adv_layout.addWidget(dest_list_group)
 
         # Backup Hooks
-        hooks_group = QGroupBox("Backup Hooks (optional)")
+        hooks_group = QGroupBox(tr("Backup Hooks (optional)"))
         hooks_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
         hooks_layout = QFormLayout(hooks_group)
         hooks_layout.setSpacing(6)
         hooks_layout.setContentsMargins(8, 10, 8, 8)
         _hook_note = QLabel(
-            "Runs a shell command before/after backup. If pre-command fails, backup is skipped."
+            tr("Runs a shell command before/after backup. If pre-command fails, backup is skipped.")
         )
         _hook_note.setStyleSheet("color:#6b7280; font-size:10px;")
         _hook_note.setWordWrap(True)
         hooks_layout.addRow(_hook_note)
         self.pre_cmd_input = QLineEdit(self.watch.get("pre_backup_cmd", ""))
-        self.pre_cmd_input.setPlaceholderText("e.g.  net stop MyService  or  /scripts/flush_db.sh")
-        hooks_layout.addRow("Pre-backup:", self.pre_cmd_input)
+        self.pre_cmd_input.setPlaceholderText(tr("e.g.  net stop MyService  or  /scripts/flush_db.sh"))
+        hooks_layout.addRow(tr("Pre-backup:"), self.pre_cmd_input)
         self.post_cmd_input = QLineEdit(self.watch.get("post_backup_cmd", ""))
-        self.post_cmd_input.setPlaceholderText("e.g.  net start MyService  or  /scripts/notify.sh")
-        hooks_layout.addRow("Post-backup:", self.post_cmd_input)
+        self.post_cmd_input.setPlaceholderText(tr("e.g.  net start MyService  or  /scripts/notify.sh"))
+        hooks_layout.addRow(tr("Post-backup:"), self.post_cmd_input)
         adv_layout.addWidget(hooks_group)
 
         # Notification Overrides
         _pn = self.watch.get("notify_overrides", {})
-        notify_ov_group = QGroupBox("Notification Overrides (optional)")
+        notify_ov_group = QGroupBox(tr("Notification Overrides (optional)"))
         notify_ov_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
         notify_ov_layout = QFormLayout(notify_ov_group)
         notify_ov_layout.setSpacing(6)
         notify_ov_layout.setContentsMargins(8, 10, 8, 8)
         _pn_note = QLabel(
-            "Leave blank to use the global settings. "
-            "Set a value here to override for this watch only."
+            tr("Leave blank to use the global settings. "
+            "Set a value here to override for this watch only.")
         )
         _pn_note.setStyleSheet("color:#6b7280; font-size:10px;")
         _pn_note.setWordWrap(True)
         notify_ov_layout.addRow(_pn_note)
         self.watch_webhook_input = QLineEdit(_pn.get("webhook_url", ""))
         self.watch_webhook_input.setPlaceholderText(
-            "https://hooks.slack.com/…  or  https://discord.com/api/webhooks/…"
+            tr("https://hooks.slack.com/…  or  https://discord.com/api/webhooks/…")
         )
         self.watch_webhook_input.setToolTip(
-            "Override the global webhook URL for this watch only.\n"
-            "Useful for routing alerts to a specific Slack channel or Discord server."
+            tr("Override the global webhook URL for this watch only.\n"
+            "Useful for routing alerts to a specific Slack channel or Discord server.")
         )
-        notify_ov_layout.addRow("Webhook URL:", self.watch_webhook_input)
+        notify_ov_layout.addRow(tr("Webhook URL:"), self.watch_webhook_input)
         self.watch_ntfy_topic_input = QLineEdit(_pn.get("ntfy_topic", ""))
-        self.watch_ntfy_topic_input.setPlaceholderText("e.g.  my-critical-watch-alerts")
+        self.watch_ntfy_topic_input.setPlaceholderText(tr("e.g.  my-critical-watch-alerts"))
         self.watch_ntfy_topic_input.setToolTip(
-            "Override the global ntfy topic for this watch only.\n"
-            "The server URL and token are still taken from global ntfy settings."
+            tr("Override the global ntfy topic for this watch only.\n"
+            "The server URL and token are still taken from global ntfy settings.")
         )
-        notify_ov_layout.addRow("ntfy topic:", self.watch_ntfy_topic_input)
+        notify_ov_layout.addRow(tr("ntfy topic:"), self.watch_ntfy_topic_input)
         adv_layout.addWidget(notify_ov_group)
 
         # Bandwidth Override
-        bw_group = QGroupBox("Bandwidth Override  (leave at 0 to use global setting)")
+        bw_group = QGroupBox(tr("Bandwidth Override  (leave at 0 to use global setting)"))
         bw_group.setStyleSheet("QGroupBox { color:#9ca3af; font-size:11px; }")
         bw_outer = QVBoxLayout(bw_group)
         bw_outer.setSpacing(6)
@@ -12754,16 +13882,16 @@ class EditWatchDialog(QDialog):
         self._watch_bw_spin = QDoubleSpinBox()
         self._watch_bw_spin.setRange(0.0, 1000.0)
         self._watch_bw_spin.setDecimals(1)
-        self._watch_bw_spin.setSuffix(" MB/s  (0 = use global)")
+        self._watch_bw_spin.setSuffix(tr(" MB/s  (0 = use global)"))
         self._watch_bw_spin.setValue(float(self.watch.get("max_backup_mbps", 0.0)))
-        bw_form.addRow("Max bandwidth:", self._watch_bw_spin)
+        bw_form.addRow(tr("Max bandwidth:"), self._watch_bw_spin)
         bw_outer.addLayout(bw_form)
-        bw_sched_lbl = QLabel("Per-watch schedule (optional — overrides max bandwidth during time windows):")
+        bw_sched_lbl = QLabel(tr("Per-watch schedule (optional — overrides max bandwidth during time windows):"))
         bw_sched_lbl.setStyleSheet("color:#6b7280; font-size:10px;")
         bw_outer.addWidget(bw_sched_lbl)
         self._watch_bw_table = QTableWidget()
         self._watch_bw_table.setColumnCount(3)
-        self._watch_bw_table.setHorizontalHeaderLabels(["Start (HH:MM)", "End (HH:MM)", "Max MB/s"])
+        self._watch_bw_table.setHorizontalHeaderLabels([tr("Start (HH:MM)"), tr("End (HH:MM)"), tr("Max MB/s")])
         self._watch_bw_table.horizontalHeader().setStretchLastSection(False)
         self._watch_bw_table.setColumnWidth(0, 110)
         self._watch_bw_table.setColumnWidth(1, 110)
@@ -12772,10 +13900,10 @@ class EditWatchDialog(QDialog):
         self._watch_bw_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         bw_outer.addWidget(self._watch_bw_table)
         bw_btn_row = QHBoxLayout()
-        _bw_add = QPushButton("Add Rule")
+        _bw_add = QPushButton(tr("Add Rule"))
         _bw_add.setObjectName("secondary")
         _bw_add.clicked.connect(self._watch_bw_add_rule)
-        _bw_remove = QPushButton("Remove Rule")
+        _bw_remove = QPushButton(tr("Remove Rule"))
         _bw_remove.setObjectName("secondary")
         _bw_remove.clicked.connect(self._watch_bw_remove_rule)
         bw_btn_row.addWidget(_bw_add)
@@ -12791,7 +13919,7 @@ class EditWatchDialog(QDialog):
         adv_layout.addWidget(bw_group)
 
         # NAS / SMB Credentials (nested collapsible inside advanced)
-        self._nas_creds_toggle = QPushButton("▶  PC Credentials  (required for who-did-it tracking)")
+        self._nas_creds_toggle = QPushButton(tr("▶  PC Credentials  (required for who-did-it tracking)"))
         self._nas_creds_toggle.setObjectName("secondary")
         self._nas_creds_toggle.setStyleSheet(
             "text-align:left; padding:6px 10px; font-size:12px; "
@@ -12807,22 +13935,22 @@ class EditWatchDialog(QDialog):
         nas_form.setContentsMargins(12, 4, 0, 4)
         nas_form.setSpacing(8)
         _nas_hint = QLabel(
-            "Enter the Windows/Mac account credentials for the PC sharing this folder.\n"
+            tr("Enter the Windows/Mac account credentials for the PC sharing this folder.\n"
             "Must be an administrator account on that PC — this is what BackupSys\n"
             "uses to query who added, modified, or deleted files (who-did-it tracking).\n"
-            "Use the same username/password you log into that PC with."
+            "Use the same username/password you log into that PC with.")
         )
         _nas_hint.setStyleSheet("color:#6b7280; font-size:11px;")
         _nas_hint.setWordWrap(True)
         nas_form.addRow("", _nas_hint)
         self.nas_user_input = QLineEdit()
-        self.nas_user_input.setPlaceholderText("SMB username  (e.g. john or DOMAIN\\john)")
-        nas_form.addRow("Username:", self.nas_user_input)
+        self.nas_user_input.setPlaceholderText(tr("SMB username  (e.g. john or DOMAIN\\john)"))
+        nas_form.addRow(tr("Username:"), self.nas_user_input)
         self.nas_pass_input = QLineEdit()
         self.nas_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.nas_pass_input.setPlaceholderText("SMB password")
-        nas_form.addRow("Password:", self.nas_pass_input)
-        self._nas_test_btn = QPushButton("Test Connection")
+        self.nas_pass_input.setPlaceholderText(tr("SMB password"))
+        nas_form.addRow(tr("Password:"), self.nas_pass_input)
+        self._nas_test_btn = QPushButton(tr("Test Connection"))
         self._nas_test_btn.setObjectName("secondary")
         self._nas_test_btn.setFixedWidth(130)
         self._nas_test_btn.clicked.connect(self._test_nas_credentials)
@@ -12901,25 +14029,40 @@ class EditWatchDialog(QDialog):
         ]):
             self._adv_toggle.setChecked(True)
 
+        layout.addStretch()
+
+        # ── Footer (outside the scroll area — always visible) ──────────────────
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setStyleSheet("color:#2d3748;")
+        root.addWidget(_sep, 0)
+
+        footer = QWidget()
+        footer_col = QVBoxLayout(footer)
+        footer_col.setSpacing(8)
+        footer_col.setContentsMargins(24, 12, 24, 16)
+
         self.error_lbl = QLabel("")
         self.error_lbl.setObjectName("status_err")
-        layout.addWidget(self.error_lbl)
+        footer_col.addWidget(self.error_lbl)
 
         btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 16, 0, 0)
-        cancel = QPushButton("Cancel")
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        cancel = QPushButton(tr("Cancel"))
         cancel.setObjectName("secondary")
         cancel.clicked.connect(self.reject)
-        save = QPushButton("Save Changes")
+        save = QPushButton(tr("Save Changes"))
         save.setObjectName("success")
         save.setStyleSheet("padding: 10px 32px; font-weight: 700; font-size: 13px;")
         save.setMinimumWidth(140)
         save.setDefault(True)
-        save.setToolTip("Save Changes (Ctrl+Enter)")
+        save.setToolTip(tr("Save Changes (Ctrl+Enter)"))
         save.clicked.connect(self._submit)
+        btn_row.addStretch()
         btn_row.addWidget(cancel)
         btn_row.addWidget(save)
-        layout.addLayout(btn_row)
+        footer_col.addLayout(btn_row)
+        root.addWidget(footer, 0)
 
         QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self._submit)
 
@@ -12997,9 +14140,9 @@ class EditWatchDialog(QDialog):
         if self._is_dirty:
             from PyQt6.QtWidgets import QMessageBox
             dlg = QMessageBox(self)
-            dlg.setWindowTitle("Discard changes?")
+            dlg.setWindowTitle(tr("Discard changes?"))
             dlg.setText(
-                "You have unsaved changes. Are you sure you want to close without saving?"
+                tr("You have unsaved changes. Are you sure you want to close without saving?")
             )
             dlg.setIcon(QMessageBox.Icon.Question)
             go_back = dlg.addButton("Go Back",  QMessageBox.ButtonRole.RejectRole)
@@ -13013,17 +14156,19 @@ class EditWatchDialog(QDialog):
 
     def _on_adv_toggled(self, checked: bool):
         arrow = "▼" if checked else "▶"
-        self._adv_toggle.setText(f"{arrow}  Advanced settings")
+        self._adv_toggle.setText(f"{arrow}  " + tr("Advanced settings"))
         self._adv_widget.setVisible(checked)
         self.adjustSize()
+        _fit_dialog_to_screen(self)
 
     def _on_nas_creds_toggled(self, checked: bool):
         arrow = "▼" if checked else "▶"
         self._nas_creds_toggle.setText(
-            f"{arrow}  PC Credentials  (required for who-did-it tracking)"
+            f"{arrow}  " + tr("PC Credentials  (required for who-did-it tracking)")
         )
         self._nas_creds_widget.setVisible(checked)
         self.adjustSize()
+        _fit_dialog_to_screen(self)
 
     def _test_nas_credentials(self):
         """Test SMB credentials by authenticating to IPC$ and running NetSessionEnum."""
@@ -13039,122 +14184,19 @@ class EditWatchDialog(QDialog):
 
         if not _user or not _pass:
             self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
-            self._nas_test_lbl.setText("⚠  Enter username and password first")
+            self._nas_test_lbl.setText(tr("⚠  Enter username and password first"))
             return
         if not _host:
             self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
-            self._nas_test_lbl.setText("⚠  Watch path is not a UNC path")
+            self._nas_test_lbl.setText(tr("⚠  Watch path is not a UNC path"))
             return
 
         self._nas_test_btn.setEnabled(False)
         self._nas_test_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
-        self._nas_test_lbl.setText("Testing…")
-
-        def _do_test():
-            # ── Why subprocess + net use instead of win32net ──────────────────
-            # win32net.NetUseAdd / NetShareEnum always go through the Windows
-            # OS SMB session cache.  When the PC already has ANY active
-            # connection to the target host (mapped drive, Explorer window, etc.)
-            # Windows reuses the cached token and never validates the typed
-            # credentials — so wrong passwords still show "Connected".
-            #
-            # There is no reliable way to flush that cache while other processes
-            # hold connections open.  The only escape hatch is to authenticate
-            # in a *separate process* under a *different logon session*.
-            #
-            # `net use \\host\IPC$ /user:domain\user pass` spawned via
-            # subprocess runs in an isolated logon context and is forced to
-            # present the supplied credentials to the server — the parent
-            # process's cached session is irrelevant.  Exit code 0 = auth OK,
-            # non-zero = bad credentials.  We immediately delete the temp
-            # connection so it doesn't linger.
-            import subprocess, sys, re as _re
-            _ipc = f"\\\\{_host}\\IPC$"
-            _CREATE_NO_WINDOW = 0x08000000
-
-            _cmd_add = [
-                "net", "use", _ipc,
-                _pass,
-                f"/user:{_user}",
-                "/persistent:no",
-            ]
-            _cmd_del = ["net", "use", _ipc, "/delete", "/yes"]
-
-            def _cleanup():
-                try:
-                    subprocess.run(_cmd_del, capture_output=True, timeout=5,
-                                   creationflags=_CREATE_NO_WINDOW)
-                except Exception:
-                    pass
-
-            def _run_net_use():
-                try:
-                    return subprocess.run(
-                        _cmd_add, capture_output=True, text=True,
-                        timeout=15, creationflags=_CREATE_NO_WINDOW,
-                    )
-                except subprocess.TimeoutExpired:
-                    return None  # caller checks for None → timeout
-                except Exception as _e:
-                    raise
-
-            try:
-                _result = _run_net_use()
-            except Exception as _e:
-                return False, f"\u274c  Could not run credential check: {_e}"
-            finally:
-                _cleanup()
-
-            if _result is None:
-                # Timeout — almost always means an existing SMB session to this
-                # host is blocking IPC$ re-authentication (Windows error 1219).
-                # Try: delete the existing IPC$ connection, then retry.
-                _cleanup()
-                try:
-                    _result = _run_net_use()
-                except Exception as _e:
-                    return False, f"\u274c  Could not run credential check: {_e}"
-                finally:
-                    _cleanup()
-                if _result is None:
-                    return False, "\u274c  Timed out \u2014 server unreachable"
-
-            # error 1219 = existing SMB session with different credentials
-            _out_txt = (_result.stderr or _result.stdout or "").strip()
-            if _result.returncode != 0 and "1219" in _out_txt:
-                # Delete the conflicting session, then retry once
-                _cleanup()
-                try:
-                    _result = _run_net_use()
-                except Exception as _e:
-                    return False, f"\u274c  Could not run credential check: {_e}"
-                finally:
-                    _cleanup()
-                if _result is None:
-                    return False, "\u274c  Timed out \u2014 server unreachable"
-                # Re-read the output from the retry so the final message
-                # reflects what actually happened the second time, not the
-                # stale first-attempt text (which would otherwise mask a
-                # second 1219, or hide that the retry actually succeeded
-                # for a different reason).
-                _out_txt = (_result.stderr or _result.stdout or "").strip()
-
-            if _result.returncode == 0:
-                _n_shares = 0
-                try:
-                    import win32net
-                    _shares, _, _ = win32net.NetShareEnum(_host, 0)
-                    _n_shares = len(_shares)
-                except Exception:
-                    pass
-                _share_txt = f" ({_n_shares} share(s) visible)" if _n_shares else ""
-                return True, f"\u2705  Connected \u2014 credentials verified{_share_txt}"
-            else:
-                _err = _re.sub(r"\s+", " ", _out_txt)
-                return False, _format_net_use_error(_err)
+        self._nas_test_lbl.setText(tr("Testing…"))
 
         def _run():
-            _ok, _msg = _do_test()
+            _ok, _msg = _verify_smb_login(_host, _user, _pass)
             from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
             QMetaObject.invokeMethod(
                 self, "_on_nas_test_result",
@@ -13211,12 +14253,12 @@ class EditWatchDialog(QDialog):
     def _submit(self):
         name = self.name_input.text().strip()
         if not name:
-            self.error_lbl.setText("Name is required.")
+            self.error_lbl.setText(tr("Name is required."))
             return
         # Validate encryption key length if one is provided
         key = self.encrypt_input.text().strip()
         if key and len(key) != 44:
-            self.error_lbl.setText(f"Encryption key must be exactly 44 characters (got {len(key)}).")
+            self.error_lbl.setText(tr("Encryption key must be exactly 44 characters (got {n}).", n=len(key)))
             return
         self._is_dirty = False
         self.accept()
@@ -13233,13 +14275,11 @@ class EditWatchDialog(QDialog):
             self.encrypt_input.setText(key)
             QApplication.clipboard().setText(key)
             QMessageBox.information(
-                self, "Key Generated",
-                f"A new encryption key has been generated and copied to your clipboard.\n\n"
-                f"⚠ IMPORTANT: Save this key somewhere safe!\n"
-                f"Without it you cannot restore your encrypted backups.\n\n{key}"
+                self, tr("Key Generated"),
+                tr("A new encryption key has been generated and copied to your clipboard.\n\n\u26a0 IMPORTANT: Save this key somewhere safe!\nWithout it you cannot restore your encrypted backups.\n\n{p0}", p0=key)
             )
         except Exception as e:
-            self.error_lbl.setText(f"Key generation failed: {e}")
+            self.error_lbl.setText(tr("Key generation failed: {err}", err=e))
 
     def _rotate_key(self):
         """Rotate the encryption key: re-encrypt all existing backups for this watch."""
@@ -13248,31 +14288,31 @@ class EditWatchDialog(QDialog):
 
         old_key = self.watch.get("encrypt_key", "").strip()
         if not old_key:
-            QMessageBox.warning(self, "Key Rotation",
-                "This watch has no encryption key set. Enable encryption first, then rotate.")
+            QMessageBox.warning(self, tr("Key Rotation"),
+                tr("This watch has no encryption key set. Enable encryption first, then rotate."))
             return
 
         # Dialog to collect new key
         dlg = QDialog(self)
-        dlg.setWindowTitle("Rotate Encryption Key")
+        dlg.setWindowTitle(tr("Rotate Encryption Key"))
         dlg.setMinimumWidth(480)
         vlay = QVBoxLayout(dlg)
         vlay.addWidget(QLabel(
-            "<b>Re-encrypt all backups for this watch with a new key.</b><br><br>"
+            tr("<b>Re-encrypt all backups for this watch with a new key.</b><br><br>"
             "The current key (shown below) will be used to decrypt existing files.<br>"
             "Enter or generate a new key; all backups will be re-encrypted in place.<br>"
-            "<span style='color:#f59e0b;'>⚠  This cannot be undone. Keep the new key safe.</span>"
+            "<span style='color:#f59e0b;'>⚠  This cannot be undone. Keep the new key safe.</span>")
         ))
         fl = QFormLayout()
         old_key_lbl = QLineEdit(old_key)
         old_key_lbl.setReadOnly(True)
         old_key_lbl.setEchoMode(QLineEdit.EchoMode.Password)
-        fl.addRow("Current key (read-only):", old_key_lbl)
+        fl.addRow(tr("Current key (read-only):"), old_key_lbl)
 
         new_key_edit = QLineEdit()
-        new_key_edit.setPlaceholderText("44-char new key")
-        fl.addRow("New key:", new_key_edit)
-        gen_btn = QPushButton("Generate new key")
+        new_key_edit.setPlaceholderText(tr("44-char new key"))
+        fl.addRow(tr("New key:"), new_key_edit)
+        gen_btn = QPushButton(tr("Generate new key"))
         gen_btn.setObjectName("secondary")
         def _gen():
             try:
@@ -13284,7 +14324,7 @@ class EditWatchDialog(QDialog):
                 new_key_edit.setText(k)
                 new_key_edit.setEchoMode(QLineEdit.EchoMode.Normal)
             except Exception as e:
-                QMessageBox.warning(dlg, "Error", str(e))
+                QMessageBox.warning(dlg, tr("Error"), str(e))
         gen_btn.clicked.connect(_gen)
         fl.addRow("", gen_btn)
         vlay.addLayout(fl)
@@ -13299,14 +14339,14 @@ class EditWatchDialog(QDialog):
 
         new_key = new_key_edit.text().strip()
         if not new_key:
-            QMessageBox.warning(self, "Key Rotation", "New key cannot be empty.")
+            QMessageBox.warning(self, tr("Key Rotation"), tr("New key cannot be empty."))
             return
         if len(new_key) != 44:
-            QMessageBox.warning(self, "Key Rotation",
-                f"New key must be exactly 44 characters (got {len(new_key)}).")
+            QMessageBox.warning(self, tr("Key Rotation"),
+                tr("New key must be exactly 44 characters (got {p0}).", p0=len(new_key)))
             return
         if new_key == old_key:
-            QMessageBox.information(self, "Key Rotation", "New key is the same as the current key — nothing to do.")
+            QMessageBox.information(self, tr("Key Rotation"), tr("New key is the same as the current key — nothing to do."))
             return
 
         # Find backup directories for this watch
@@ -13314,34 +14354,31 @@ class EditWatchDialog(QDialog):
         watch_id = self.watch.get("id", "")
 
         if not dest:
-            QMessageBox.warning(self, "Key Rotation",
-                "This watch has no destination set. Save the watch with a destination first, then rotate.")
+            QMessageBox.warning(self, tr("Key Rotation"),
+                tr("This watch has no destination set. Save the watch with a destination first, then rotate."))
             return
 
         if not BACKEND_AVAILABLE:
-            QMessageBox.critical(self, "Key Rotation", "Backend not available — cannot rotate key.")
+            QMessageBox.critical(self, tr("Key Rotation"), tr("Backend not available — cannot rotate key."))
             return
 
         backups = backup_engine.list_backups(dest, watch_id)
         if not backups:
             # No existing backups — just update the key in the field
             self.encrypt_input.setText(new_key)
-            QMessageBox.information(self, "Key Rotation",
-                "No existing backups found — key updated in the field.\n"
-                "Click Save Changes to apply.")
+            QMessageBox.information(self, tr("Key Rotation"),
+                tr("No existing backups found — key updated in the field.\n"
+                "Click Save Changes to apply."))
             return
 
-        reply = QMessageBox.question(self, "Confirm Key Rotation",
-            f"<b>{len(backups)} backup snapshot(s)</b> will be re-encrypted in place.<br><br>"
-            "This may take a while depending on backup size.<br>"
-            "The app will be unresponsive during rotation.<br><br>"
-            "Proceed?",
+        reply = QMessageBox.question(self, tr("Confirm Key Rotation"),
+            tr("<b>{p0} backup snapshot(s)</b> will be re-encrypted in place.<br><br>This may take a while depending on backup size.<br>The app will be unresponsive during rotation.<br><br>Proceed?", p0=len(backups)),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
 
         progress = QProgressDialog("Rotating encryption key…", None, 0, len(backups), self)
-        progress.setWindowTitle("Key Rotation")
+        progress.setWindowTitle(tr("Key Rotation"))
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setValue(0)
         progress.show()
@@ -13351,7 +14388,7 @@ class EditWatchDialog(QDialog):
             bd = b.get("backup_dir", "")
             if not bd:
                 continue
-            progress.setLabelText(f"Rotating snapshot {i+1}/{len(backups)}…\n{bd}")
+            progress.setLabelText(tr("Rotating snapshot {i}/{total}…", i=i+1, total=len(backups)) + f"\n{bd}")
             from PyQt6.QtWidgets import QApplication
             QApplication.processEvents()
 
@@ -13367,14 +14404,13 @@ class EditWatchDialog(QDialog):
         progress.close()
 
         if errors:
-            QMessageBox.warning(self, "Key Rotation — Partial Errors",
+            QMessageBox.warning(self, tr("Key Rotation — Partial Errors"),
                 f"Key rotation completed with {len(errors)} error(s):\n\n" +
                 "\n".join(errors[:10]) +
                 (f"\n…and {len(errors)-10} more" if len(errors) > 10 else ""))
         else:
-            QMessageBox.information(self, "Key Rotation Complete",
-                f"All {len(backups)} snapshot(s) re-encrypted successfully.\n\n"
-                f"New key has been placed in the field — click Save Changes to apply.")
+            QMessageBox.information(self, tr("Key Rotation Complete"),
+                tr("All {p0} snapshot(s) re-encrypted successfully.\n\nNew key has been placed in the field \u2014 click Save Changes to apply.", p0=len(backups)))
 
         self.encrypt_input.setText(new_key)
         self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Normal)
@@ -13395,7 +14431,7 @@ class EditWatchDialog(QDialog):
         from PyQt6.QtWidgets import QListWidgetItem
         row = self._dest_list_widget.currentRow()
         if row < 0:
-            QMessageBox.information(self, "Edit Destination", "Select a destination from the list first.")
+            QMessageBox.information(self, tr("Edit Destination"), tr("Select a destination from the list first."))
             return
         existing = self._dest_list_widget.item(row).data(Qt.ItemDataRole.UserRole)
         dlg = _DestinationEntryDialog(self, existing=existing)
@@ -13481,7 +14517,8 @@ class AddWatchDialog(QDialog):
 
     Public attributes (read/written externally by _edit_watch):
         name_input      QLineEdit
-        source_type     QComboBox   index 0 = local, 1 = WebDAV, 2 = SFTP, 3 = FTP
+        source_type     QComboBox   resolve the key via _SOURCE_TYPES[index] — do not
+                                    hardcode indices; the list's contents can change
         path_input      QLineEdit
         interval_spin   QSpinBox
         dest_input      QLineEdit
@@ -13489,23 +14526,36 @@ class AddWatchDialog(QDialog):
         _submit_btn     QPushButton
     """
 
+    # WebDAV is not offered as a source type.  The backend and the WebDAV input
+    # widgets below still exist; restore the ("WebDAV", "webdav") entry here to
+    # re-enable it.  Every read of this list resolves the key via _SOURCE_TYPES[idx],
+    # so entries can be added/removed without breaking the other protocols.
     _SOURCE_TYPES = [
         ("Local / Mapped Drive", "local"),
-        ("WebDAV",               "webdav"),
         ("SFTP / FTPS",          "sftp"),
         ("FTP",                  "ftp"),
     ]
 
-    def __init__(self, parent=None, *, cfg: dict | None = None, edit_watch_id: str | None = None):
+    def __init__(self, parent=None, *, cfg: dict | None = None, edit_watch_id: str | None = None,
+                 prefill_path: str = ""):
         super().__init__(parent)
         self._cfg            = cfg or {}
         self._edit_watch_id  = edit_watch_id
-        self.setWindowTitle("Add Watched Folder · Backup System")
+        self.setWindowTitle(tr("Add Watched Folder · Backup System"))
         self.setMinimumWidth(540)
         self.setModal(True)
         self._is_dirty = False
         self._build_ui()
         self._connect_dirty_signals()
+        _fit_dialog_to_screen(self)
+        # Drag-and-drop / quick-add: pre-fill the source folder and suggest a name.
+        if prefill_path:
+            try:
+                self.path_input.setText(prefill_path)
+                if not self.name_input.text().strip():
+                    self.name_input.setText(os.path.basename(prefill_path.rstrip("/\\")))
+            except Exception:
+                pass
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -13527,7 +14577,7 @@ class AddWatchDialog(QDialog):
         root.addWidget(scroll, 1)
 
         # ── Title ─────────────────────────────────────────────────────────────
-        title = QLabel("Add Watched Folder")
+        title = QLabel(tr("Add Watched Folder"))
         title.setObjectName("heading")
         title.setStyleSheet("font-size:15px; font-weight:700; margin-bottom:4px;")
         body.addWidget(title)
@@ -13544,39 +14594,42 @@ class AddWatchDialog(QDialog):
 
         _sec_label_style = "font-size:11px; font-weight:600; color:#6b7280; letter-spacing:0.5px;"
 
-        _src_sec = QLabel("SOURCE")
+        _src_sec = QLabel(tr("SOURCE"))
         _src_sec.setStyleSheet(_sec_label_style)
         src_layout.addRow("", _src_sec)
 
         # Name
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("e.g.  Documents Backup")
-        src_layout.addRow("Name:", self.name_input)
+        self.name_input.setPlaceholderText(tr("e.g.  Documents Backup"))
+        src_layout.addRow(tr("Name:"), self.name_input)
 
         # Source type — the key dropdown
         self.source_type = QComboBox()
         for label, _ in self._SOURCE_TYPES:
-            self.source_type.addItem(label)
+            # Display-only; the value is read via currentIndex() (never currentText()),
+            # so translating the visible label is safe. Protocol names (WebDAV/SFTP/FTP)
+            # fall through untranslated; "Local / Mapped Drive" gets a JA string.
+            self.source_type.addItem(tr(label))
         self.source_type.currentIndexChanged.connect(self._on_source_type_changed)
-        src_layout.addRow("Source type:", self.source_type)
+        src_layout.addRow(tr("Source type:"), self.source_type)
 
         # ── Local path (shown for Local/Mapped Drive) ─────────────────────────
         self._local_path_widget = QWidget()
         _lp = QHBoxLayout(self._local_path_widget)
         _lp.setContentsMargins(0, 0, 0, 0)
         self.path_input = QLineEdit()
-        self.path_input.setPlaceholderText("C:\\Users\\you\\Documents  or  \\\\192.168.1.100\\share")
-        _browse_btn = QPushButton("Browse")
+        self.path_input.setPlaceholderText(tr("C:\\Users\\you\\Documents  or  \\\\192.168.1.100\\share"))
+        _browse_btn = QPushButton(tr("Browse"))
         _browse_btn.setObjectName("secondary")
         _browse_btn.setFixedWidth(76)
         _browse_btn.clicked.connect(self._browse_path)
-        self._path_ok_lbl = QLabel("✓ Folder selected")
+        self._path_ok_lbl = QLabel(tr("✓ Folder selected"))
         self._path_ok_lbl.setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;")
         self._path_ok_lbl.hide()
         _lp.addWidget(self.path_input)
         _lp.addWidget(_browse_btn)
         _lp.addWidget(self._path_ok_lbl)
-        src_layout.addRow("Source path:", self._local_path_widget)
+        src_layout.addRow(tr("Source path:"), self._local_path_widget)
 
         # ── WebDAV inline fields ───────────────────────────────────────────────
         self._webdav_widget = QWidget()
@@ -13584,15 +14637,15 @@ class AddWatchDialog(QDialog):
         _wdv.setContentsMargins(0, 0, 0, 0)
         _wdv.setSpacing(8)
         self.webdav_url_input  = QLineEdit()
-        self.webdav_url_input.setPlaceholderText("https://dav.example.com/remote.php/webdav/")
+        self.webdav_url_input.setPlaceholderText(tr("https://dav.example.com/remote.php/webdav/"))
         self.webdav_user_input = QLineEdit()
-        self.webdav_user_input.setPlaceholderText("username")
+        self.webdav_user_input.setPlaceholderText(tr("username"))
         self.webdav_pass_input = QLineEdit()
         self.webdav_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.webdav_pass_input.setPlaceholderText("password")
-        _wdv.addRow("URL:",      self.webdav_url_input)
-        _wdv.addRow("Username:", self.webdav_user_input)
-        _wdv.addRow("Password:", self.webdav_pass_input)
+        self.webdav_pass_input.setPlaceholderText(tr("password"))
+        _wdv.addRow(tr("URL:"),      self.webdav_url_input)
+        _wdv.addRow(tr("Username:"), self.webdav_user_input)
+        _wdv.addRow(tr("Password:"), self.webdav_pass_input)
         self._webdav_widget.hide()
         src_layout.addRow("", self._webdav_widget)
 
@@ -13602,22 +14655,22 @@ class AddWatchDialog(QDialog):
         _sftp.setContentsMargins(0, 0, 0, 0)
         _sftp.setSpacing(8)
         self.sftp_host_input = QLineEdit()
-        self.sftp_host_input.setPlaceholderText("sftp.example.com")
+        self.sftp_host_input.setPlaceholderText(tr("sftp.example.com"))
         self.sftp_port_spin  = QSpinBox()
         self.sftp_port_spin.setRange(1, 65535)
         self.sftp_port_spin.setValue(22)
         self.sftp_user_input = QLineEdit()
-        self.sftp_user_input.setPlaceholderText("username")
+        self.sftp_user_input.setPlaceholderText(tr("username"))
         self.sftp_pass_input = QLineEdit()
         self.sftp_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.sftp_pass_input.setPlaceholderText("password  (or leave blank to use key file)")
+        self.sftp_pass_input.setPlaceholderText(tr("password  (or leave blank to use key file)"))
         self.sftp_key_input  = QLineEdit()
-        self.sftp_key_input.setPlaceholderText("/home/user/.ssh/id_rsa  (optional)")
-        _sftp.addRow("Host:",     self.sftp_host_input)
-        _sftp.addRow("Port:",     self.sftp_port_spin)
-        _sftp.addRow("Username:", self.sftp_user_input)
-        _sftp.addRow("Password:", self.sftp_pass_input)
-        _sftp.addRow("Key file:", self.sftp_key_input)
+        self.sftp_key_input.setPlaceholderText(tr("/home/user/.ssh/id_rsa  (optional)"))
+        _sftp.addRow(tr("Host:"),     self.sftp_host_input)
+        _sftp.addRow(tr("Port:"),     self.sftp_port_spin)
+        _sftp.addRow(tr("Username:"), self.sftp_user_input)
+        _sftp.addRow(tr("Password:"), self.sftp_pass_input)
+        _sftp.addRow(tr("Key file:"), self.sftp_key_input)
         self._sftp_widget.hide()
         src_layout.addRow("", self._sftp_widget)
 
@@ -13627,19 +14680,19 @@ class AddWatchDialog(QDialog):
         _ftp.setContentsMargins(0, 0, 0, 0)
         _ftp.setSpacing(8)
         self.ftp_host_input = QLineEdit()
-        self.ftp_host_input.setPlaceholderText("ftp.example.com")
+        self.ftp_host_input.setPlaceholderText(tr("ftp.example.com"))
         self.ftp_port_spin  = QSpinBox()
         self.ftp_port_spin.setRange(1, 65535)
         self.ftp_port_spin.setValue(21)
         self.ftp_user_input = QLineEdit()
-        self.ftp_user_input.setPlaceholderText("username")
+        self.ftp_user_input.setPlaceholderText(tr("username"))
         self.ftp_pass_input = QLineEdit()
         self.ftp_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ftp_pass_input.setPlaceholderText("password")
-        _ftp.addRow("Host:",     self.ftp_host_input)
-        _ftp.addRow("Port:",     self.ftp_port_spin)
-        _ftp.addRow("Username:", self.ftp_user_input)
-        _ftp.addRow("Password:", self.ftp_pass_input)
+        self.ftp_pass_input.setPlaceholderText(tr("password"))
+        _ftp.addRow(tr("Host:"),     self.ftp_host_input)
+        _ftp.addRow(tr("Port:"),     self.ftp_port_spin)
+        _ftp.addRow(tr("Username:"), self.ftp_user_input)
+        _ftp.addRow(tr("Password:"), self.ftp_pass_input)
         self._ftp_widget.hide()
         src_layout.addRow("", self._ftp_widget)
 
@@ -13655,7 +14708,7 @@ class AddWatchDialog(QDialog):
         dst_layout.setSpacing(10)
         dst_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        _dst_sec = QLabel("DESTINATION")
+        _dst_sec = QLabel(tr("DESTINATION"))
         _dst_sec.setStyleSheet(_sec_label_style)
         dst_layout.addRow("", _dst_sec)
 
@@ -13664,19 +14717,19 @@ class AddWatchDialog(QDialog):
         _dest_row.setContentsMargins(0, 0, 0, 0)
         self.dest_input = QLineEdit()
         self.dest_input.setPlaceholderText(
-            "Required — enter backup destination folder  ·  e.g. \\\\server\\share\\folder"
+            tr("Required — enter backup destination folder  ·  e.g. \\\\server\\share\\folder")
         )
-        _dest_browse = QPushButton("Browse")
+        _dest_browse = QPushButton(tr("Browse"))
         _dest_browse.setObjectName("secondary")
         _dest_browse.setFixedWidth(76)
         _dest_browse.clicked.connect(self._browse_dest)
-        self._dest_ok_lbl = QLabel("✓ Folder selected")
+        self._dest_ok_lbl = QLabel(tr("✓ Folder selected"))
         self._dest_ok_lbl.setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;")
         self._dest_ok_lbl.hide()
         _dest_row.addWidget(self.dest_input)
         _dest_row.addWidget(_dest_browse)
         _dest_row.addWidget(self._dest_ok_lbl)
-        dst_layout.addRow("Destination:", _dest_widget)
+        dst_layout.addRow(tr("Destination:"), _dest_widget)
 
         # ── SMB Credentials (shown only for Local/Mapped Drive) ────────────────
         # Placed here, right after Destination, so it's obvious it relates to
@@ -13690,29 +14743,29 @@ class AddWatchDialog(QDialog):
         _nas_inner.setSpacing(8)
         _nas_inner.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        self._nas_hdr = QLabel("WHO-DID-IT TRACKING  (optional)")
+        self._nas_hdr = QLabel(tr("WHO-DID-IT TRACKING  (optional)"))
         self._nas_hdr.setStyleSheet(_sec_label_style)
         _nas_inner.addRow("", self._nas_hdr)
 
         _nas_hint = QLabel(
-"Enter the SMB credentials BackupSys uses to connect to this share.\n"
+tr("Enter the SMB credentials BackupSys uses to connect to this share.\n"
             "Any account with read access works — same username/password as Windows Explorer.\n"
-            "Required for who-did-it tracking (identifies who changed files)."
+            "Required for who-did-it tracking (identifies who changed files).")
         )
         _nas_hint.setStyleSheet("color:#6b7280; font-size:11px;")
         _nas_hint.setWordWrap(True)
         _nas_inner.addRow("", _nas_hint)
 
         self.nas_user_input = QLineEdit()
-        self.nas_user_input.setPlaceholderText("SMB username  (e.g. john or DOMAIN\\john)")
-        _nas_inner.addRow("Username:", self.nas_user_input)
+        self.nas_user_input.setPlaceholderText(tr("SMB username  (e.g. john or DOMAIN\\john)"))
+        _nas_inner.addRow(tr("Username:"), self.nas_user_input)
 
         self.nas_pass_input = QLineEdit()
         self.nas_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.nas_pass_input.setPlaceholderText("SMB password")
-        _nas_inner.addRow("Password:", self.nas_pass_input)
+        self.nas_pass_input.setPlaceholderText(tr("SMB password"))
+        _nas_inner.addRow(tr("Password:"), self.nas_pass_input)
 
-        self._nas_test_btn = QPushButton("Test Connection")
+        self._nas_test_btn = QPushButton(tr("Test Connection"))
         self._nas_test_btn.setObjectName("secondary")
         self._nas_test_btn.setFixedWidth(130)
         self._nas_test_btn.clicked.connect(self._test_nas_credentials)
@@ -13738,12 +14791,12 @@ class AddWatchDialog(QDialog):
             _dp = self.dest_input.text().strip()
             _unc = _is_unc(_sp) or _is_unc(_dp)
             if _unc:
-                self._nas_hdr.setText("WHO-DID-IT TRACKING  ⚠️ REQUIRED for network path")
+                self._nas_hdr.setText(tr("WHO-DID-IT TRACKING  ⚠️ REQUIRED for network path"))
                 self._nas_hdr.setStyleSheet("font-size:10px; font-weight:700; letter-spacing:1px; color:#f59e0b;")
                 self._nas_audit_frame.setStyleSheet(
                     "QFrame { background:#1a1700; border:2px solid #f59e0b; border-radius:6px; }")
             else:
-                self._nas_hdr.setText("WHO-DID-IT TRACKING  (optional)")
+                self._nas_hdr.setText(tr("WHO-DID-IT TRACKING  (optional)"))
                 self._nas_hdr.setStyleSheet(_sec_label_style)
                 self._nas_audit_frame.setStyleSheet(
                     "QFrame { background:#161d2e; border:1px solid #2d3748; border-radius:6px; }")
@@ -13764,7 +14817,7 @@ class AddWatchDialog(QDialog):
         opt_outer.setContentsMargins(0, 0, 0, 0)
         opt_outer.setSpacing(0)
 
-        self._opts_toggle = QPushButton("▶  Schedule & Options")
+        self._opts_toggle = QPushButton(tr("▶  Schedule & Options"))
         self._opts_toggle.setCheckable(True)
         self._opts_toggle.setChecked(False)
         self._opts_toggle.setStyleSheet(
@@ -13783,45 +14836,45 @@ class AddWatchDialog(QDialog):
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(0, 1440)
         self.interval_spin.setValue(0)
-        self.interval_spin.setSuffix(" min  (0 = use global)")
-        opt_form.addRow("Interval:", self.interval_spin)
+        self.interval_spin.setSuffix(tr(" min  (0 = use global)"))
+        opt_form.addRow(tr("Interval:"), self.interval_spin)
 
         self.compress_combo = QComboBox()
-        self.compress_combo.addItem("Off",                0)
-        self.compress_combo.addItem("Fast (level 1)",     1)
-        self.compress_combo.addItem("Balanced (level 6)", 6)
-        self.compress_combo.addItem("Best (level 9)",     9)
-        opt_form.addRow("Compression:", self.compress_combo)
+        self.compress_combo.addItem(tr("Off"),                0)
+        self.compress_combo.addItem(tr("Fast (level 1)"),     1)
+        self.compress_combo.addItem(tr("Balanced (level 6)"), 6)
+        self.compress_combo.addItem(tr("Best (level 9)"),     9)
+        opt_form.addRow(tr("Compression:"), self.compress_combo)
 
         _enc_widget = QWidget()
         _enc_row = QHBoxLayout(_enc_widget)
         _enc_row.setContentsMargins(0, 0, 0, 0)
         self.encrypt_input = QLineEdit()
         self.encrypt_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.encrypt_input.setPlaceholderText("44-char key  (leave blank to disable encryption)")
-        _gen_btn = QPushButton("Generate")
+        self.encrypt_input.setPlaceholderText(tr("44-char key  (leave blank to disable encryption)"))
+        _gen_btn = QPushButton(tr("Generate"))
         _gen_btn.setObjectName("secondary")
         _gen_btn.setFixedWidth(80)
         _gen_btn.clicked.connect(self._generate_key)
         _enc_row.addWidget(self.encrypt_input)
         _enc_row.addWidget(_gen_btn)
-        opt_form.addRow("Encrypt key:", _enc_widget)
+        opt_form.addRow(tr("Encrypt key:"), _enc_widget)
 
-        _excl_lbl = QLabel("Exclude patterns  (one per line):")
+        _excl_lbl = QLabel(tr("Exclude patterns  (one per line):"))
         _excl_lbl.setStyleSheet("color:#9ca3af; font-size:11px;")
         opt_form.addRow("", _excl_lbl)
         self.excl_edit = QTextEdit()
         self.excl_edit.setMaximumHeight(60)
-        self.excl_edit.setPlaceholderText("*.tmp\n~$*\nThumbs.db")
+        self.excl_edit.setPlaceholderText(tr("*.tmp\n~$*\nThumbs.db"))
         self.excl_edit.setTabChangesFocus(True)
-        opt_form.addRow("Exclusions:", self.excl_edit)
+        opt_form.addRow(tr("Exclusions:"), self.excl_edit)
 
         self.pre_cmd_input = QLineEdit()
-        self.pre_cmd_input.setPlaceholderText("Command to run before backup  (optional)")
+        self.pre_cmd_input.setPlaceholderText(tr("Command to run before backup  (optional)"))
         self.post_cmd_input = QLineEdit()
-        self.post_cmd_input.setPlaceholderText("Command to run after backup  (optional)")
-        opt_form.addRow("Pre-backup cmd:",  self.pre_cmd_input)
-        opt_form.addRow("Post-backup cmd:", self.post_cmd_input)
+        self.post_cmd_input.setPlaceholderText(tr("Command to run after backup  (optional)"))
+        opt_form.addRow(tr("Pre-backup cmd:"),  self.pre_cmd_input)
+        opt_form.addRow(tr("Post-backup cmd:"), self.post_cmd_input)
 
         self._opts_widget.hide()
         opt_outer.addWidget(self._opts_widget)
@@ -13840,16 +14893,16 @@ class AddWatchDialog(QDialog):
         btn_row = QHBoxLayout(btn_bar)
         btn_row.setContentsMargins(24, 16, 24, 16)
         btn_row.addStretch()
-        _cancel_btn = QPushButton("Cancel")
+        _cancel_btn = QPushButton(tr("Cancel"))
         _cancel_btn.setObjectName("secondary")
         _cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(_cancel_btn)
-        self._submit_btn = QPushButton("Add Watch")
+        self._submit_btn = QPushButton(tr("Add Watch"))
         self._submit_btn.setObjectName("success")
         self._submit_btn.setStyleSheet("padding: 10px 32px; font-weight: 700; font-size: 13px;")
         self._submit_btn.setMinimumWidth(140)
         self._submit_btn.setDefault(True)
-        self._submit_btn.setToolTip("Add Watch (Ctrl+Enter)")
+        self._submit_btn.setToolTip(tr("Add Watch (Ctrl+Enter)"))
         self._submit_btn.clicked.connect(self._on_submit)
         btn_row.addWidget(self._submit_btn)
         root.addWidget(btn_bar)
@@ -14022,116 +15075,19 @@ class AddWatchDialog(QDialog):
 
         if not _user or not _pass:
             self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
-            self._nas_test_lbl.setText("⚠  Enter username and password first")
+            self._nas_test_lbl.setText(tr("⚠  Enter username and password first"))
             return
         if not _host:
             self._nas_test_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
-            self._nas_test_lbl.setText("⚠  Enter a UNC source/destination path first")
+            self._nas_test_lbl.setText(tr("⚠  Enter a UNC source/destination path first"))
             return
 
         self._nas_test_btn.setEnabled(False)
         self._nas_test_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
-        self._nas_test_lbl.setText("Testing…")
+        self._nas_test_lbl.setText(tr("Testing…"))
 
         def _do_test():
-            ok, msg = False, ""
-            # ── Why subprocess + net use instead of win32net ──────────────────
-            # win32net.NetUseAdd / NetShareEnum always go through the Windows
-            # OS SMB session cache.  When the PC already has ANY active
-            # connection to the target host (mapped drive, Explorer window, etc.)
-            # Windows reuses the cached token and never validates the typed
-            # credentials — so wrong passwords still show "Connected".
-            #
-            # There is no reliable way to flush that cache while other processes
-            # hold connections open.  The only escape hatch is to authenticate
-            # in a *separate process* under a *different logon session*.
-            #
-            # `net use \\host\IPC$ /user:user pass` spawned via subprocess runs
-            # in an isolated logon context and is forced to present the supplied
-            # credentials to the server — the parent process's cached session is
-            # irrelevant.  Exit code 0 = auth OK, non-zero = bad credentials.
-            # We immediately delete the temp connection so it doesn't linger.
-            import subprocess, re as _re
-            _ipc = f"\\\\{_host}\\IPC$"
-            _CREATE_NO_WINDOW = 0x08000000
-
-            _cmd_add = [
-                "net", "use", _ipc,
-                _pass,
-                f"/user:{_user}",
-                "/persistent:no",
-            ]
-            _cmd_del = ["net", "use", _ipc, "/delete", "/yes"]
-
-            def _cleanup():
-                try:
-                    subprocess.run(_cmd_del, capture_output=True, timeout=5,
-                                   creationflags=_CREATE_NO_WINDOW)
-                except Exception:
-                    pass
-
-            def _run_net_use():
-                try:
-                    return subprocess.run(
-                        _cmd_add, capture_output=True, text=True,
-                        timeout=15, creationflags=_CREATE_NO_WINDOW,
-                    )
-                except subprocess.TimeoutExpired:
-                    return None
-                except Exception as _e:
-                    raise
-
-            try:
-                _result = _run_net_use()
-            except Exception as _e:
-                return False, f"\u274c  Could not run credential check: {_e}"
-            finally:
-                _cleanup()
-
-            if _result is None:
-                # Timeout — likely existing SMB session blocking IPC$ (error 1219).
-                # Delete the conflicting connection and retry once.
-                _cleanup()
-                try:
-                    _result = _run_net_use()
-                except Exception as _e:
-                    return False, f"\u274c  Could not run credential check: {_e}"
-                finally:
-                    _cleanup()
-                if _result is None:
-                    return False, "\u274c  Timed out \u2014 server unreachable"
-
-            _out_txt = (_result.stderr or _result.stdout or "").strip()
-            if _result.returncode != 0 and "1219" in _out_txt:
-                _cleanup()
-                try:
-                    _result = _run_net_use()
-                except Exception as _e:
-                    return False, f"\u274c  Could not run credential check: {_e}"
-                finally:
-                    _cleanup()
-                if _result is None:
-                    return False, "\u274c  Timed out \u2014 server unreachable"
-                # Re-read the output from the retry — the original _out_txt
-                # is stale and would otherwise mask whatever the retry
-                # actually returned (including a second 1219).
-                _out_txt = (_result.stderr or _result.stdout or "").strip()
-
-            if _result.returncode == 0:
-                _n_shares = 0
-                try:
-                    import win32net
-                    _shares, _, _ = win32net.NetShareEnum(_host, 0)
-                    _n_shares = len(_shares)
-                except Exception:
-                    pass
-                _share_txt = f" ({_n_shares} share(s) visible)" if _n_shares else ""
-                ok = True
-                msg = f"\u2705  Connected \u2014 credentials verified{_share_txt}"
-            else:
-                ok = False
-                msg = _format_net_use_error(_out_txt)
-            return ok, msg
+            return _verify_smb_login(_host, _user, _pass)
 
         def _run():
             _ok, _msg = _do_test()
@@ -14163,7 +15119,7 @@ class AddWatchDialog(QDialog):
 
     def _on_opts_toggled(self, checked: bool):
         arrow = "▼" if checked else "▶"
-        self._opts_toggle.setText(f"{arrow}  Schedule & Options")
+        self._opts_toggle.setText(f"{arrow}  " + tr("Schedule & Options"))
         self._opts_widget.setVisible(checked)
 
     def _browse_path(self):
@@ -14189,13 +15145,11 @@ class AddWatchDialog(QDialog):
             self.encrypt_input.setText(key)
             QApplication.clipboard().setText(key)
             QMessageBox.information(
-                self, "Key Generated",
-                f"A new encryption key has been generated and copied to your clipboard.\n\n"
-                f"⚠ IMPORTANT: Save this key somewhere safe!\n"
-                f"Without it you cannot restore your encrypted backups.\n\n{key}"
+                self, tr("Key Generated"),
+                tr("A new encryption key has been generated and copied to your clipboard.\n\n\u26a0 IMPORTANT: Save this key somewhere safe!\nWithout it you cannot restore your encrypted backups.\n\n{p0}", p0=key)
             )
         except Exception as e:
-            self._err_label.setText(f"Key generation failed: {e}")
+            self._err_label.setText(tr("Key generation failed: {err}", err=e))
             self._err_label.show()
 
     def _connect_dirty_signals(self):
@@ -14231,9 +15185,9 @@ class AddWatchDialog(QDialog):
         if self._is_dirty:
             from PyQt6.QtWidgets import QMessageBox
             dlg = QMessageBox(self)
-            dlg.setWindowTitle("Discard changes?")
+            dlg.setWindowTitle(tr("Discard changes?"))
             dlg.setText(
-                "You have unsaved inputs. Are you sure you want to close without adding the watch?"
+                tr("You have unsaved inputs. Are you sure you want to close without adding the watch?")
             )
             dlg.setIcon(QMessageBox.Icon.Question)
             go_back = dlg.addButton("Go Back",  QMessageBox.ButtonRole.RejectRole)
@@ -14248,7 +15202,7 @@ class AddWatchDialog(QDialog):
     def _on_submit(self):
         name = self.name_input.text().strip()
         if not name:
-            self._err_label.setText("Name is required.")
+            self._err_label.setText(tr("Name is required."))
             self._err_label.show()
             self.name_input.setFocus()
             return
@@ -14259,32 +15213,32 @@ class AddWatchDialog(QDialog):
         if src == "local":
             path = self.path_input.text().strip()
             if not path:
-                self._err_label.setText("Source path is required.")
+                self._err_label.setText(tr("Source path is required."))
                 self._err_label.show()
                 self.path_input.setFocus()
                 return
         elif src == "webdav":
             path = self.webdav_url_input.text().strip()
             if not path:
-                self._err_label.setText("WebDAV URL is required.")
+                self._err_label.setText(tr("WebDAV URL is required."))
                 self._err_label.show()
                 return
         elif src == "sftp":
             path = self.sftp_host_input.text().strip()
             if not path:
-                self._err_label.setText("SFTP host is required.")
+                self._err_label.setText(tr("SFTP host is required."))
                 self._err_label.show()
                 return
         else:  # ftp
             path = self.ftp_host_input.text().strip()
             if not path:
-                self._err_label.setText("FTP host is required.")
+                self._err_label.setText(tr("FTP host is required."))
                 self._err_label.show()
                 return
 
         key = self.encrypt_input.text().strip()
         if key and len(key) != 44:
-            self._err_label.setText(f"Encryption key must be exactly 44 characters (got {len(key)}).")
+            self._err_label.setText(tr("Encryption key must be exactly 44 characters (got {n}).", n=len(key)))
             self._err_label.show()
             return
 
@@ -14297,7 +15251,7 @@ class AddWatchDialog(QDialog):
 
         _dest_path = self.dest_input.text().strip()
         if not _dest_path:
-            self._err_label.setText("Destination is required — enter the backup folder path.")
+            self._err_label.setText(tr("Destination is required — enter the backup folder path."))
             self._err_label.show()
             self.dest_input.setFocus()
             return
@@ -14319,7 +15273,7 @@ class AddWatchDialog(QDialog):
                     self._nas_audit_frame.setVisible(True)
                 except Exception:
                     pass
-                self._err_label.setText('⚠️  SMB username and password are required when the source or destination is a network path. Enter the credentials BackupSys uses to connect to this share.')
+                self._err_label.setText(tr('⚠️  SMB username and password are required when the source or destination is a network path. Enter the credentials BackupSys uses to connect to this share.'))
                 self._err_label.show()
                 (self.nas_user_input if not _cred_user else self.nas_pass_input).setFocus()
                 return
@@ -14360,10 +15314,10 @@ class AddWatchDialog(QDialog):
         except Exception:
             pass
         self._submit_btn.setEnabled(False)
-        self._submit_btn.setText("Verifying…")
+        self._submit_btn.setText(tr("Verifying…"))
         try:
             self._nas_test_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
-            self._nas_test_lbl.setText("Verifying credentials…")
+            self._nas_test_lbl.setText(tr("Verifying credentials…"))
         except Exception:
             pass
         # Pause the ready-glow while a verification is in flight.
@@ -14391,7 +15345,7 @@ class AddWatchDialog(QDialog):
     def _on_verify_before_accept(self, ok: bool, msg: str, host: str, user: str, password: str):
         self._verifying = False
         self._submit_btn.setEnabled(True)
-        self._submit_btn.setText("Add Watch")
+        self._submit_btn.setText(tr("Add Watch"))
         if ok:
             # Remember this exact (host,user,pass) so a later submit is instant.
             self._verified_cred_sig = (host.lower(), user, password)
@@ -14403,9 +15357,7 @@ class AddWatchDialog(QDialog):
             self._finalize_accept()
         else:
             self._err_label.setText(
-                "❌  Cannot add watch — the SMB credentials were rejected.\n"
-                f"{msg}\n"
-                "Fix the username/password (or use Test Connection) and try again."
+                tr("\u274c  Cannot add watch \u2014 the SMB credentials were rejected.\n{p0}\nFix the username/password (or use Test Connection) and try again.", p0=msg)
             )
             self._err_label.show()
             try:
@@ -14530,9 +15482,9 @@ class PasswordDialog(QDialog):
 
     def _build_ui(self):
         if self._mode == "set":
-            self.setWindowTitle("Set Admin Password · Backup System")
+            self.setWindowTitle(tr("Set Admin Password · Backup System"))
         else:
-            self.setWindowTitle("Admin Login · Backup System")
+            self.setWindowTitle(tr("Admin Login · Backup System"))
 
         self.setMinimumWidth(360)
         layout = QVBoxLayout(self)
@@ -14540,14 +15492,14 @@ class PasswordDialog(QDialog):
         layout.setContentsMargins(24, 24, 24, 20)
 
         # ── title label ──
-        title = QLabel("Set Admin Password" if self._mode == "set" else "Enter Admin Password")
+        title = QLabel(tr("Set Admin Password") if self._mode == "set" else tr("Enter Admin Password"))
         title.setStyleSheet("font-size:14px; font-weight:700;")
         layout.addWidget(title)
 
         # ── password field ──
         self._pw_input = QLineEdit()
         self._pw_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._pw_input.setPlaceholderText("Password")
+        self._pw_input.setPlaceholderText(tr("Password"))
         layout.addWidget(self._pw_input)
 
         # ── confirm field (set-mode only) ──
@@ -14555,14 +15507,14 @@ class PasswordDialog(QDialog):
         if self._mode == "set":
             self._confirm_input = QLineEdit()
             self._confirm_input.setEchoMode(QLineEdit.EchoMode.Password)
-            self._confirm_input.setPlaceholderText("Confirm password")
+            self._confirm_input.setPlaceholderText(tr("Confirm password"))
             layout.addWidget(self._confirm_input)
 
         # ── "Forgot password?" link (verify-mode only) ──
         if self._mode == "verify":
             forgot_row = QHBoxLayout()
             forgot_row.addStretch()
-            forgot_btn = QPushButton("Forgot password?")
+            forgot_btn = QPushButton(tr("Forgot password?"))
             forgot_btn.setObjectName("secondary")
             forgot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             forgot_btn.setStyleSheet(
@@ -14585,12 +15537,12 @@ class PasswordDialog(QDialog):
         btn_row.setSpacing(8)
         btn_row.addStretch()
 
-        cancel_btn = QPushButton("Cancel")
+        cancel_btn = QPushButton(tr("Cancel"))
         cancel_btn.setObjectName("secondary")
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(cancel_btn)
 
-        ok_label = "Set Password" if self._mode == "set" else "Unlock"
+        ok_label = tr("Set Password") if self._mode == "set" else tr("Unlock")
         ok_btn = QPushButton(ok_label)
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self._on_accept)
@@ -14618,20 +15570,21 @@ class PasswordDialog(QDialog):
         admin out permanently.
         """
         reply = QMessageBox.question(
-            self, "Reset Admin Password",
-            "This will erase the current admin password.\n"
+            self, tr("Reset Admin Password"),
+            tr("This will erase the current admin password.\n"
             "Anyone using this PC will then be able to set a new one.\n\n"
-            "Continue?",
+            "Continue?"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        s.remove(self._SETTINGS_KEY)
-        s.sync()
-
+        # NOTE: do NOT erase the stored password here. The old hash must stay
+        # in place until a *new* one is actually confirmed in the follow-up
+        # "set" dialog (which overwrites it on save). Erasing it now would leave
+        # the Admin panel completely unprotected if the user abandons the reset
+        # dialog — anyone could then open Admin by clicking "skip".
         self._forgot_clicked = True
         self.reject()  # close this "verify" dialog; caller opens a "set" dialog
 
@@ -14653,7 +15606,7 @@ class PasswordDialog(QDialog):
                 self._show_error("Password must be at least 4 characters.")
                 return
             self._save_hash(self._hash(pw))
-            QMessageBox.information(self, "Password Set", "Admin password has been updated.")
+            QMessageBox.information(self, tr("Password Set"), tr("Admin password has been updated."))
             self.accept()
 
         else:  # verify
@@ -14780,8 +15733,14 @@ class AdminPanel(QDialog):
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self.cfg = cfg
-        self.setWindowTitle("Admin Settings  · Backup System")
-        self.setMinimumSize(880, 580)
+        self.setWindowTitle(tr("Admin Settings  · Backup System"))
+        # The Watches table has 13 columns totalling ~950px of fixed width plus a
+        # stretchy Path column.  At the old 880px minimum it overflowed: Path
+        # collapsed to "\..." and the 🗑 Remove button scrolled off the right edge,
+        # leaving users no visible way to delete a watch.  This minimum guarantees
+        # the whole table — including both action buttons — is always on screen.
+        self.setMinimumSize(1080, 580)
+        self.resize(1180, 720)
         self.setModal(True)
         # Cache OAuth credentials once at init — avoids re-reading .env on
         # every GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET property access.
@@ -14802,7 +15761,7 @@ class AdminPanel(QDialog):
         header.setFixedHeight(56)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 20, 0)
-        title = QLabel("Admin Settings")
+        title = QLabel(tr("Admin Settings"))
         title.setStyleSheet("font-size:15px; font-weight:700; color:#f1f3f9;")
         hl.addWidget(title)
         hl.addStretch()
@@ -14827,22 +15786,22 @@ class AdminPanel(QDialog):
         gl.setSpacing(16)
         gl.setContentsMargins(20, 20, 20, 20)
 
-        dest_group = QGroupBox("Backup Destination")
+        dest_group = QGroupBox(tr("Backup Destination"))
         dg_main = QVBoxLayout(dest_group)
         dg_main.setSpacing(8)
 
         dest_type_row = QHBoxLayout()
-        dest_type_row.addWidget(QLabel("Type:"))
+        dest_type_row.addWidget(QLabel(tr("Type:")))
         self.dest_type_combo = QComboBox()
-        self.dest_type_combo.addItems([
-            "Local / Mapped Drive",
-            "SFTP",
-            "FTPS",
-            "FTP",
-            "HTTPS API",
-            "rclone",
-            "WebDAV / Nextcloud",
-            "Google Drive",
+        self.dest_type_combo.addItems([   # display only; read via currentIndex()
+            tr("Local / Mapped Drive"),
+            tr("SFTP"),
+            tr("FTPS"),
+            tr("FTP"),
+            tr("HTTPS API"),
+            tr("rclone"),
+            tr("WebDAV / Nextcloud"),
+            tr("Google Drive"),
         ])
         self.dest_type_combo.currentIndexChanged.connect(self._on_dest_type_changed)
         dest_type_row.addWidget(self.dest_type_combo, stretch=1)
@@ -14852,7 +15811,7 @@ class AdminPanel(QDialog):
         # dest_input kept as a hidden stub so _load_values() and _save_general() compile.
         self.dest_input = QLineEdit()
         self.dest_local_widget = QWidget()
-        _dest_info = QLabel("Local destination paths are configured per-watch (Edit Watch → Destination).")
+        _dest_info = QLabel(tr("Local destination paths are configured per-watch (Edit Watch → Destination)."))
         _dest_info.setWordWrap(True)
         _dest_info.setStyleSheet("color:#94a3b8; font-size:11px;")
         _dest_local_layout = QVBoxLayout(self.dest_local_widget)
@@ -14866,28 +15825,28 @@ class AdminPanel(QDialog):
         sfl = QFormLayout(self.dest_sftp_widget)
         sfl.setContentsMargins(0,0,0,0)
         sfl.setSpacing(4)
-        self.sftp_host = QLineEdit(); self.sftp_host.setPlaceholderText("192.168.1.100 or hostname")
+        self.sftp_host = QLineEdit(); self.sftp_host.setPlaceholderText(tr("192.168.1.100 or hostname"))
         self.sftp_port = QSpinBox();  self.sftp_port.setRange(1, 65535); self.sftp_port.setValue(22)
-        self.sftp_user = QLineEdit(); self.sftp_user.setPlaceholderText("username")
-        self.sftp_pass = QLineEdit(); self.sftp_pass.setPlaceholderText("password"); self.sftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.sftp_path = QLineEdit(); self.sftp_path.setPlaceholderText("/remote/backup/path")
-        self.sftp_keyfile = QLineEdit(); self.sftp_keyfile.setPlaceholderText("Path to private key file (optional)")
+        self.sftp_user = QLineEdit(); self.sftp_user.setPlaceholderText(tr("username"))
+        self.sftp_pass = QLineEdit(); self.sftp_pass.setPlaceholderText(tr("password")); self.sftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sftp_path = QLineEdit(); self.sftp_path.setPlaceholderText(tr("/remote/backup/path"))
+        self.sftp_keyfile = QLineEdit(); self.sftp_keyfile.setPlaceholderText(tr("Path to private key file (optional)"))
         sftp_key_row = QHBoxLayout()
         sftp_key_row.addWidget(self.sftp_keyfile)
-        sftp_browse_key = QPushButton("Browse"); sftp_browse_key.setObjectName("secondary"); sftp_browse_key.setMaximumWidth(70)
+        sftp_browse_key = QPushButton(tr("Browse")); sftp_browse_key.setObjectName("secondary"); sftp_browse_key.setMaximumWidth(70)
         sftp_browse_key.clicked.connect(lambda: self.sftp_keyfile.setText(
             QFileDialog.getOpenFileName(self, "Select Key File")[0] or self.sftp_keyfile.text()
         ))
         sftp_key_row.addWidget(sftp_browse_key)
-        self.sftp_key_pass = QLineEdit(); self.sftp_key_pass.setPlaceholderText("Passphrase (if key is password-protected)"); self.sftp_key_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        sfl.addRow("Host:", self.sftp_host)
-        sfl.addRow("Port:", self.sftp_port)
-        sfl.addRow("User:", self.sftp_user)
-        sfl.addRow("Password:", self.sftp_pass)
-        sfl.addRow("Remote Path:", self.sftp_path)
-        sfl.addRow("Key File:", sftp_key_row)
-        sfl.addRow("Key Passphrase:", self.sftp_key_pass)
-        sftp_test_btn = QPushButton("Test Connection")
+        self.sftp_key_pass = QLineEdit(); self.sftp_key_pass.setPlaceholderText(tr("Passphrase (if key is password-protected)")); self.sftp_key_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        sfl.addRow(tr("Host:"), self.sftp_host)
+        sfl.addRow(tr("Port:"), self.sftp_port)
+        sfl.addRow(tr("User:"), self.sftp_user)
+        sfl.addRow(tr("Password:"), self.sftp_pass)
+        sfl.addRow(tr("Remote Path:"), self.sftp_path)
+        sfl.addRow(tr("Key File:"), sftp_key_row)
+        sfl.addRow(tr("Key Passphrase:"), self.sftp_key_pass)
+        sftp_test_btn = QPushButton(tr("Test Connection"))
         sftp_test_btn.setObjectName("secondary")
         sftp_test_btn.clicked.connect(self._test_sftp)
         sfl.addRow("", sftp_test_btn)
@@ -14899,21 +15858,21 @@ class AdminPanel(QDialog):
         ftpl = QFormLayout(self.dest_ftp_widget)
         ftpl.setContentsMargins(0, 0, 0, 0)
         ftpl.setSpacing(4)
-        self.ftp_host = QLineEdit(); self.ftp_host.setPlaceholderText("192.168.1.100 or hostname")
+        self.ftp_host = QLineEdit(); self.ftp_host.setPlaceholderText(tr("192.168.1.100 or hostname"))
         self.ftp_port = QSpinBox();  self.ftp_port.setRange(1, 65535); self.ftp_port.setValue(21)
-        self.ftp_user = QLineEdit(); self.ftp_user.setPlaceholderText("username")
-        self.ftp_pass = QLineEdit(); self.ftp_pass.setPlaceholderText("password"); self.ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ftp_path = QLineEdit(); self.ftp_path.setPlaceholderText("/remote/backup/path")
-        ftpl.addRow("Host:",        self.ftp_host)
-        ftpl.addRow("Port:",        self.ftp_port)
-        ftpl.addRow("User:",        self.ftp_user)
-        ftpl.addRow("Password:",    self.ftp_pass)
-        ftpl.addRow("Remote Path:", self.ftp_path)
-        ftp_warn = QLabel("⚠ FTP sends credentials in plaintext. Use FTPS/SFTP when possible.")
+        self.ftp_user = QLineEdit(); self.ftp_user.setPlaceholderText(tr("username"))
+        self.ftp_pass = QLineEdit(); self.ftp_pass.setPlaceholderText(tr("password")); self.ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ftp_path = QLineEdit(); self.ftp_path.setPlaceholderText(tr("/remote/backup/path"))
+        ftpl.addRow(tr("Host:"),        self.ftp_host)
+        ftpl.addRow(tr("Port:"),        self.ftp_port)
+        ftpl.addRow(tr("User:"),        self.ftp_user)
+        ftpl.addRow(tr("Password:"),    self.ftp_pass)
+        ftpl.addRow(tr("Remote Path:"), self.ftp_path)
+        ftp_warn = QLabel(tr("⚠ FTP sends credentials in plaintext. Use FTPS/SFTP when possible."))
         ftp_warn.setStyleSheet("color: #f59e0b; font-size: 11px;")
         ftp_warn.setWordWrap(True)
         ftpl.addRow("", ftp_warn)
-        ftp_test_btn = QPushButton("Test Connection")
+        ftp_test_btn = QPushButton(tr("Test Connection"))
         ftp_test_btn.setObjectName("secondary")
         ftp_test_btn.clicked.connect(self._test_ftp)
         ftpl.addRow("", ftp_test_btn)
@@ -14925,21 +15884,21 @@ class AdminPanel(QDialog):
         htal = QFormLayout(self.dest_https_widget)
         htal.setContentsMargins(0, 0, 0, 0)
         htal.setSpacing(4)
-        self.https_url   = QLineEdit(); self.https_url.setPlaceholderText("https://backup.company.com/api/upload")
-        self.https_token = QLineEdit(); self.https_token.setPlaceholderText("Bearer token (optional)"); self.https_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self.https_verify_ssl = QCheckBox("Verify SSL certificate")
+        self.https_url   = QLineEdit(); self.https_url.setPlaceholderText(tr("https://backup.company.com/api/upload"))
+        self.https_token = QLineEdit(); self.https_token.setPlaceholderText(tr("Bearer token (optional)")); self.https_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.https_verify_ssl = QCheckBox(tr("Verify SSL certificate"))
         self.https_verify_ssl.setChecked(True)
-        htal.addRow("Endpoint URL:", self.https_url)
-        htal.addRow("Auth Token:",   self.https_token)
+        htal.addRow(tr("Endpoint URL:"), self.https_url)
+        htal.addRow(tr("Auth Token:"),   self.https_token)
         htal.addRow("",              self.https_verify_ssl)
         https_note = QLabel(
-            "Files are POSTed as multipart/form-data with fields 'file' and 'path'.\n"
-            "Your server must accept POST requests at the endpoint above."
+            tr("Files are POSTed as multipart/form-data with fields 'file' and 'path'.\n"
+            "Your server must accept POST requests at the endpoint above.")
         )
         https_note.setStyleSheet("color: #94a3b8; font-size: 11px;")
         https_note.setWordWrap(True)
         htal.addRow("", https_note)
-        https_test_btn = QPushButton("Test Connection")
+        https_test_btn = QPushButton(tr("Test Connection"))
         https_test_btn.setObjectName("secondary")
         https_test_btn.clicked.connect(self._test_https)
         htal.addRow("", https_test_btn)
@@ -14955,34 +15914,34 @@ class AdminPanel(QDialog):
         # ── In-app remote picker ─────────────────────────────────────────
         rclone_picker_row = QHBoxLayout()
         self.rclone_picker_combo = QComboBox()
-        self.rclone_picker_combo.setPlaceholderText("— detect remotes first —")
+        self.rclone_picker_combo.setPlaceholderText(tr("— detect remotes first —"))
         self.rclone_picker_combo.setMinimumWidth(160)
         self.rclone_picker_combo.currentTextChanged.connect(self._on_rclone_picker_changed)
-        rclone_detect_btn = QPushButton("🔍 Detect Remotes")
+        rclone_detect_btn = QPushButton(tr("🔍 Detect Remotes"))
         rclone_detect_btn.setObjectName("secondary")
-        rclone_detect_btn.setToolTip("Run 'rclone listremotes' to find configured remotes")
+        rclone_detect_btn.setToolTip(tr("Run 'rclone listremotes' to find configured remotes"))
         rclone_detect_btn.clicked.connect(self._detect_rclone_remotes)
-        rclone_config_btn = QPushButton("⚙ rclone config…")
+        rclone_config_btn = QPushButton(tr("⚙ rclone config…"))
         rclone_config_btn.setObjectName("secondary")
-        rclone_config_btn.setToolTip("Open a terminal running 'rclone config' to add / edit remotes")
+        rclone_config_btn.setToolTip(tr("Open a terminal running 'rclone config' to add / edit remotes"))
         rclone_config_btn.clicked.connect(self._launch_rclone_config)
         rclone_picker_row.addWidget(self.rclone_picker_combo, stretch=1)
         rclone_picker_row.addWidget(rclone_detect_btn)
         rclone_picker_row.addWidget(rclone_config_btn)
-        rcl.addRow("Pick remote:", rclone_picker_row)
+        rcl.addRow(tr("Pick remote:"), rclone_picker_row)
 
-        self.rclone_remote = QLineEdit(); self.rclone_remote.setPlaceholderText("myremote")
-        self.rclone_path = QLineEdit(); self.rclone_path.setPlaceholderText("/backups")
-        rcl.addRow("Remote name:", self.rclone_remote)
-        rcl.addRow("Remote path:", self.rclone_path)
+        self.rclone_remote = QLineEdit(); self.rclone_remote.setPlaceholderText(tr("myremote"))
+        self.rclone_path = QLineEdit(); self.rclone_path.setPlaceholderText(tr("/backups"))
+        rcl.addRow(tr("Remote name:"), self.rclone_remote)
+        rcl.addRow(tr("Remote path:"), self.rclone_path)
         rclone_note = QLabel(
-            "Click \u2018Detect Remotes\u2019 to list remotes from your rclone config, or type a name "
-            "manually. Use \u2018rclone config\u2026\u2019 to add a new provider (70+ supported)."
+            tr("Click \u2018Detect Remotes\u2019 to list remotes from your rclone config, or type a name "
+            "manually. Use \u2018rclone config\u2026\u2019 to add a new provider (70+ supported).")
         )
         rclone_note.setStyleSheet("color: #94a3b8; font-size: 11px;")
         rclone_note.setWordWrap(True)
         rcl.addRow("", rclone_note)
-        rclone_test_btn = QPushButton("Test Connection")
+        rclone_test_btn = QPushButton(tr("Test Connection"))
         rclone_test_btn.setObjectName("secondary")
         rclone_test_btn.clicked.connect(self._test_rclone)
         rcl.addRow("", rclone_test_btn)
@@ -14992,21 +15951,21 @@ class AdminPanel(QDialog):
         # ── WebDAV / Nextcloud destination ─────────────────────────────────
         self.dest_webdav_widget = QWidget()
         wdvl = QFormLayout(self.dest_webdav_widget)
-        self.webdav_url  = QLineEdit(); self.webdav_url.setPlaceholderText("https://nextcloud.example.com")
-        self.webdav_user = QLineEdit(); self.webdav_user.setPlaceholderText("username")
-        self.webdav_pass = QLineEdit(); self.webdav_pass.setPlaceholderText("password"); self.webdav_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.webdav_path = QLineEdit(); self.webdav_path.setPlaceholderText("/backups")
-        self.webdav_root = QLineEdit(); self.webdav_root.setPlaceholderText("/remote.php/dav/files/username/  (Nextcloud)")
-        self.webdav_ssl  = QCheckBox("Verify SSL certificate"); self.webdav_ssl.setChecked(True)
+        self.webdav_url  = QLineEdit(); self.webdav_url.setPlaceholderText(tr("https://nextcloud.example.com"))
+        self.webdav_user = QLineEdit(); self.webdav_user.setPlaceholderText(tr("username"))
+        self.webdav_pass = QLineEdit(); self.webdav_pass.setPlaceholderText(tr("password")); self.webdav_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.webdav_path = QLineEdit(); self.webdav_path.setPlaceholderText(tr("/backups"))
+        self.webdav_root = QLineEdit(); self.webdav_root.setPlaceholderText(tr("/remote.php/dav/files/username/  (Nextcloud)"))
+        self.webdav_ssl  = QCheckBox(tr("Verify SSL certificate")); self.webdav_ssl.setChecked(True)
         wdv_btn_row = QHBoxLayout()
-        self.webdav_test_btn = QPushButton("Test WebDAV")
+        self.webdav_test_btn = QPushButton(tr("Test WebDAV"))
         self.webdav_test_btn.clicked.connect(self._test_webdav)
         wdv_btn_row.addWidget(self.webdav_test_btn); wdv_btn_row.addStretch()
-        wdvl.addRow("URL:",         self.webdav_url)
-        wdvl.addRow("Username:",    self.webdav_user)
-        wdvl.addRow("Password:",    self.webdav_pass)
-        wdvl.addRow("Remote path:", self.webdav_path)
-        wdvl.addRow("DAV root:",    self.webdav_root)
+        wdvl.addRow(tr("URL:"),         self.webdav_url)
+        wdvl.addRow(tr("Username:"),    self.webdav_user)
+        wdvl.addRow(tr("Password:"),    self.webdav_pass)
+        wdvl.addRow(tr("Remote path:"), self.webdav_path)
+        wdvl.addRow(tr("DAV root:"),    self.webdav_root)
         wdvl.addRow("",             self.webdav_ssl)
         wdvl.addRow("",             wdv_btn_row)
         self.dest_webdav_widget.setVisible(False)
@@ -15017,9 +15976,9 @@ class AdminPanel(QDialog):
         gdl = QVBoxLayout(self.dest_gdrive_widget)
         gdl.setContentsMargins(0, 4, 0, 4)
         gdrive_info = QLabel(
-            "<b>Google Drive</b> is configured in the <b>Cloud</b> tab of Settings.<br>"
+            tr("<b>Google Drive</b> is configured in the <b>Cloud</b> tab of Settings.<br>"
             "Connect your account there, then assign this watch to Google Drive.<br>"
-            "Once assigned the <i>dest_type</i> for this watch is managed automatically."
+            "Once assigned the <i>dest_type</i> for this watch is managed automatically.")
         )
         gdrive_info.setWordWrap(True)
         gdrive_info.setStyleSheet("color: #94a3b8; font-size: 12px;")
@@ -15042,23 +16001,23 @@ class AdminPanel(QDialog):
         # the per-watch controls instead.
         dest_group.setVisible(False)
         _dest_perwatch_note = QLabel(
-            "Backup destinations are configured <b>per-watch</b>.  Open "
+            tr("Backup destinations are configured <b>per-watch</b>.  Open "
             "<b>Watches → Edit</b> → <b>Destination</b> (local / mapped-drive folder) "
             "and <b>Advanced → Additional Destinations</b> to add SFTP, FTPS, FTP, "
-            "HTTPS, WebDAV, rclone or Google Drive targets for that watch."
+            "HTTPS, rclone or Google Drive targets for that watch.")
         )
         _dest_perwatch_note.setTextFormat(Qt.TextFormat.RichText)
         _dest_perwatch_note.setWordWrap(True)
         _dest_perwatch_note.setStyleSheet("color:#94a3b8; font-size:12px;")
-        _dest_perwatch_group = QGroupBox("Backup Destination")
+        _dest_perwatch_group = QGroupBox(tr("Backup Destination"))
         _dpw_layout = QVBoxLayout(_dest_perwatch_group)
         _dpw_layout.setContentsMargins(12, 8, 12, 8)
         _dpw_layout.addWidget(_dest_perwatch_note)
         gl.addWidget(_dest_perwatch_group)
 
-        sched_group = QGroupBox("Schedule & Limits")
+        sched_group = QGroupBox(tr("Schedule & Limits"))
         sg = QFormLayout(sched_group)
-        self.auto_check = QCheckBox("Enable auto backup")
+        self.auto_check = QCheckBox(tr("Enable auto backup"))
         sg.addRow("", self.auto_check)
         interval_row = QHBoxLayout()
         self.interval_spin = QSpinBox()
@@ -15066,13 +16025,13 @@ class AdminPanel(QDialog):
         self.interval_spin.setValue(30)
         interval_row.addWidget(self.interval_spin)
         self.interval_unit = QComboBox()
-        self.interval_unit.addItems(["minutes", "seconds (test only)"])
+        self.interval_unit.addItems([tr("minutes"), tr("seconds (test only)")])  # read via currentIndex()
         self.interval_unit.currentIndexChanged.connect(self._on_interval_unit_changed)
         interval_row.addWidget(self.interval_unit)
-        sg.addRow("Interval:", interval_row)
+        sg.addRow(tr("Interval:"), interval_row)
         self.seconds_warning_label = QLabel(
-            "⚠️  Seconds mode is for testing only — do not use in production. "
-            "Backups will run every few seconds and may hammer your filesystem."
+            tr("⚠️  Seconds mode is for testing only — do not use in production. "
+            "Backups will run every few seconds and may hammer your filesystem.")
         )
         self.seconds_warning_label.setStyleSheet("color: #c0392b; font-weight: bold;")
         self.seconds_warning_label.setWordWrap(True)
@@ -15081,52 +16040,52 @@ class AdminPanel(QDialog):
         # Disk space alert threshold
         self.disk_alert_spin = QSpinBox()
         self.disk_alert_spin.setRange(0, 1000)
-        self.disk_alert_spin.setSuffix(" GB")
-        self.disk_alert_spin.setSpecialValueText("0 — Disabled")
-        sg.addRow("Alert when free space below:", self.disk_alert_spin)
+        self.disk_alert_spin.setSuffix(tr(" GB"))
+        self.disk_alert_spin.setSpecialValueText(tr("0 — Disabled"))
+        sg.addRow(tr("Alert when free space below:"), self.disk_alert_spin)
 
         # Scheduled backup times (day-of-week aware)
         self.schedule_times_widget = ScheduleTableWidget()
         self.schedule_times_widget.setToolTip(
-            "Add one row per scheduled time.\n"
+            tr("Add one row per scheduled time.\n"
             "Tick the day checkboxes to restrict which days of the week each time fires.\n"
-            "Leave all days ticked to run every day (the original behaviour)."
+            "Leave all days ticked to run every day (the original behaviour).")
         )
-        sg.addRow("Run at times:", self.schedule_times_widget)
+        sg.addRow(tr("Run at times:"), self.schedule_times_widget)
 
         # Backup window — start and stop times
         self.backup_window_start_input = QLineEdit()
-        self.backup_window_start_input.setPlaceholderText("e.g. 01:00  (leave blank for no start limit)")
+        self.backup_window_start_input.setPlaceholderText(tr("e.g. 01:00  (leave blank for no start limit)"))
         self.backup_window_start_input.setToolTip(
-            "If set, auto-backups will not START before this time each day.\n"
+            tr("If set, auto-backups will not START before this time each day.\n"
             "Combine with Stop by to define a quiet-hours window.\n"
-            "Example: Start after 01:00 + Stop by 06:00 = backups only between 1 AM and 6 AM."
+            "Example: Start after 01:00 + Stop by 06:00 = backups only between 1 AM and 6 AM.")
         )
-        sg.addRow("Start after:", self.backup_window_start_input)
+        sg.addRow(tr("Start after:"), self.backup_window_start_input)
 
         window_row = QHBoxLayout()
         self.backup_window_end_input = QLineEdit()
-        self.backup_window_end_input.setPlaceholderText("e.g. 06:00  (leave blank for no cutoff)")
+        self.backup_window_end_input.setPlaceholderText(tr("e.g. 06:00  (leave blank for no cutoff)"))
         self.backup_window_end_input.setToolTip(
-            "If set, auto-backups that START after this time are skipped until the next day.\n"
+            tr("If set, auto-backups that START after this time are skipped until the next day.\n"
             "Useful to avoid backups running into business hours.\n"
-            "Example: set Start after to 01:00 and Stop by to 06:00."
+            "Example: set Start after to 01:00 and Stop by to 06:00.")
         )
         window_row.addWidget(self.backup_window_end_input)
-        sg.addRow("Stop by:", window_row)
+        sg.addRow(tr("Stop by:"), window_row)
         self.bw_spin = QDoubleSpinBox()
         self.bw_spin.setRange(0.0, 1000.0)
         self.bw_spin.setDecimals(1)
-        self.bw_spin.setSuffix(" MB/s  (0 = unlimited)")
+        self.bw_spin.setSuffix(tr(" MB/s  (0 = unlimited)"))
         self.bw_spin.setValue(0.0)
-        sg.addRow("Max bandwidth:", self.bw_spin)
+        sg.addRow(tr("Max bandwidth:"), self.bw_spin)
 
         # Bandwidth schedule table
-        bw_sched_label = QLabel("Schedule (optional — overrides max bandwidth during time windows):")
+        bw_sched_label = QLabel(tr("Schedule (optional — overrides max bandwidth during time windows):"))
         sg.addRow("", bw_sched_label)
         self.bw_table = QTableWidget()
         self.bw_table.setColumnCount(3)
-        self.bw_table.setHorizontalHeaderLabels(["Start (HH:MM)", "End (HH:MM)", "Max MB/s"])
+        self.bw_table.setHorizontalHeaderLabels([tr("Start (HH:MM)"), tr("End (HH:MM)"), tr("Max MB/s")])
         self.bw_table.horizontalHeader().setStretchLastSection(False)
         self.bw_table.setColumnWidth(0, 120)
         self.bw_table.setColumnWidth(1, 120)
@@ -15137,10 +16096,10 @@ class AdminPanel(QDialog):
         
         # Bandwidth schedule buttons
         btn_row = QHBoxLayout()
-        add_bw_btn = QPushButton("Add Schedule Rule")
+        add_bw_btn = QPushButton(tr("Add Schedule Rule"))
         add_bw_btn.setMinimumWidth(150)
         add_bw_btn.clicked.connect(self._add_bw_rule)
-        remove_bw_btn = QPushButton("Remove Rule")
+        remove_bw_btn = QPushButton(tr("Remove Rule"))
         remove_bw_btn.setMinimumWidth(110)
         remove_bw_btn.clicked.connect(self._remove_bw_rule)
         btn_row.addWidget(add_bw_btn)
@@ -15151,143 +16110,143 @@ class AdminPanel(QDialog):
         # System idle threshold
         self.idle_spin = QSpinBox()
         self.idle_spin.setRange(0, 100)
-        self.idle_spin.setSuffix("%  CPU  (0 = always run)")
+        self.idle_spin.setSuffix(tr("%  CPU  (0 = always run)"))
         self.idle_spin.setToolTip(
-            "Auto-backups are deferred while CPU usage exceeds this threshold.\n"
+            tr("Auto-backups are deferred while CPU usage exceeds this threshold.\n"
             "Example: 60 = only run auto-backups when CPU is below 60%.\n"
-            "Requires psutil (pip install psutil). Set to 0 to disable."
+            "Requires psutil (pip install psutil). Set to 0 to disable.")
         )
         self.idle_spin.setValue(0)
-        sg.addRow("Idle threshold:", self.idle_spin)
+        sg.addRow(tr("Idle threshold:"), self.idle_spin)
 
         # Metered connection pause
-        self.metered_check = QCheckBox("Pause auto-backups on metered connections (Windows only)")
+        self.metered_check = QCheckBox(tr("Pause auto-backups on metered connections (Windows only)"))
         self.metered_check.setToolTip(
-            "When enabled, scheduled backups are skipped if Windows detects a metered network\n"
+            tr("When enabled, scheduled backups are skipped if Windows detects a metered network\n"
             "(e.g. mobile hotspot, cellular connection). Check only applies on Windows.\n"
-            "Non-Windows systems will ignore this setting."
+            "Non-Windows systems will ignore this setting.")
         )
         sg.addRow("", self.metered_check)
 
         # Battery pause
-        self.battery_check = QCheckBox("Pause auto-backups when running on battery")
+        self.battery_check = QCheckBox(tr("Pause auto-backups when running on battery"))
         self.battery_check.setToolTip(
-            "When enabled, scheduled backups are skipped while the laptop is unplugged.\n"
+            tr("When enabled, scheduled backups are skipped while the laptop is unplugged.\n"
             "Backups resume automatically once the power adapter is reconnected.\n"
-            "Uses psutil.sensors_battery() \u2014 works on Windows, macOS, and Linux."
+            "Uses psutil.sensors_battery() \u2014 works on Windows, macOS, and Linux.")
         )
         sg.addRow("", self.battery_check)
 
         # Remote upload verification
-        self.verify_remote_cb = QCheckBox("Verify remote uploads after transfer (SFTP / FTP / WebDAV)")
+        self.verify_remote_cb = QCheckBox(tr("Verify remote uploads after transfer (SFTP / FTP)"))
         self.verify_remote_cb.setToolTip(
-            "After each remote upload, BackupSys re-reads the first 8 KB of every file\n"
+            tr("After each remote upload, BackupSys re-reads the first 8 KB of every file\n"
             "and compares its MD5 against the local copy.\n"
             "Catches silent corruption and truncated transfers.\n"
-            "Adds a small overhead — enable for critical or slow/unreliable connections."
+            "Adds a small overhead — enable for critical or slow/unreliable connections.")
         )
         sg.addRow("", self.verify_remote_cb)
 
-        self.verify_after_cb = QCheckBox("Verify backup integrity after each backup (local)")
+        self.verify_after_cb = QCheckBox(tr("Verify backup integrity after each backup (local)"))
         self.verify_after_cb.setToolTip(
-            "After each backup completes successfully, BackupSys will re-read every\n"
+            tr("After each backup completes successfully, BackupSys will re-read every\n"
             "copied file and compare its checksum against the source.\n"
             "Detects silent write errors and storage corruption.\n"
-            "Adds extra time proportional to backup size — recommended for critical data."
+            "Adds extra time proportional to backup size — recommended for critical data.")
         )
         sg.addRow("", self.verify_after_cb)
 
         # Auto-retry
         retry_row = QHBoxLayout()
-        self.retry_check = QCheckBox("Auto-retry on failure")
+        self.retry_check = QCheckBox(tr("Auto-retry on failure"))
         self.retry_delay_spin = QSpinBox()
         self.retry_delay_spin.setRange(1, 60)
-        self.retry_delay_spin.setSuffix(" min delay")
+        self.retry_delay_spin.setSuffix(tr(" min delay"))
         self.retry_delay_spin.setValue(5)
         retry_row.addWidget(self.retry_check)
         retry_row.addWidget(self.retry_delay_spin)
-        sg.addRow("Retry:", retry_row)
+        sg.addRow(tr("Retry:"), retry_row)
 
         gl.addWidget(sched_group)
 
         # ── Integrity Checks ───────────────────────────────────────────────
-        integ_group = QGroupBox("Integrity Checks")
+        integ_group = QGroupBox(tr("Integrity Checks"))
         integ_layout = QVBoxLayout(integ_group)
         integ_layout.setSpacing(8)
-        self.integrity_enabled_cb = QCheckBox("Enable scheduled backup integrity checks")
+        self.integrity_enabled_cb = QCheckBox(tr("Enable scheduled backup integrity checks"))
         self.integrity_enabled_cb.setToolTip(
-            "Periodically re-hashes each watch's most recent backup and compares\n"
+            tr("Periodically re-hashes each watch's most recent backup and compares\n"
             "it against the stored SHA-256 and manifest.  Failures trigger email\n"
-            "and webhook notifications using your existing notification settings."
+            "and webhook notifications using your existing notification settings.")
         )
         integ_layout.addWidget(self.integrity_enabled_cb)
         integ_row = QHBoxLayout()
-        integ_row.addWidget(QLabel("Check every"))
+        integ_row.addWidget(QLabel(tr("Check every")))
         self.integrity_interval_spin = QSpinBox()
         self.integrity_interval_spin.setRange(1, 365)
-        self.integrity_interval_spin.setSuffix(" day(s)")
+        self.integrity_interval_spin.setSuffix(tr(" day(s)"))
         self.integrity_interval_spin.setFixedWidth(110)
         integ_row.addWidget(self.integrity_interval_spin)
         integ_row.addStretch()
         integ_layout.addLayout(integ_row)
         _integ_note = QLabel(
-            "Each watch is checked on its own independent timer.\n"
-            "Requires at least one completed backup before the first check fires."
+            tr("Each watch is checked on its own independent timer.\n"
+            "Requires at least one completed backup before the first check fires.")
         )
         _integ_note.setStyleSheet("color: #888; font-size: 11px;")
         integ_layout.addWidget(_integ_note)
-        self._run_integrity_btn = QPushButton("🔍  Run Integrity Check Now")
+        self._run_integrity_btn = QPushButton(tr("🔍  Run Integrity Check Now"))
         self._run_integrity_btn.setToolTip(
-            "Immediately run an integrity check on all watches, bypassing the\n"
-            "scheduled interval. Useful after a restore or when troubleshooting."
+            tr("Immediately run an integrity check on all watches, bypassing the\n"
+            "scheduled interval. Useful after a restore or when troubleshooting.")
         )
         self._run_integrity_btn.clicked.connect(self._trigger_integrity_check_now)
         integ_layout.addWidget(self._run_integrity_btn)
         gl.addWidget(integ_group)
 
         # ── Global Scheduled Force-Full Backup ──────────────────────────────
-        ff_group = QGroupBox("Scheduled Force-Full Backup")
+        ff_group = QGroupBox(tr("Scheduled Force-Full Backup"))
         ff_layout = QVBoxLayout(ff_group)
         ff_layout.setSpacing(8)
         ff_row = QHBoxLayout()
-        ff_row.addWidget(QLabel("Force full backup every"))
+        ff_row.addWidget(QLabel(tr("Force full backup every")))
         self.force_full_global_spin = QSpinBox()
         self.force_full_global_spin.setRange(0, 3650)
-        self.force_full_global_spin.setSuffix(" days  (0 = disabled)")
+        self.force_full_global_spin.setSuffix(tr(" days  (0 = disabled)"))
         self.force_full_global_spin.setFixedWidth(160)
         self.force_full_global_spin.setToolTip(
-            "Discard the incremental snapshot and run a full backup every N days "
+            tr("Discard the incremental snapshot and run a full backup every N days "
             "across all watches.  Individual watches can override this in their "
-            "own settings (Watch Settings → Force full every)."
+            "own settings (Watch Settings → Force full every).")
         )
         ff_row.addWidget(self.force_full_global_spin)
         ff_row.addStretch()
         ff_layout.addLayout(ff_row)
         _ff_note = QLabel(
-            "0 = disabled (default).  Set e.g. 7 to force a full backup weekly.\n"
-            "Per-watch overrides take priority; set −1 on a watch to exempt it."
+            tr("0 = disabled (default).  Set e.g. 7 to force a full backup weekly.\n"
+            "Per-watch overrides take priority; set −1 on a watch to exempt it.")
         )
         _ff_note.setStyleSheet("color: #888; font-size: 11px;")
         ff_layout.addWidget(_ff_note)
         gl.addWidget(ff_group)
 
         # ── Startup / Auto-launch ───────────────────────────────────────────
-        startup_group = QGroupBox("Startup")
+        startup_group = QGroupBox(tr("Startup"))
         stl = QVBoxLayout(startup_group)
-        self.startup_check = QCheckBox("Start with Windows (runs in background)")
+        self.startup_check = QCheckBox(tr("Start with Windows (runs in background)"))
         self.startup_check.stateChanged.connect(self._toggle_startup)
         stl.addWidget(self.startup_check)
-        _startup_note = QLabel("Uncheck this box to stop BackupSys from launching at login.")
+        _startup_note = QLabel(tr("Uncheck this box to stop BackupSys from launching at login."))
         _startup_note.setWordWrap(True)
         _startup_note.setStyleSheet("color: #888; font-size: 11px;")
         stl.addWidget(_startup_note)
 
         # ── Auto-SACL for owned SMB shares ─────────────────────────────────
-        self.auto_sacl_smb_check = QCheckBox(
+        self.auto_sacl_smb_check = QCheckBox(tr(
             "Auto-enable file auditing on all shared folders owned by this PC (recommended)"
-        )
+        ))
         self.auto_sacl_smb_check.setToolTip(
-            "When enabled, BackupSys will automatically configure Windows object-auditing\n"
+            tr("When enabled, BackupSys will automatically configure Windows object-auditing\n"
             "(SACL) on every SMB share hosted by this PC at startup — even if you have\n"
             "not added those folders to your own watch list.\n\n"
             "This ensures that when a coworker's BackupSys app watches one of your shared\n"
@@ -15295,40 +16254,64 @@ class AdminPanel(QDialog):
             "(add / modify / delete / rename), so 'Change History' shows the real user\n"
             "name instead of 'Unknown'.\n\n"
             "Disabling this only affects folders you own but have not personally added\n"
-            "to your watches — your own watched folders are always audited."
+            "to your watches — your own watched folders are always audited.")
         )
         stl.addWidget(self.auto_sacl_smb_check)
-        _auto_sacl_note = QLabel(
+        _auto_sacl_note = QLabel(tr(
             "Requires Administrator approval (one-time UAC prompt per folder). "
             "Only applies to Windows shared folders hosted on this PC."
-        )
+        ))
         _auto_sacl_note.setWordWrap(True)
         _auto_sacl_note.setStyleSheet("color: #888; font-size: 11px;")
         stl.addWidget(_auto_sacl_note)
 
+        # ── Remote audit setup over SMB (opt-in, AV-sensitive) ──────────────
+        self.remote_smb_fallback_check = QCheckBox(tr(
+            "Configure a coworker's PC over SMB when WinRM/WMI are blocked (advanced)"
+        ))
+        self.remote_smb_fallback_check.setToolTip(
+            tr("When you watch a coworker's shared folder, BackupSys tries to set up\n"
+            "auditing on their PC automatically via WinRM, then WMI. If BOTH are\n"
+            "disabled (the 'RPC server is unavailable' error), enable this to fall\n"
+            "back to configuring it over SMB instead — using the admin credentials\n"
+            "you already saved for that watch. No action is needed on their PC.\n\n"
+            "This uses the same technique as PsExec (a temporary Windows service),\n"
+            "which some antivirus/EDR products flag as suspicious. Leave it OFF\n"
+            "unless you trust the network and understand the implication. Requires\n"
+            "administrator credentials for the target PC.")
+        )
+        stl.addWidget(self.remote_smb_fallback_check)
+        _smb_fb_note = QLabel(tr(
+            "Off by default. Only needed for coworker PCs where WinRM and WMI are "
+            "both disabled. May be flagged by antivirus."
+        ))
+        _smb_fb_note.setWordWrap(True)
+        _smb_fb_note.setStyleSheet("color: #888; font-size: 11px;")
+        stl.addWidget(_smb_fb_note)
+
         gl.addWidget(startup_group)
 
         # ── Auto-Shutdown ───────────────────────────────────────────────────
-        shutdown_group = QGroupBox("Auto-Shutdown")
+        shutdown_group = QGroupBox(tr("Auto-Shutdown"))
         sdl = QVBoxLayout(shutdown_group)
-        self.shutdown_check = QCheckBox("Shut down PC automatically when all backups complete")
+        self.shutdown_check = QCheckBox(tr("Shut down PC automatically when all backups complete"))
         self.shutdown_check.setToolTip(
-            "When enabled, BackupSys will shut down this computer once every\n"
+            tr("When enabled, BackupSys will shut down this computer once every\n"
             "active backup finishes. A 60-second countdown dialog will appear\n"
-            "first so you can cancel if needed."
+            "first so you can cancel if needed.")
         )
         sdl.addWidget(self.shutdown_check)
-        _shutdown_note = QLabel(
+        _shutdown_note = QLabel(tr(
             "Only triggers when a backup was started manually or by the scheduler — "
             "not on app launch.  A 60-second countdown lets you cancel."
-        )
+        ))
         _shutdown_note.setWordWrap(True)
         _shutdown_note.setStyleSheet("color: #888; font-size: 11px;")
         sdl.addWidget(_shutdown_note)
         gl.addWidget(shutdown_group)
 
         # ── Portable mode indicator ─────────────────────────────────────────
-        _portable_group = QGroupBox("Portable Mode")
+        _portable_group = QGroupBox(tr("Portable Mode"))
         _pl = QVBoxLayout(_portable_group)
         try:
             _is_portable = config_manager._IS_PORTABLE
@@ -15341,32 +16324,50 @@ class AdminPanel(QDialog):
             )
         else:
             _pm_label = QLabel(
-                "Portable mode is OFF.  To enable it, create an empty file named\n"
+                tr("Portable mode is OFF.  To enable it, create an empty file named\n"
                 "\"portable.flag\" next to desktop_app.py, then restart BackupSys.\n"
-                "All config, snapshots and logs will move into the app folder."
+                "All config, snapshots and logs will move into the app folder.")
             )
         _pm_label.setWordWrap(True)
         _pm_label.setStyleSheet("font-size: 11px;")
         _pl.addWidget(_pm_label)
         gl.addWidget(_portable_group)
 
-        pass_group = QGroupBox("Admin Password")
+        pass_group = QGroupBox(tr("Admin Password"))
         pl = QVBoxLayout(pass_group)
-        change_pw = QPushButton("Change Admin Password")
+        change_pw = QPushButton(tr("Change Admin Password"))
         change_pw.setObjectName("secondary")
         change_pw.clicked.connect(self._change_password)
         pl.addWidget(change_pw)
         gl.addWidget(pass_group)
 
+        # ── Language ─────────────────────────────────────────────────────────
+        lang_group = QGroupBox(tr("Language"))
+        lgl = QVBoxLayout(lang_group)
+        lgl.addWidget(QLabel(tr("Choose your language (applies after restart):")))
+        lang_row = QHBoxLayout()
+        self.lang_combo = QComboBox()
+        _cur_lang = QSettings(SETTINGS_ORG, SETTINGS_APP).value("language", "ja")
+        for _code, _name in available_languages().items():
+            self.lang_combo.addItem(_name, _code)
+            if _code == _cur_lang:
+                self.lang_combo.setCurrentIndex(self.lang_combo.count() - 1)
+        self.lang_combo.setFixedWidth(180)
+        self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
+        lang_row.addWidget(self.lang_combo)
+        lang_row.addStretch()
+        lgl.addLayout(lang_row)
+        gl.addWidget(lang_group)
+
         # ── Theme ──────────────────────────────────────────────────────────────
-        theme_group = QGroupBox("Appearance")
+        theme_group = QGroupBox(tr("Appearance"))
         thl = QVBoxLayout(theme_group)
-        thl.addWidget(QLabel("Choose a colour theme (takes effect immediately):"))
+        thl.addWidget(QLabel(tr("Choose a colour theme (takes effect immediately):")))
         theme_row = QHBoxLayout()
         _s_theme = QSettings(SETTINGS_ORG, SETTINGS_APP)
         _cur = _s_theme.value("theme", "dark")   # "dark" or "light"
-        self.theme_dark  = QRadioButton("Dark")
-        self.theme_light = QRadioButton("Light")
+        self.theme_dark  = QRadioButton(tr("Dark"))
+        self.theme_light = QRadioButton(tr("Light"))
         from PyQt6.QtWidgets import QButtonGroup
         self._theme_btn_group = QButtonGroup(self)
         self._theme_btn_group.addButton(self.theme_dark)
@@ -15385,26 +16386,26 @@ class AdminPanel(QDialog):
         gl.addStretch()
 
         footer_row = QHBoxLayout()
-        save_btn = QPushButton("Save Settings")
+        save_btn = QPushButton(tr("Save Settings"))
         save_btn.setObjectName("success")
         save_btn.clicked.connect(self._save_general)
         footer_row.addWidget(save_btn)
 
-        export_btn = QPushButton("📤 Export Config…")
+        export_btn = QPushButton(tr("📤 Export Config…"))
         export_btn.setObjectName("secondary")
-        export_btn.setToolTip(
+        export_btn.setToolTip(tr(
             "Save a copy of config.json (with passwords redacted) to a file you choose.\n"
             "Use this to back up your BackupSys configuration or move it to another PC."
-        )
+        ))
         export_btn.clicked.connect(self._export_config)
         footer_row.addWidget(export_btn)
 
-        import_btn = QPushButton("📥 Import Config…")
+        import_btn = QPushButton(tr("📥 Import Config…"))
         import_btn.setObjectName("secondary")
-        import_btn.setToolTip(
+        import_btn.setToolTip(tr(
             "Load a previously exported config file and merge it into your current configuration.\n"
             "Passwords will need to be re-entered."
-        )
+        ))
         import_btn.clicked.connect(self._import_config)
         footer_row.addWidget(import_btn)
         footer_row.addStretch()
@@ -15416,7 +16417,7 @@ class AdminPanel(QDialog):
         general.setWidgetResizable(True)
         general.setFrameShape(QFrame.Shape.NoFrame)
         general.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        tabs.addTab(general, "General")
+        tabs.addTab(general, tr("General"))
 
         # ── Tab 2: Watches ──────────────────────────────────────────────────
         self._watches_tab = QWidget()
@@ -15426,13 +16427,13 @@ class AdminPanel(QDialog):
         wl.setSpacing(12)
 
         btn_row = QHBoxLayout()
-        add_btn = QPushButton("➕ Add Watch")
+        add_btn = QPushButton(tr("➕ Add Watch"))
         add_btn.setObjectName("success")
-        add_btn.setToolTip("Add Watch (Ctrl+N)")
+        add_btn.setToolTip(tr("Add Watch (Ctrl+N)"))
         add_btn.clicked.connect(self._add_watch)
-        refresh_btn = QPushButton("↻ Refresh")
+        refresh_btn = QPushButton(tr("↻ Refresh"))
         refresh_btn.setObjectName("secondary")
-        refresh_btn.setToolTip("Refresh watch list (F5)")
+        refresh_btn.setToolTip(tr("Refresh watch list (F5)"))
         refresh_btn.clicked.connect(self._refresh_watch_table)
         btn_row.addStretch()
         btn_row.addWidget(refresh_btn)
@@ -15441,22 +16442,51 @@ class AdminPanel(QDialog):
 
         self.watch_table = QTableWidget(0, 13)
         self.watch_table.setHorizontalHeaderLabels([
-            "Name", "Path", "Status", "Last Backup", "Duration",
-            "Next Backup", "Runs", "Failed", "Size", "History", "Destination", "", ""
+            tr("Name"), tr("Path"), tr("Status"), tr("Last Backup"), tr("Duration"),
+            tr("Next Backup"), tr("Runs"), tr("Failed"), tr("Size"), tr("History"), tr("Destination"), "", ""
         ])
-        self.watch_table.horizontalHeaderItem(4).setToolTip("How long the last backup took to complete")
-        self.watch_table.horizontalHeaderItem(6).setToolTip("Total number of backups completed for this watch")
-        self.watch_table.horizontalHeaderItem(7).setToolTip("Number of backup attempts that failed")
-        self.watch_table.horizontalHeaderItem(8).setToolTip("Total size of all backup data for this watch")
-        for col in range(11):
-            self.watch_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        self.watch_table.horizontalHeader().setSectionResizeMode(1,  QHeaderView.ResizeMode.Stretch)
-        self.watch_table.horizontalHeader().setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
-        self.watch_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Fixed)
-        self.watch_table.horizontalHeader().setSectionResizeMode(12, QHeaderView.ResizeMode.Fixed)
-        self.watch_table.horizontalHeader().setMinimumSectionSize(60)
-        self.watch_table.horizontalHeader().resizeSection(11, 90)
-        self.watch_table.horizontalHeader().resizeSection(12, 110)  # was 80 — too narrow for "🗑 Remove"
+        self.watch_table.horizontalHeaderItem(4).setToolTip(tr("How long the last backup took to complete"))
+        self.watch_table.horizontalHeaderItem(6).setToolTip(tr("Total number of backups completed for this watch"))
+        self.watch_table.horizontalHeaderItem(7).setToolTip(tr("Number of backup attempts that failed"))
+        self.watch_table.horizontalHeaderItem(8).setToolTip(tr("Total size of all backup data for this watch"))
+        # Every column gets an explicit compact width — do NOT use ResizeToContents
+        # here.  ResizeToContents sizes each column to its *header* text, and the
+        # translated headers are long ("前回のバックアップ", "次回のバックアップ").
+        # The 13 columns then overflowed the window, which squeezed the Stretch
+        # column (Path) down to its minimum ("\...") AND pushed the last column —
+        # the 🗑 Remove button — off the right edge behind the h-scrollbar, so users
+        # could not find how to delete a watch at all.  Fixed widths keep the total
+        # bounded and guarantee both action buttons stay on screen.
+        _COL_W = {
+            0:  100,   # Name
+            2:   64,   # Status
+            3:   96,   # Last Backup
+            4:   76,   # Duration
+            5:   96,   # Next Backup
+            6:   52,   # Runs
+            7:   52,   # Failed
+            8:   68,   # Size
+            9:   64,   # History
+            10: 110,   # Destination
+            11:  76,   # ✏ Edit
+            12:  96,   # 🗑 Remove
+        }
+        _hdr = self.watch_table.horizontalHeader()
+        _hdr.setMinimumSectionSize(48)
+        for _c, _w in _COL_W.items():
+            _hdr.setSectionResizeMode(_c, QHeaderView.ResizeMode.Interactive)
+            _hdr.resizeSection(_c, _w)
+        # The two action columns must never be resized away by the user.
+        _hdr.setSectionResizeMode(11, QHeaderView.ResizeMode.Fixed)
+        _hdr.setSectionResizeMode(12, QHeaderView.ResizeMode.Fixed)
+        # Path (col 1) is the ONLY stretch column, so it absorbs all leftover width.
+        # Total fixed width is ~950px; AdminPanel's minimum width guarantees room
+        # for that plus a readable Path, so no horizontal scrollbar ever appears.
+        _hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        _hdr.setStretchLastSection(False)
+        # Elide long paths in the MIDDLE (\\host\share…\file) instead of the
+        # left, so both the server and the leaf folder stay visible.
+        self.watch_table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.watch_table.setMouseTracking(True)
         self.watch_table.viewport().setMouseTracking(True)
         self.watch_table.verticalHeader().setVisible(False)
@@ -15476,16 +16506,16 @@ class AdminPanel(QDialog):
         _folder_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _folder_icon.setStyleSheet("font-size: 52px; color: #374151;")
         _ev.addWidget(_folder_icon)
-        _empty_heading = QLabel("No watches yet")
+        _empty_heading = QLabel(tr("No watches yet"))
         _empty_heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _empty_heading.setStyleSheet("font-size: 16px; font-weight: 700; color: #9ca3af;")
         _ev.addWidget(_empty_heading)
-        _empty_sub = QLabel("Add a folder to start monitoring and backing it up automatically.")
+        _empty_sub = QLabel(tr("Add a folder to start monitoring and backing it up automatically."))
         _empty_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _empty_sub.setWordWrap(True)
         _empty_sub.setStyleSheet("font-size: 12px; color: #6b7280;")
         _ev.addWidget(_empty_sub)
-        _empty_add_btn = QPushButton("＋  Add Watch")
+        _empty_add_btn = QPushButton(tr("＋  Add Watch"))
         _empty_add_btn.setObjectName("success")
         _empty_add_btn.setStyleSheet("padding: 10px 32px; font-weight: 700; font-size: 13px;")
         _empty_add_btn.setMinimumWidth(160)
@@ -15499,7 +16529,7 @@ class AdminPanel(QDialog):
 
         # ── Search bar ───────────────────────────────────────────────────────
         self._watch_search = QLineEdit()
-        self._watch_search.setPlaceholderText("Search watches by name or path…")
+        self._watch_search.setPlaceholderText(tr("Search watches by name or path…"))
         self._watch_search.setClearButtonEnabled(True)
         self._watch_search.setFixedHeight(34)
         self._watch_search.setStyleSheet(
@@ -15520,7 +16550,7 @@ class AdminPanel(QDialog):
         _nm_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _nm_icon.setStyleSheet("font-size:36px;")
         _nm_v.addWidget(_nm_icon)
-        _nm_lbl = QLabel("No matches found")
+        _nm_lbl = QLabel(tr("No matches found"))
         _nm_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _nm_lbl.setStyleSheet("font-size:14px; font-weight:600; color:#9ca3af;")
         _nm_v.addWidget(_nm_lbl)
@@ -15533,7 +16563,7 @@ class AdminPanel(QDialog):
         self._watch_table_stack.addWidget(_no_matches)        # index 2
         wl.addWidget(self._watch_table_stack)
 
-        tabs.addTab(watches_tab, "Watches")
+        tabs.addTab(watches_tab, tr("Watches"))
 
         # ── Tab 3: Cloud ────────────────────────────────────────────────────
         self._cloud_tab = QWidget()
@@ -15543,8 +16573,8 @@ class AdminPanel(QDialog):
         cl.setSpacing(16)
 
         cloud_info = QLabel(
-            "Connect your cloud accounts below. Once connected, select a watch and assign "
-            "a cloud provider  · backups will upload automatically after each local backup."
+            tr("Connect your cloud accounts below. Once connected, select a watch and assign "
+            "a cloud provider  · backups will upload automatically after each local backup.")
         )
         cloud_info.setWordWrap(True)
         cloud_info.setStyleSheet("color:#6b7280; font-size:11px;")
@@ -15562,10 +16592,10 @@ class AdminPanel(QDialog):
 
         gd_text = QVBoxLayout()
         gd_text.setSpacing(2)
-        gd_title = QLabel("Google Drive")
+        gd_title = QLabel(tr("Google Drive"))
         gd_title.setStyleSheet("font-size:14px; font-weight:700; color:#f1f3f9;")
         gd_text.addWidget(gd_title)
-        self.gd_status_lbl = QLabel("Not connected")
+        self.gd_status_lbl = QLabel(tr("Not connected"))
         self.gd_status_lbl.setObjectName("status_err")
         gd_text.addWidget(self.gd_status_lbl)
         self.gd_quota_lbl = QLabel("")
@@ -15575,20 +16605,20 @@ class AdminPanel(QDialog):
         gd_layout.addLayout(gd_text, stretch=1)
 
         gd_btn_col = QVBoxLayout()
-        self.gd_connect_btn = QPushButton("Connect Google Drive")
+        self.gd_connect_btn = QPushButton(tr("Connect Google Drive"))
         self.gd_connect_btn.setObjectName("success")
         self.gd_connect_btn.clicked.connect(self._connect_gdrive)
         gd_btn_col.addWidget(self.gd_connect_btn)
-        self.gd_test_btn = QPushButton("Test Connection")
+        self.gd_test_btn = QPushButton(tr("Test Connection"))
         self.gd_test_btn.setObjectName("secondary")
         self.gd_test_btn.setVisible(False)
         self.gd_test_btn.setToolTip(
-            "Verify that the saved Google Drive token is still valid.\n"
-            "A silent token refresh is attempted automatically if it is about to expire."
+            tr("Verify that the saved Google Drive token is still valid.\n"
+            "A silent token refresh is attempted automatically if it is about to expire.")
         )
         self.gd_test_btn.clicked.connect(self._test_gdrive)
         gd_btn_col.addWidget(self.gd_test_btn)
-        self.gd_disconnect_btn = QPushButton("Disconnect")
+        self.gd_disconnect_btn = QPushButton(tr("Disconnect"))
         self.gd_disconnect_btn.setObjectName("danger")
         self.gd_disconnect_btn.setVisible(False)
         self.gd_disconnect_btn.clicked.connect(self._disconnect_gdrive)
@@ -15597,30 +16627,30 @@ class AdminPanel(QDialog):
         cl.addWidget(gd_card)
 
         # ── Assign cloud to watches (multi-select) ──────────────────────────────
-        assign_group = QGroupBox("Assign Cloud to Watches")
+        assign_group = QGroupBox(tr("Assign Cloud to Watches"))
         agl = QFormLayout(assign_group)
 
         # Multi-watch checklist: check any number of watches; Save applies to all
         self.cloud_watch_list = QListWidget()
         self.cloud_watch_list.setFixedHeight(90)
-        self.cloud_watch_list.setToolTip("Check every watch that should upload to this GDrive folder.")
-        agl.addRow("Watches:", self.cloud_watch_list)
+        self.cloud_watch_list.setToolTip(tr("Check every watch that should upload to this GDrive folder."))
+        agl.addRow(tr("Watches:"), self.cloud_watch_list)
 
         # Provider checkbox
         # (Removed chk_gdrive checkbox and related row)
 
         self.gd_folder_id = QLineEdit()
-        self.gd_folder_id.setPlaceholderText("Google Drive folder ID (leave blank for root)")
+        self.gd_folder_id.setPlaceholderText(tr("Google Drive folder ID (leave blank for root)"))
         self.gd_folder_id.setToolTip(
-            "The ID of the Drive folder where backups are stored."
+            tr("The ID of the Drive folder where backups are stored.")
         )
         gd_folder_row = QHBoxLayout()
         gd_folder_row.addWidget(self.gd_folder_id)
         gd_folder_widget = QWidget()
         gd_folder_widget.setLayout(gd_folder_row)
-        agl.addRow("GDrive folder:", gd_folder_widget)
+        agl.addRow(tr("GDrive folder:"), gd_folder_widget)
 
-        save_assign_btn = QPushButton("Save Assignment to All Checked Watches")
+        save_assign_btn = QPushButton(tr("Save Assignment to All Checked Watches"))
         save_assign_btn.setObjectName("success")
         save_assign_btn.clicked.connect(self._save_cloud)
         agl.addRow("", save_assign_btn)
@@ -15628,7 +16658,7 @@ class AdminPanel(QDialog):
 
         cl.addStretch()
 
-        tabs.addTab(cloud_tab, "Cloud")
+        tabs.addTab(cloud_tab, tr("Cloud"))
 
         # ── Tab 4: Notifications ────────────────────────────────────────────
         self._notif_inner = QWidget()
@@ -15638,54 +16668,54 @@ class AdminPanel(QDialog):
         nl.setSpacing(16)
 
         # ── Email section ────────────────────────────────────────────────────
-        email_group = QGroupBox("Email Notifications")
+        email_group = QGroupBox(tr("Email Notifications"))
         egl = QFormLayout(email_group)
         egl.setSpacing(8)
 
-        self.email_enabled_check = QCheckBox("Enable email notifications")
+        self.email_enabled_check = QCheckBox(tr("Enable email notifications"))
         egl.addRow("", self.email_enabled_check)
 
-        self.email_notify_success_check = QCheckBox("Send on successful backup")
+        self.email_notify_success_check = QCheckBox(tr("Send on successful backup"))
         egl.addRow("", self.email_notify_success_check)
 
-        self.email_notify_failure_check = QCheckBox("Send on failed backup")
+        self.email_notify_failure_check = QCheckBox(tr("Send on failed backup"))
         self.email_notify_failure_check.setChecked(True)   # default on  · failure alerts are more important
         egl.addRow("", self.email_notify_failure_check)
 
         self.email_smtp_host = QLineEdit()
-        self.email_smtp_host.setPlaceholderText("smtp.gmail.com")
-        egl.addRow("SMTP Host:", self.email_smtp_host)
+        self.email_smtp_host.setPlaceholderText(tr("smtp.gmail.com"))
+        egl.addRow(tr("SMTP Host:"), self.email_smtp_host)
 
         self.email_smtp_port = QSpinBox()
         self.email_smtp_port.setRange(1, 65535)
         self.email_smtp_port.setValue(587)
-        egl.addRow("SMTP Port:", self.email_smtp_port)
+        egl.addRow(tr("SMTP Port:"), self.email_smtp_port)
 
-        self.email_use_ssl = QCheckBox("Use SSL (port 465)")
+        self.email_use_ssl = QCheckBox(tr("Use SSL (port 465)"))
         egl.addRow("", self.email_use_ssl)
 
         self.email_username = QLineEdit()
-        self.email_username.setPlaceholderText("your@email.com")
-        egl.addRow("Username:", self.email_username)
+        self.email_username.setPlaceholderText(tr("your@email.com"))
+        egl.addRow(tr("Username:"), self.email_username)
 
         self.email_password = QLineEdit()
         self.email_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.email_password.setPlaceholderText("App password or SMTP password")
-        egl.addRow("Password:", self.email_password)
+        self.email_password.setPlaceholderText(tr("App password or SMTP password"))
+        egl.addRow(tr("Password:"), self.email_password)
 
         self.email_from = QLineEdit()
-        self.email_from.setPlaceholderText("backupsys@yourdomain.com (optional)")
-        egl.addRow("From Address:", self.email_from)
+        self.email_from.setPlaceholderText(tr("backupsys@yourdomain.com (optional)"))
+        egl.addRow(tr("From Address:"), self.email_from)
 
         self.email_to = QLineEdit()
-        self.email_to.setPlaceholderText("alerts@yourdomain.com")
-        egl.addRow("To Address:", self.email_to)
+        self.email_to.setPlaceholderText(tr("alerts@yourdomain.com"))
+        egl.addRow(tr("To Address:"), self.email_to)
 
         email_btn_row = QHBoxLayout()
-        save_email_btn = QPushButton("Save Email Settings")
+        save_email_btn = QPushButton(tr("Save Email Settings"))
         save_email_btn.setObjectName("success")
         save_email_btn.clicked.connect(self._save_email_settings)
-        test_email_btn = QPushButton("Send Test Email")
+        test_email_btn = QPushButton(tr("Send Test Email"))
         test_email_btn.setObjectName("secondary")
         test_email_btn.clicked.connect(self._test_email)
         email_btn_row.addWidget(save_email_btn)
@@ -15695,32 +16725,32 @@ class AdminPanel(QDialog):
         nl.addWidget(email_group)
 
         # ── Webhook section ──────────────────────────────────────────────────
-        webhook_group = QGroupBox("Webhook Notifications")
+        webhook_group = QGroupBox(tr("Webhook Notifications"))
         wgl = QFormLayout(webhook_group)
         wgl.setSpacing(8)
 
         self.webhook_url_input = QLineEdit()
-        self.webhook_url_input.setPlaceholderText("https://hooks.slack.com/… or https://your-api.com/webhook")
-        wgl.addRow("Webhook URL:", self.webhook_url_input)
+        self.webhook_url_input.setPlaceholderText(tr("https://hooks.slack.com/… or https://your-api.com/webhook"))
+        wgl.addRow(tr("Webhook URL:"), self.webhook_url_input)
 
-        self.webhook_success_only = QCheckBox("Only send on successful backup")
+        self.webhook_success_only = QCheckBox(tr("Only send on successful backup"))
         wgl.addRow("", self.webhook_success_only)
 
         webhook_note = QLabel(
-            "Backup results are sent as JSON via HTTP POST.  Works with Slack, Discord,\n"
+            tr("Backup results are sent as JSON via HTTP POST.  Works with Slack, Discord,\n"
             "Make/Zapier, or any custom API that accepts POST requests.\n"
             "Each payload includes a machine_id field (this machine's hostname) "
-            "so you can distinguish events when multiple machines share the same webhook URL."
+            "so you can distinguish events when multiple machines share the same webhook URL.")
         )
         webhook_note.setStyleSheet("color:#94a3b8; font-size:11px;")
         webhook_note.setWordWrap(True)
         wgl.addRow("", webhook_note)
 
         webhook_btn_row = QHBoxLayout()
-        save_webhook_btn = QPushButton("Save Webhook")
+        save_webhook_btn = QPushButton(tr("Save Webhook"))
         save_webhook_btn.setObjectName("success")
         save_webhook_btn.clicked.connect(self._save_webhook_settings)
-        test_webhook_btn = QPushButton("Send Test Ping")
+        test_webhook_btn = QPushButton(tr("Send Test Ping"))
         test_webhook_btn.setObjectName("secondary")
         test_webhook_btn.clicked.connect(self._test_webhook)
         webhook_btn_row.addWidget(save_webhook_btn)
@@ -15730,55 +16760,55 @@ class AdminPanel(QDialog):
         nl.addWidget(webhook_group)
 
         # ── ntfy.sh Push Notifications section ──────────────────────────────
-        ntfy_group = QGroupBox("Push Notifications (ntfy.sh)")
+        ntfy_group = QGroupBox(tr("Push Notifications (ntfy.sh)"))
         ngl = QFormLayout(ntfy_group)
         ngl.setSpacing(8)
 
-        self.ntfy_enabled_check = QCheckBox("Enable ntfy push notifications")
+        self.ntfy_enabled_check = QCheckBox(tr("Enable ntfy push notifications"))
         ngl.addRow("", self.ntfy_enabled_check)
 
-        self.ntfy_notify_success_check = QCheckBox("Send on successful backup")
+        self.ntfy_notify_success_check = QCheckBox(tr("Send on successful backup"))
         ngl.addRow("", self.ntfy_notify_success_check)
 
-        self.ntfy_notify_failure_check = QCheckBox("Send on failed backup")
+        self.ntfy_notify_failure_check = QCheckBox(tr("Send on failed backup"))
         self.ntfy_notify_failure_check.setChecked(True)
         ngl.addRow("", self.ntfy_notify_failure_check)
 
         self.ntfy_server_input = QLineEdit()
-        self.ntfy_server_input.setPlaceholderText("https://ntfy.sh  (or your self-hosted URL)")
-        self.ntfy_server_input.setText("https://ntfy.sh")
-        ngl.addRow("Server URL:", self.ntfy_server_input)
+        self.ntfy_server_input.setPlaceholderText(tr("https://ntfy.sh  (or your self-hosted URL)"))
+        self.ntfy_server_input.setText(tr("https://ntfy.sh"))
+        ngl.addRow(tr("Server URL:"), self.ntfy_server_input)
 
         self.ntfy_topic_input = QLineEdit()
-        self.ntfy_topic_input.setPlaceholderText("my-backupsys-alerts  (required)")
-        ngl.addRow("Topic:", self.ntfy_topic_input)
+        self.ntfy_topic_input.setPlaceholderText(tr("my-backupsys-alerts  (required)"))
+        ngl.addRow(tr("Topic:"), self.ntfy_topic_input)
 
         self.ntfy_token_input = QLineEdit()
         self.ntfy_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ntfy_token_input.setPlaceholderText("Bearer token (optional — for protected topics)")
-        ngl.addRow("Auth Token:", self.ntfy_token_input)
+        self.ntfy_token_input.setPlaceholderText(tr("Bearer token (optional — for protected topics)"))
+        ngl.addRow(tr("Auth Token:"), self.ntfy_token_input)
 
         self.ntfy_priority_combo = QComboBox()
         for _p in ["min", "low", "default", "high", "urgent"]:
             self.ntfy_priority_combo.addItem(_p)
         self.ntfy_priority_combo.setCurrentText("default")
-        ngl.addRow("Priority:", self.ntfy_priority_combo)
+        ngl.addRow(tr("Priority:"), self.ntfy_priority_combo)
 
         ntfy_note = QLabel(
-            "Delivers instant push notifications to your phone via the free ntfy.sh service\n"
+            tr("Delivers instant push notifications to your phone via the free ntfy.sh service\n"
             "or a self-hosted ntfy server.  Install the ntfy app (iOS / Android) and\n"
             "subscribe to your topic to receive alerts.\n"
-            "Tip: use a hard-to-guess topic name as a lightweight secret."
+            "Tip: use a hard-to-guess topic name as a lightweight secret.")
         )
         ntfy_note.setStyleSheet("color:#94a3b8; font-size:11px;")
         ntfy_note.setWordWrap(True)
         ngl.addRow("", ntfy_note)
 
         ntfy_btn_row = QHBoxLayout()
-        save_ntfy_btn = QPushButton("Save Push Settings")
+        save_ntfy_btn = QPushButton(tr("Save Push Settings"))
         save_ntfy_btn.setObjectName("success")
         save_ntfy_btn.clicked.connect(self._save_ntfy_settings)
-        test_ntfy_btn = QPushButton("Send Test Push")
+        test_ntfy_btn = QPushButton(tr("Send Test Push"))
         test_ntfy_btn.setObjectName("secondary")
         test_ntfy_btn.clicked.connect(self._test_ntfy)
         ntfy_btn_row.addWidget(save_ntfy_btn)
@@ -15788,43 +16818,43 @@ class AdminPanel(QDialog):
         nl.addWidget(ntfy_group)
 
         # ── Telegram Bot Notifications section ──────────────────────────────
-        tg_group = QGroupBox("Telegram Bot Notifications")
+        tg_group = QGroupBox(tr("Telegram Bot Notifications"))
         tgl = QFormLayout(tg_group)
         tgl.setSpacing(8)
 
-        self.tg_enabled_check = QCheckBox("Enable Telegram notifications")
+        self.tg_enabled_check = QCheckBox(tr("Enable Telegram notifications"))
         tgl.addRow("", self.tg_enabled_check)
 
-        self.tg_notify_success_check = QCheckBox("Send on successful backup")
+        self.tg_notify_success_check = QCheckBox(tr("Send on successful backup"))
         tgl.addRow("", self.tg_notify_success_check)
 
-        self.tg_notify_failure_check = QCheckBox("Send on failed backup")
+        self.tg_notify_failure_check = QCheckBox(tr("Send on failed backup"))
         self.tg_notify_failure_check.setChecked(True)
         tgl.addRow("", self.tg_notify_failure_check)
 
         self.tg_token_input = QLineEdit()
         self.tg_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.tg_token_input.setPlaceholderText("123456:ABC-DEFxxxxxxxxxxxxxxxxxxxxxxxx")
-        tgl.addRow("Bot Token:", self.tg_token_input)
+        self.tg_token_input.setPlaceholderText(tr("123456:ABC-DEFxxxxxxxxxxxxxxxxxxxxxxxx"))
+        tgl.addRow(tr("Bot Token:"), self.tg_token_input)
 
         self.tg_chat_id_input = QLineEdit()
-        self.tg_chat_id_input.setPlaceholderText("Your user ID or group/channel chat_id")
-        tgl.addRow("Chat ID:", self.tg_chat_id_input)
+        self.tg_chat_id_input.setPlaceholderText(tr("Your user ID or group/channel chat_id"))
+        tgl.addRow(tr("Chat ID:"), self.tg_chat_id_input)
 
         tg_note = QLabel(
-            "Get a bot token from @BotFather on Telegram (/newbot).\n"
+            tr("Get a bot token from @BotFather on Telegram (/newbot).\n"
             "Find your chat_id by messaging @userinfobot on Telegram.\n"
-            "Works for private messages, groups, and channels."
+            "Works for private messages, groups, and channels.")
         )
         tg_note.setStyleSheet("color:#94a3b8; font-size:11px;")
         tg_note.setWordWrap(True)
         tgl.addRow("", tg_note)
 
         tg_btn_row = QHBoxLayout()
-        save_tg_btn = QPushButton("Save Telegram Settings")
+        save_tg_btn = QPushButton(tr("Save Telegram Settings"))
         save_tg_btn.setObjectName("success")
         save_tg_btn.clicked.connect(self._save_telegram_settings)
-        test_tg_btn = QPushButton("Send Test Message")
+        test_tg_btn = QPushButton(tr("Send Test Message"))
         test_tg_btn.setObjectName("secondary")
         test_tg_btn.clicked.connect(self._test_telegram)
         tg_btn_row.addWidget(save_tg_btn)
@@ -15834,55 +16864,55 @@ class AdminPanel(QDialog):
         nl.addWidget(tg_group)
 
         # ── Pushover Notifications section ──────────────────────────────────
-        po_group = QGroupBox("Pushover Notifications")
+        po_group = QGroupBox(tr("Pushover Notifications"))
         pol = QFormLayout(po_group)
         pol.setSpacing(8)
 
-        self.po_enabled_check = QCheckBox("Enable Pushover notifications")
+        self.po_enabled_check = QCheckBox(tr("Enable Pushover notifications"))
         pol.addRow("", self.po_enabled_check)
 
-        self.po_notify_success_check = QCheckBox("Send on successful backup")
+        self.po_notify_success_check = QCheckBox(tr("Send on successful backup"))
         pol.addRow("", self.po_notify_success_check)
 
-        self.po_notify_failure_check = QCheckBox("Send on failed backup")
+        self.po_notify_failure_check = QCheckBox(tr("Send on failed backup"))
         self.po_notify_failure_check.setChecked(True)
         pol.addRow("", self.po_notify_failure_check)
 
         self.po_user_key_input = QLineEdit()
         self.po_user_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.po_user_key_input.setPlaceholderText("Your Pushover user key")
-        pol.addRow("User Key:", self.po_user_key_input)
+        self.po_user_key_input.setPlaceholderText(tr("Your Pushover user key"))
+        pol.addRow(tr("User Key:"), self.po_user_key_input)
 
         self.po_api_token_input = QLineEdit()
         self.po_api_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.po_api_token_input.setPlaceholderText("Your application API token")
-        pol.addRow("API Token:", self.po_api_token_input)
+        self.po_api_token_input.setPlaceholderText(tr("Your application API token"))
+        pol.addRow(tr("API Token:"), self.po_api_token_input)
 
         self.po_device_input = QLineEdit()
-        self.po_device_input.setPlaceholderText("Device name (leave blank for all devices)")
-        pol.addRow("Device:", self.po_device_input)
+        self.po_device_input.setPlaceholderText(tr("Device name (leave blank for all devices)"))
+        pol.addRow(tr("Device:"), self.po_device_input)
 
         self.po_priority_combo = QComboBox()
         for _lbl, _val in [("Lowest (-2)", -2), ("Low / Quiet (-1)", -1),
                             ("Normal (0)", 0), ("High (1)", 1)]:
             self.po_priority_combo.addItem(_lbl, _val)
         self.po_priority_combo.setCurrentIndex(2)   # Normal
-        pol.addRow("Failure Priority:", self.po_priority_combo)
+        pol.addRow(tr("Failure Priority:"), self.po_priority_combo)
 
         po_note = QLabel(
-            "Register at pushover.net — free 30-day trial, then a one-time $5 per platform.\n"
+            tr("Register at pushover.net — free 30-day trial, then a one-time $5 per platform.\n"
             "Create an application at pushover.net/apps/build to get an API token.\n"
-            "Priority 'High' will bypass Do Not Disturb on iOS/Android."
+            "Priority 'High' will bypass Do Not Disturb on iOS/Android.")
         )
         po_note.setStyleSheet("color:#94a3b8; font-size:11px;")
         po_note.setWordWrap(True)
         pol.addRow("", po_note)
 
         po_btn_row = QHBoxLayout()
-        save_po_btn = QPushButton("Save Pushover Settings")
+        save_po_btn = QPushButton(tr("Save Pushover Settings"))
         save_po_btn.setObjectName("success")
         save_po_btn.clicked.connect(self._save_pushover_settings)
-        test_po_btn = QPushButton("Send Test Push")
+        test_po_btn = QPushButton(tr("Send Test Push"))
         test_po_btn.setObjectName("secondary")
         test_po_btn.clicked.connect(self._test_pushover)
         po_btn_row.addWidget(save_po_btn)
@@ -15899,7 +16929,7 @@ class AdminPanel(QDialog):
         notif_scroll.setFrameShape(QFrame.Shape.NoFrame)
         notif_scroll.setWidget(notif_inner)
 
-        tabs.addTab(notif_scroll, "Notifications")
+        tabs.addTab(notif_scroll, tr("Notifications"))
 
         # ── Tab 5: Logs ────────────────────────────────────────────────────────
         logs_tab = QWidget()
@@ -15911,26 +16941,26 @@ class AdminPanel(QDialog):
         log_toolbar = QHBoxLayout()
 
         self._log_filter_input = QLineEdit()
-        self._log_filter_input.setPlaceholderText("Filter logs…")
+        self._log_filter_input.setPlaceholderText(tr("Filter logs…"))
         self._log_filter_input.setClearButtonEnabled(True)
         self._log_filter_input.textChanged.connect(self._apply_log_filter)
         log_toolbar.addWidget(self._log_filter_input, stretch=1)
 
-        self._log_tail_check = QCheckBox("Tail (follow)")
+        self._log_tail_check = QCheckBox(tr("Tail (follow)"))
         self._log_tail_check.setChecked(True)
         log_toolbar.addWidget(self._log_tail_check)
 
-        log_refresh_btn = QPushButton("🔄 Refresh")
+        log_refresh_btn = QPushButton(tr("🔄 Refresh"))
         log_refresh_btn.setObjectName("secondary")
         log_refresh_btn.clicked.connect(self._load_log_tab)
         log_toolbar.addWidget(log_refresh_btn)
 
-        log_clear_btn = QPushButton("🗑 Clear Log")
+        log_clear_btn = QPushButton(tr("🗑 Clear Log"))
         log_clear_btn.setObjectName("secondary")
         log_clear_btn.clicked.connect(self._clear_log_file)
         log_toolbar.addWidget(log_clear_btn)
 
-        log_export_btn = QPushButton("💾 Export Log")
+        log_export_btn = QPushButton(tr("💾 Export Log"))
         log_export_btn.setObjectName("secondary")
         log_export_btn.clicked.connect(self._export_log)
         log_toolbar.addWidget(log_export_btn)
@@ -15964,7 +16994,7 @@ class AdminPanel(QDialog):
         # Start polling when the Logs tab is visible; stop otherwise
         self._tabs.currentChanged.connect(self._on_tab_changed_log_poll)
 
-        tabs.addTab(logs_tab, "Logs")
+        tabs.addTab(logs_tab, tr("Logs"))
 
         # ── Tab 6: SSH Keys ────────────────────────────────────────────────────
         ssh_tab = QWidget()
@@ -15973,14 +17003,14 @@ class AdminPanel(QDialog):
         ssh_l.setSpacing(14)
 
         # Key generation group
-        keygen_group = QGroupBox("SSH Key Pair")
+        keygen_group = QGroupBox(tr("SSH Key Pair"))
         keygen_layout = QVBoxLayout(keygen_group)
         keygen_layout.setSpacing(8)
 
         keygen_info = QLabel(
-            "BackupSys can generate an Ed25519 key pair for password-less SFTP authentication. "
+            tr("BackupSys can generate an Ed25519 key pair for password-less SFTP authentication. "
             "The private key is saved to <code>~/.backupsys_keys/id_ed25519</code> and used "
-            "automatically when no password is entered in the SFTP settings."
+            "automatically when no password is entered in the SFTP settings.")
         )
         keygen_info.setTextFormat(Qt.TextFormat.RichText)
         keygen_info.setWordWrap(True)
@@ -15988,7 +17018,7 @@ class AdminPanel(QDialog):
         keygen_layout.addWidget(keygen_info)
 
         keygen_btn_row = QHBoxLayout()
-        self._keygen_btn = QPushButton("⚡ Generate Ed25519 Key Pair")
+        self._keygen_btn = QPushButton(tr("⚡ Generate Ed25519 Key Pair"))
         self._keygen_btn.setObjectName("secondary")
         self._keygen_btn.clicked.connect(self._generate_ssh_key)
         keygen_btn_row.addWidget(self._keygen_btn)
@@ -15997,14 +17027,14 @@ class AdminPanel(QDialog):
 
         self._pubkey_edit = QPlainTextEdit()
         self._pubkey_edit.setReadOnly(True)
-        self._pubkey_edit.setPlaceholderText("No key generated yet — click Generate above.")
+        self._pubkey_edit.setPlaceholderText(tr("No key generated yet — click Generate above."))
         self._pubkey_edit.setMaximumHeight(72)
         self._pubkey_edit.setStyleSheet(
             "background:#0f172a; color:#a3e635; font-family:monospace; font-size:11px; border-radius:4px;"
         )
         keygen_layout.addWidget(self._pubkey_edit)
 
-        copy_key_btn = QPushButton("📋 Copy Public Key")
+        copy_key_btn = QPushButton(tr("📋 Copy Public Key"))
         copy_key_btn.setObjectName("secondary")
         copy_key_btn.clicked.connect(self._copy_public_key)
         keygen_layout.addWidget(copy_key_btn)
@@ -16012,20 +17042,20 @@ class AdminPanel(QDialog):
         ssh_l.addWidget(keygen_group)
 
         # Known-hosts management group
-        hosts_group = QGroupBox("Trusted Host Fingerprints  (~/.backupsys_known_hosts)")
+        hosts_group = QGroupBox(tr("Trusted Host Fingerprints  (~/.backupsys_known_hosts)"))
         hosts_layout = QVBoxLayout(hosts_group)
         hosts_layout.setSpacing(6)
 
         hosts_info = QLabel(
-            "On first SFTP connection BackupSys trusts the server automatically (TOFU). "
-            "Remove a host entry here to force re-verification on the next connection."
+            tr("On first SFTP connection BackupSys trusts the server automatically (TOFU). "
+            "Remove a host entry here to force re-verification on the next connection.")
         )
         hosts_info.setWordWrap(True)
         hosts_info.setStyleSheet("color:#94a3b8; font-size:11px;")
         hosts_layout.addWidget(hosts_info)
 
         self._known_hosts_table = QTableWidget(0, 3)
-        self._known_hosts_table.setHorizontalHeaderLabels(["Host", "Key Type", "Fingerprint (SHA-256)"])
+        self._known_hosts_table.setHorizontalHeaderLabels([tr("Host"), tr("Key Type"), tr("Fingerprint (SHA-256)")])
         self._known_hosts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self._known_hosts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._known_hosts_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -16035,10 +17065,10 @@ class AdminPanel(QDialog):
         hosts_layout.addWidget(self._known_hosts_table)
 
         hosts_btn_row = QHBoxLayout()
-        refresh_hosts_btn = QPushButton("↻ Refresh")
+        refresh_hosts_btn = QPushButton(tr("↻ Refresh"))
         refresh_hosts_btn.setObjectName("secondary")
         refresh_hosts_btn.clicked.connect(self._load_known_hosts)
-        remove_host_btn = QPushButton("🗑 Remove Selected")
+        remove_host_btn = QPushButton(tr("🗑 Remove Selected"))
         remove_host_btn.setObjectName("danger")
         remove_host_btn.clicked.connect(self._remove_selected_known_host)
         hosts_btn_row.addWidget(refresh_hosts_btn)
@@ -16049,7 +17079,7 @@ class AdminPanel(QDialog):
         ssh_l.addWidget(hosts_group)
         ssh_l.addStretch()
 
-        tabs.addTab(ssh_tab, "SSH Keys")
+        tabs.addTab(ssh_tab, tr("SSH Keys"))
         # Populate known-hosts and existing key (if any) immediately
         QTimer.singleShot(0, self._load_known_hosts)
         QTimer.singleShot(0, self._refresh_pubkey_display)
@@ -16102,20 +17132,20 @@ class AdminPanel(QDialog):
             "path": self.rclone_path.text().strip(),
         }
         if not cfg["remote"]:
-            QMessageBox.warning(self, "Missing", "Please enter an rclone remote name first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an rclone remote name first."))
             return
         try:
             from transport_utils import test_rclone_connection
             result = test_rclone_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "rclone Test Failed", str(e))
+            QMessageBox.critical(self, tr("rclone Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "rclone  ·  Connected ✓",
+            QMessageBox.information(self, tr("rclone  ·  Connected ✓"),
                 f"{result.get('message', 'rclone can access the remote')}")
         else:
-            QMessageBox.critical(self, "rclone  ·  Failed",
-                f"Could not connect:\n\n{result.get('message', 'Unknown error')}")
+            QMessageBox.critical(self, tr("rclone  ·  Failed"),
+                tr("Could not connect:\n\n{p0}", p0=result.get('message', 'Unknown error')))
 
     # ── rclone wizard helpers ──────────────────────────────────────────────
 
@@ -16130,24 +17160,24 @@ class AdminPanel(QDialog):
             )
         except FileNotFoundError:
             QMessageBox.critical(
-                self, "rclone not found",
-                "rclone is not installed or not on PATH.\n\n"
-                "Download it from https://rclone.org/downloads/ and re-try.",
+                self, tr("rclone not found"),
+                tr("rclone is not installed or not on PATH.\n\n"
+                "Download it from https://rclone.org/downloads/ and re-try."),
             )
             return
         except subprocess.TimeoutExpired:
-            QMessageBox.warning(self, "Timeout", "rclone listremotes timed out after 10 s.")
+            QMessageBox.warning(self, tr("Timeout"), tr("rclone listremotes timed out after 10 s."))
             return
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            QMessageBox.critical(self, tr("Error"), str(exc))
             return
 
         remotes = [r.rstrip(":").strip() for r in proc.stdout.splitlines() if r.strip()]
         if not remotes:
             QMessageBox.information(
-                self, "No remotes found",
-                "rclone reported no configured remotes.\n\n"
-                "Click '⚙ rclone config…' to add one.",
+                self, tr("No remotes found"),
+                tr("rclone reported no configured remotes.\n\n"
+                "Click '⚙ rclone config…' to add one."),
             )
             return
 
@@ -16185,8 +17215,8 @@ class AdminPanel(QDialog):
                         continue
         except Exception as exc:
             QMessageBox.warning(
-                self, "Could not open terminal",
-                f"Please open a terminal manually and run:\n    rclone config\n\nError: {exc}",
+                self, tr("Could not open terminal"),
+                tr("Please open a terminal manually and run:\n    rclone config\n\nError: {p0}", p0=exc),
             )
 
     # ── SSH key management helpers ─────────────────────────────────────────
@@ -16216,8 +17246,8 @@ class AdminPanel(QDialog):
 
         if privkey.exists():
             ans = QMessageBox.question(
-                self, "Key already exists",
-                f"A key already exists at:\n{privkey}\n\nOverwrite it?",
+                self, tr("Key already exists"),
+                tr("A key already exists at:\n{p0}\n\nOverwrite it?", p0=privkey),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if ans != QMessageBox.StandardButton.Yes:
@@ -16227,8 +17257,8 @@ class AdminPanel(QDialog):
             import paramiko
         except ImportError:
             QMessageBox.critical(
-                self, "paramiko not installed",
-                "Install paramiko to use SSH key generation:\n    pip install paramiko",
+                self, tr("paramiko not installed"),
+                tr("Install paramiko to use SSH key generation:\n    pip install paramiko"),
             )
             return
 
@@ -16240,20 +17270,19 @@ class AdminPanel(QDialog):
             pubkey.write_text(pub_line + "\n", encoding="utf-8")
             self._pubkey_edit.setPlainText(pub_line)
             QMessageBox.information(
-                self, "Key generated ✓",
-                f"Ed25519 key pair created.\n\nPrivate key: {privkey}\nPublic key:  {pubkey}\n\n"
-                "Copy the public key and add it to ~/.ssh/authorized_keys on your SFTP server.",
+                self, tr("Key generated ✓"),
+                tr("Ed25519 key pair created.\n\nPrivate key: {p0}\nPublic key:  {p1}\n\nCopy the public key and add it to ~/.ssh/authorized_keys on your SFTP server.", p0=privkey, p1=pubkey),
             )
         except Exception as exc:
-            QMessageBox.critical(self, "Key generation failed", str(exc))
+            QMessageBox.critical(self, tr("Key generation failed"), str(exc))
 
     def _copy_public_key(self):
         text = self._pubkey_edit.toPlainText().strip()
         if not text:
-            QMessageBox.information(self, "Nothing to copy", "Generate a key pair first.")
+            QMessageBox.information(self, tr("Nothing to copy"), tr("Generate a key pair first."))
             return
         QApplication.clipboard().setText(text)
-        QMessageBox.information(self, "Copied", "Public key copied to clipboard.")
+        QMessageBox.information(self, tr("Copied"), tr("Public key copied to clipboard."))
 
     def _load_known_hosts(self):
         """Load ~/.backupsys_known_hosts into the table widget."""
@@ -16289,15 +17318,14 @@ class AdminPanel(QDialog):
         """Remove the selected host entry from ~/.backupsys_known_hosts."""
         rows = self._known_hosts_table.selectedItems()
         if not rows:
-            QMessageBox.information(self, "No selection", "Select a row to remove.")
+            QMessageBox.information(self, tr("No selection"), tr("Select a row to remove."))
             return
         row_idx = self._known_hosts_table.currentRow()
         host_id = self._known_hosts_table.item(row_idx, 0).text()
 
         ans = QMessageBox.question(
-            self, "Remove host?",
-            f"Remove trusted fingerprint for:\n  {host_id}\n\n"
-            "BackupSys will re-verify on the next SFTP connection.",
+            self, tr("Remove host?"),
+            tr("Remove trusted fingerprint for:\n  {p0}\n\nBackupSys will re-verify on the next SFTP connection.", p0=host_id),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans != QMessageBox.StandardButton.Yes:
@@ -16310,7 +17338,7 @@ class AdminPanel(QDialog):
             kh_path.write_text("".join(kept), encoding="utf-8")
             self._known_hosts_table.removeRow(row_idx)
         except Exception as exc:
-            QMessageBox.critical(self, "Error removing host", str(exc))
+            QMessageBox.critical(self, tr("Error removing host"), str(exc))
 
     def _test_sftp(self):
         cfg = {
@@ -16323,20 +17351,20 @@ class AdminPanel(QDialog):
             "key_pass": self.sftp_key_pass.text(),
         }
         if not cfg["host"]:
-            QMessageBox.warning(self, "Missing", "Please enter an SFTP host first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an SFTP host first."))
             return
         try:
             from transport_utils import test_sftp_connection
             result = test_sftp_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "SFTP Test Failed", str(e))
+            QMessageBox.critical(self, tr("SFTP Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "SFTP  ·  Connected ✓",
-                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+            QMessageBox.information(self, tr("SFTP  ·  Connected ✓"),
+                tr("Successfully connected to:\n{p0}:{p1}", p0=cfg['host'], p1=cfg['port']))
         else:
-            QMessageBox.critical(self, "SFTP  ·  Failed",
-                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
+            QMessageBox.critical(self, tr("SFTP  ·  Failed"),
+                tr("Could not connect:\n\n{p0}", p0=result.get('error', 'Unknown error')))
 
     def _test_ftp(self):
         cfg = {
@@ -16347,20 +17375,20 @@ class AdminPanel(QDialog):
             "path": self.ftp_path.text().strip(),
         }
         if not cfg["host"]:
-            QMessageBox.warning(self, "Missing", "Please enter an FTP host first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an FTP host first."))
             return
         try:
             from transport_utils import test_ftp_connection
             result = test_ftp_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "FTP Test Failed", str(e))
+            QMessageBox.critical(self, tr("FTP Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "FTP  ·  Connected ✓",
-                f"Successfully connected to:\n{cfg['host']}:{cfg['port']}")
+            QMessageBox.information(self, tr("FTP  ·  Connected ✓"),
+                tr("Successfully connected to:\n{p0}:{p1}", p0=cfg['host'], p1=cfg['port']))
         else:
-            QMessageBox.critical(self, "FTP  ·  Failed",
-                f'Could not connect:\n\n{result.get("error", "Unknown error")}')
+            QMessageBox.critical(self, tr("FTP  ·  Failed"),
+                tr("Could not connect:\n\n{p0}", p0=result.get('error', 'Unknown error')))
 
     def _test_https(self):
         cfg = {
@@ -16369,20 +17397,20 @@ class AdminPanel(QDialog):
             "verify_ssl": self.https_verify_ssl.isChecked(),
         }
         if not cfg["url"]:
-            QMessageBox.warning(self, "Missing", "Please enter an endpoint URL first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an endpoint URL first."))
             return
         try:
             from transport_utils import test_https_connection
             result = test_https_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "HTTPS Test Failed", str(e))
+            QMessageBox.critical(self, tr("HTTPS Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "HTTPS  ·  Connected ✓",
-                f"Endpoint reachable:\n{cfg['url']}\n\nHTTP status: {result.get('status_code', 'n/a')}")
+            QMessageBox.information(self, tr("HTTPS  ·  Connected ✓"),
+                tr("Endpoint reachable:\n{p0}\n\nHTTP status: {p1}", p0=cfg['url'], p1=result.get('status_code', 'n/a')))
         else:
-            QMessageBox.critical(self, "HTTPS  ·  Failed",
-                f'Could not reach endpoint:\n\n{result.get("error", "Unknown error")}')
+            QMessageBox.critical(self, tr("HTTPS  ·  Failed"),
+                tr("Could not reach endpoint:\n\n{p0}", p0=result.get('error', 'Unknown error')))
 
     def _test_webdav(self):
         cfg = {
@@ -16393,25 +17421,20 @@ class AdminPanel(QDialog):
             "verify_ssl":  self.webdav_ssl.isChecked(),
         }
         if not cfg["url"]:
-            QMessageBox.warning(self, "Missing", "Please enter the WebDAV URL first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter the WebDAV URL first."))
             return
         try:
             from transport_utils import test_webdav_connection
             result = test_webdav_connection(cfg)
         except Exception as e:
-            QMessageBox.critical(self, "WebDAV Test Failed", str(e))
+            QMessageBox.critical(self, tr("WebDAV Test Failed"), str(e))
             return
         if result.get("ok"):
-            QMessageBox.information(self, "WebDAV  ·  Connected ✓",
-                f"WebDAV server reachable:\n{cfg['url']}\n\n"
-                "PROPFIND succeeded — credentials and URL are correct.")
+            QMessageBox.information(self, tr("WebDAV  ·  Connected ✓"),
+                tr("WebDAV server reachable:\n{p0}\n\nPROPFIND succeeded \u2014 credentials and URL are correct.", p0=cfg['url']))
         else:
-            QMessageBox.critical(self, "WebDAV  ·  Failed",
-                f'Could not connect:\n\n{result.get("error", "Unknown error")}\n\n'
-                "Tips:\n"
-                "• Nextcloud DAV root: /remote.php/dav/files/<USERNAME>/\n"
-                "• ownCloud DAV root: /remote.php/webdav/\n"
-                "• Plain WebDAV: leave DAV root empty")
+            QMessageBox.critical(self, tr("WebDAV  ·  Failed"),
+                tr("Could not connect:\n\n{p0}\n\nTips:\n\u2022 Nextcloud DAV root: /remote.php/dav/files/<USERNAME>/\n\u2022 ownCloud DAV root: /remote.php/webdav/\n\u2022 Plain WebDAV: leave DAV root empty", p0=result.get('error', 'Unknown error')))
 
     def _trigger_integrity_check_now(self):
         """Delegate integrity check to the MainWindow instance (parent)."""
@@ -16420,9 +17443,9 @@ class AdminPanel(QDialog):
             main_win._trigger_integrity_check_now()
         else:
             QMessageBox.information(
-                self, "Integrity Check",
-                "Could not reach the main window to trigger an integrity check.\n"
-                "Please use the tray menu or restart the application."
+                self, tr("Integrity Check"),
+                tr("Could not reach the main window to trigger an integrity check.\n"
+                "Please use the tray menu or restart the application.")
             )
 
     def _on_interval_unit_changed(self, idx):
@@ -16518,6 +17541,7 @@ class AdminPanel(QDialog):
         self.startup_check.setChecked(self._is_startup_enabled())
         self.shutdown_check.setChecked(self.cfg.get("auto_shutdown_on_complete", False))
         self.auto_sacl_smb_check.setChecked(self.cfg.get("auto_sacl_owned_smb_shares", True))
+        self.remote_smb_fallback_check.setChecked(self.cfg.get("remote_setup_smb_fallback", False))
         self._refresh_watch_table()
         self._refresh_cloud_combo()
         self._check_cloud_connections()
@@ -16698,7 +17722,7 @@ class AdminPanel(QDialog):
             # Build a helpful dialog with a "Create .env template" button
             # so the user can get started without manual file editing.
             _dlg = QDialog(self)
-            _dlg.setWindowTitle("Google Drive — not configured")
+            _dlg.setWindowTitle(tr("Google Drive — not configured"))
             _dlg.setMinimumWidth(480)
             _vlay = QVBoxLayout(_dlg)
             _vlay.setSpacing(10)
@@ -16719,9 +17743,9 @@ class AdminPanel(QDialog):
             _vlay.addWidget(_msg)
 
             _btn_row = QHBoxLayout()
-            _create_btn = QPushButton("📄  Create .env template")
-            _open_btn   = QPushButton("📂  Open folder")
-            _close_btn  = QPushButton("Close")
+            _create_btn = QPushButton(tr("📄  Create .env template"))
+            _open_btn   = QPushButton(tr("📂  Open folder"))
+            _close_btn  = QPushButton(tr("Close"))
             _close_btn.setDefault(True)
             _btn_row.addWidget(_create_btn)
             _btn_row.addWidget(_open_btn)
@@ -16743,7 +17767,7 @@ class AdminPanel(QDialog):
                     subprocess.Popen(["notepad.exe", str(env_path)], creationflags=_WIN_NO_WINDOW)
                     _dlg.accept()
                 except Exception as _ce:
-                    QMessageBox.warning(_dlg, "Error", f"Could not create file:\n{_ce}")
+                    QMessageBox.warning(_dlg, tr("Error"), tr("Could not create file:\n{p0}", p0=_ce))
 
             def _open_folder():
                 import subprocess
@@ -16785,9 +17809,8 @@ class AdminPanel(QDialog):
         try:
             srv = HTTPServer(("localhost", 0), _Handler)
         except Exception as e:
-            QMessageBox.critical(self, "Google Drive",
-                f"Could not start local OAuth server:\n{e}\n\n"
-                "Try again or check your firewall settings.")
+            QMessageBox.critical(self, tr("Google Drive"),
+                tr("Could not start local OAuth server:\n{p0}\n\nTry again or check your firewall settings.", p0=e))
             return
 
         actual_port = srv.server_address[1]
@@ -16807,7 +17830,7 @@ class AdminPanel(QDialog):
         }
         url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
 
-        self.gd_connect_btn.setText("Waiting for login…")
+        self.gd_connect_btn.setText(tr("Waiting for login…"))
         self.gd_connect_btn.setEnabled(False)
         webbrowser.open(url)
 
@@ -16915,14 +17938,14 @@ class AdminPanel(QDialog):
 
         # Show a placeholder label immediately so the UI updates without waiting
         # for the userinfo network call.
-        self.gd_status_lbl.setText("✓ Connected")
+        self.gd_status_lbl.setText(tr("✓ Connected"))
         self.gd_status_lbl.setObjectName("status_ok")
         self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
         self.gd_status_lbl.style().polish(self.gd_status_lbl)
         self.gd_connect_btn.setVisible(False)
         self.gd_test_btn.setVisible(True)
         self.gd_disconnect_btn.setVisible(True)
-        QMessageBox.information(self, "Google Drive", "Google Drive connected successfully!")
+        QMessageBox.information(self, tr("Google Drive"), tr("Google Drive connected successfully!"))
 
         # Fetch the connected account email in the background so the status
         # label updates to "✓ Connected as you@gmail.com" without blocking the UI.
@@ -17006,13 +18029,8 @@ class AdminPanel(QDialog):
                 err_str = str(exc)
                 logger.warning(f"⚠ Google Drive write test failed: {err_str}")
                 QTimer.singleShot(0, lambda: QMessageBox.warning(
-                    self, "Google Drive — Write Test Failed",
-                    f"Connected but the upload test failed:\n\n{err_str}\n\n"
-                    "Possible causes:\n"
-                    "  • The drive.file scope was not granted\n"
-                    "  • The account lacks Drive storage space\n"
-                    "  • A network error occurred\n\n"
-                    "Backups may fail. Try disconnecting and reconnecting Google Drive."
+                    self, tr("Google Drive — Write Test Failed"),
+                    tr("Connected but the upload test failed:\n\n{p0}\n\nPossible causes:\n  \u2022 The drive.file scope was not granted\n  \u2022 The account lacks Drive storage space\n  \u2022 A network error occurred\n\nBackups may fail. Try disconnecting and reconnecting Google Drive.", p0=err_str)
                 ))
 
         threading.Thread(target=_run, daemon=True).start()
@@ -17025,31 +18043,31 @@ class AdminPanel(QDialog):
         saved email without making a network call.
         """
         if email:
-            self.gd_status_lbl.setText(f"✓ Connected as {email}")
+            self.gd_status_lbl.setText("✓ " + tr("Connected as {email}", email=email))
         else:
-            self.gd_status_lbl.setText("✓ Connected")
+            self.gd_status_lbl.setText(tr("✓ Connected"))
         self.gd_status_lbl.setObjectName("status_ok")
         self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
         self.gd_status_lbl.style().polish(self.gd_status_lbl)
 
     def _gdrive_connect_failed(self, err=""):
-        self.gd_connect_btn.setText("Connect Google Drive")
+        self.gd_connect_btn.setText(tr("Connect Google Drive"))
         self.gd_connect_btn.setEnabled(True)
-        QMessageBox.critical(self, "Google Drive", f"Connection failed: {err}")
+        QMessageBox.critical(self, tr("Google Drive"), tr("Connection failed: {p0}", p0=err))
 
     def _disconnect_gdrive(self):
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         s.remove("gdrive_access_token")
         s.remove("gdrive_refresh_token")
         s.remove("gdrive_email")
-        self.gd_status_lbl.setText("Not connected")
+        self.gd_status_lbl.setText(tr("Not connected"))
         self.gd_status_lbl.setObjectName("status_err")
         self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
         self.gd_status_lbl.style().polish(self.gd_status_lbl)
         self.gd_quota_lbl.setVisible(False)
         self.gd_quota_lbl.setText("")
         self.gd_connect_btn.setVisible(True)
-        self.gd_connect_btn.setText("Connect Google Drive")
+        self.gd_connect_btn.setText(tr("Connect Google Drive"))
         self.gd_connect_btn.setEnabled(True)
         self.gd_test_btn.setVisible(False)
         self.gd_disconnect_btn.setVisible(False)
@@ -17066,7 +18084,7 @@ class AdminPanel(QDialog):
         from transport_utils import test_gdrive_connection
 
         self.gd_test_btn.setEnabled(False)
-        self.gd_test_btn.setText("Testing…")
+        self.gd_test_btn.setText(tr("Testing…"))
 
         s = QSettings(SETTINGS_ORG, SETTINGS_APP)
         cloud_config = {
@@ -17082,20 +18100,20 @@ class AdminPanel(QDialog):
 
         def _done(result):
             self.gd_test_btn.setEnabled(True)
-            self.gd_test_btn.setText("Test Connection")
+            self.gd_test_btn.setText(tr("Test Connection"))
             if result["ok"]:
                 QMessageBox.information(
-                    self, "Google Drive — Connection OK",
+                    self, tr("Google Drive — Connection OK"),
                     f"✓ {result['detail']}"
                 )
                 saved_email = QSettings(SETTINGS_ORG, SETTINGS_APP).value("gdrive_email", "")
                 self._set_gdrive_status_label(saved_email)
             else:
                 QMessageBox.warning(
-                    self, "Google Drive — Connection Failed",
+                    self, tr("Google Drive — Connection Failed"),
                     f"✗ {result['detail']}"
                 )
-                self.gd_status_lbl.setText("⚠ Token issue — test again or reconnect")
+                self.gd_status_lbl.setText(tr("⚠ Token issue — test again or reconnect"))
                 self.gd_status_lbl.setObjectName("status_err")
                 self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
                 self.gd_status_lbl.style().polish(self.gd_status_lbl)
@@ -17240,7 +18258,7 @@ class AdminPanel(QDialog):
                 import config_manager as _cm
                 _cm.save(self.cfg)
                 from PyQt6.QtCore import QTimer
-                QTimer.singleShot(0, lambda: self._append_log("🔄 Google Drive token refreshed silently"))
+                QTimer.singleShot(0, lambda: self._append_log(tr("🔄 Google Drive token refreshed silently")))
                 return True
         except Exception:
             pass
@@ -17253,12 +18271,12 @@ class AdminPanel(QDialog):
             name = "Google Drive"
             # 1. Update Cloud tab status label
             if provider == "gdrive" and hasattr(self, "gd_status_lbl"):
-                self.gd_status_lbl.setText("⚠ Token expired  · reconnect")
+                self.gd_status_lbl.setText(tr("⚠ Token expired  · reconnect"))
                 self.gd_status_lbl.setObjectName("status_err")
                 self.gd_status_lbl.style().unpolish(self.gd_status_lbl)
                 self.gd_status_lbl.style().polish(self.gd_status_lbl)
                 self.gd_connect_btn.setVisible(True)
-                self.gd_connect_btn.setText("🔄 Reconnect Google Drive")
+                self.gd_connect_btn.setText(tr("🔄 Reconnect Google Drive"))
                 self.gd_test_btn.setVisible(False)
             # 2. Tray notification
             if hasattr(self, "_tray"):
@@ -17271,7 +18289,7 @@ class AdminPanel(QDialog):
             # 3. Log
             if hasattr(self, "log_text"):
                 self._append_log(
-                    f"⚠ {name} token expired  · go to Settings >Cloud tab to reconnect"
+                    tr("\u26a0 {p0} token expired  \u00b7 go to Settings >Cloud tab to reconnect", p0=name)
                 )
 
     def _save_cloud(self):
@@ -17284,15 +18302,15 @@ class AdminPanel(QDialog):
                 checked_wids.append(item.data(Qt.ItemDataRole.UserRole))
 
         if not checked_wids:
-            QMessageBox.warning(self, "No Watch Selected",
-                "Please check at least one watch in the list above.")
+            QMessageBox.warning(self, tr("No Watch Selected"),
+                tr("Please check at least one watch in the list above."))
             return
 
         s      = QSettings(SETTINGS_ORG, SETTINGS_APP)
         # Always use GDrive for all checked watches
         token = s.value("gdrive_access_token", "")
         if not token:
-            QMessageBox.warning(self, "Not Connected", "Please connect Google Drive first.")
+            QMessageBox.warning(self, tr("Not Connected"), tr("Please connect Google Drive first."))
             return
         cloud_config = {
             "provider":      "gdrive",
@@ -17327,15 +18345,13 @@ class AdminPanel(QDialog):
             config_manager.save(self.cfg)
             if saved_names:
                 names_str = ", ".join(saved_names)
-                QMessageBox.information(self, "Saved",
-                    f"Cloud assignment saved to {len(saved_names)} watch(es).\n\n"
-                    f"Watches:  {names_str}\n"
-                    f"Provider: GDrive")
+                QMessageBox.information(self, tr("Saved"),
+                    tr("Cloud assignment saved to {p0} watch(es).\n\nWatches:  {p1}\nProvider: GDrive", p0=len(saved_names), p1=names_str))
             else:
-                QMessageBox.information(self, "Saved",
-                    "Cloud assignment cleared for all watches.")
+                QMessageBox.information(self, tr("Saved"),
+                    tr("Cloud assignment cleared for all watches."))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save: {e}")
+            QMessageBox.critical(self, tr("Error"), tr("Failed to save: {p0}", p0=e))
 
     def _apply_local_sacl_with_feedback(self, path: str):
         """Run _apply_sacl_local in a background thread and show a feedback dialog on failure.
@@ -17364,17 +18380,17 @@ class AdminPanel(QDialog):
                 return
             try:
                 dlg = QMessageBox(self)
-                dlg.setWindowTitle("SACL Setup — Permission Required")
+                dlg.setWindowTitle(tr("SACL Setup — Permission Required"))
                 dlg.setIcon(QMessageBox.Icon.Warning)
                 dlg.setText(
-                    "<b>Administrator permission was not granted.</b><br><br>"
+                    tr("<b>Administrator permission was not granted.</b><br><br>"
                     "File auditing could not be enabled for this folder. "
                     "Click <b>Retry</b> to try again now, or <b>Dismiss</b> to skip — "
-                    "the folder will still be backed up normally."
+                    "the folder will still be backed up normally.")
                 )
                 dlg.setTextFormat(Qt.TextFormat.RichText)
-                retry_btn = dlg.addButton("Retry",   QMessageBox.ButtonRole.ActionRole)
-                dlg.addButton("Dismiss", QMessageBox.ButtonRole.RejectRole)
+                retry_btn = dlg.addButton(tr("Retry"),   QMessageBox.ButtonRole.ActionRole)
+                dlg.addButton(tr("Dismiss"), QMessageBox.ButtonRole.RejectRole)
                 dlg.exec()
                 if dlg.clickedButton() is retry_btn:
                     self._apply_local_sacl_with_feedback(path)
@@ -17383,8 +18399,8 @@ class AdminPanel(QDialog):
 
         QTimer.singleShot(500, _poll)
 
-    def _add_watch(self):
-        dlg = AddWatchDialog(self, cfg=self.cfg)
+    def _add_watch(self, prefill_path: str = ""):
+        dlg = AddWatchDialog(self, cfg=self.cfg, prefill_path=prefill_path)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             try:
                 v        = dlg.get_values()
@@ -17496,39 +18512,47 @@ class AdminPanel(QDialog):
                 self._refresh_cloud_combo()
                 self.watches_changed.emit()
             except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+                QMessageBox.critical(self, tr("Error"), str(e))
 
     from PyQt6.QtCore import pyqtSlot as _pyqtSlot_sacl
     @_pyqtSlot_sacl(bool, str, str)
     def _on_remote_sacl_result(self, ok: bool, host: str, msg: str):
-        """Warn the user when who-did-it auditing couldn't be enabled on a
-        remote (coworker's) PC when adding a network watch.  Runs on the main
-        thread (invoked from the background SACL-setup thread)."""
+        """Inform the user when BackupSys couldn't AUTO-CONFIGURE who-did-it
+        auditing on a remote (coworker's) PC while adding a network watch.
+
+        IMPORTANT: ok=False only means the automatic setup step (WinRM/WMI)
+        didn't complete — it does NOT prove attribution is broken.  If auditing
+        was already enabled on that PC (e.g. from a previous run or a manual
+        setup), BackupSys can still read its Security log and show the correct
+        name.  So this message is worded as 'may need attention', not a flat
+        'tracking is off' — the old wording was a false alarm in exactly that
+        case.  Runs on the main thread (invoked from the background SACL thread)."""
         if ok:
-            return  # auditing enabled — nothing to warn about
+            return  # auditing configured — nothing to say
         from PyQt6.QtWidgets import QMessageBox
+        # The raw failure string is developer-facing (WMI/com_error/RPC/UAC/XPath…).
+        # A non-technical user must never have to read it, so it goes into the
+        # collapsed "Show Details" pane; the visible text stays plain language and
+        # offers exactly ONE next action.
         _low = (msg or "").lower()
-        if any(k in _low for k in ("denied", "unauthorized", "0x5", "not an admin", "administrator")):
-            _hint = (f"The username/password you entered must belong to an account in the "
-                     f"Administrators group on {host} (a correct password for a standard "
-                     f"user isn't enough to read that PC's audit log).")
-        elif any(k in _low for k in ("winrm", "wsman", "rpc", "connect", "refused",
-                                     "timed out", "unreachable", "cannot", "0x")):
-            _hint = (f"{host} isn't reachable for remote management. On {host}, run "
-                     f"'Enable-PSRemoting -Force' in an elevated PowerShell (or allow "
-                     f"WinRM/WMI through its firewall), and make sure its network is set "
-                     f"to Private.")
+        if "uac" in _low or "user account control" in _low or "elevat" in _low:
+            # Local folder on THIS PC — Windows asked for permission, nobody approved it.
+            _action = tr("Add the watch again and choose \u201cYes\u201d when Windows asks for permission.")
+        elif any(k in _low for k in ("denied", "unauthorized", "0x5", "not an admin", "administrator")):
+            _action = tr("Open the watch's settings and enter an administrator account for {p0}, then add the watch again.", p0=host)
         else:
-            _hint = (f"Use an administrator account for {host} and make sure remote "
-                     f"management (WinRM/WMI) is allowed on it.")
-        QMessageBox.warning(
-            self, "Who-did-it tracking not enabled",
-            f"Couldn't turn on change-attribution auditing on {host}.\n\n"
-            f"Reason: {msg}\n\n"
-            f"{_hint}\n\n"
-            f"Backups will still run normally — but changes on this folder will show as "
-            f"“Unknown” (rather than a possibly-wrong name) until this is fixed."
+            _action = tr("Ask whoever owns {p0} to let BackupSys switch this on (their IT contact can do it in a minute), then add the watch again.", p0=host)
+        _box = QMessageBox(self)
+        _box.setIcon(QMessageBox.Icon.Information)
+        _box.setWindowTitle(tr("Who-made-the-change tracking isn\u2019t set up yet"))
+        _box.setText(
+            tr("Your backups are running normally \u2014 nothing is broken.\n\nBackupSys just couldn\u2019t finish switching on the Windows feature that records WHO changed a file on {p0}. If that feature is already on there, names will still appear correctly \u2014 open Change History after a few changes to check.\n\nIf names appear as \u201cUnknown\u201d:\n{p1}\n\nBackupSys never guesses a name: anyone it cannot confirm always reads \u201cUnknown\u201d.", p0=host, p1=_action)
         )
+        # Technical detail for IT/support only — hidden behind "Show Details".
+        _box.setDetailedText(
+            tr("Technical details (for IT support):\n\nHost: {p0}\n{p1}\n\nManual setup on {p2}: run 'Enable-PSRemoting -Force' in an elevated PowerShell (or allow WinRM/WMI through the firewall), set the network profile to Private, and enable object-access auditing (SACL) on the shared folder. Then re-add the watch so BackupSys can configure it automatically.", p0=host, p1=(msg or ""), p2=host)
+        )
+        _box.exec()
 
     def _remove_watch(self):
         btn = self.sender()
@@ -17542,8 +18566,8 @@ class AdminPanel(QDialog):
             return
         watch_name = watch.get("name", "this watch")
         reply = QMessageBox.question(
-            self, "Delete Watch",
-            f"Delete <b>{watch_name}</b> from the watch list?<br><br>Your backup files will <b>not</b> be deleted.",
+            self, tr("Delete Watch"),
+            tr("Delete <b>{p0}</b> from the watch list?<br><br>Your backup files will <b>not</b> be deleted.", p0=watch_name),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -17552,11 +18576,18 @@ class AdminPanel(QDialog):
         # Commit any in-flight pending removal before starting a new one
         self._commit_pending_removal()
 
-        # Soft-delete: remove from in-memory config only — disk write is deferred
+        # Remove from config and persist right away. The write cannot be deferred:
+        # watches_changed makes MainWindow reload the config from disk, so a watch
+        # still on disk would immediately reappear on the dashboard. Undo re-inserts
+        # and re-saves instead.
         original_index = next((i for i, w in enumerate(watches) if w["id"] == wid), -1)
         import copy as _copy
         saved_watch = _copy.deepcopy(watch)
         watches[:] = [w for w in watches if w["id"] != wid]
+        try:
+            config_manager.save(self.cfg)
+        except Exception:
+            pass
         self._refresh_watch_table()
         self._refresh_cloud_combo()
         self.watches_changed.emit()
@@ -17630,9 +18661,9 @@ class AdminPanel(QDialog):
         _row = QHBoxLayout(snackbar)
         _row.setContentsMargins(16, 10, 16, 10)
         _row.setSpacing(16)
-        _lbl = QLabel(f"Watch ‘{watch_name}’ removed.")
+        _lbl = QLabel(tr("Watch ‘{p0}’ removed.", p0=watch_name))
         _row.addWidget(_lbl)
-        _undo_btn = QPushButton("Undo")
+        _undo_btn = QPushButton(tr("Undo"))
         _undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _undo_btn.clicked.connect(self._undo_watch_removal)
         _row.addWidget(_undo_btn)
@@ -17662,6 +18693,10 @@ class AdminPanel(QDialog):
             watches.insert(idx, pr["watch"])
         else:
             watches.append(pr["watch"])
+        try:
+            config_manager.save(self.cfg)
+        except Exception:
+            pass
 
         self._refresh_watch_table()
         self._refresh_cloud_combo()
@@ -17712,8 +18747,8 @@ class AdminPanel(QDialog):
             return
 
         dlg = AddWatchDialog(self, cfg=self.cfg, edit_watch_id=wid)
-        dlg.setWindowTitle("Edit Watched Folder")
-        dlg._submit_btn.setText("Save Changes")
+        dlg.setWindowTitle(tr("Edit Watched Folder"))
+        dlg._submit_btn.setText(tr("Save Changes"))
 
         # Pre-fill existing values
         dlg.name_input.setText(watch.get("name", ""))
@@ -17803,7 +18838,7 @@ class AdminPanel(QDialog):
                 if _mw and hasattr(_mw, "_show_toast"):
                     _mw._show_toast("Failed to save watch settings.", success=False)
                 else:
-                    QMessageBox.critical(self, "Error", str(e))
+                    QMessageBox.critical(self, tr("Error"), str(e))
 
     def _refresh_watch_table(self):
         self.watch_table.setRowCount(0)
@@ -17833,7 +18868,7 @@ class AdminPanel(QDialog):
             self.watch_table.setItem(row, 10, QTableWidgetItem(w.get("destination", "")))
 
             # ── Edit button (col 11) ────────────────────────────────────────
-            edit_btn = QPushButton("✏ Edit")
+            edit_btn = QPushButton(tr("✏ Edit"))
             edit_btn.setObjectName("secondary")
             edit_btn.setFixedHeight(26)
             edit_btn.setProperty("watch_id", w["id"])
@@ -17841,7 +18876,7 @@ class AdminPanel(QDialog):
             self.watch_table.setCellWidget(row, 11, edit_btn)
 
             # ── Delete button (col 12) ──────────────────────────────────────
-            del_btn = QPushButton("🗑 Remove")
+            del_btn = QPushButton(tr("🗑 Remove"))
             del_btn.setObjectName("danger")
             del_btn.setFixedHeight(26)
             del_btn.setProperty("watch_id", w["id"])
@@ -17925,9 +18960,9 @@ class AdminPanel(QDialog):
         ec["to_addr"]          = self.email_to.text().strip()
         try:
             config_manager.save(self.cfg)
-            QMessageBox.information(self, "Saved", "Email settings saved.")
+            QMessageBox.information(self, tr("Saved"), tr("Email settings saved."))
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, tr("Error"), str(e))
 
     def _test_email(self):
         """Send a quick test email using the current (unsaved) form values."""
@@ -17943,7 +18978,7 @@ class AdminPanel(QDialog):
         }
         to = ec["to_addr"]
         if not to:
-            QMessageBox.warning(self, "Missing", "Please enter a To Address first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter a To Address first."))
             return
         try:
             # Use the local _send_email_notification function with test subject/body
@@ -17954,26 +18989,26 @@ class AdminPanel(QDialog):
                 "This is a test email from BackupSys.\n\nEmail notifications are working correctly."
             )
             QMessageBox.information(
-                self, "Test Email Sent",
-                f"Test email sent to {to}.\nCheck your inbox (and spam folder)."
+                self, tr("Test Email Sent"),
+                tr("Test email sent to {p0}.\nCheck your inbox (and spam folder).", p0=to)
             )
         except Exception as e:
-            QMessageBox.critical(self, "Test Failed", str(e))
+            QMessageBox.critical(self, tr("Test Failed"), str(e))
 
     def _save_webhook_settings(self):
         self.cfg["webhook_url"]        = self.webhook_url_input.text().strip()
         self.cfg["webhook_on_success"] = self.webhook_success_only.isChecked()
         try:
             config_manager.save(self.cfg)
-            QMessageBox.information(self, "Saved", "Webhook settings saved.")
+            QMessageBox.information(self, tr("Saved"), tr("Webhook settings saved."))
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, tr("Error"), str(e))
 
     def _test_webhook(self):
         """Send a test ping to the webhook URL."""
         url = self.webhook_url_input.text().strip()
         if not url:
-            QMessageBox.warning(self, "Missing", "Please enter a Webhook URL first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter a Webhook URL first."))
             return
         test_cfg = {"webhook_url": url, "webhook_on_success": False}
         test_result = {
@@ -17990,9 +19025,9 @@ class AdminPanel(QDialog):
         }
         try:
             _send_webhook(test_cfg, test_result)
-            QMessageBox.information(self, "Webhook Test", f"Test ping sent to:\n{url}\n\nCheck your endpoint for the request.")
+            QMessageBox.information(self, tr("Webhook Test"), tr("Test ping sent to:\n{p0}\n\nCheck your endpoint for the request.", p0=url))
         except Exception as e:
-            QMessageBox.critical(self, "Test Failed", str(e))
+            QMessageBox.critical(self, tr("Test Failed"), str(e))
 
     def _save_ntfy_settings(self):
         nc = self.cfg.setdefault("ntfy_config", {})
@@ -18005,15 +19040,15 @@ class AdminPanel(QDialog):
         nc["notify_on_failure"] = self.ntfy_notify_failure_check.isChecked()
         try:
             config_manager.save(self.cfg)
-            QMessageBox.information(self, "Saved", "ntfy push settings saved.")
+            QMessageBox.information(self, tr("Saved"), tr("ntfy push settings saved."))
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, tr("Error"), str(e))
 
     def _test_ntfy(self):
         """Send a test push via ntfy to verify topic/token."""
         topic = self.ntfy_topic_input.text().strip()
         if not topic:
-            QMessageBox.warning(self, "Missing", "Please enter an ntfy Topic first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter an ntfy Topic first."))
             return
         nc = {
             "enabled": True,
@@ -18026,16 +19061,15 @@ class AdminPanel(QDialog):
             res = _test_ntfy_fn(nc)
             if res["ok"]:
                 QMessageBox.information(
-                    self, "Test Push Sent",
-                    f"Test notification sent to topic '{topic}'.\n"
-                    "Check the ntfy app on your phone."
+                    self, tr("Test Push Sent"),
+                    tr("Test notification sent to topic '{p0}'.\nCheck the ntfy app on your phone.", p0=topic)
                 )
             else:
-                QMessageBox.critical(self, "Test Failed", res.get("error", "Unknown error"))
+                QMessageBox.critical(self, tr("Test Failed"), res.get("error", "Unknown error"))
         except ImportError:
-            QMessageBox.warning(self, "Unavailable", "notification_utils.py not found.")
+            QMessageBox.warning(self, tr("Unavailable"), tr("notification_utils.py not found."))
         except Exception as e:
-            QMessageBox.critical(self, "Test Failed", str(e))
+            QMessageBox.critical(self, tr("Test Failed"), str(e))
 
     # ── Telegram settings ──────────────────────────────────────────────────────
 
@@ -18049,19 +19083,19 @@ class AdminPanel(QDialog):
         tc["parse_mode"]        = "HTML"
         try:
             config_manager.save(self.cfg)
-            QMessageBox.information(self, "Saved", "Telegram notification settings saved.")
+            QMessageBox.information(self, tr("Saved"), tr("Telegram notification settings saved."))
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, tr("Error"), str(e))
 
     def _test_telegram(self):
         """Send a test message via Telegram to verify bot_token and chat_id."""
         token   = self.tg_token_input.text().strip()
         chat_id = self.tg_chat_id_input.text().strip()
         if not token:
-            QMessageBox.warning(self, "Missing", "Please enter a Bot Token first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter a Bot Token first."))
             return
         if not chat_id:
-            QMessageBox.warning(self, "Missing", "Please enter a Chat ID first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter a Chat ID first."))
             return
         tc = {"bot_token": token, "chat_id": chat_id, "parse_mode": "HTML"}
         try:
@@ -18069,16 +19103,15 @@ class AdminPanel(QDialog):
             res = _test_tg(tc)
             if res["ok"]:
                 QMessageBox.information(
-                    self, "Message Sent",
-                    f"Test message sent to chat_id '{chat_id}'.\n"
-                    "Check your Telegram."
+                    self, tr("Message Sent"),
+                    tr("Test message sent to chat_id '{p0}'.\nCheck your Telegram.", p0=chat_id)
                 )
             else:
-                QMessageBox.critical(self, "Test Failed", res.get("error", "Unknown error"))
+                QMessageBox.critical(self, tr("Test Failed"), res.get("error", "Unknown error"))
         except ImportError:
-            QMessageBox.warning(self, "Unavailable", "notification_utils.py not found.")
+            QMessageBox.warning(self, tr("Unavailable"), tr("notification_utils.py not found."))
         except Exception as e:
-            QMessageBox.critical(self, "Test Failed", str(e))
+            QMessageBox.critical(self, tr("Test Failed"), str(e))
 
     # ── Pushover settings ──────────────────────────────────────────────────────
 
@@ -18093,19 +19126,19 @@ class AdminPanel(QDialog):
         pc["notify_on_failure"] = self.po_notify_failure_check.isChecked()
         try:
             config_manager.save(self.cfg)
-            QMessageBox.information(self, "Saved", "Pushover notification settings saved.")
+            QMessageBox.information(self, tr("Saved"), tr("Pushover notification settings saved."))
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, tr("Error"), str(e))
 
     def _test_pushover(self):
         """Send a test push via Pushover to verify user_key and api_token."""
         user_key  = self.po_user_key_input.text().strip()
         api_token = self.po_api_token_input.text().strip()
         if not user_key:
-            QMessageBox.warning(self, "Missing", "Please enter your Pushover User Key first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter your Pushover User Key first."))
             return
         if not api_token:
-            QMessageBox.warning(self, "Missing", "Please enter your Pushover API Token first.")
+            QMessageBox.warning(self, tr("Missing"), tr("Please enter your Pushover API Token first."))
             return
         pc = {"user_key": user_key, "api_token": api_token,
               "device": self.po_device_input.text().strip()}
@@ -18114,16 +19147,16 @@ class AdminPanel(QDialog):
             res = _test_po(pc)
             if res["ok"]:
                 QMessageBox.information(
-                    self, "Test Push Sent",
-                    "Test notification sent via Pushover.\n"
-                    "Check your device."
+                    self, tr("Test Push Sent"),
+                    tr("Test notification sent via Pushover.\n"
+                    "Check your device.")
                 )
             else:
-                QMessageBox.critical(self, "Test Failed", res.get("error", "Unknown error"))
+                QMessageBox.critical(self, tr("Test Failed"), res.get("error", "Unknown error"))
         except ImportError:
-            QMessageBox.warning(self, "Unavailable", "notification_utils.py not found.")
+            QMessageBox.warning(self, tr("Unavailable"), tr("notification_utils.py not found."))
         except Exception as e:
-            QMessageBox.critical(self, "Test Failed", str(e))
+            QMessageBox.critical(self, tr("Test Failed"), str(e))
 
     # ── Logs tab ───────────────────────────────────────────────────────────────
 
@@ -18132,7 +19165,7 @@ class AdminPanel(QDialog):
         # The Logs tab is the last tab; find it by title to be robust
         logs_tab_index = self._tabs.count() - 1
         for i in range(self._tabs.count()):
-            if self._tabs.tabText(i) == "Logs":
+            if self._tabs.tabText(i) == tr("Logs"):
                 logs_tab_index = i
                 break
         if index == logs_tab_index:
@@ -18205,21 +19238,21 @@ class AdminPanel(QDialog):
             if _mw and hasattr(_mw, "_show_toast"):
                 _mw._show_toast(f"Log exported to {path}")
             else:
-                QMessageBox.information(self, "Export Log", f"Log saved to:\n{path}")
+                QMessageBox.information(self, tr("Export Log"), tr("Log saved to:\n{p0}", p0=path))
         except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Could not save log file:\n{e}")
+            QMessageBox.critical(self, tr("Export Failed"), tr("Could not save log file:\n{p0}", p0=e))
 
     def _clear_log_file(self):
         """Confirm then truncate the log file."""
         dlg = QMessageBox(self)
-        dlg.setWindowTitle("Clear all logs?")
+        dlg.setWindowTitle(tr("Clear all logs?"))
         dlg.setText(
-            "This will permanently delete all log entries and cannot be undone.\n"
-            "Are you sure?"
+            tr("This will permanently delete all log entries and cannot be undone.\n"
+            "Are you sure?")
         )
         dlg.setIcon(QMessageBox.Icon.Warning)
-        cancel_btn = dlg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        clear_btn  = dlg.addButton("Clear Logs", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = dlg.addButton(tr("Cancel"), QMessageBox.ButtonRole.RejectRole)
+        clear_btn  = dlg.addButton(tr("Clear Logs"), QMessageBox.ButtonRole.DestructiveRole)
         clear_btn.setStyleSheet(
             "QPushButton { background:#dc2626; color:#fff; font-weight:700;"
             " border:none; border-radius:4px; padding:6px 16px; }"
@@ -18237,7 +19270,7 @@ class AdminPanel(QDialog):
             if mw and hasattr(mw, "_show_toast"):
                 mw._show_toast("Logs cleared.")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not clear log file:\n{e}")
+            QMessageBox.critical(self, tr("Error"), tr("Could not clear log file:\n{p0}", p0=e))
 
     def _apply_theme(self):
         """Apply the selected theme immediately and persist the choice."""
@@ -18249,6 +19282,49 @@ class AdminPanel(QDialog):
         _QApp.instance().setStyleSheet(sheet)
         _QApp.instance().setProperty("theme", choice)
 
+    def _on_language_changed(self, _idx: int):
+        """Persist the chosen language and offer to restart to apply it.
+
+        We apply on restart (not live) because every already-built widget would
+        otherwise need re-translating; a restart is simple and reliable.
+        """
+        code = self.lang_combo.currentData()
+        name = self.lang_combo.currentText()
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        if s.value("language", "ja") == code:
+            return  # no actual change
+        s.setValue("language", code)
+        s.sync()
+        resp = QMessageBox.question(
+            self,
+            tr("Language changed"),
+            tr("The language will change to {lang} after restarting BackupSys.\n\n"
+               "Restart now?", lang=name),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if resp == QMessageBox.StandardButton.Yes:
+            self._restart_app()
+
+    def _restart_app(self):
+        """Relaunch BackupSys (used to apply a language change)."""
+        try:
+            import subprocess
+            if getattr(sys, "frozen", False):
+                subprocess.Popen([sys.executable] + sys.argv[1:])
+            else:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        except Exception as e:
+            logger.warning(f"Restart failed: {e}")
+            QMessageBox.information(
+                self, tr("Language changed"),
+                tr("Please close and reopen BackupSys to apply the new language."),
+            )
+            return
+        from PyQt6.QtWidgets import QApplication as _QApp
+        _QApp.instance().quit()
+        os._exit(0)
+
     def _export_config(self):
         """Export a redacted copy of config.json that the user can save anywhere."""
         import copy, json as _json
@@ -18257,7 +19333,7 @@ class AdminPanel(QDialog):
         try:
             raw = copy.deepcopy(config_manager.load())
         except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Could not load config: {e}")
+            QMessageBox.critical(self, tr("Export Failed"), tr("Could not load config: {p0}", p0=e))
             return
 
         # ── Redact all known secret fields ────────────────────────────────
@@ -18295,12 +19371,11 @@ class AdminPanel(QDialog):
             with open(out_path, "w", encoding="utf-8") as fh:
                 _json.dump(redacted, fh, indent=2)
             QMessageBox.information(
-                self, "Config Exported",
-                f"Configuration exported to:\n{out_path}\n\n"
-                "Passwords have been redacted — re-enter them after importing."
+                self, tr("Config Exported"),
+                tr("Configuration exported to:\n{p0}\n\nPasswords have been redacted \u2014 re-enter them after importing.", p0=out_path)
             )
         except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Could not write file: {e}")
+            QMessageBox.critical(self, tr("Export Failed"), tr("Could not write file: {p0}", p0=e))
 
     def _import_config(self):
         """Import a previously exported config file and merge it into the current config."""
@@ -18319,24 +19394,24 @@ class AdminPanel(QDialog):
             with open(in_path, "r", encoding="utf-8") as fh:
                 imported = _json.load(fh)
         except _json.JSONDecodeError as e:
-            QMessageBox.critical(self, "Import Failed", f"Invalid JSON file: {e}")
+            QMessageBox.critical(self, tr("Import Failed"), tr("Invalid JSON file: {p0}", p0=e))
             return
         except Exception as e:
-            QMessageBox.critical(self, "Import Failed", f"Could not read file: {e}")
+            QMessageBox.critical(self, tr("Import Failed"), tr("Could not read file: {p0}", p0=e))
             return
 
         # ── Validate required keys ──────────────────────────────────────────
         if not isinstance(imported, dict):
             QMessageBox.critical(
-                self, "Import Failed",
-                "Config file must be a JSON object (not an array or scalar)."
+                self, tr("Import Failed"),
+                tr("Config file must be a JSON object (not an array or scalar).")
             )
             return
 
         if "watches" not in imported:
             QMessageBox.critical(
-                self, "Import Failed",
-                "Config file is missing required 'watches' key."
+                self, tr("Import Failed"),
+                tr("Config file is missing required 'watches' key.")
             )
             return
 
@@ -18346,11 +19421,11 @@ class AdminPanel(QDialog):
             self.cfg.update(imported)
             config_manager.save(self.cfg)
             QMessageBox.information(
-                self, "Config Imported",
-                "Config imported. Restart may be required for all changes to take effect."
+                self, tr("Config Imported"),
+                tr("Config imported. Restart may be required for all changes to take effect.")
             )
         except Exception as e:
-            QMessageBox.critical(self, "Import Failed", f"Could not merge config: {e}")
+            QMessageBox.critical(self, tr("Import Failed"), tr("Could not merge config: {p0}", p0=e))
 
     def _save_general(self):
         self.cfg["dest_sftp"] = {
@@ -18426,11 +19501,12 @@ class AdminPanel(QDialog):
         self.cfg["force_full_interval_days"]      = self.force_full_global_spin.value()
         self.cfg["auto_shutdown_on_complete"]     = self.shutdown_check.isChecked()
         self.cfg["auto_sacl_owned_smb_shares"]    = self.auto_sacl_smb_check.isChecked()
+        self.cfg["remote_setup_smb_fallback"]     = self.remote_smb_fallback_check.isChecked()
         try:
             config_manager.save(self.cfg)
-            QMessageBox.information(self, "Saved", "Settings saved.")
+            QMessageBox.information(self, tr("Saved"), tr("Settings saved."))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save settings: {e}")
+            QMessageBox.critical(self, tr("Error"), tr("Failed to save settings: {p0}", p0=e))
 
     def _change_password(self):
         """Open the password-change dialog from within the Admin panel."""
@@ -18445,7 +19521,7 @@ class AdminPanel(QDialog):
 
     def _set_startup(self, enable: bool):
         if not WINREG_AVAILABLE:
-            QMessageBox.warning(self, "Startup", "Run-at-startup is only supported on Windows.")
+            QMessageBox.warning(self, tr("Startup"), tr("Run-at-startup is only supported on Windows."))
             return
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE)
@@ -18460,7 +19536,7 @@ class AdminPanel(QDialog):
                     pass
             winreg.CloseKey(key)
         except Exception as e:
-            QMessageBox.warning(self, "Startup", f"Could not update startup: {e}")
+            QMessageBox.warning(self, tr("Startup"), tr("Could not update startup: {p0}", p0=e))
 
     def _is_startup_enabled(self) -> bool:
         if not WINREG_AVAILABLE:
@@ -18608,7 +19684,7 @@ class StorageChartWidget(QWidget):
             except:
                 pass
         # Y axis label
-        painter.drawText(5, 10, f"Size (MB, max {max_size:.0f})")
+        painter.drawText(5, 10, tr("Size (MB, max {n})", n=f"{max_size:.0f}"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -18620,14 +19696,13 @@ class WatchCard(QFrame):
     full_backup_requested     = pyqtSignal(dict)  # watch  · force full backup
     dry_run_requested         = pyqtSignal(dict)  # watch  · preview only
     validate_requested        = pyqtSignal(dict)
-    restore_requested         = pyqtSignal(dict)
-    restore_to_original_requested = pyqtSignal(dict)
     pause_requested           = pyqtSignal(str, bool)   # watch_id, paused
     pause_backup_requested    = pyqtSignal(str)         # watch_id  · pause running backup
     resume_backup_requested   = pyqtSignal(str)         # watch_id  · resume paused backup
     cancel_requested          = pyqtSignal(str)         # watch_id
     open_backup_requested     = pyqtSignal(str)      # watch_id
     watch_settings_requested  = pyqtSignal(dict)     # watch  · open advanced settings
+    export_diagnostics_requested = pyqtSignal(dict)  # watch  · bundle logs for support
 
     def __init__(self, watch: dict, dest_type: str = "local", parent=None):
         super().__init__(parent)
@@ -18672,18 +19747,18 @@ class WatchCard(QFrame):
 
         paused = self.watch.get("paused", False)
         if paused:
-            badge = QLabel("PAUSED")
+            badge = QLabel(tr("PAUSED"))
             badge.setStyleSheet("background:#f59e0b; color:#000; font-size:9px; font-weight:700;"
                                 "padding:2px 6px; border-radius:3px;")
             name_row.addWidget(badge)
 
         if self.watch.get("sync_mode", False):
-            sync_badge = QLabel("SYNC")
+            sync_badge = QLabel(tr("SYNC"))
             sync_badge.setStyleSheet(
                 "background:#0ea5e9; color:#fff; font-size:9px; font-weight:700;"
                 "padding:2px 6px; border-radius:3px;"
             )
-            sync_badge.setToolTip("Sync mode: files are copied directly into the destination folder, no versioned subfolders.")
+            sync_badge.setToolTip(tr("Sync mode: files are copied directly into the destination folder, no versioned subfolders."))
             name_row.addWidget(sync_badge)
 
         # Change count badge
@@ -18696,7 +19771,7 @@ class WatchCard(QFrame):
         name_row.addWidget(self.change_badge)
 
         # Expand/collapse toggle
-        self.toggle_btn = QPushButton("▾ Changes")
+        self.toggle_btn = QPushButton(tr("▾ Changes"))
         self.toggle_btn.setObjectName("secondary")
         self.toggle_btn.setFixedHeight(22)
         self.toggle_btn.setStyleSheet(
@@ -18716,13 +19791,14 @@ class WatchCard(QFrame):
         info_layout.addWidget(path_lbl)
 
         lb = self.watch.get("last_backup", "")
-        lb_text = "Never backed up"
+        lb_text = tr("Never backed up")
         if lb:
             try:
                 dt = datetime.fromisoformat(lb)
-                lb_text = f"Last backup: {dt.strftime('%b %d, %Y %H:%M')}"
+                # The date FORMAT is translatable too — ja.json maps it to "%Y/%m/%d %H:%M".
+                lb_text = tr("Last backup: {p0}", p0=dt.strftime(tr("%b %d, %Y %H:%M")))
             except Exception:
-                lb_text = f"Last backup: {lb}"
+                lb_text = tr("Last backup: {p0}", p0=lb)
 
         count = self.watch.get("backup_count", 0)
 
@@ -18742,7 +19818,7 @@ class WatchCard(QFrame):
         meta_row.setSpacing(6)
         meta_row.setContentsMargins(0, 0, 0, 0)
 
-        self.meta_lbl = QLabel(f"{lb_text}   ·   {count} backup(s)")
+        self.meta_lbl = QLabel(f"{lb_text}   ·   " + tr("{n} backup(s)", n=count))
         self.meta_lbl.setStyleSheet("color: #4b5563; font-size: 11px;")
         meta_row.addWidget(self.meta_lbl)
 
@@ -18751,7 +19827,7 @@ class WatchCard(QFrame):
             f"color: {_status_color}; font-size: 13px; font-weight: 700;"
         )
         self._status_dot.setToolTip(
-            f"Last backup status: {_last_status or 'unknown'}"
+            tr("Last backup status: {p0}", p0=_last_status or 'unknown')
         )
         meta_row.addWidget(self._status_dot)
         meta_row.addStretch()
@@ -18769,7 +19845,7 @@ class WatchCard(QFrame):
         )
         self._err_msg_lbl.setWordWrap(False)
         _eb_row.addWidget(self._err_msg_lbl, stretch=1)
-        self._err_logs_btn = QPushButton("See Logs")
+        self._err_logs_btn = QPushButton(tr("See Logs"))
         self._err_logs_btn.setObjectName("secondary")
         self._err_logs_btn.setFixedHeight(18)
         self._err_logs_btn.setStyleSheet(
@@ -18817,7 +19893,7 @@ class WatchCard(QFrame):
         status_layout.setSpacing(4)
         status_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.status_lbl = QLabel("▶ Watching")
+        self.status_lbl = QLabel(tr("▶ Watching"))
         self.status_lbl.setObjectName("status_ok")
         self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         status_layout.addWidget(self.status_lbl)
@@ -18851,14 +19927,14 @@ class WatchCard(QFrame):
         self.details_lbl.setWordWrap(False)
         status_layout.addWidget(self.details_lbl)
 
-        self.backup_btn = QPushButton("Backup Now")
+        self.backup_btn = QPushButton(tr("Backup Now"))
         self.backup_btn.setFixedWidth(175)
         self.backup_btn.clicked.connect(lambda: self.backup_requested.emit(self.watch))
         status_layout.addWidget(self.backup_btn)
 
         # ── "More ▾" dropdown for secondary actions ────────────────────────
         self._more_btn = QToolButton()
-        self._more_btn.setText("More ▾")
+        self._more_btn.setText(tr("More ▾"))
         self._more_btn.setFixedWidth(175)
         self._more_btn.setObjectName("secondary")
         self._more_btn.setPopupMode(
@@ -18879,41 +19955,34 @@ class WatchCard(QFrame):
 
         more_menu.addSeparator()
 
-        act_full = more_menu.addAction("⟳ Force Full Backup")
+        act_full = more_menu.addAction(tr("⟳ Force Full Backup"))
         act_full.triggered.connect(lambda: self.full_backup_requested.emit(self.watch))
 
-        act_dry = more_menu.addAction("🔍 Dry Run")
-        act_dry.setToolTip("Preview what would be backed up without copying any files")
+        act_dry = more_menu.addAction(tr("🔍 Dry Run"))
+        act_dry.setToolTip(tr("Preview what would be backed up without copying any files"))
         act_dry.triggered.connect(lambda: self.dry_run_requested.emit(self.watch))
 
-        act_validate = more_menu.addAction("▶ Validate")
+        act_validate = more_menu.addAction(tr("▶ Validate"))
         act_validate.triggered.connect(lambda: self.validate_requested.emit(self.watch))
-
-        more_menu.addSeparator()
-
-        act_restore = more_menu.addAction("↩ Restore")
-        act_restore.triggered.connect(lambda: self.restore_requested.emit(self.watch))
-
-        act_restore_orig = more_menu.addAction("🏠 Restore to Original")
-        act_restore_orig.setToolTip("Restore files to their original source location")
-        act_restore_orig.triggered.connect(lambda: self.restore_to_original_requested.emit(self.watch))
 
         if self.dest_type == "local":
             more_menu.addSeparator()
-            act_open = more_menu.addAction("📂 Open Folder")
+            act_open = more_menu.addAction(tr("📂 Open Folder"))
             act_open.triggered.connect(lambda: self.open_backup_requested.emit(self.watch["id"]))
 
         more_menu.addSeparator()
-        act_settings = more_menu.addAction("⚙ Watch Settings…")
-        act_settings.setToolTip("Edit encryption, exclusions, hooks and more for this watch")
+        act_settings = more_menu.addAction(tr("⚙ Watch Settings…"))
+        act_settings.setToolTip(tr("Edit encryption, exclusions, hooks and more for this watch"))
         act_settings.triggered.connect(lambda: self.watch_settings_requested.emit(self.watch))
+
+        act_diag = more_menu.addAction(tr("🛟 Export Diagnostics…"))
+        act_diag.setToolTip(tr("Bundle this watch's logs and settings into one file to send to support"))
+        act_diag.triggered.connect(lambda: self.export_diagnostics_requested.emit(self.watch))
 
         # Store action references so external code can enable/disable them
         self._act_full_backup   = act_full
         self._act_dry_run       = act_dry
         self._act_validate      = act_validate
-        self._act_restore       = act_restore
-        self._act_restore_orig  = act_restore_orig
 
         self._more_btn.setMenu(more_menu)
         status_layout.addWidget(self._more_btn)
@@ -18934,19 +20003,17 @@ class WatchCard(QFrame):
         self.dry_run_btn          = _StubBtn(act_dry)
         self.pause_btn            = _StubBtn(None)
         self.validate_btn         = _StubBtn(act_validate)
-        self.restore_btn          = _StubBtn(act_restore)
-        self.restore_original_btn = _StubBtn(act_restore_orig)
         self.open_backup_btn      = _StubBtn(None)
 
         # ── Pause/Resume and Cancel buttons (shown during backup) ─────
-        self.pause_backup_btn = QPushButton("⏸ Pause")
+        self.pause_backup_btn = QPushButton(tr("⏸ Pause"))
         self.pause_backup_btn.setObjectName("secondary")
         self.pause_backup_btn.setFixedWidth(175)
         self.pause_backup_btn.setVisible(False)
         self.pause_backup_btn.clicked.connect(self._on_pause_backup_clicked)
         status_layout.addWidget(self.pause_backup_btn)
 
-        self.cancel_btn = QPushButton("▶ Cancel")
+        self.cancel_btn = QPushButton(tr("▶ Cancel"))
         self.cancel_btn.setObjectName("danger")
         self.cancel_btn.setFixedWidth(175)
         self.cancel_btn.setVisible(False)
@@ -18967,7 +20034,7 @@ class WatchCard(QFrame):
         cp_layout.setContentsMargins(20, 10, 20, 10)
         cp_layout.setSpacing(4)
 
-        changes_title = QLabel("RECENT CHANGES")
+        changes_title = QLabel(tr("RECENT CHANGES"))
         changes_title.setStyleSheet("color:#374151; font-size:10px; font-weight:700; letter-spacing:0.08em;")
         cp_layout.addWidget(changes_title)
 
@@ -18981,7 +20048,7 @@ class WatchCard(QFrame):
         cp_layout.addWidget(self.changes_list)
 
         # Storage trend chart
-        chart_title = QLabel("STORAGE TREND")
+        chart_title = QLabel(tr("STORAGE TREND"))
         chart_title.setStyleSheet("color:#374151; font-size:10px; font-weight:700; letter-spacing:0.08em;")
         cp_layout.addWidget(chart_title)
 
@@ -19000,7 +20067,7 @@ class WatchCard(QFrame):
         self.change_badge.setText(str(count))
         self.change_badge.setVisible(True)
         self.toggle_btn.setVisible(True)
-        self.toggle_btn.setText(f"{'▴' if self._expanded else '▾'}  {count} change(s)")
+        self.toggle_btn.setText(f"{'▴' if self._expanded else '▾'}  " + tr("{n} change(s)", n=count))
 
         # Update changes list
         icon_map = {"modified": "✏", "added": "➕", "deleted": "➖", "renamed": "↗", "backed up": "📦"}
@@ -19027,7 +20094,7 @@ class WatchCard(QFrame):
         self.changes_list.setPlainText("\n".join(lines))
 
         # Update status label
-        self.status_lbl.setText(f"⚠  {count} change(s)")
+        self.status_lbl.setText("⚠  " + tr("{n} change(s)", n=count))
         self.status_lbl.setObjectName("status_warn")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
@@ -19040,7 +20107,7 @@ class WatchCard(QFrame):
         self.changes_panel.setVisible(False)
         self._expanded = False
         self.changes_list.clear()
-        self.status_lbl.setText("▶  Watching")
+        self.status_lbl.setText(tr("▶  Watching"))
         self.status_lbl.setObjectName("status_ok")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
@@ -19049,24 +20116,24 @@ class WatchCard(QFrame):
         self._expanded = not self._expanded
         self.changes_panel.setVisible(self._expanded)
         count = len(self._changes)
-        self.toggle_btn.setText(f"{'▴' if self._expanded else '▾'}  {count} change(s)")
+        self.toggle_btn.setText(f"{'▴' if self._expanded else '▾'}  " + tr("{n} change(s)", n=count))
 
     def _on_pause_backup_clicked(self):
         """Toggle pause/resume for a running backup."""
         if self._backup_paused:
             # Resume the backup
             self._backup_paused = False
-            self.pause_backup_btn.setText("⏸ Pause")
+            self.pause_backup_btn.setText(tr("⏸ Pause"))
             self.resume_backup_requested.emit(self.watch["id"])
         else:
             # Pause the backup
             self._backup_paused = True
-            self.pause_backup_btn.setText("▶ Resume")
+            self.pause_backup_btn.setText(tr("▶ Resume"))
             self.pause_backup_requested.emit(self.watch["id"])
 
     def set_backing_up(self, active: bool):
         self.backup_btn.setEnabled(not active)
-        self.backup_btn.setText("Backing up…" if active else "Backup Now")
+        self.backup_btn.setText(tr("Backing up…") if active else tr("Backup Now"))
         # Disable/enable secondary actions in the More menu during backup
         if hasattr(self, "_more_btn"):
             self._more_btn.setEnabled(not active)
@@ -19078,16 +20145,16 @@ class WatchCard(QFrame):
         if active:
             self._speed_window.clear()   # fresh window for each backup run
             self._backup_paused = False   # track pause state during this backup run
-            self.pause_backup_btn.setText("⏸ Pause")  # reset to Pause
+            self.pause_backup_btn.setText(tr("⏸ Pause"))  # reset to Pause
             # FIX: always reset cancel button so a previous "Cancelling…" state
             # doesn't leave it permanently disabled on the next backup run.
             self.cancel_btn.setEnabled(True)
-            self.cancel_btn.setText("▶ Cancel")
-            self.status_lbl.setText("▶ Backing up…")
+            self.cancel_btn.setText(tr("▶ Cancel"))
+            self.status_lbl.setText(tr("▶ Backing up…"))
             self.status_lbl.setObjectName("status_warn")
             # Start in indeterminate (scanning) mode
             self.progress_bar.setRange(0, 0)
-            self.file_lbl.setText("Scanning…")
+            self.file_lbl.setText(tr("Scanning…"))
             self.details_lbl.setText("")
         else:
             self.progress_bar.setRange(0, 10000)
@@ -19095,7 +20162,7 @@ class WatchCard(QFrame):
             self.progress_bar.setFormat("%p%")
             self.file_lbl.setText("")
             self.details_lbl.setText("")
-            self.status_lbl.setText("▶ Watching")
+            self.status_lbl.setText(tr("▶ Watching"))
             self.status_lbl.setObjectName("status_ok")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
@@ -19104,24 +20171,24 @@ class WatchCard(QFrame):
         """Show/hide a 'Queued' status when this watch is waiting in the Backup All queue."""
         if active:
             pos_str = f" (#{position})" if position > 1 else ""
-            self.status_lbl.setText(f"⏳ Queued{pos_str} — waiting…")
+            self.status_lbl.setText(tr("⏳ Queued{pos} — waiting…", pos=pos_str))
             self.status_lbl.setObjectName("status_warn")
             self.status_lbl.setToolTip(
-                "This backup is queued and will start automatically once the current backup finishes."
+                tr("This backup is queued and will start automatically once the current backup finishes.")
             )
             self.backup_btn.setEnabled(False)
-            self.backup_btn.setText("Queued…")
+            self.backup_btn.setText(tr("Queued…"))
             if hasattr(self, "_more_btn"):
                 self._more_btn.setEnabled(False)
         else:
             self.status_lbl.setToolTip("")
             self.backup_btn.setEnabled(True)
-            self.backup_btn.setText("Backup Now")
+            self.backup_btn.setText(tr("Backup Now"))
             if hasattr(self, "_more_btn"):
                 self._more_btn.setEnabled(True)
             # Only reset status label if we're not already backing up
             if "Backing up" not in self.status_lbl.text() and "Queued" in self.status_lbl.text():
-                self.status_lbl.setText("▶ Watching")
+                self.status_lbl.setText(tr("▶ Watching"))
                 self.status_lbl.setObjectName("status_ok")
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
@@ -19225,7 +20292,7 @@ class WatchCard(QFrame):
                 # Indeterminate — we're copying but don't know total size
                 if self.progress_bar.maximum() != 0:
                     self.progress_bar.setRange(0, 0)
-                verb = "Uploading" if _is_uploading else ("Verifying" if _is_verify else "Copying")
+                verb = tr("Uploading") if _is_uploading else (tr("Verifying") if _is_verify else tr("Copying"))
                 if short_name:
                     max_name     = 35
                     display_name = (short_name[:max_name] + "…") if len(short_name) > max_name else short_name
@@ -19265,17 +20332,17 @@ class WatchCard(QFrame):
                         _short_nas = _nas_fname.split("\\")[-1].split("/")[-1]
                         if self.progress_bar.maximum() != 0:
                             self.progress_bar.setRange(0, 0)  # indeterminate / pulsing
-                        self.file_lbl.setText(f"Copying: {_short_nas}" if _short_nas else "Copying…")
+                        self.file_lbl.setText(tr("Copying: {name}", name=_short_nas) if _short_nas else tr("Copying…"))
                         self.details_lbl.setText(
-                            f"{_fmt_bytes(total_bytes)} · server-side copy in progress…"
+                            f"{_fmt_bytes(total_bytes)} · " + tr("server-side copy in progress…")
                         )
                         self.details_lbl.setVisible(True)
                         return
                 if _is_uptodate:
                     if self.progress_bar.maximum() != 0:
                         self.progress_bar.setRange(0, 0)  # indeterminate
-                    self.file_lbl.setText("Up to date…")
-                    self.details_lbl.setText("Destination already matches source")
+                    self.file_lbl.setText(tr("Up to date…"))
+                    self.details_lbl.setText(tr("Destination already matches source"))
                     self.details_lbl.setVisible(True)
                     return
                 if _is_robocopy:
@@ -19289,9 +20356,9 @@ class WatchCard(QFrame):
                     else:
                         if self.progress_bar.maximum() != 0:
                             self.progress_bar.setRange(0, 0)  # indeterminate
-                        self.file_lbl.setText("Copying…")
+                        self.file_lbl.setText(tr("Copying…"))
                         self.details_lbl.setText(
-                            f"{_fmt_bytes(total_bytes)} · fast copy (robocopy)"
+                            f"{_fmt_bytes(total_bytes)} · " + tr("fast copy (robocopy)")
                         )
                         self.details_lbl.setVisible(True)
                         return
@@ -19303,14 +20370,14 @@ class WatchCard(QFrame):
                         # is still 0 (e.g. file sizes missing from snapshot for a
                         # first/full backup).  Show "Copying…" so the UI doesn't
                         # remain stuck on "Preparing…" while data is flowing.
-                        self.file_lbl.setText("Copying\u2026")
+                        self.file_lbl.setText(tr("Copying\u2026"))
                         self.details_lbl.setText(
-                            f"{current} file(s) copied \u00b7 {_fmt_bytes(total_bytes)} total"
+                            tr("{n} file(s) copied \u00b7 {size} total", n=current, size=_fmt_bytes(total_bytes))
                         )
                     else:
-                        self.file_lbl.setText("Preparing\u2026")
+                        self.file_lbl.setText(tr("Preparing\u2026"))
                         self.details_lbl.setText(
-                            f"{_fmt_bytes(total_bytes)} to copy"
+                            tr("{size} to copy", size=_fmt_bytes(total_bytes))
                         )
                     self.details_lbl.setVisible(True)
                     return
@@ -19342,11 +20409,11 @@ class WatchCard(QFrame):
 
                 if pct == 100:
                     # All bytes transferred — engine is still finalising (MANIFEST, etc.)
-                    self.file_lbl.setText("Verifying…" if _is_verify else "Finalizing…")
+                    self.file_lbl.setText(tr("Verifying…") if _is_verify else tr("Finalizing…"))
                 elif short_name:
                     max_name     = 35
                     display_name = (short_name[:max_name] + "…") if len(short_name) > max_name else short_name
-                    verb         = "Uploading" if _is_uploading else ("Verifying" if _is_verify else "Copying")
+                    verb         = tr("Uploading") if _is_uploading else (tr("Verifying") if _is_verify else tr("Copying"))
                     self.file_lbl.setText(f"{verb}: {display_name}")
 
                 # ── Details row: bytes left · files left · speed · ETA ────────
@@ -19418,7 +20485,7 @@ class WatchCard(QFrame):
             self.clear_changes()
             self._hide_error_banner()
         else:
-            self.status_lbl.setText("▶  Failed")
+            self.status_lbl.setText(tr("▶  Failed"))
             self.status_lbl.setObjectName("status_err")
             self._show_error_banner(error_msg)
         self.status_lbl.style().unpolish(self.status_lbl)
@@ -19431,7 +20498,7 @@ class WatchCard(QFrame):
 
         # If watch opts out of auto-backup, show "Manual only"
         if self.watch.get("skip_auto_backup", False):
-            self.next_lbl.setText("Manual only")
+            self.next_lbl.setText(tr("Manual only"))
             self.next_lbl.setVisible(True)
             return
 
@@ -19477,7 +20544,7 @@ class WatchCard(QFrame):
                     continue
 
             if next_time:
-                label_prefix = "Next (watch):" if w_sched else "Next:"
+                label_prefix = tr("Next (watch):") if w_sched else tr("Next:")
                 self.next_lbl.setText(f"{label_prefix} {next_time}")
                 self.next_lbl.setVisible(True)
                 return
@@ -19490,7 +20557,7 @@ class WatchCard(QFrame):
 
         lb = self.watch.get("last_backup", "")
         if not lb:
-            self.next_lbl.setText("Auto-backup pending")
+            self.next_lbl.setText(tr("Auto-backup pending"))
             self.next_lbl.setVisible(True)
             return
 
@@ -19529,20 +20596,20 @@ class WatchCard(QFrame):
         paused = not self.watch.get("paused", False)
         self.watch["paused"] = paused
         if hasattr(self, "_pause_action"):
-            self._pause_action.setText("▶ Resume" if paused else "⏸ Pause")
+            self._pause_action.setText(tr("▶ Resume") if paused else tr("⏸ Pause"))
         self.pause_requested.emit(self.watch["id"], paused)
 
     def update_watch(self, watch: dict):
         self.watch = watch
         # Refresh last-backup / count meta label
         lb = watch.get("last_backup", "")
-        lb_text = "Never backed up"
+        lb_text = tr("Never backed up")
         if lb:
             try:
                 dt = datetime.fromisoformat(lb)
-                lb_text = f"Last backup: {dt.strftime('%b %d, %Y %H:%M')}"
+                lb_text = tr("Last backup: {p0}", p0=dt.strftime(tr("%b %d, %Y %H:%M")))
             except Exception:
-                lb_text = f"Last backup: {lb}"
+                lb_text = tr("Last backup: {p0}", p0=lb)
         count = watch.get("backup_count", 0)
         size  = watch.get("last_backup_size", 0)
         size_h = ""
@@ -19552,7 +20619,7 @@ class WatchCard(QFrame):
             except Exception:
                 pass
         if hasattr(self, "meta_lbl"):
-            self.meta_lbl.setText(f"{lb_text}   ·   {count} backup(s){size_h}")
+            self.meta_lbl.setText(f"{lb_text}   ·   " + tr("{n} backup(s)", n=count) + size_h)
 
         # Refresh the status dot and error banner
         if hasattr(self, "_status_dot"):
@@ -19570,12 +20637,12 @@ class WatchCard(QFrame):
             else:
                 self._status_dot.setText("—")
                 self._status_dot.setStyleSheet("color: #6b7280; font-size: 13px; font-weight: 700;")
-            self._status_dot.setToolTip(f"Last backup status: {_ls or 'unknown'}")
+            self._status_dot.setToolTip(tr("Last backup status: {status}", status=_ls or tr("unknown")))
 
         # Refresh pause button label
         paused = watch.get("paused", False)
         if hasattr(self, "_pause_action"):
-            self._pause_action.setText("▶ Resume" if paused else "⏸ Pause")
+            self._pause_action.setText(tr("▶ Resume") if paused else tr("⏸ Pause"))
 
         # Rebuild the entire card UI if name/path/color changed significantly
         # (cheaply update the known labels instead of rebuilding)
@@ -19616,7 +20683,7 @@ class _WelcomeDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.add_to_startup = False
-        self.setWindowTitle(f"Welcome to {APP_NAME}")
+        self.setWindowTitle(tr("Welcome to {name}", name=APP_NAME))
         self.setMinimumWidth(460)
         self.setMaximumWidth(520)
         self.setSizePolicy(
@@ -19638,7 +20705,7 @@ class _WelcomeDialog(QDialog):
         outer.addSpacing(16)
 
         # ── Heading ───────────────────────────────────────────────────────────
-        heading = QLabel(f"Welcome to {APP_NAME}!")
+        heading = QLabel(tr("Welcome to {p0}!", p0=APP_NAME))
         heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         heading.setStyleSheet(
             "font-size:22px; font-weight:700; color:#e8eaf0; background:transparent;"
@@ -19646,7 +20713,7 @@ class _WelcomeDialog(QDialog):
         outer.addWidget(heading)
         outer.addSpacing(8)
 
-        subtitle = QLabel("Here's how to get started:")
+        subtitle = QLabel(tr("Here's how to get started:"))
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet("font-size:13px; color:#9ca3af; background:transparent;")
         outer.addWidget(subtitle)
@@ -19688,7 +20755,7 @@ class _WelcomeDialog(QDialog):
         outer.addSpacing(32)
 
         # ── Get Started button ────────────────────────────────────────────────
-        get_started = QPushButton("Get Started")
+        get_started = QPushButton(tr("Get Started"))
         get_started.setObjectName("success")
         get_started.setFixedHeight(44)
         get_started.setStyleSheet(
@@ -19699,7 +20766,7 @@ class _WelcomeDialog(QDialog):
         outer.addSpacing(10)
 
         # ── Add to Startup button ─────────────────────────────────────────────
-        startup_btn = QPushButton("Add to Startup")
+        startup_btn = QPushButton(tr("Add to Startup"))
         startup_btn.setObjectName("secondary")
         startup_btn.setFixedHeight(36)
         def _on_startup():
@@ -19736,9 +20803,11 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setWindowTitle(tr("{p0} v{p1}", p0=APP_NAME, p1=APP_VERSION))
         self.setMinimumSize(780, 620)
         self.resize(860, 680)
+        # Drag a folder from Explorer onto the window to jump straight into Add Watch.
+        self.setAcceptDrops(True)
 
         # Wire the dry-run signal so the background thread can safely show
         # the result dialog on the Qt main thread.
@@ -19768,6 +20837,10 @@ class MainWindow(QMainWindow):
         self._history_window         = None
         self._user_cancelled_watches: set = set()  # watches cancelled by user — suppress auto-restart
         self._source_queues: dict    = {}   # source_path -> [watches] for smart grouping
+        # Global one-at-a-time backup queue: only ONE backup runs at a time so
+        # concurrent runs never split the (shared) upload bandwidth. Entries are
+        # (watch, triggered_by) tuples, started FIFO as each backup finishes.
+        self._backup_pending: list   = []
         self._skipped_notified: dict = {}   # watch_id > {'window': bool, 'idle': bool}
         # Post-backup grace period: suppress dest-watcher noise for 60s after backup
         # completes (robocopy tail-end writes fire modified events after worker exits)
@@ -19879,15 +20952,39 @@ class MainWindow(QMainWindow):
                 self.watch_search_input.clearFocus()
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(_esc_clear)
 
-    def _shortcut_add_watch(self):
-        """Ctrl+N: open Admin and immediately open the Add Watch dialog."""
-        self._open_admin(_after_show=lambda panel: panel._add_watch())
+    def _shortcut_add_watch(self, prefill_path: str = ""):
+        """Ctrl+N / empty-state button: open Admin and the Add Watch dialog."""
+        self._open_admin(_after_show=lambda panel: panel._add_watch(prefill_path=prefill_path))
+
+    # ── Drag-and-drop a folder to add a watch ────────────────────────────────
+    def _dropped_folder(self, urls):
+        """Return the first dropped local folder path, or '' if none."""
+        for u in urls:
+            p = u.toLocalFile()
+            if p and os.path.isdir(p):
+                return p
+        return ""
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md.hasUrls() and self._dropped_folder(md.urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        path = self._dropped_folder(event.mimeData().urls())
+        if path:
+            event.acceptProposedAction()
+            self._shortcut_add_watch(prefill_path=path)
+        else:
+            event.ignore()
 
     def _shortcut_jump_logs(self):
         """Ctrl+L: open Admin and switch directly to the Logs tab."""
         def _go(panel):
             for i in range(panel._tabs.count()):
-                if panel._tabs.tabText(i) == "Logs":
+                if panel._tabs.tabText(i) == tr("Logs"):
                     panel._tabs.setCurrentIndex(i)
                     break
         self._open_admin(_after_show=_go)
@@ -19928,20 +21025,20 @@ class MainWindow(QMainWindow):
                     ok = _sw.offer_startup_gui()
                     if ok:
                         QMessageBox.information(
-                            self, "Startup entry added",
-                            "BackupSys will now launch automatically when you log in.\n"
-                            "You can remove this later from Settings → General → 'Start on login'."
+                            self, tr("Startup entry added"),
+                            tr("BackupSys will now launch automatically when you log in.\n"
+                            "You can remove this later from Settings → General → 'Start on login'.")
                         )
                     else:
                         QMessageBox.warning(
-                            self, "Startup entry failed",
-                            "Could not write the startup entry automatically.\n"
-                            "You can enable this later from Settings → General → 'Start on login'."
+                            self, tr("Startup entry failed"),
+                            tr("Could not write the startup entry automatically.\n"
+                            "You can enable this later from Settings → General → 'Start on login'.")
                         )
                 except Exception as exc:
                     QMessageBox.warning(
-                        self, "Startup entry failed",
-                        f"Could not write the startup entry: {exc}"
+                        self, tr("Startup entry failed"),
+                        tr("Could not write the startup entry: {p0}", p0=exc)
                     )
 
         except Exception:
@@ -20064,7 +21161,7 @@ class MainWindow(QMainWindow):
             # This ensures file auditing is always active before the app is used.
             try:
                 dlg = QDialog(self)
-                dlg.setWindowTitle("Administrator Permission Required")
+                dlg.setWindowTitle(tr("Administrator Permission Required"))
                 dlg.setWindowFlags(
                     dlg.windowFlags()
                     | Qt.WindowType.WindowStaysOnTopHint
@@ -20088,20 +21185,20 @@ class MainWindow(QMainWindow):
                 )
                 _title_row.addWidget(_icon_lbl)
                 _title_row.addSpacing(10)
-                _title_lbl = QLabel("<b style='font-size:14px'>Permission Required to Continue</b>")
+                _title_lbl = QLabel(tr("<b style='font-size:14px'>Permission Required to Continue</b>"))
                 _title_lbl.setTextFormat(Qt.TextFormat.RichText)
                 _title_row.addWidget(_title_lbl, 1)
                 _layout.addLayout(_title_row)
 
                 # Body text
                 _body = QLabel(
-                    "BackupSys needs <b>Administrator permission</b> to enable Windows file "
+                    tr("BackupSys needs <b>Administrator permission</b> to enable Windows file "
                     "auditing on shared folders.<br><br>"
                     "This is a one-time setup. Without it, the app <b>cannot track who "
                     "adds, modifies, deletes, or renames files</b> in watched folders — "
                     "Change History will show <i>Unknown</i> for every event.<br><br>"
                     "Please click <b>Allow</b> below and then click <b>Yes</b> on the "
-                    "Windows <i>User Account Control</i> prompt that appears."
+                    "Windows <i>User Account Control</i> prompt that appears.")
                 )
                 _body.setTextFormat(Qt.TextFormat.RichText)
                 _body.setWordWrap(True)
@@ -20110,10 +21207,10 @@ class MainWindow(QMainWindow):
                 # Buttons
                 _btn_row = QHBoxLayout()
                 _btn_row.addStretch()
-                _quit_btn  = QPushButton("Quit")
+                _quit_btn  = QPushButton(tr("Quit"))
                 _quit_btn.setFixedWidth(90)
                 _quit_btn.setObjectName("secondary")
-                _allow_btn = QPushButton("Allow  ▶")
+                _allow_btn = QPushButton(tr("Allow  ▶"))
                 _allow_btn.setFixedWidth(110)
                 _allow_btn.setDefault(True)
                 _btn_row.addWidget(_quit_btn)
@@ -20279,24 +21376,22 @@ class MainWindow(QMainWindow):
             return
 
         msg = QMessageBox(self)
-        msg.setWindowTitle("BackupSys v1.1.0 — What's New")
+        msg.setWindowTitle(tr("BackupSys v1.1.0 — What's New"))
         msg.setIcon(QMessageBox.Icon.Information)
-        msg.setText("<b>Welcome to BackupSys v1.1.0!</b>")
+        msg.setText(tr("<b>Welcome to BackupSys v1.1.0!</b>"))
         msg.setInformativeText(
-            "Here's what changed since v1.0.x:\n\n"
+            tr("Here's what changed since v1.0.x:\n\n"
             "🔐  Encryption upgraded to AES-256-GCM streaming\n"
             "     (old Fernet backups still open automatically — no action needed)\n\n"
             "📁  Google Drive folder picker — choose exactly where backups land\n\n"
             "⚙️  Pre/post backup script hooks per watch\n"
             "     (Settings → Edit Watch → Backup Hooks)\n\n"
-            "📄  Single-file restore — restore one file from any snapshot\n"
-            "     (History → Preview → Restore Selected File)\n\n"
             "🕐  Backup window stop time — limit auto-backups to a time window\n"
             "     (Settings → Run at times / Stop by)\n\n"
             "📤  Config export — back up your settings\n"
             "     (Settings → General → Export Config)\n\n"
             "✔  Per-watch last-backup status shown inline on each watch card\n\n"
-            "No migration steps required — all existing watches and backups continue to work."
+            "No migration steps required — all existing watches and backups continue to work.")
         )
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
@@ -20337,8 +21432,7 @@ class MainWindow(QMainWindow):
                 f"(label={label!r} serial={serial!r})"
             )
             self._append_log(
-                f"🔌 Drive connected ({label or serial or mount_point}) — "
-                f"triggering backup: {w['name']}"
+                tr("🔌 Drive connected ({p0}) \u2014 triggering backup: {p1}", p0=label or serial or mount_point, p1=w['name'])
             )
             self._backup_single(w, triggered_by="drive_trigger")
             matched_any = True
@@ -20377,42 +21471,42 @@ class MainWindow(QMainWindow):
         tl.addWidget(logo)
         tl.addStretch()
 
-        self.status_dot = QLabel("● Active")
+        self.status_dot = QLabel(tr("● Active"))
         self.status_dot.setObjectName("status_ok")
         tl.addWidget(self.status_dot)
 
         tl.addSpacing(16)
 
-        history_btn = QPushButton("📋  History")
+        history_btn = QPushButton(tr("📋  History"))
         history_btn.setObjectName("secondary")
         history_btn.clicked.connect(self._open_history)
         tl.addWidget(history_btn)
 
         tl.addSpacing(8)
 
-        dashboard_btn = QPushButton("📈  Dashboard")
+        dashboard_btn = QPushButton(tr("📈  Dashboard"))
         dashboard_btn.setObjectName("secondary")
         dashboard_btn.clicked.connect(self._open_global_dashboard)
         tl.addWidget(dashboard_btn)
 
         tl.addSpacing(8)
 
-        logs_btn = QPushButton("📜  Logs")
+        logs_btn = QPushButton(tr("📜  Logs"))
         logs_btn.setObjectName("secondary")
         logs_btn.clicked.connect(self._open_logs)
         tl.addWidget(logs_btn)
 
         tl.addSpacing(8)
 
-        admin_btn = QPushButton("🔧 Admin")
+        admin_btn = QPushButton(tr("🔧 Admin"))
         admin_btn.setObjectName("secondary")
-        admin_btn.setToolTip("Admin Settings (Ctrl+,)")
+        admin_btn.setToolTip(tr("Admin Settings (Ctrl+,)"))
         admin_btn.clicked.connect(self._open_admin)
         tl.addWidget(admin_btn)
 
         tl.addSpacing(8)
 
-        self.quit_btn = QPushButton("❌ Quit")
+        self.quit_btn = QPushButton(tr("❌ Quit"))
         self.quit_btn.setObjectName("secondary")
         self.quit_btn.clicked.connect(self._quit_app)
         tl.addWidget(self.quit_btn)
@@ -20433,7 +21527,7 @@ class MainWindow(QMainWindow):
         sl.setContentsMargins(16, 24, 16, 16)
         sl.setSpacing(8)
 
-        sl.addWidget(self._sidebar_label("OVERVIEW"))
+        sl.addWidget(self._sidebar_label(tr("OVERVIEW")))
 
         self._stat_cards = {}
         for key, icon, label in [
@@ -20443,20 +21537,30 @@ class MainWindow(QMainWindow):
             ("next",     "⏰", "Next Backup"),
             ("disk",     "💾", "Backup Storage"),
         ]:
-            card = self._make_stat_card(icon, label, "0")
+            card = self._make_stat_card(icon, tr(label), "0")
             self._stat_cards[key] = card
             sl.addWidget(card)
 
         sl.addSpacing(16)
-        sl.addWidget(self._sidebar_label("QUICK ACTIONS"))
+        sl.addWidget(self._sidebar_label(tr("QUICK ACTIONS")))
 
 
-        self._pause_all_btn = QPushButton("⏸  Pause All Backups")
+        self._backup_all_btn = QPushButton(tr("⬆  Backup All Now"))
+        self._backup_all_btn.setToolTip(
+            tr("Back up every watched folder in one click.\n"
+            "Backups run one at a time (queued) to avoid splitting bandwidth —\n"
+            "you don't need to click each folder's button. Paused folders are skipped.\n\n"
+            "Tip: for hands-off recurring backups, turn on Auto Backup / Schedule instead.")
+        )
+        self._backup_all_btn.clicked.connect(self._backup_all_now)
+        sl.addWidget(self._backup_all_btn)
+
+        self._pause_all_btn = QPushButton(tr("⏸  Pause All Backups"))
         self._pause_all_btn.setObjectName("secondary")
         self._pause_all_btn.setToolTip(
-            "Pause all watched folders at once.\n"
+            tr("Pause all watched folders at once.\n"
             "Useful before presentations or on slow connections.\n"
-            "Click again to resume all watches."
+            "Click again to resume all watches.")
         )
         self._pause_all_btn.clicked.connect(self._toggle_pause_all)
         sl.addWidget(self._pause_all_btn)
@@ -20477,14 +21581,14 @@ class MainWindow(QMainWindow):
 
         # Header row
         header_row = QHBoxLayout()
-        watches_lbl = QLabel("Watched Folders")
+        watches_lbl = QLabel(tr("Watched Folders"))
         watches_lbl.setObjectName("heading")
         header_row.addWidget(watches_lbl)
         header_row.addStretch()
         self.watch_search_input = QLineEdit()
-        self.watch_search_input.setPlaceholderText("🔍  Filter watches…")
+        self.watch_search_input.setPlaceholderText(tr("🔍  Filter watches…"))
         self.watch_search_input.setFixedWidth(200)
-        self.watch_search_input.setToolTip("Filter the watch list by name (Ctrl+F)")
+        self.watch_search_input.setToolTip(tr("Filter the watch list by name (Ctrl+F)"))
         self.watch_search_input.textChanged.connect(self._filter_watch_cards)
         header_row.addWidget(self.watch_search_input)
         cl.addLayout(header_row)
@@ -20512,14 +21616,14 @@ class MainWindow(QMainWindow):
         gdb_icon.setStyleSheet("color:#fbbf24; font-size:16px; font-weight:bold;")
         gdb_row.addWidget(gdb_icon)
         self._gdrive_banner_lbl = QLabel(
-            "<b style='color:#fef3c7;'>Google Drive disconnected</b> "
+            tr("<b style='color:#fef3c7;'>Google Drive disconnected</b> "
             "<span style='color:#fcd34d;'>— your token has expired or been revoked. "
-            "Backups to Google Drive will fail until you reconnect.</span>"
+            "Backups to Google Drive will fail until you reconnect.</span>")
         )
         self._gdrive_banner_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._gdrive_banner_lbl.setWordWrap(True)
         gdb_row.addWidget(self._gdrive_banner_lbl, stretch=1)
-        gdrive_reconnect_btn = QPushButton("Reconnect Drive →")
+        gdrive_reconnect_btn = QPushButton(tr("Reconnect Drive →"))
         gdrive_reconnect_btn.setObjectName("secondary")
         gdrive_reconnect_btn.setStyleSheet(
             "QPushButton { background:#ea580c; color:#fff; border:none; border-radius:4px; padding:4px 12px; }"
@@ -20530,7 +21634,7 @@ class MainWindow(QMainWindow):
         gdrive_dismiss_btn = QPushButton("✕")
         gdrive_dismiss_btn.setObjectName("secondary")
         gdrive_dismiss_btn.setFixedWidth(28)
-        gdrive_dismiss_btn.setToolTip("Dismiss until next backup")
+        gdrive_dismiss_btn.setToolTip(tr("Dismiss until next backup"))
         gdrive_dismiss_btn.setStyleSheet(
             "QPushButton { background:transparent; color:#fcd34d; border:none; font-size:14px; }"
             "QPushButton:hover { color:#fff; }"
@@ -20560,7 +21664,7 @@ class MainWindow(QMainWindow):
         ll = QVBoxLayout(log_frame)
         ll.setContentsMargins(12, 8, 12, 8)
         ll.setSpacing(6)
-        log_title = QLabel("Activity Log")
+        log_title = QLabel(tr("Activity Log"))
         log_title.setStyleSheet("color:#6b7280; font-size:11px; font-weight:700; text-transform:uppercase;")
         ll.addWidget(log_title)
         self.log_text = QTextEdit()
@@ -20607,14 +21711,12 @@ class MainWindow(QMainWindow):
         interval = self.cfg.get("interval_min", 30)
         if auto:
             self.auto_lbl.setText(
-                f"<span style='color:#22c55e; font-weight:700;'>▶ Auto Backup ON</span>"
-                f"  ·  Every <b>{interval} min</b>"
-                f"  ·  Per-watch destinations"
+                tr("<span style='color:#22c55e; font-weight:700;'>\u25b6 Auto Backup ON</span>  \u00b7  Every <b>{p0} min</b>  \u00b7  Per-watch destinations", p0=interval)
             )
         else:
             self.auto_lbl.setText(
-                "<span style='color:#6b7280; font-weight:700;'>▶ Auto Backup OFF</span>"
-                "  ·  Manual backups only"
+                tr("<span style='color:#6b7280; font-weight:700;'>▶ Auto Backup OFF</span>"
+                "  ·  Manual backups only")
             )
 
     def _refresh_watches(self):
@@ -20635,19 +21737,35 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_pause_all_btn"):
             all_paused = bool(watches) and all(w.get("paused", False) for w in watches)
             if all_paused:
-                self._pause_all_btn.setText("▶  Resume All Backups")
-                self._pause_all_btn.setToolTip("Resume all watched folders (backups were globally paused).")
+                self._pause_all_btn.setText(tr("▶  Resume All Backups"))
+                self._pause_all_btn.setToolTip(tr("Resume all watched folders (backups were globally paused)."))
             else:
-                self._pause_all_btn.setText("⏸  Pause All Backups")
+                self._pause_all_btn.setText(tr("⏸  Pause All Backups"))
                 self._pause_all_btn.setToolTip(
-                    "Pause all watched folders at once.\n"
+                    tr("Pause all watched folders at once.\n"
                     "Useful before presentations or on slow connections.\n"
-                    "Click again to resume all watches."
+                    "Click again to resume all watches.")
                 )
         if not watches:
-            placeholder = QLabel("No folders are being watched.\nClick Admin > Watches > Add Watch to get started.")
-            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            placeholder.setStyleSheet("color:#374151; font-size:13px; padding:40px;")
+            placeholder = QWidget()
+            _pv = QVBoxLayout(placeholder)
+            _pv.setContentsMargins(0, 40, 0, 40)
+            _pv.setSpacing(14)
+            _pv.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _lbl = QLabel(tr("No folders are being watched yet."))
+            _lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _lbl.setStyleSheet("color:#6b7280; font-size:14px;")
+            _pv.addWidget(_lbl)
+            _hint = QLabel(tr("Add a folder to start monitoring and backing it up automatically."))
+            _hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _hint.setStyleSheet("color:#374151; font-size:12px;")
+            _pv.addWidget(_hint)
+            _empty_add = QPushButton(tr("➕ Add Watch"))
+            _empty_add.setObjectName("success")
+            _empty_add.setFixedWidth(200)
+            _empty_add.setToolTip(tr("Add a folder to start monitoring and backing it up automatically."))
+            _empty_add.clicked.connect(self._shortcut_add_watch)
+            _pv.addWidget(_empty_add, alignment=Qt.AlignmentFlag.AlignCenter)
             self.watches_layout.insertWidget(0, placeholder)
             self._no_watches_placeholder = placeholder
         else:
@@ -20658,14 +21776,13 @@ class MainWindow(QMainWindow):
                 card.full_backup_requested.connect(self._force_full_backup)
                 card.dry_run_requested.connect(self._dry_run_watch)
                 card.validate_requested.connect(self._validate_watch)
-                card.restore_requested.connect(self._restore_watch)
-                card.restore_to_original_requested.connect(self._restore_to_original)
                 card.pause_requested.connect(self._on_pause_requested)
                 card.pause_backup_requested.connect(self._on_pause_backup_requested)
                 card.resume_backup_requested.connect(self._on_resume_backup_requested)
                 card.cancel_requested.connect(self._on_cancel_requested)
                 card.open_backup_requested.connect(self._on_open_backup_folder)
                 card.watch_settings_requested.connect(self._on_watch_settings_requested)
+                card.export_diagnostics_requested.connect(self._export_watch_diagnostics)
                 self._cards[w["id"]] = card
                 self.watches_layout.insertWidget(self.watches_layout.count() - 1, card)
                 # Restore active backup state so the progress bar stays visible
@@ -20725,17 +21842,17 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                 self._stat_cards["disk"]._value_label.setText(
-                    backup_engine._human_size(total_bytes) if total_bytes else "0 B"
+                    backup_engine._human_size(total_bytes) if total_bytes else tr("0 B")
                 )
             except Exception:
-                self._stat_cards["disk"]._value_label.setText("Error")
+                self._stat_cards["disk"]._value_label.setText(tr("Error"))
 
         auto = self.cfg.get("auto_backup", False)
         interval = self.cfg.get("interval_min", 30)
         if auto and hasattr(self, "_last_auto_time"):
             pass
         self._stat_cards["next"]._value_label.setText(
-            f"{interval}m" if auto else "Manual"
+            f"{interval}m" if auto else tr("Manual")
         )
 
     # ── Startup Queue ──────────────────────────────────────────────────────────
@@ -20767,16 +21884,14 @@ class MainWindow(QMainWindow):
                         accessible = False
                     if not accessible:
                         self._append_log(
-                            f"⚠ Skipping queued backup '{watch.get('name', wid)}' "
-                            f"— source path not accessible at startup "
-                            f"(network share may be inaccessible). Will retry on next scheduled run."
+                            tr("\u26a0 Skipping queued backup '{p0}' \u2014 source path not accessible at startup (network share may be inaccessible). Will retry on next scheduled run.", p0=watch.get('name', wid))
                         )
                         continue
-                self._append_log(f"⏳ Resuming queued backup: {watch.get('name', wid)}")
+                self._append_log(tr("\u23f3 Resuming queued backup: {p0}", p0=watch.get('name', wid)))
                 try:
                     self._backup_single(watch, triggered_by="queue")
                 except Exception as e:
-                    self._append_log(f"⚠ Could not resume queued backup '{watch.get('name', wid)}': {e}")
+                    self._append_log(tr("\u26a0 Could not resume queued backup '{p0}': {p1}", p0=watch.get('name', wid), p1=e))
 
     # ── Watchers ───────────────────────────────────────────────────────────────
 
@@ -21205,6 +22320,15 @@ class MainWindow(QMainWindow):
                     script_lines.append(
                         "wevtutil sl Security /ms:524288000 /rt:false; "
                         "Write-Output ('WEVTUTIL_RC=' + $LASTEXITCODE);"
+                    )
+                    # Open the firewall so a coworker's PC watching one of THIS
+                    # machine's shares can read our Security log (Event 4663)
+                    # remotely.  Without it the SACL records events but the
+                    # watcher can't fetch them → attribution stays 'Unknown'.
+                    script_lines.append(
+                        "Enable-NetFirewallRule -DisplayGroup "
+                        "'Remote Event Log Management' -EA SilentlyContinue; "
+                        "Write-Output ('FWRULE_RC=' + $LASTEXITCODE);"
                     )
                     # Verification step: prints the resulting policy so the log shows
                     # whether 'File System' auditing is actually ON afterwards.
@@ -21920,12 +23044,60 @@ class MainWindow(QMainWindow):
                             f"machine — this is a backup-engine write, suppressing"
                         )
                         return False
+                    # ── Share-host's own identity is NOT a third-party actor ──
+                    # The backup runs on THIS PC and writes into \\HOST\share
+                    # (e.g. \\192.168.254.105\test\test4).  That remote write is
+                    # recorded on HOST under HOST's OWN local account; when it
+                    # can't be LogonId-mapped back to us it resolves to HOST
+                    # itself (e.g. DESKTOP-KGG55PU / .105).  That is exactly what
+                    # the backup engine's own copy looks like — NOT proof of a
+                    # coworker.  Since we only reach here for a file that IS in
+                    # the backup's just-written set, treat "resolved to the share
+                    # host itself" like own/inconclusive and suppress it.  Only a
+                    # genuinely DIFFERENT third machine is a real coworker.
+                    import re as _sp_re
+                    _sp_host_ids = set()
+                    try:
+                        _m_host = _sp_re.match(r"^[\\/]{2}([^\\/]+)", event_path or "")
+                        if _m_host:
+                            _uh = (_m_host.group(1) or "").strip().lower()
+                            if _uh:
+                                _sp_host_ids.add(_uh)
+                                try:
+                                    _sp_host_ids.add(_sp_sock.gethostbyname(_uh).lower())
+                                except Exception:
+                                    pass
+                                try:
+                                    _rev = _sp_sock.gethostbyaddr(_uh)
+                                    if _rev and _rev[0]:
+                                        _sp_host_ids.add(_rev[0].lower())
+                                    for _al in (_rev[1] if _rev else []):
+                                        if _al:
+                                            _sp_host_ids.add(_al.lower())
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    _sp_host_ids.discard("")
+                    _is_share_host = bool(
+                        (_probe_ip and _probe_ip.lower() in _sp_host_ids)
+                        or (_probe_mach and _probe_mach in _sp_host_ids)
+                    )
+                    if _is_share_host:
+                        _sp.info(
+                            f"[desktop._on_file_change] SUPPRESSOR_PROBE: resolved to the "
+                            f"SHARE HOST's OWN local identity (user={_probe_user!r} "
+                            f"machine={_probe_mach!r} ip={_probe_ip!r}) — this is the backup "
+                            f"engine's own remote write recorded under the host's local "
+                            f"account, NOT a third-party coworker. Suppressing backup artifact."
+                        )
+                        return False
                     # Resolved to a different machine → real coworker action
                     _sp.info(
                         f"[desktop._on_file_change] SUPPRESSOR_PROBE: THIRD-PARTY ACTOR "
                         f"detected — user={_probe_user!r} machine={_probe_mach!r} "
-                        f"ip={_probe_ip!r} is NOT own machine ({_own_ip_sp!r}). "
-                        f"Event will NOT be suppressed."
+                        f"ip={_probe_ip!r} is NOT own machine ({_own_ip_sp!r}) nor the "
+                        f"share host. Event will NOT be suppressed."
                     )
                     # Pre-fill attribution into the entry so downstream enrichment
                     # doesn't double-query SMB (saves a round-trip)
@@ -22013,6 +23185,91 @@ class MainWindow(QMainWindow):
                         or (_event_basename in _backed_fnames)   # file was newly copied this run
                         or (_event_basename in _dest_fnames)     # file was already in dest (robocopy touched mtime)
                     )
+                    # ── Genuine-edit escape hatch (MODIFIED only) ─────────────
+                    # A sync backup makes dest == source.  So the ONE reliable way
+                    # to tell a genuine external edit of a dest file apart from
+                    # (a) a spurious robocopy touch or (b) the backup's OWN write
+                    # being detected late by the poll — both of which also resolve
+                    # to the share host's server-local identity under matching
+                    # credentials, so the SMB probe can't help — is to compare the
+                    # dest file against its SOURCE counterpart:
+                    #   • dest content == source content  → in sync = backup wrote
+                    #     it (or nothing changed) → SUPPRESS.
+                    #   • dest content != source content  → the dest copy diverged
+                    #     from source = someone edited the dest directly → SHOW.
+                    #   • source missing / unreadable     → can't prove divergence;
+                    #     a dest file with no live source is almost always a backup
+                    #     leftover, so lean SUPPRESS (avoids the spurious "modified"
+                    #     row after a delete-only session).
+                    # (An earlier version compared against the recorded source
+                    # SNAPSHOT, but build_snapshot reuses stale entries for
+                    # "unchanged" files, so a backup's own write looked like an
+                    # edit and leaked a bogus row — hence the direct dest-vs-source
+                    # content check here.)
+                    if _is_backup_file and _etype == "modified":
+                        def _grace_file_fp(_p):
+                            try:
+                                _st = _os_gs.stat(_p)
+                                _h = None
+                                try:
+                                    import hashlib as _gh
+                                    with open(_p, "rb") as _fh:
+                                        _h = _gh.sha256(_fh.read(65536)).hexdigest()
+                                except Exception:
+                                    pass
+                                return (_st.st_size, _h)
+                            except Exception:
+                                return None
+                        _dest_evt_path = entry.get("path", "")
+                        _src_root  = _watch_cfg_early.get("path", "") or ""
+                        _dest_root = _watch_cfg_early.get("destination", "") or ""
+                        _src_counterpart = ""
+                        if _src_root and _dest_root:
+                            _dn = _dest_evt_path.replace("/", "\\")
+                            _dr = _dest_root.replace("/", "\\").rstrip("\\")
+                            if _dn.lower().startswith(_dr.lower() + "\\"):
+                                _rel_dc = _dn[len(_dr) + 1:]
+                                _src_counterpart = (
+                                    _src_root.replace("/", "\\").rstrip("\\") + "\\" + _rel_dc
+                                )
+                        _dest_fp = _grace_file_fp(_dest_evt_path)
+                        _src_fp  = _grace_file_fp(_src_counterpart) if _src_counterpart else None
+                        _diverged = bool(
+                            _dest_fp is not None and _src_fp is not None
+                            and (
+                                _dest_fp[0] != _src_fp[0]
+                                or (_dest_fp[1] is not None and _src_fp[1] is not None
+                                    and _dest_fp[1] != _src_fp[1])
+                            )
+                        )
+                        if _diverged:
+                            logger.info(
+                                f"[desktop._on_file_change] SUPPRESSOR: GENUINE EDIT in "
+                                f"grace window — dest copy DIVERGED from its source "
+                                f"(dest fp={_dest_fp} vs source fp={_src_fp}, "
+                                f"source={_src_counterpart!r}); a sync backup makes them "
+                                f"equal, so this is a real dest-side edit, not a backup "
+                                f"write or robocopy touch. NOT suppressing. "
+                                f"basename={_event_basename!r} watch_id={watch_id!r} "
+                                f"path={_dest_evt_path!r}"
+                            )
+                            _is_backup_file = False  # fall through to normal processing
+                            # The backup's own late-detected 'added' may have seeded
+                            # the content fingerprint with this same content, so the
+                            # spurious-mod / fingerprint-unchanged suppressors below
+                            # would compare current-vs-seed (equal) and re-suppress
+                            # this genuine edit.  Flag the entry so they honor the
+                            # dest-vs-source divergence we just proved.
+                            entry["_grace_genuine_edit"] = True
+                        else:
+                            logger.info(
+                                f"[desktop._on_file_change] SUPPRESSOR: dest matches source "
+                                f"(or source gone) — dest fp={_dest_fp} source fp={_src_fp} "
+                                f"source={_src_counterpart!r}; treating as backup's own write / "
+                                f"in-sync, NOT a user edit. Will suppress. "
+                                f"basename={_event_basename!r} watch_id={watch_id!r} "
+                                f"path={_dest_evt_path!r}"
+                            )
                     if _is_backup_file:
                         # Before suppressing, probe SMB attribution to detect a
                         # coworker adding a same-named file during the grace window.
@@ -22148,7 +23405,14 @@ class MainWindow(QMainWindow):
                 # genuine edit (e.g. user saved in Excel right after copying
                 # the file in), NOT a spurious write-notification artifact.
                 _spur_fp_key = (watch_id, entry.get("path", "").lower())
-                _spur_fp_bypass = False
+                _spur_fp_bypass = bool(entry.get("_grace_genuine_edit"))
+                if _spur_fp_bypass:
+                    _dbg.info(
+                        f"[desktop._on_file_change] SPURIOUS-MOD BYPASS — grace-window "
+                        f"genuine-edit flag set (content differs from what the backup "
+                        f"left); not a spurious notification. watch_id={watch_id!r} "
+                        f"path={entry.get('path')!r}"
+                    )
                 with self._dest_content_fp_lock:
                     _spur_seed_fp = self._dest_content_fp.get(_spur_fp_key)
                 if _spur_seed_fp is not None:
@@ -22175,6 +23439,11 @@ class MainWindow(QMainWindow):
                             )
                     except Exception:
                         _spur_fp_bypass = True   # stat failed — fail open
+                if _spur_fp_bypass:
+                    # Accepted as a real edit on this path too (the fingerprint
+                    # block below is skipped when an 'added' stamp was found), so
+                    # mark it — the rename-correlation guard reads this flag.
+                    entry["_fp_genuine_edit"] = True
                 if not _spur_fp_bypass:
                     _dbg.info(
                         f"[desktop._on_file_change] SPURIOUS-MODIFIED suppressed: "
@@ -22231,6 +23500,10 @@ class MainWindow(QMainWindow):
                     # even though the file genuinely changed.
                     _fp_current = (_fp_stat.st_size, _fp_stat.st_mtime)
                 except Exception as _fp_stat_err:
+                    # Unverifiable — fail open here AND downstream: the rename
+                    # correlation guard must not silently drop an edit we were
+                    # merely unable to confirm.
+                    entry["_fp_unverified"] = True
                     _dbg.info(
                         f"[desktop._on_file_change] FINGERPRINT-CHECK: stat failed "
                         f"({_fp_stat_err!r}) for path={_fp_path_raw!r} — cannot verify, "
@@ -22295,14 +23568,34 @@ class MainWindow(QMainWindow):
                                     f"last accepted add/edit"
                                 )
                             elif _fp_prev_hash is None:
-                                # Old entry had no hash (transition from earlier code
-                                # version). Treat as a genuine edit so we don't miss it,
-                                # and store the hash going forward.
+                                # Baseline was seeded WITHOUT a hash (e.g. a rename
+                                # coalesce, or an older code version).  Size AND mtime
+                                # match the baseline exactly — overwhelming evidence the
+                                # file is byte-for-byte unchanged: an SMB/SACL Set-Acl
+                                # metadata touch or a CHANGE_NOTIFY handle-reopen re-fire,
+                                # NOT a user edit.  (A real edit refreshes mtime to ~now.)
+                                # Suppress it, and backfill the now-computed hash into the
+                                # baseline so a genuine future edit that lands on the same
+                                # size+mtime — the rare FAT32/SMB 1-second-granularity
+                                # case — can still be caught by the hash-differs branch.
+                                # NOTE: previously this treated the event as a genuine edit
+                                # "to avoid false suppression", which surfaced a phantom
+                                # 'modified' row (Unknown actor) after every rename.
+                                _fp_suppress = True
+                                _fp_suppress_reason = (
+                                    f"size={_fp_current[0]} mtime_float={_fp_current[1]} "
+                                    f"identical to baseline (which had no stored hash) — "
+                                    f"backfilled sha256_64k={_fp_current_hash!r}; no content change"
+                                )
+                                with self._dest_content_fp_lock:
+                                    self._dest_content_fp[_fp_key] = (
+                                        _fp_current[0], _fp_current[1], _fp_current_hash
+                                    )
                                 _dbg.info(
                                     f"[desktop._on_file_change] FINGERPRINT-CHECK: "
-                                    f"size+mtime matched but prev entry has no hash "
-                                    f"(legacy format or hash failed at seed time) — "
-                                    f"treating as genuine edit to avoid false suppression. "
+                                    f"size+mtime matched, prev entry had no hash — exact "
+                                    f"size+mtime match means unchanged; suppressing phantom "
+                                    f"'modified' and backfilling hash. "
                                     f"path={_fp_path_raw!r} watch_id={watch_id!r} "
                                     f"current_hash={_fp_current_hash!r}"
                                 )
@@ -22318,6 +23611,33 @@ class MainWindow(QMainWindow):
                                     f"current_hash={_fp_current_hash!r} "
                                     f"size={_fp_current[0]} mtime_float={_fp_current[1]}"
                                 )
+                    elif _fp_prev is None:
+                        # No fingerprint baseline yet for this path (watcher just
+                        # started, or first time we've seen it).  A genuine edit
+                        # refreshes the file's mtime to ~now; a spurious 'modified'
+                        # on a PRE-EXISTING file — startup SACL Set-Acl touching
+                        # metadata, or CHANGE_NOTIFY handle-reopen churn — leaves the
+                        # file's ORIGINAL mtime untouched.  So if the on-disk mtime is
+                        # far in the past relative to when we detected the event, the
+                        # file was NOT actually just modified — suppress the phantom.
+                        # The threshold is deliberately large (1 h) so clock skew
+                        # between this PC and the file server can never suppress a
+                        # real, recently-made edit (those are detected within seconds
+                        # and carry a near-now mtime).  Fail open on any error.
+                        _FP_STALE_MTIME_SECS = 3600.0
+                        try:
+                            _fp_mtime_age = _time_mod.time() - float(_fp_current[1])
+                        except Exception:
+                            _fp_mtime_age = 0.0
+                        if _fp_mtime_age > _FP_STALE_MTIME_SECS:
+                            _fp_suppress = True
+                            _fp_suppress_reason = (
+                                f"no fingerprint baseline and the file's mtime is "
+                                f"{_fp_mtime_age:.0f}s old (> {_FP_STALE_MTIME_SECS:.0f}s) — a "
+                                f"real edit would set mtime to ~now, so this 'modified' is a "
+                                f"phantom notification (e.g. startup SACL Set-Acl metadata "
+                                f"touch), not an actual content change"
+                            )
 
                     _dbg.info(
                         f"[desktop._on_file_change] FINGERPRINT-CHECK: "
@@ -22328,6 +23648,19 @@ class MainWindow(QMainWindow):
                         f"size_mtime_match={_fp_size_mtime_match} "
                         f"suppress={_fp_suppress}"
                     )
+                    if _fp_suppress and entry.get("_grace_genuine_edit"):
+                        # The grace-window escape hatch already proved the dest
+                        # content differs from what the backup left.  The stored
+                        # fingerprint here matches only because the backup's own
+                        # late-detected 'added' seeded it with this SAME post-edit
+                        # content — so "unchanged vs. seed" is expected and must
+                        # NOT hide the edit.  Honor the proven content delta.
+                        _dbg.info(
+                            f"[desktop._on_file_change] FINGERPRINT-SUPPRESS OVERRIDDEN by "
+                            f"grace-window genuine-edit flag — accepting the edit. "
+                            f"path={_fp_path_raw!r} watch_id={watch_id!r}"
+                        )
+                        _fp_suppress = False
                     if _fp_suppress:
                         _dbg.info(
                             f"[desktop._on_file_change] FINGERPRINT-SUPPRESSED: "
@@ -22351,6 +23684,11 @@ class MainWindow(QMainWindow):
                             _keys_to_drop = list(self._dest_content_fp.keys())[:1000]
                             for _k in _keys_to_drop:
                                 self._dest_content_fp.pop(_k, None)
+                    # Proven content delta.  Downstream guards that drop 'modified'
+                    # events by path/time heuristics (rename correlation) must not
+                    # override this — a real save whose path happens to be a rename
+                    # endpoint is still a real save.
+                    entry["_fp_genuine_edit"] = True
                     _dbg.info(
                         f"[desktop._on_file_change] FINGERPRINT-ACCEPTED: "
                         f"'modified' for path={_fp_path_raw!r} is a genuine edit. "
@@ -22382,6 +23720,23 @@ class MainWindow(QMainWindow):
             import threading as _pdm_threading
             import time as _pdm_time
             _pdm_key = (watch_id, entry.get("path", "").lower())
+            # First: did a DELETE for this same path already arrive in the last
+            # window?  Windows can fire the pre-delete 'modified' AFTER the
+            # 'deleted' (typical for a folder emptied by child deletions), and the
+            # forward-only wait below would miss it and leak a spurious 'modified'
+            # row.  If so, suppress immediately — the 'modified' is the delete's
+            # side-effect, not a real edit.
+            with self._pending_mod_lock:
+                _recent_del_ts = getattr(self, "_recent_dest_deletes", {}).get(_pdm_key)
+            if _recent_del_ts is not None and (_pdm_time.time() - _recent_del_ts) <= _PRE_DEL_MOD_WINDOW:
+                _dbg.info(
+                    f"[desktop._on_file_change] PRE-DELETE-MOD suppressed (delete "
+                    f"already seen {_pdm_time.time() - _recent_del_ts:.2f}s ago for "
+                    f"same path — pre-delete 'modified' fired after the 'deleted', "
+                    f"not a real edit). watch_id={watch_id!r} path={entry.get('path')!r} "
+                    f"detection_source={entry.get('detection_source')!r}"
+                )
+                return
             _pdm_event = _pdm_threading.Event()
             with self._pending_mod_lock:
                 self._pending_mod_before_del[_pdm_key] = _pdm_event
@@ -22415,9 +23770,26 @@ class MainWindow(QMainWindow):
         # If a MODIFIED for this path is currently held in the pre-delete window,
         # wake it so it can suppress itself.
         if _etype == "deleted" and _is_dest:
+            import time as _pdm_del_time
             _pdm_key = (watch_id, entry.get("path", "").lower())
             with self._pending_mod_lock:
                 _pdm_ev = self._pending_mod_before_del.get(_pdm_key)
+                # Record this delete's time so a 'modified' for the same path that
+                # arrives just AFTER the 'deleted' (Windows fires the pre-delete
+                # 'modified' either before OR after the 'deleted' — the latter is
+                # common for a folder whose children were removed) can still
+                # suppress itself.  The forward-only Event.wait below misses that
+                # ordering, which leaked a spurious 'modified' row for deleted
+                # folders/files.
+                if not hasattr(self, "_recent_dest_deletes"):
+                    self._recent_dest_deletes = {}
+                _now_del = _pdm_del_time.time()
+                self._recent_dest_deletes[_pdm_key] = _now_del
+                if len(self._recent_dest_deletes) > 2000:
+                    _del_cutoff = _now_del - 30.0
+                    for _k in [k for k, t in list(self._recent_dest_deletes.items())
+                               if t < _del_cutoff]:
+                        self._recent_dest_deletes.pop(_k, None)
             if _pdm_ev is not None:
                 _dbg.info(
                     f"[desktop._on_file_change] PRE-DELETE-MOD signal: 'deleted' waking "
@@ -22433,7 +23805,14 @@ class MainWindow(QMainWindow):
         # deleted/renamed are also deduped — two detectors seeing the same
         # deletion is still just one deletion.
         _dedup_key = (watch_id, entry.get("path", "").lower(), _etype)
-        _DEDUP_WINDOW = 25  # seconds — covers watchdog+unc_poll overlap (max ~15s gap)
+        # 25s covers the plain watchdog→unc_poll gap for add/modify.  Deletions need
+        # much longer: when a user deletes N files at once, the poller re-reports the
+        # whole burst and each re-reported file costs a SACL/wevtutil round-trip
+        # (~5s), so file #8 of an 11-file burst reaches this check ~40s after the
+        # watchdog row and used to slip past the 25s window as a SECOND 'deleted' row
+        # for the same file.  A genuine second deletion of the same path within 120s
+        # is impossible without an intervening 'added' event, so widening is safe.
+        _DEDUP_WINDOW = 120 if _etype in ("deleted", "renamed") else 25
         # Atomic check-and-claim: prevents two concurrent threads from both
         # passing "key not found" before either writes the key.
         if not hasattr(self, '_dest_event_seen_lock'):
@@ -22602,6 +23981,35 @@ class MainWindow(QMainWindow):
                         # Bug #2 fix: previously `if _retry_editor.get("user")`
                         # was True for "Unknown" (non-empty string).
                         _retry_user = _retry_editor.get("user", "")
+                        # PURE-SACL gate (same as the main enrichment path): this
+                        # retry re-runs _get_editor_info, which returns the RAW
+                        # attribution WITHOUT the pure-SACL gate.  On a REMOTE-hosted
+                        # share a non-SACL-confirmed identity is a server-local owner
+                        # / session GUESS (e.g. the share host `.105` itself, because
+                        # our matching-cred SMB delete — and a coworker's own local
+                        # delete — both log under the host's local account).  Letting
+                        # it overwrite an existing "Unknown" row is exactly the bug
+                        # where earlier rows retroactively FLIP to `.105` when a later
+                        # delete burst re-triggers dedup.  Require real SACL proof on
+                        # a remote share; `_sacl_confirmed_local` does NOT count there.
+                        _retry_is_remote = self._event_host_is_remote(entry.get("path", ""))
+                        # STRICT PURE-SACL: only a LogonId-exact remote match may flip
+                        # an existing row on a remote share — a time-window guess
+                        # (`_sacl_remote_via_auditlog`) must not (user: "no guessing").
+                        _retry_sacl_ok = bool(
+                            _retry_editor.get("_sacl_confirmed_remote")
+                            or (_retry_editor.get("_sacl_confirmed_local") and not _retry_is_remote)
+                        )
+                        if _retry_is_remote and not _retry_sacl_ok:
+                            logger.info(
+                                f"[desktop._on_file_change] DEDUP retry: refusing to upgrade "
+                                f"'{_stored.get('editor_user')}' → '{_retry_user}' on a REMOTE "
+                                f"share without SACL confirmation (server-local/owner guess) — "
+                                f"leaving row Unknown (pure-SACL, no retroactive flip). "
+                                f"path={entry.get('path')!r} machine={_retry_editor.get('machine')!r} "
+                                f"ip={_retry_editor.get('ip')!r}"
+                            )
+                            _retry_user = "Unknown"  # force the no-upgrade branch below
                         if _retry_user and _retry_user != "Unknown":
                             _stored["editor_user"]        = _retry_editor["user"]
                             _stored["editor_machine"]     = _retry_editor["machine"]
@@ -22706,6 +24114,27 @@ class MainWindow(QMainWindow):
                                         f"has_snap={_has_snap2}"
                                     )
                                     _r2_user = _retry2.get("user", "")
+                                    # PURE-SACL gate (see the primary DEDUP retry
+                                    # above): never retroactively overwrite an
+                                    # Unknown row with a non-SACL-confirmed
+                                    # server-local guess on a remote-hosted share.
+                                    _r2_is_remote = self._event_host_is_remote(entry.get("path", ""))
+                                    # STRICT PURE-SACL: LogonId-exact only on a remote
+                                    # share; time-window `_sacl_remote_via_auditlog` is a
+                                    # guess and must not flip a row (user: "no guessing").
+                                    _r2_sacl_ok = bool(
+                                        _retry2.get("_sacl_confirmed_remote")
+                                        or (_retry2.get("_sacl_confirmed_local") and not _r2_is_remote)
+                                    )
+                                    if _r2_is_remote and not _r2_sacl_ok:
+                                        logger.info(
+                                            f"[desktop._on_file_change] DEDUP late-retry: refusing "
+                                            f"to upgrade → '{_r2_user}' on a REMOTE share without "
+                                            f"SACL confirmation (server-local/owner guess) — leaving "
+                                            f"row Unknown (pure-SACL, no retroactive flip). "
+                                            f"path={entry.get('path')!r}"
+                                        )
+                                        _r2_user = "Unknown"
                                     if _r2_user and _r2_user != "Unknown":
                                         _stored_late["editor_user"]        = _retry2["user"]
                                         _stored_late["editor_machine"]     = _retry2["machine"]
@@ -22918,7 +24347,11 @@ class MainWindow(QMainWindow):
                 }
         elif _rc_etype in ("deleted", "added", "modified"):
             _rc_seen_ts = self._recent_rename_paths.get((_rc_wid, _rc_path))
-            if _rc_seen_ts is not None and (_rc_now - _rc_seen_ts) < _RENAME_CORR_WINDOW:
+            if (
+                _rc_seen_ts is not None
+                and (_rc_now - _rc_seen_ts) < _RENAME_CORR_WINDOW
+                and not self._is_real_edit_near_rename(entry, _rc_etype, _rc_now - _rc_seen_ts)
+            ):
                 logger.info(
                     f"[desktop._on_file_change] RENAME-CORRELATION suppressed "
                     f"({'dest' if _is_dest else 'source'}): '{_rc_etype}' for "
@@ -22950,7 +24383,10 @@ class MainWindow(QMainWindow):
             # the second detector should attempt an attribution upgrade (in case
             # the first landed as Unknown) and then return — never append a new row.
             # For other event types: simply drop the duplicate.
-            _SRC_DEDUP_WINDOW = 25  # seconds — covers watchdog+unc_poll overlap (max ~15s gap)
+            # Same reasoning as the destination dedup above: a multi-file delete burst
+            # is re-reported by the poller one file at a time, each costing a ~5s SACL
+            # lookup, so the later files land far outside a 25s window.
+            _SRC_DEDUP_WINDOW = 120 if _etype in ("deleted", "renamed") else 25
             # Strip __unc_poll/__unc_notify suffix: watchdog uses 'w_xxx', unc_poll
             # uses 'w_xxx__unc_poll' — same logical watch must share the same dedup slot.
             _src_wid_norm   = watch_id.partition("__")[0]
@@ -23648,14 +25084,73 @@ class MainWindow(QMainWindow):
         # guess: that would blame the wrong person.  Show "Unknown" instead.  This
         # applies to add / modify / delete / rename, on source AND destination.
         # (Same-host self-hosted shares and any SACL-confirmed actor are untouched.)
+        _is_remote_share = self._event_host_is_remote(entry.get("path", ""))
+        # CRITICAL: on a REMOTE-hosted share, `_sacl_confirmed_local` (the "actor
+        # was LOCAL" loopback-4624 path) is NOT trustworthy.  In a workgroup where
+        # this PC and the share host use the SAME account name (e.g. both `user`),
+        # our own SMB write to \\HOST\share is logged on HOST under HOST's LOCAL
+        # session — the 4663's SubjectLogonId ties to HOST's loopback logon, so
+        # "confirmed local" fires even though WE (a remote client) did it.  It is
+        # therefore indistinguishable from a genuine HOST-local action → must NOT
+        # be shown as a confirmed name.  Only a CONFIRMED-REMOTE actor (a specific
+        # machine matched via a NETWORK 4624 LogonId) is trustworthy on a remote
+        # share.  On a SAME-HOST self-hosted watch, `_sacl_confirmed_local` = this
+        # PC's own local user = correct, so it still counts there.
+        # STRICT PURE-SACL (user directive 2026-07-08: "pure sacl display in the
+        # history only, no guessing"): a remote name displays ONLY when backed by a
+        # LogonId-exact 4663→4624 correlation (`_sacl_confirmed_remote`).  The old
+        # `_sacl_remote_via_auditlog` term also trusted a *time-window* nearest-4624
+        # guess (see where it is set: "LogonId-exact OR time-window") — that is a
+        # guess, so it is intentionally NOT accepted here anymore, on source AND
+        # destination watches alike.  Same-host self-hosted local actor still counts.
+        # NO-GUESSING EXCEPTION for a keyboard-user of the share host:
+        # A confirmed-LOCAL 4663 actor on a remote share is normally suppressed
+        # (see above) because it is indistinguishable from THIS app's own SMB
+        # write when both machines use the same account name.  But when the 4663's
+        # account is provably NOT the account this app logs in with, that
+        # ambiguity is gone: the host's own audit log recorded a DIFFERENT local
+        # account touching the file — a fact, not a guess.  Show it.
+        #   • same account (e.g. host 'user' + app login 'user')  -> stay Unknown
+        #   • different account (host 'alice' + app login 'backupsvc') -> show 'alice'
+        # This is why using a DEDICATED SMB service account for the watch (distinct
+        # from the coworker's interactive login) is what makes attribution resolve.
+        def _bare_account(_u: str) -> str:
+            return (_u or "").split("\\")[-1].strip().lower()
+        _app_smb_account = _bare_account((_smb_audit_cfg or {}).get("username", ""))
+        _actor_account   = _bare_account(entry.get("editor_user", ""))
+        _local_actor_is_not_app = bool(
+            editor.get("_sacl_confirmed_local")
+            and _is_remote_share
+            and not editor.get("_s1b_parent_only_match")   # exact-file match only
+            and _app_smb_account
+            and _actor_account
+            and _actor_account != _app_smb_account
+        )
+        # Host keyboard/console actor — PURE SACL, always on, no toggle, no guess.
+        # Shown only when the file's 4663 Logon ID EXACTLY matched a loopback 4624
+        # (`_sacl_local_console`) — positive audit-log proof someone was at the
+        # host's own keyboard.  A LogonId is unique per session, so a loopback
+        # match is definitively the console session, NOT this PC's SMB write (which
+        # always carries a NETWORK logon with our own IP under a different LogonId).
+        # Therefore our own writes (backup or manual, from .106) can never satisfy
+        # this.  Requires an exact-file 4663 match (never a parent-only guess); the
+        # weak "no-remote-match → assumed local" case (no loopback proof) does NOT
+        # qualify and stays Unknown.
+        _host_local_console = bool(
+            editor.get("_sacl_local_console")
+            and editor.get("_sacl_confirmed_local")
+            and _is_remote_share
+            and not editor.get("_s1b_parent_only_match")
+        )
         _sacl_confirmed = bool(
             editor.get("_sacl_confirmed_remote")
-            or editor.get("_sacl_confirmed_local")
-            or editor.get("_sacl_remote_via_auditlog")
+            or (editor.get("_sacl_confirmed_local") and not _is_remote_share)
+            or _local_actor_is_not_app
+            or _host_local_console
         )
         if (not _sacl_confirmed
                 and (entry.get("editor_user") or entry.get("editor_machine") or entry.get("editor_ip"))
-                and self._event_host_is_remote(entry.get("path", ""))):
+                and _is_remote_share):
             import logging as _pslog
             _pslog.getLogger(__name__).info(
                 f"[desktop._on_file_change] PURE-SACL: remote-hosted share and NO "
@@ -23930,7 +25425,15 @@ class MainWindow(QMainWindow):
                 _sd_patched = False
                 if _sd_host:
                     _sd_etype = entry.get("type", "")
-                    _sd_bc = _burst_cache_any_for_host(_sd_host, event_type=_sd_etype)
+                    # PURE-SACL: on a remote-hosted share require a confirmed REMOTE
+                    # actor (never the share host's own local_actor entry) AND require
+                    # LogonId-exact proof — a time-window/session guess must not be
+                    # inherited onto this Unknown row (would bypass the central gate).
+                    _sd_is_remote = self._event_host_is_remote(entry.get("path", ""))
+                    _sd_bc = _burst_cache_any_for_host(
+                        _sd_host, event_type=_sd_etype,
+                        require_remote=_sd_is_remote,
+                        require_logon_confirmed=_sd_is_remote)
                     _sdl2_log.info(
                         f"[desktop._on_file_change] DEDUP-BURST-PATCH: "
                         f"_burst_cache_any_for_host({_sd_host!r} event_type={_sd_etype!r}) -> "
@@ -24051,7 +25554,38 @@ class MainWindow(QMainWindow):
                     pass
                 if _fwd_host:
                     _fwd_etype = entry.get("type", "")
-                    _fwd_bc = _burst_cache_any_for_host(_fwd_host, event_type=_fwd_etype)
+                    _fwd_is_remote = self._event_host_is_remote(entry.get("path", ""))
+                    # Inheritance rules for a file the pure-SACL gate left Unknown:
+                    #  • Only inherit from a genuinely CONCURRENT sibling (tight same-burst
+                    #    window), never a prior actor's stale-but-within-TTL entry.
+                    #  • On a REMOTE-hosted share, require a CONFIRMED-REMOTE actor
+                    #    (require_remote) — NEVER the share host's own server-local
+                    #    (local_actor) attribution.  The gate already rejected that as
+                    #    Unknown; re-applying it is a guess that wrongly showed .106's
+                    #    own dest file as .105 (and .105's local entry leaking onto
+                    #    coworkers' files generally).  Only a distinct remote third-party
+                    #    machine confirmed via SACL is safe to inherit.
+                    _fwd_bc = _burst_cache_any_for_host(
+                        _fwd_host, event_type=_fwd_etype,
+                        max_age_secs=_BURST_SAME_BURST_SECS,
+                        require_remote=_fwd_is_remote,
+                        # PURE-SACL: on a remote share only inherit a LogonId-exact
+                        # sibling — never a time-window/session guess (the comment
+                        # above says "confirmed via SACL"; this enforces it).
+                        require_logon_confirmed=_fwd_is_remote)
+                    if _fwd_bc and _attribution_is_own_machine(_fwd_bc[0], _fwd_bc[1], _fwd_bc[2]) \
+                            and _fwd_is_remote:
+                        # Defence-in-depth: a burst entry pointing at THIS PC on a
+                        # remote-hosted share is the backup app's own SMB session,
+                        # never a real actor.  Never inherit it — keep 'Unknown'.
+                        import logging as _fwdl0
+                        _fwdl0.getLogger(__name__).info(
+                            f"[desktop._on_file_change] FORWARD-BURST-PATCH: REFUSED own-machine "
+                            f"burst entry (machine={_fwd_bc[0]!r} ip={_fwd_bc[1]!r}) for remote-hosted "
+                            f"path={entry.get('path')!r} — backup app's own SMB session, not a real "
+                            f"actor; entry stays Unknown (pure-SACL)."
+                        )
+                        _fwd_bc = None
                     if _fwd_bc:
                         _fwd_m, _fwd_i, _fwd_u = _fwd_bc
                         import logging as _fwdl
@@ -24087,7 +25621,12 @@ class MainWindow(QMainWindow):
                 _rcc_wid  = watch_id.partition("__")[0]
                 _rcc_path = (entry.get("path", "") or "").lower()
                 _rcc_seen = self._recent_rename_paths.get((_rcc_wid, _rcc_path))
-                if _rcc_seen is not None and (_rcc_time.monotonic() - _rcc_seen) < 30:
+                _rcc_age  = (_rcc_time.monotonic() - _rcc_seen) if _rcc_seen is not None else None
+                if (
+                    _rcc_seen is not None
+                    and _rcc_age < 30
+                    and not self._is_real_edit_near_rename(entry, _rcc_etype, _rcc_age)
+                ):
                     import logging as _rccl
                     _rccl.getLogger(__name__).info(
                         f"[desktop._on_file_change] RENAME-CORRELATION suppressed (post-attribution "
@@ -24097,6 +25636,10 @@ class MainWindow(QMainWindow):
                         f"dropping duplicate before append."
                     )
                     return
+
+            # Internal suppression-decision flags — not part of the history record.
+            entry.pop("_fp_genuine_edit", None)
+            entry.pop("_fp_unverified", None)
 
             self._history_log.append(entry)
             if len(self._history_log) > 5000:
@@ -24154,6 +25697,50 @@ class MainWindow(QMainWindow):
                         _burst_patch_host = _bpn.lstrip("/").split("/")[0].lower()
                 except Exception:
                     pass
+                # Refuse to PROPAGATE a share-host server-local (or own-machine)
+                # attribution retroactively onto sibling Unknown rows on a remote
+                # share.  The just-resolved trigger (`_burst_new_*`) is a confirmed
+                # actor for ITS OWN file, but if it resolves to the share host's own
+                # local identity (e.g. .105 confirmed local) it must NEVER be spread
+                # to other files — those may be a DIFFERENT actor's (.106's) earlier
+                # rows.  This is the retroactive twin of the forward-patch require_remote
+                # guard; it also covers the `_burst_new_*` fallback (burst_cache_hit=False)
+                # that the cache-level require_remote does not.  Only a genuinely remote
+                # THIRD-PARTY machine may be propagated.
+                _bp_trigger_remote = self._event_host_is_remote(entry.get("path", ""))
+                if _bp_trigger_remote and _burst_patch_host:
+                    import socket as _bp_sock
+                    _bp_host_ids = {_burst_patch_host}
+                    try:
+                        _bp_host_ids.add(_bp_sock.gethostbyname(_burst_patch_host).lower())
+                    except Exception:
+                        pass
+                    try:
+                        _bp_rev = _bp_sock.gethostbyaddr(_burst_patch_host)
+                        if _bp_rev and _bp_rev[0]:
+                            _bp_host_ids.add(_bp_rev[0].lower())
+                        for _bp_al in (_bp_rev[1] if _bp_rev else []):
+                            if _bp_al:
+                                _bp_host_ids.add(_bp_al.lower())
+                    except Exception:
+                        pass
+                    _bp_is_share_host = bool(
+                        (_burst_new_ip and _burst_new_ip.lower() in _bp_host_ids)
+                        or (_burst_new_machine and _burst_new_machine.lower() in _bp_host_ids)
+                    )
+                    _bp_is_own = _attribution_is_own_machine(
+                        _burst_new_machine, _burst_new_ip, _burst_new_user)
+                    if _bp_is_share_host or _bp_is_own:
+                        import logging as _bp_skip_log
+                        _bp_skip_log.getLogger(__name__).info(
+                            f"[desktop._on_file_change] BURST-PATCH: NOT propagating "
+                            f"attribution (user={_burst_new_user!r} machine={_burst_new_machine!r} "
+                            f"ip={_burst_new_ip!r}) — resolves to the share host's own local "
+                            f"identity or THIS PC on remote-hosted '{_burst_patch_host}'. "
+                            f"Sibling Unknown rows may be a different actor; leaving them "
+                            f"Unknown (pure-SACL, no cross-actor guess)."
+                        )
+                        _burst_patch_host = ""
                 if _burst_patch_host:
                     _burst_patched_count = 0
                     import time     as _bp_time_now
@@ -24255,7 +25842,17 @@ class MainWindow(QMainWindow):
                         # attributions from a different event type (e.g. 'added' by .106
                         # must never patch 'deleted' entries that may have been done by .105).
                         _burst_patch_etype = entry.get("type", "")
-                        _burst_bc_hit = _burst_cache_any_for_host(_burst_patch_host, event_type=_burst_patch_etype)
+                        # On a remote-hosted share, never inherit the share host's own
+                        # server-local (local_actor) attribution — only a confirmed remote
+                        # third-party.  (Same rule as the forward burst-patch above.)
+                        _burst_patch_remote = self._event_host_is_remote(_burst_older.get("path", ""))
+                        _burst_bc_hit = _burst_cache_any_for_host(
+                            _burst_patch_host, event_type=_burst_patch_etype,
+                            max_age_secs=_BURST_SAME_BURST_SECS,
+                            require_remote=_burst_patch_remote,
+                            # STRICT PURE-SACL: only inherit a LogonId-exact sibling on
+                            # a remote share — never a time-window/session guess.
+                            require_logon_confirmed=_burst_patch_remote)
                         _burst_pu = (_burst_bc_hit[2] if _burst_bc_hit else _burst_new_user)    or _burst_new_user
                         _burst_pm = (_burst_bc_hit[0] if _burst_bc_hit else _burst_new_machine) or _burst_new_machine
                         _burst_pi = (_burst_bc_hit[1] if _burst_bc_hit else _burst_new_ip)      or _burst_new_ip
@@ -24391,7 +25988,13 @@ class MainWindow(QMainWindow):
                                     # fall back to the values captured at append time.
                                     # CRITICAL: pass event_type so the burst cache does NOT
                                     # reuse attributions from a different event type.
-                                    _bp_bc = _burst_cache_any_for_host(_bp_host_cap, event_type=_bp_etype_cap)
+                                    _bp_delayed_remote = self._event_host_is_remote(_bp_r.get("path", ""))
+                                    _bp_bc = _burst_cache_any_for_host(
+                                        _bp_host_cap, event_type=_bp_etype_cap,
+                                        max_age_secs=_BURST_SAME_BURST_SECS,
+                                        require_remote=_bp_delayed_remote,
+                                        # STRICT PURE-SACL: LogonId-exact sibling only.
+                                        require_logon_confirmed=_bp_delayed_remote)
                                     _bp_pu = (_bp_bc[2] if _bp_bc else _bp_user_cap)    or _bp_user_cap
                                     _bp_pm = (_bp_bc[0] if _bp_bc else _bp_machine_cap) or _bp_machine_cap
                                     _bp_pi = (_bp_bc[1] if _bp_bc else _bp_ip_cap)      or _bp_ip_cap
@@ -24450,6 +26053,44 @@ class MainWindow(QMainWindow):
                 f"no new row emitted to UI. "
                 f"Total in-memory entries: {len(self._history_log)}"
             )
+
+    def _is_real_edit_near_rename(self, entry: dict, etype: str, age_s: float) -> bool:
+        """True when a rename-correlated 'modified' is actually a user edit.
+
+        The rename-correlation guards drop any add/delete/modify landing on a
+        rename endpoint, because a rename is ONE row (unc_poll reports it as
+        delete-of-old + add-of-new, and watchdog fires CHANGE_NOTIFY 'modified'
+        churn on the new name).  But a user can genuinely SAVE a file within the
+        30s window — on either endpoint:
+
+          • save the OLD name, then a coworker renames it while our ~4s SACL
+            attribution is still running (the edit lands after the endpoints are
+            registered), or
+          • save the file again AFTER the rename (observed: 12345.xlsx edited
+            21s after being renamed from 1234.xlsx — 8228 → 8247 bytes).
+
+        Both were being swallowed, so the edit never reached Change History.
+        The fingerprint check upstream already distinguishes the two cases by
+        content, so trust it: churn leaves size/mtime/hash identical and never
+        reaches this point (it is suppressed as FINGERPRINT-SUPPRESSED), while a
+        real save carries a proven content delta.  'added'/'deleted' are never
+        rescued — those genuinely are the two sides of the rename.
+        """
+        if etype != "modified":
+            return False
+        if entry.get("_fp_genuine_edit"):
+            _reason = "fingerprint proved a content delta"
+        elif entry.get("_fp_unverified"):
+            _reason = "fingerprint could not be verified (stat failed) — failing open"
+        else:
+            return False
+        import logging as _rel
+        _rel.getLogger(__name__).info(
+            f"[desktop._on_file_change] RENAME-CORRELATION kept 'modified' for "
+            f"path={entry.get('path')!r}: {_reason} — this is a real user save "
+            f"{age_s:.1f}s from the rename, not CHANGE_NOTIFY churn on a rename endpoint."
+        )
+        return True
 
     def _purge_rename_phantom_rows(self, rename_entry: dict):
         """Retroactively drop a rename's phantom delete-of-old / add-of-new rows.
@@ -24533,6 +26174,46 @@ class MainWindow(QMainWindow):
         if entry.get("type") == "renamed":
             try:
                 self._purge_rename_phantom_rows(entry)
+            except Exception:
+                pass
+        # ── Symmetric backstop: drop a phantom delete-of-old / add-of-new that
+        # arrives on the main thread AFTER the 'renamed' row already ran its
+        # retroactive purge.  The forward guard + pre-append re-check in
+        # _on_file_change_inner run on the worker thread and can lose a subtle
+        # race between the parallel 'renamed' and 'deleted'/'added' attributions
+        # (both take seconds on a remote dest).  _apply_file_change is the single
+        # serialized main-thread chokepoint every appended row passes through, and
+        # the rename registers its endpoints in _recent_rename_paths at DETECTION
+        # time (before attribution) — so by the time any phantom side reaches here
+        # the tracker is set.  This is what guarantees a rename is exactly ONE row.
+        if entry.get("type") in ("deleted", "added", "modified") and hasattr(self, "_recent_rename_paths"):
+            try:
+                import time as _afc_rc_time
+                _afc_wid  = watch_id.partition("__")[0]
+                _afc_path = (entry.get("path", "") or "").lower()
+                _afc_seen = self._recent_rename_paths.get((_afc_wid, _afc_path))
+                if _afc_seen is not None and (_afc_rc_time.monotonic() - _afc_seen) < 30:
+                    # Remove the row that _on_file_change_inner already appended.
+                    _rid = id(entry)
+                    _before = len(self._history_log)
+                    self._history_log = [e for e in self._history_log if id(e) != _rid]
+                    _logging.getLogger(__name__).info(
+                        f"[desktop._apply_file_change] RENAME-CORRELATION main-thread backstop: "
+                        f"dropped phantom '{entry.get('type')}' row for path={entry.get('path')!r} "
+                        f"(matches a rename endpoint registered "
+                        f"{(_afc_rc_time.monotonic() - _afc_seen):.1f}s ago, watch={_afc_wid!r}) — "
+                        f"a rename is ONE row. removed_from_log={_before - len(self._history_log)}"
+                    )
+                    if self._history_window and self._history_window.isVisible():
+                        try:
+                            self._history_window.remove_entries([entry])
+                        except Exception:
+                            pass
+                    try:
+                        config_manager.save_history(self._history_log)
+                    except Exception:
+                        pass
+                    return  # do NOT update card / history / tray for a phantom row
             except Exception:
                 pass
         # Update card
@@ -24784,7 +26465,7 @@ class MainWindow(QMainWindow):
                             f"for {w['name']} — deferring auto-backup until system is idle"
                         )
                         if not self._skipped_notified.get(wid, {}).get('idle', False):
-                            self.tray_icon.showMessage("BackupSys — Backup Skipped", "Scheduled backup deferred — system is not idle (CPU above threshold).", QSystemTrayIcon.MessageIcon.Information, 4000)
+                            self.tray_icon.showMessage(tr("BackupSys — Backup Skipped"), tr("Scheduled backup deferred — system is not idle (CPU above threshold)."), QSystemTrayIcon.MessageIcon.Information, 4000)
                             if wid not in self._skipped_notified:
                                 self._skipped_notified[wid] = {}
                             self._skipped_notified[wid]['idle'] = True
@@ -24867,10 +26548,38 @@ class MainWindow(QMainWindow):
 
     # ── Backup Logic ───────────────────────────────────────────────────────────
 
-    def _backup_single(self, watch: dict, triggered_by="manual"):
+    def _backup_single(self, watch: dict, triggered_by="manual", _from_queue: bool = False):
         wid = watch["id"]
         if wid in self._workers:
             return  # already running
+
+        # ── Global one-at-a-time serialization ──────────────────────────────
+        # Only one backup may run at a time.  If a backup is already running —
+        # or others are already waiting — queue this one and start it when the
+        # current backup finishes (drained in _on_backup_done).  This prevents
+        # two watches from uploading at once and splitting the shared upload
+        # bandwidth (which made each run crawl).  _from_queue=True is the drain
+        # re-entry and bypasses the gate so the queued watch actually starts.
+        if not _from_queue:
+            if any(w["id"] == wid for w, _ in self._backup_pending):
+                return  # already queued — ignore duplicate click
+            if self._workers or self._backup_pending:
+                self._backup_pending.append((watch, triggered_by))
+                if wid in self._cards:
+                    self._cards[wid].set_queued(True, position=len(self._backup_pending))
+                self._append_log(
+                    tr("\u23f8 Queued '{p0}' \u2014 a backup is already running ({p1} waiting)", p0=watch.get('name', wid), p1=len(self._backup_pending))
+                )
+                # Persist so crash recovery re-runs queued watches too.
+                if BACKEND_AVAILABLE:
+                    try:
+                        queue = config_manager.load_backup_queue()
+                        if not any(q.get("watch_id") == wid for q in queue):
+                            queue.append({"watch_id": wid, "triggered_by": triggered_by})
+                            config_manager.save_backup_queue(queue)
+                    except Exception:
+                        pass
+                return
 
         # A new backup starting (manual or scheduled) clears any prior
         # user-cancel so auto-backups resume normally after this run.
@@ -24891,10 +26600,7 @@ class MainWindow(QMainWindow):
                 # get_watch_disk_usage scans the local backup_dir path which does
                 # not exist for remote-only targets.  Warn once and skip the check.
                 self._append_log(
-                    f"⚠ Storage quota for '{watch.get('name', wid)}' is set but cannot be "
-                    f"enforced for remote destination '{_dest_type_for_quota}'. "
-                    "The quota is only supported for local destinations. "
-                    "Proceeding with backup."
+                    tr("\u26a0 Storage quota for '{p0}' is set but cannot be enforced for remote destination '{p1}'. The quota is only supported for local destinations. Proceeding with backup.", p0=watch.get('name', wid), p1=_dest_type_for_quota)
                 )
             else:
                 try:
@@ -24914,9 +26620,7 @@ class MainWindow(QMainWindow):
                         _used_h  = backup_engine._human_size(_used)
                         _limit_h = backup_engine._human_size(_max_bytes)
                         self._append_log(
-                            f"⚠ Skipped backup for '{watch.get('name', wid)}' — "
-                            f"storage quota exceeded ({_used_h} used of {_limit_h} limit). "
-                            "Delete old backups or raise the quota in Settings → Edit Watch."
+                            tr("\u26a0 Skipped backup for '{p0}' \u2014 storage quota exceeded ({p1} used of {p2} limit). Delete old backups or raise the quota in Settings \u2192 Edit Watch.", p0=watch.get('name', wid), p1=_used_h, p2=_limit_h)
                         )
                         if hasattr(self, "_tray"):
                             self._tray.showMessage(
@@ -25015,7 +26719,7 @@ class MainWindow(QMainWindow):
             self._cards[wid].set_queued(False)   # clear any "Queued" state before starting
             self._cards[wid].set_backing_up(True)
 
-        self.status_dot.setText("● Backing up…")
+        self.status_dot.setText(tr("● Backing up…"))
         self.status_dot.setObjectName("status_warn")
         self.status_dot.style().unpolish(self.status_dot)
         self.status_dot.style().polish(self.status_dot)
@@ -25027,8 +26731,8 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QMessageBox
         wid = watch["id"]
         reply = QMessageBox.question(
-            self, "Force Full Backup",
-            "This will re-upload ALL files regardless of changes.\n\nContinue?",
+            self, tr("Force Full Backup"),
+            tr("This will re-upload ALL files regardless of changes.\n\nContinue?"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -25149,6 +26853,24 @@ class MainWindow(QMainWindow):
                     + (f" — {remaining} more in this group" if remaining else " — last in group")
                 )
                 self._backup_single(next_watch, triggered_by="manual")
+
+        # ── Global one-at-a-time: start the next queued backup, if any ──────
+        # With single-worker serialization, self._workers is now empty; pull
+        # the next FIFO watch off the pending queue and start it.
+        if not self._workers and self._backup_pending:
+            next_watch, next_trigger = self._backup_pending.pop(0)
+            if next_watch["id"] in self._cards:
+                self._cards[next_watch["id"]].set_queued(False)
+            # Refresh the "Queued (#n)" badges on the watches still waiting.
+            for _pos, (_pw, _pt) in enumerate(self._backup_pending, start=1):
+                if _pw["id"] in self._cards:
+                    self._cards[_pw["id"]].set_queued(True, position=_pos)
+            self._append_log(
+                f"▶ Starting queued '{next_watch.get('name', next_watch['id'])}'"
+                + (f" — {len(self._backup_pending)} more waiting" if self._backup_pending else "")
+            )
+            self._backup_single(next_watch, triggered_by=next_trigger, _from_queue=True)
+
         if BACKEND_AVAILABLE:
             try:
                 queue = config_manager.load_backup_queue()
@@ -25290,6 +27012,52 @@ class MainWindow(QMainWindow):
                 if self._history_window and self._history_window.isVisible():
                     for _he in _injected:
                         self._history_window.append_entry(_he)
+            else:
+                # No local source diff, but the cloud stage may still have pushed
+                # files that were staged by an earlier run whose upload hadn't
+                # finished (e.g. a large file uploaded over a slow link).  Without
+                # this, such a run shows nothing in History even though gigabytes
+                # reached the cloud.  Inject "backed up" rows from the uploader's
+                # returned filenames so the run is visible.
+                _cloud_names = []
+                for _res in (result.get("destinations_upload") or []):
+                    if _res.get("ok"):
+                        _cloud_names.extend(_res.get("uploaded_names") or [])
+                if _cloud_names:
+                    watch_name = self._watch_name_for(wid)
+                    ts_iso     = result.get("timestamp", datetime.now().isoformat())
+                    _watch_src = result.get("source", "")
+                    _sample_fp = str(Path(_watch_src) / _cloud_names[0]) if _watch_src else ""
+                    editor     = _get_editor_info(_sample_fp, detection_source="watchdog",
+                                                  force_local=True)
+                    _injected = []
+                    for _rel in _cloud_names:
+                        _full_path = str(Path(_watch_src) / _rel) if _watch_src and _rel else _rel
+                        hist_entry = {
+                            "type":           "backed up",
+                            "path":           _full_path,
+                            "timestamp":      ts_iso,
+                            "watch_name":     watch_name,
+                            "watch_id":       wid,
+                            "editor_user":    editor["user"],
+                            "editor_machine": editor["machine"],
+                            "editor_ip":      editor["ip"],
+                            "source":         "cloud_upload",
+                        }
+                        self._history_log.append(hist_entry)
+                        _injected.append(hist_entry)
+                    if len(self._history_log) > 5000:
+                        self._history_log = self._history_log[-2500:]
+                    if BACKEND_AVAILABLE:
+                        try:
+                            config_manager.save_history(self._history_log)
+                        except Exception as _save_err:
+                            _bdlog.warning(
+                                f"[_on_backup_done] cloud_upload history SAVE FAILED: {_save_err!r}"
+                            )
+                    if self._history_window and self._history_window.isVisible():
+                        for _he in _injected:
+                            self._history_window.append_entry(_he)
             # Clear needs_full_backup flag now that full backup is done
             if BACKEND_AVAILABLE:
                 try:
@@ -25357,8 +27125,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # Cloud/remote upload count.  The "files_copied" figure below reflects
+        # ONLY the local source→staging copy (robocopy over SMB); a run can
+        # stage 0 new files yet still push gigabytes to Drive/SFTP/WebDAV in a
+        # separate stage.  Surface that count so a Drive-only run isn't reported
+        # as a misleading "0 file(s)".
+        _cloud_uploaded = 0
+        for _res in (result.get("destinations_upload") or []):
+            if _res.get("ok"):
+                try:
+                    _cloud_uploaded += int(_res.get("uploaded") or 0)
+                except (TypeError, ValueError):
+                    pass
+        _cloud_part = f"  ·  ☁ {_cloud_uploaded} uploaded to cloud" if _cloud_uploaded else ""
+
         if not self._workers:
-            self.status_dot.setText("● Active")
+            self.status_dot.setText(tr("● Active"))
             self.status_dot.setObjectName("status_ok")
             self.status_dot.style().unpolish(self.status_dot)
             self.status_dot.style().polish(self.status_dot)
@@ -25371,13 +27153,13 @@ class MainWindow(QMainWindow):
                 if watch.get("_quota_warning_90"):
                     self._tray.showMessage(
                         APP_NAME,
-                        f"Watch '{watch.get('name', wid)}' is at 90% of its storage quota — consider cleaning up old backups.",
+                        tr("Watch '{p0}' is at 90% of its storage quota — consider cleaning up old backups.", p0=watch.get('name', wid)),
                         QSystemTrayIcon.MessageIcon.Warning, 8000
                     )
                 elif watch.get("_quota_warning_80"):
                     self._tray.showMessage(
                         APP_NAME,
-                        f"Watch '{watch.get('name', wid)}' is at 80% of its storage quota — consider cleaning up old backups.",
+                        tr("Watch '{p0}' is at 80% of its storage quota — consider cleaning up old backups.", p0=watch.get('name', wid)),
                         QSystemTrayIcon.MessageIcon.Warning, 6000
                     )
                 # Clean up the temporary flags
@@ -25388,22 +27170,21 @@ class MainWindow(QMainWindow):
                 dur_str  = _fmt_duration(result.get("duration_s", 0.0))
                 dur_part = f"  ·  {dur_str}" if dur_str else ""
                 sz_part  = f"  ·  {result.get('total_size','')}" if result.get("total_size") else ""
-                msg = f"✅ Backup complete: {result.get('files_copied',0)} file(s){sz_part}{dur_part}"
+                msg = tr("✅ Backup complete: {p0} file(s){p1}{p2}{p3}", p0=result.get('files_copied', 0), p1=_cloud_part, p2=sz_part, p3=dur_part)
                 _icon = QSystemTrayIcon.MessageIcon.Information
             elif partial:
                 _nfailed = len(result.get("failed_files", []))
-                msg = (
-                    f"⚠ Partial backup: {self._watch_name_for(wid)} — "
-                    f"{result.get('files_copied', 0)} file(s) OK, {_nfailed} failed. "
-                    f"Check activity log for details."
+                msg = tr(
+                    "⚠ Partial backup: {p0} — {p1} file(s) OK, {p2} failed. Check activity log for details.",
+                    p0=self._watch_name_for(wid), p1=result.get('files_copied', 0), p2=_nfailed,
                 )
                 _icon = QSystemTrayIcon.MessageIcon.Warning
             elif result.get("status") == "cancelled":
-                msg   = f"⏹ Backup cancelled: {result.get('watch_name', self._watch_name_for(wid))}"
+                msg   = tr("⏹ Backup cancelled: {p0}", p0=result.get('watch_name', self._watch_name_for(wid)))
                 _icon = QSystemTrayIcon.MessageIcon.Information
             else:
                 err_detail = result.get("error", "unknown error")
-                msg   = f"❌ Backup FAILED: {self._watch_name_for(wid)} — {err_detail}"
+                msg   = tr("❌ Backup FAILED: {p0} — {p1}", p0=self._watch_name_for(wid), p1=err_detail)
                 # Surface the Drive reconnect banner if the error is a token failure
                 if err_detail and "reconnect Google Drive" in err_detail and hasattr(self, "gdrive_banner"):
                     self.gdrive_banner.show()
@@ -25417,17 +27198,16 @@ class MainWindow(QMainWindow):
             dur_str  = _fmt_duration(result.get("duration_s", 0.0))
             dur_part = f"  ·  {dur_str}" if dur_str else ""
             sz_part  = f"  ·  {result.get('total_size', '')}" if result.get("total_size") else ""
-            self._append_log(f"✅ Backup complete: {self._watch_name_for(wid)} — {result.get('files_copied', 0)} file(s){sz_part}{dur_part}")
+            self._append_log(tr("\u2705 Backup complete: {p0} \u2014 {p1} file(s){p2}{p3}{p4}", p0=self._watch_name_for(wid), p1=result.get('files_copied', 0), p2=_cloud_part, p3=sz_part, p4=dur_part))
         elif partial:
             _nfailed = len(result.get("failed_files", []))
             self._append_log(
-                f"⚠ Partial backup: {self._watch_name_for(wid)} — "
-                f"{result.get('files_copied', 0)} file(s) OK, {_nfailed} failed"
+                tr("\u26a0 Partial backup: {p0} \u2014 {p1} file(s) OK, {p2} failed", p0=self._watch_name_for(wid), p1=result.get('files_copied', 0), p2=_nfailed)
             )
         elif result.get("status") == "cancelled":
-            self._append_log(f"⏹ Backup cancelled: {self._watch_name_for(wid)}")
+            self._append_log(tr("\u23f9 Backup cancelled: {p0}", p0=self._watch_name_for(wid)))
         else:
-            self._append_log(f"❌ Backup FAILED: {self._watch_name_for(wid)} — {result.get('error', 'unknown error')}")
+            self._append_log(tr("\u274c Backup FAILED: {p0} \u2014 {p1}", p0=self._watch_name_for(wid), p1=result.get('error', 'unknown error')))
 
         # ── Auto-shutdown: trigger only when ALL backups are done ────────────
         # _workers is empty → no backups running.  Check the config flag and
@@ -25444,10 +27224,10 @@ class MainWindow(QMainWindow):
         dlg = ShutdownCountdownDialog(self, countdown=60)
         result = dlg.exec()
         if dlg.was_cancelled():
-            self._append_log("⏹ Auto-shutdown cancelled by user.")
+            self._append_log(tr("\u23f9 Auto-shutdown cancelled by user."))
             return
         # Accepted (timer expired or 'Shut Down Now')
-        self._append_log("🖥  Auto-shutdown initiated — all backups complete.")
+        self._append_log(tr("🖥  Auto-shutdown initiated \u2014 all backups complete."))
         import platform, subprocess
         try:
             if platform.system() == "Windows":
@@ -25458,9 +27238,8 @@ class MainWindow(QMainWindow):
                 subprocess.run(["systemctl", "poweroff"], check=True)
         except Exception as exc:
             QMessageBox.critical(
-                self, "Shutdown Failed",
-                f"Could not shut down the computer:\n{exc}\n\n"
-                "You may need to run BackupSys as administrator."
+                self, tr("Shutdown Failed"),
+                tr("Could not shut down the computer:\n{p0}\n\nYou may need to run BackupSys as administrator.", p0=exc)
             )
 
     def _append_log(self, text: str):
@@ -25493,7 +27272,7 @@ class MainWindow(QMainWindow):
         watch_id   = watch["id"]
         watch_name = watch.get("name", "Unknown")
 
-        self._append_log(f"🔍 Running backup preview for \'{watch_name}\' …")
+        self._append_log(tr("🔍 Running backup preview for '{p0}' \u2026", p0=watch_name))
 
         if watch_id in self._cards:
             self._cards[watch_id].dry_run_btn.setEnabled(False)
@@ -25593,7 +27372,7 @@ class MainWindow(QMainWindow):
         from PyQt6.QtGui import QTextCursor as _QTC
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Backup Preview — {watch_name}")
+        dlg.setWindowTitle(tr("Backup Preview — {name}", name=watch_name))
         dlg.setMinimumSize(720, 520)
         dlg.resize(720, 520)
 
@@ -25610,7 +27389,7 @@ class MainWindow(QMainWindow):
 
         # Status banner
         ok = result.get("status") == "ok"
-        banner = QLabel("✅  Preview completed successfully" if ok else "❌  Preview encountered an error")
+        banner = QLabel(tr("✅  Preview completed successfully") if ok else tr("❌  Preview encountered an error"))
         banner.setStyleSheet(
             "color:#4ade80; font-weight:600; font-size:13px; padding:4px 0;" if ok
             else "color:#f87171; font-weight:600; font-size:13px; padding:4px 0;"
@@ -25639,7 +27418,7 @@ class MainWindow(QMainWindow):
         # Close button
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton(tr("Close"))
         close_btn.setMinimumWidth(80)
         close_btn.clicked.connect(dlg.accept)
         btn_layout.addWidget(close_btn)
@@ -25653,9 +27432,9 @@ class MainWindow(QMainWindow):
 
         # Log summary
         if ok:
-            self._append_log(f"✔ Backup preview for '{watch_name}' completed")
+            self._append_log(tr("\u2714 Backup preview for '{p0}' completed", p0=watch_name))
         else:
-            self._append_log(f"❌ Backup preview for '{watch_name}' failed")
+            self._append_log(tr("\u274c Backup preview for '{p0}' failed", p0=watch_name))
 
     def _validate_watch(self, watch: dict):
         if not BACKEND_AVAILABLE:
@@ -25669,9 +27448,9 @@ class MainWindow(QMainWindow):
         if watch.get("sync_mode", False):
             folder = self._watch_dest(watch)
             if not folder:
-                QMessageBox.warning(self, "Validate", "No destination path configured.")
+                QMessageBox.warning(self, tr("Validate"), tr("No destination path configured."))
                 return
-            self._append_log(f"Validating sync destination: {watch['name']} …")
+            self._append_log(tr("Validating sync destination: {p0} \u2026", p0=watch['name']))
             import os
             try:
                 exists      = os.path.isdir(folder)
@@ -25683,37 +27462,29 @@ class MainWindow(QMainWindow):
                 file_count  = 0
                 _acc_err    = str(exc)
             except Exception as exc:
-                QMessageBox.critical(self, "Validate Error", str(exc))
+                QMessageBox.critical(self, tr("Validate Error"), str(exc))
                 return
 
             if exists and accessible:
                 QMessageBox.information(
-                    self, "Validate  · Passed",
-                    f"▶  Sync destination is accessible\n\n"
-                    f"Watch:   {watch['name']}\n"
-                    f"Folder:  {folder}\n"
-                    f"Items:   {file_count} file(s) / folder(s) present\n\n"
-                    f"Note: sync folders do not store a checksum file — "
-                    f"file integrity is maintained by the sync process itself."
+                    self, tr("Validate  · Passed"),
+                    tr("\u25b6  Sync destination is accessible\n\nWatch:   {p0}\nFolder:  {p1}\nItems:   {p2} file(s) / folder(s) present\n\nNote: sync folders do not store a checksum file \u2014 file integrity is maintained by the sync process itself.", p0=watch['name'], p1=folder, p2=file_count)
                 )
-                self._append_log(f"▶ Validate passed: {watch['name']}")
+                self._append_log(tr("\u25b6 Validate passed: {p0}", p0=watch['name']))
             else:
                 reason = _acc_err if not accessible else f"Folder not found: {folder}"
                 QMessageBox.critical(
-                    self, "Validate  · Failed",
-                    f"⚠  Sync destination is not accessible\n\n"
-                    f"Watch:  {watch['name']}\n"
-                    f"Folder: {folder}\n"
-                    f"Error:  {reason}"
+                    self, tr("Validate  · Failed"),
+                    tr("\u26a0  Sync destination is not accessible\n\nWatch:  {p0}\nFolder: {p1}\nError:  {p2}", p0=watch['name'], p1=folder, p2=reason)
                 )
-                self._append_log(f"⚠ Validate failed: {watch['name']}")
+                self._append_log(tr("\u26a0 Validate failed: {p0}", p0=watch['name']))
             return
 
         dest = self._watch_dest(watch)
         backups = backup_engine.list_backups(dest, watch["id"])
         if not backups:
-            QMessageBox.warning(self, "Validate",
-                f"No backups found for \"{watch['name']}\".\nRun a backup first.")
+            QMessageBox.warning(self, tr("Validate"),
+                tr("No backups found for \"{p0}\".\nRun a backup first.", p0=watch['name']))
             return
 
         latest = backups[0]
@@ -25724,12 +27495,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        self._append_log(f"Validating backup: {watch['name']} ({ts}) …")
+        self._append_log(tr("Validating backup: {p0} ({p1}) \u2026", p0=watch['name'], p1=ts))
 
         try:
             result = backup_engine.validate_backup(backup_dir)
         except Exception as e:
-            QMessageBox.critical(self, "Validate Error", str(e))
+            QMessageBox.critical(self, tr("Validate Error"), str(e))
             return
 
         if result.get("valid") and result.get("manifest_ok"):
@@ -25740,8 +27511,8 @@ class MainWindow(QMainWindow):
                 f"Hash:      {result.get('stored_hash', '')[:16]}…\n"
                 f"Files OK:  {result.get('manifest_ok')}"
             )
-            QMessageBox.information(self, "Validate  · Passed", msg)
-            self._append_log(f"▶ Validate passed: {watch['name']}")
+            QMessageBox.information(self, tr("Validate  · Passed"), msg)
+            self._append_log(tr("\u25b6 Validate passed: {p0}", p0=watch['name']))
         else:
             missing   = result.get("missing_files", [])
             corrupted = result.get("corrupted_files", [])
@@ -25753,648 +27524,9 @@ class MainWindow(QMainWindow):
                 details += f"\nCorrupted files ({len(corrupted)}):\n  " + "\n  ".join(corrupted[:5])
             if err:
                 details += f"\nError: {err}"
-            QMessageBox.critical(self, "Validate  · Failed",
-                f"⚠  Backup validation failed\n\nWatch: {watch['name']}\nDate:  {ts}{details}")
-            self._append_log(f"⚠ Validate failed: {watch['name']}")
-
-    # ── Restore ────────────────────────────────────────────────────────────────
-
-    def _pick_restore_destination(self, watch: dict) -> tuple:
-        """
-        Return (dest_path, dest_type, temp_dir_or_None) for a restore operation.
-
-        Priority:
-          1. If the global dest_type is non-local, use it (existing behaviour).
-          2. If the watch has per-watch destinations (watch["destinations"]),
-             let the user choose which remote to restore from.
-          3. Fall back to the local destination path.
-
-        Returns (dest_path, dest_type, temp_dir) where:
-          - dest_path  — local path to use for list_backups / restore_backup
-          - dest_type  — resolved type string (for display only after this call)
-          - temp_dir   — path to clean up after restore, or None if not a temp dir
-        Returns (None, None, None) if the user cancelled or download failed.
-        """
-        global_dest_type = self.cfg.get("dest_type", "local")
-
-        # ── Global non-local destination ──────────────────────────────────────
-        # "gdrive" is the canonical dest_type saved by the Settings dialog;
-        # "cloud" is kept as a legacy alias for configs saved by older versions.
-        _REMOTE_TYPES = {"sftp", "ftps", "ftp", "webdav", "https", "rclone", "cloud", "gdrive"}
-        if global_dest_type in _REMOTE_TYPES:
-            local_path = self._download_for_restore(
-                self._watch_dest(watch), global_dest_type, watch)
-            if local_path is None:
-                return None, None, None
-            return local_path["path"], global_dest_type, local_path["temp_dir"]
-
-        # ── Per-watch destinations (watch["destinations"] list) ───────────────
-        per_watch_dests = watch.get("destinations", [])
-        remote_dests = [
-            d for d in per_watch_dests
-            if d.get("dest_type", "local") in _REMOTE_TYPES
-        ]
-
-        if remote_dests:
-            # Build choice list: local first (if configured), then each remote
-            choices = []
-            local_path = self._watch_dest(watch)
-            local_accessible = bool(local_path) and Path(local_path).exists()
-            if local_accessible:
-                choices.append(f"Local  —  {local_path}")
-            for d in remote_dests:
-                dt = d.get("dest_type", "?").upper()
-                cfg_d = d.get("config", {})
-                host = cfg_d.get("host", "") or cfg_d.get("remote", "") or dt
-                choices.append(f"{dt}  —  {host}")
-
-            if len(choices) > 1:
-                from PyQt6.QtWidgets import QInputDialog
-                chosen_label, ok = QInputDialog.getItem(
-                    self, "Choose Restore Source",
-                    f"Watch \"{watch['name']}\" has multiple backup destinations.\n"
-                    "Choose which to restore from:",
-                    choices, 0, False,
-                )
-                if not ok:
-                    return None, None, None
-                chosen_idx = choices.index(chosen_label)
-                if local_accessible and chosen_idx == 0:
-                    return local_path, "local", None
-                # Adjust index if local was prepended
-                remote_idx = chosen_idx - (1 if local_accessible else 0)
-                chosen_dest = remote_dests[remote_idx]
-            elif remote_dests:
-                chosen_dest = remote_dests[0]
-            else:
-                return self._watch_dest(watch), "local", None
-
-            dt = chosen_dest.get("dest_type", "local")
-            rpath = chosen_dest.get("config", {}).get("path", self._watch_dest(watch))
-            result = self._download_for_restore(rpath, dt, watch,
-                                                 dest_cfg=chosen_dest.get("config", {}))
-            if result is None:
-                return None, None, None
-            return result["path"], dt, result["temp_dir"]
-
-        # ── Plain local destination ───────────────────────────────────────────
-        return self._watch_dest(watch), "local", None
-
-    def _download_for_restore(self, dest: str, dest_type: str, watch: dict,
-                               dest_cfg: dict = None) -> dict | None:
-        """
-        Download a remote backup store to a local temp directory.
-        Returns {"path": str, "temp_dir": str} on success, or None on failure/cancel.
-        Uses a modal progress dialog while downloading.
-        dest_cfg overrides the global cfg section when supplied (for per-watch dests).
-        """
-        import tempfile as _tmpmod
-        import shutil   as _sh
-        from PyQt6.QtWidgets import QProgressDialog
-        from PyQt6.QtCore    import Qt
-
-        label_map = {
-            "sftp": "SFTP", "ftps": "SFTP/TLS", "ftp": "FTP",
-            "webdav": "WebDAV", "https": "HTTPS",
-            "rclone": "rclone", "cloud": "Google Drive", "gdrive": "Google Drive",
-        }
-        label = label_map.get(dest_type, dest_type.upper())
-
-        temp_dir = _tmpmod.mkdtemp(prefix="backupsys_restore_")
-
-        progress = QProgressDialog(f"Downloading backup from {label}…", "Cancel", 0, 0, self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
-
-        def _prog(n, fname):
-            if progress.wasCanceled():
-                return
-            progress.setLabelText(f"Downloading from {label}… ({n} file(s))\n{fname}")
-            from PyQt6.QtWidgets import QApplication
-            QApplication.processEvents()
-
-        try:
-            from transport_utils import (
-                download_from_sftp, download_from_ftp,
-                download_from_webdav, download_from_https, download_from_rclone,
-            )
-
-            def _cfg(key):
-                # Use dest_cfg when explicitly supplied (even if empty);
-                # only fall back to global config when dest_cfg is None.
-                return dest_cfg if dest_cfg is not None else self.cfg.get(key, {})
-
-            if dest_type in ("sftp", "ftps"):
-                result = download_from_sftp(dest, temp_dir, _cfg("dest_sftp"), progress_cb=_prog)
-            elif dest_type == "ftp":
-                result = download_from_ftp(dest, temp_dir, _cfg("dest_ftp"), progress_cb=_prog)
-            elif dest_type == "webdav":
-                result = download_from_webdav(dest, temp_dir, _cfg("dest_webdav"), progress_cb=_prog)
-            elif dest_type == "https":
-                result = download_from_https(dest, temp_dir, _cfg("dest_https"), progress_cb=_prog)
-            elif dest_type == "rclone":
-                result = download_from_rclone(dest, temp_dir, _cfg("dest_rclone"), progress_cb=_prog)
-            elif dest_type in ("cloud", "gdrive"):
-                w_cloud = watch.get("cloud_config") or {}
-                result  = backup_engine.download_from_gdrive(w_cloud, temp_dir)
-                # gdrive uses "ok" key not "status"
-                if result.get("ok"):
-                    result["status"] = "ok"
-            else:
-                _sh.rmtree(temp_dir, ignore_errors=True)
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.critical(self, "Download Failed",
-                    f"Unsupported destination type: {dest_type}")
-                return None
-
-            if result.get("status") != "ok":
-                _sh.rmtree(temp_dir, ignore_errors=True)
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.critical(self, "Download Failed",
-                    f"Failed to download from {label}:\n{result.get('error', 'Unknown error')}")
-                return None
-
-            return {"path": temp_dir, "temp_dir": temp_dir}
-
-        except Exception as exc:
-            _sh.rmtree(temp_dir, ignore_errors=True)
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Download Failed",
-                f"Failed to download from {label}:\n{exc}")
-            return None
-        finally:
-            progress.close()
-
-    def _restore_watch(self, watch: dict):
-        if not BACKEND_AVAILABLE:
-            return
-
-        # Sync mode: the destination IS the live copy — no restore needed.
-        if watch.get("sync_mode", False):
-            folder = self._watch_dest(watch)
-            QMessageBox.information(self, "Restore  · Sync Mode",
-                f"This watch uses sync mode.\n\n"
-                f"Your files are stored directly at:\n{folder}\n\n"
-                f"To recover a file, open that folder and copy it back manually.")
-            return
-
-        # Resolve destination — handles global remote types AND per-watch destinations.
-        dest, _resolved_type, temp_dir = self._pick_restore_destination(watch)
-        if dest is None:
-            return   # user cancelled or download failed
-        backups = backup_engine.list_backups(dest, watch["id"])
-        if not backups:
-            QMessageBox.warning(self, "Restore",
-                f"No backups found for \"{watch['name']}\".\nRun a backup first.")
-            return
-
-        # Let user pick which backup to restore
-        from PyQt6.QtWidgets import QInputDialog
-        items = []
-        for b in backups[:100]:  # show latest 100
-            ts = b.get("timestamp", "")
-            try:
-                ts = datetime.fromisoformat(ts).strftime("%b %d, %Y %H:%M")
-            except Exception:
-                pass
-            files = b.get("files_copied", 0)
-            size  = b.get("total_size_bytes", 0)
-            size_h = f"{size // 1024} KB" if size < 1024*1024 else f"{size // (1024*1024)} MB"
-            incremental = "incremental" if b.get("incremental") else "full"
-            items.append(f"{ts}   ·  {files} file(s)  {size_h}  [{incremental}]")
-
-        chosen, ok = QInputDialog.getItem(
-            self, "Restore Backup",
-            f"Select a restore point for \"{watch['name']}\":\n"
-            "(Full Chain Restore replays ALL backups up to the chosen point  · recommended for incremental setups)",
-            items, 0, False
-        )
-        if not ok:
-            return
-
-        chosen_idx    = items.index(chosen)
-        chosen_backup = backups[chosen_idx]
-        backup_dir    = chosen_backup.get("backup_dir", "")
-        chosen_id     = chosen_backup.get("backup_id", "")
-
-        # Determine if any backup in the chain is incremental
-        is_incremental = any(b.get("incremental") for b in backups[:chosen_idx + 1])
-        if is_incremental:
-            mode_reply = QMessageBox.question(
-                self, "Restore Mode",
-                "<b>Full Chain Restore (Recommended)</b><br>"
-                "Replays every backup from the oldest up to your chosen point.<br>"
-                "Gives you the exact folder state at that point in time.<br><br>"
-                "<b>Single Snapshot Restore</b><br>"
-                "Only restores files changed in the selected backup (delta only).<br>"
-                "Use this only if you know what you're doing.<br><br>"
-                "Use Full Chain Restore?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
-            )
-            if mode_reply == QMessageBox.StandardButton.Cancel:
-                return
-            use_chain = (mode_reply == QMessageBox.StandardButton.Yes)
-        else:
-            use_chain = False
-
-        # Optionally browse backup contents before restoring
-        browse_reply = QMessageBox.question(
-            self, "Preview Backup Contents",
-            "Would you like to preview the files in this backup snapshot before restoring?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if browse_reply == QMessageBox.StandardButton.Yes:
-            try:
-                contents = backup_engine.browse_backup_contents(backup_dir)
-                total    = contents.get("total", 0)
-
-                # ── Scrollable tree preview dialog ────────────────────────────
-                from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel, QDialogButtonBox
-                from PyQt6.QtCore import Qt
-
-                dlg = QDialog(self)
-                dlg.setWindowTitle(f"Backup Preview  ·  {chosen}")
-                dlg.setMinimumSize(680, 480)
-                dlg.resize(760, 540)
-
-                vlay = QVBoxLayout(dlg)
-                vlay.addWidget(QLabel(f"<b>{total} file(s)</b> in this snapshot — scroll to see all:"))
-
-                tree = QTreeWidget()
-                tree.setHeaderLabels(["Path", "Size", "Status"])
-                tree.setColumnWidth(0, 420)
-                tree.setColumnWidth(1, 90)
-                tree.setColumnWidth(2, 80)
-                tree.setSortingEnabled(True)
-                tree.setRootIsDecorated(False)
-                tree.setAlternatingRowColors(True)
-
-                for f in contents.get("files", []):
-                    item = QTreeWidgetItem([
-                        f.get("path", ""),
-                        f.get("size_human", ""),
-                        "added/modified"
-                    ])
-                    tree.addTopLevelItem(item)
-
-                for p in contents.get("deleted", []):
-                    item = QTreeWidgetItem([p, "", "deleted"])
-                    item.setForeground(0, tree.palette().highlight())
-                    tree.addTopLevelItem(item)
-
-                vlay.addWidget(tree)
-
-                # ── Single-file restore button ─────────────────────────────
-                sfr_note = QLabel(
-                    "💡 Select a file above then click <b>Restore Selected File</b> "
-                    "to restore just that one file."
-                )
-                sfr_note.setWordWrap(True)
-                sfr_note.setStyleSheet("color:#9ca3af; font-size:11px; padding:4px 0;")
-                vlay.addWidget(sfr_note)
-
-                sfr_btn_row = QHBoxLayout()
-                sfr_btn = QPushButton("📄 Restore Selected File…")
-                sfr_btn.setObjectName("secondary")
-                sfr_btn.setToolTip("Restore only the selected file from this backup snapshot.")
-
-                def _do_single_file_restore():
-                    sel = tree.selectedItems()
-                    if not sel:
-                        QMessageBox.information(dlg, "No Selection",
-                            "Please select a file in the list first.")
-                        return
-                    rel_path = sel[0].text(0)
-                    if not rel_path or sel[0].text(2) == "deleted":
-                        QMessageBox.warning(dlg, "Invalid Selection",
-                            "The selected entry is a deleted file and cannot be restored.")
-                        return
-                    dest_dir = QFileDialog.getExistingDirectory(
-                        dlg, f"Choose folder to restore  '{rel_path}'  into"
-                    )
-                    if not dest_dir:
-                        return
-                    _enc_key = watch.get("encrypt_key") or None
-                    res = backup_engine.restore_single_file(
-                        backup_dir  = backup_dir,
-                        relative_path = rel_path,
-                        target_path = dest_dir,
-                        encrypt_key = _enc_key,
-                        overwrite   = True,
-                    )
-                    if res.get("ok"):
-                        QMessageBox.information(
-                            dlg, "File Restored",
-                            f"✔  Restored successfully\n\n"
-                            f"File: {rel_path}\n"
-                            f"Destination: {res['restored_to']}\n"
-                            f"Size: {backup_engine._human_size(res['size_bytes'])}"
-                        )
-                    else:
-                        QMessageBox.critical(
-                            dlg, "Restore Failed",
-                            f"Could not restore file:\n{res.get('error', 'Unknown error')}"
-                        )
-
-                sfr_btn.clicked.connect(_do_single_file_restore)
-                sfr_btn_row.addWidget(sfr_btn)
-                sfr_btn_row.addStretch()
-                vlay.addLayout(sfr_btn_row)
-
-                btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-                btns.accepted.connect(dlg.accept)
-                vlay.addWidget(btns)
-                dlg.exec()
-
-            except Exception as e:
-                QMessageBox.warning(self, "Preview Error", str(e))
-
-
-        # Ask for target folder
-        target = QFileDialog.getExistingDirectory(
-            self, "Select Restore Destination Folder"
-        )
-        if not target:
-            return
-
-        # Check for restore conflicts
-        overwrite = True
-        if os.path.exists(target) and os.listdir(target):
-            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QRadioButton, QLabel, QDialogButtonBox
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Restore Conflict")
-            dlg.setModal(True)
-            vlay = QVBoxLayout(dlg)
-            vlay.addWidget(QLabel("The target folder is not empty. Choose how to handle conflicts:"))
-            rb1 = QRadioButton("Overwrite existing files")
-            rb1.setChecked(True)
-            rb2 = QRadioButton("Skip files that already exist")
-            rb3 = QRadioButton("Restore to new folder (add '_restored' suffix)")
-            vlay.addWidget(rb1)
-            vlay.addWidget(rb2)
-            vlay.addWidget(rb3)
-            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            btns.accepted.connect(dlg.accept)
-            btns.rejected.connect(dlg.reject)
-            vlay.addWidget(btns)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                if rb1.isChecked():
-                    overwrite = True
-                elif rb2.isChecked():
-                    overwrite = False
-                elif rb3.isChecked():
-                    target = target.rstrip(os.sep) + "_restored"
-                    overwrite = True
-            else:
-                return
-
-        # Confirm
-        mode_label = "Full Chain Restore" if use_chain else "Single Snapshot Restore"
-        conflict_msg = ""
-        if overwrite:
-            conflict_msg = "Existing files with the same name will be overwritten."
-        elif not os.path.exists(target) or not os.listdir(target):
-            conflict_msg = "Existing files with the same name will be overwritten."
-        else:
-            conflict_msg = "Existing files will be skipped."
-        reply = QMessageBox.question(
-            self, "Confirm Restore",
-            f"Mode:  {mode_label}\n"
-            f"Restore to:  {target}\n\n"
-            f"{conflict_msg}\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        self._append_log(f"Restoring backup: {watch['name']} >{target} ({mode_label}) …")
-
-        # Disable restore button while running to prevent double-trigger
-        if watch["id"] in self._cards:
-            self._cards[watch["id"]].restore_btn.setEnabled(False)
-
-        def _on_restore_progress(step, total, label):
-            self._append_log(f"  ↳ Step {step}/{total}: {label}")
-
-        def _on_restore_done(result):
-            # Re-enable restore button
-            if watch["id"] in self._cards:
-                self._cards[watch["id"]].restore_btn.setEnabled(True)
-            if result.get("ok"):
-                steps = result.get("steps_applied")
-                extra = f"\nChain steps applied:  {steps}" if steps is not None else ""
-                QMessageBox.information(self, "Restore Complete",
-                    f"▶  Restore complete\n\n"
-                    f"Files restored:  {result.get('files_restored', 0)}\n"
-                    f"Files skipped:   {result.get('skipped', 0)}\n"
-                    f"Destination:     {target}{extra}"
-                )
-                self._append_log(
-                    f"▶ Restore complete: {watch['name']}  · "
-                    f"{result.get('files_restored', 0)} file(s) >{target}"
-                )
-            else:
-                errors = result.get("errors", [])
-                err_preview = "\n".join(errors[:5]) if errors else result.get("error", "Unknown error")
-                QMessageBox.critical(self, "Restore Failed",
-                    f"⚠  Restore failed\n\n{err_preview}")
-                self._append_log(f"⚠ Restore failed: {watch['name']}")
-            # Clean up temp dir
-            if temp_dir:
-                import shutil
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception:
-                    pass
-
-        if use_chain:
-            kwargs = dict(
-                destination=dest,
-                watch_id=watch["id"],
-                target_path=target,
-                up_to_backup_id=chosen_id,
-                encrypt_key=watch.get("encrypt_key") or None,
-                overwrite=overwrite,
-            )
-            worker = RestoreWorker("chain", kwargs, parent=self)
-        else:
-            kwargs = dict(
-                backup_dir=backup_dir,
-                target_path=target,
-                encrypt_key=watch.get("encrypt_key") or None,
-                overwrite=overwrite,
-            )
-            worker = RestoreWorker("single", kwargs, parent=self)
-
-        worker.progress.connect(_on_restore_progress)
-        worker.finished.connect(_on_restore_done)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
-
-    def _restore_to_original(self, watch: dict):
-        if not BACKEND_AVAILABLE:
-            return
-
-        # Sync mode: the destination IS the live copy — no restore needed.
-        if watch.get("sync_mode", False):
-            folder = self._watch_dest(watch)
-            QMessageBox.information(self, "Restore  · Sync Mode",
-                f"This watch uses sync mode.\n\n"
-                f"Your files are stored directly at:\n{folder}\n\n"
-                f"To recover a file, open that folder and copy it back manually.")
-            return
-
-        # Resolve destination — handles global remote types AND per-watch destinations.
-        dest, _resolved_type, temp_dir = self._pick_restore_destination(watch)
-        if dest is None:
-            return   # user cancelled or download failed
-
-        backups = backup_engine.list_backups(dest, watch["id"])
-        if not backups:
-            QMessageBox.warning(self, "Restore",
-                f"No backups found for \"{watch['name']}\".\nRun a backup first.")
-            return
-
-        # Let user pick which backup to restore
-        from PyQt6.QtWidgets import QInputDialog
-        items = []
-        for b in backups[:100]:  # show latest 100
-            ts = b.get("timestamp", "")
-            try:
-                ts = datetime.fromisoformat(ts).strftime("%b %d, %Y %H:%M")
-            except Exception:
-                pass
-            files = b.get("files_copied", 0)
-            size  = b.get("total_size_bytes", 0)
-            size_h = f"{size // 1024} KB" if size < 1024*1024 else f"{size // (1024*1024)} MB"
-            incremental = "incremental" if b.get("incremental") else "full"
-            items.append(f"{ts}   ·  {files} file(s)  {size_h}  [{incremental}]")
-
-        chosen, ok = QInputDialog.getItem(
-            self, "Restore to Original Location",
-            f"Select a restore point for \"{watch['name']}\":\n"
-            "(Full Chain Restore replays ALL backups up to the chosen point  · recommended for incremental setups)",
-            items, 0, False
-        )
-        if not ok:
-            return
-
-        chosen_idx    = items.index(chosen)
-        chosen_backup = backups[chosen_idx]
-        backup_dir    = chosen_backup.get("backup_dir", "")
-        chosen_id     = chosen_backup.get("backup_id", "")
-
-        # Load manifest to get source_path
-        manifest_path = os.path.join(backup_dir, "MANIFEST.json")
-        try:
-            with open(manifest_path, 'r') as f:
-                manifest = json.load(f)
-            source_path = manifest.get("source")
-            if not source_path:
-                QMessageBox.warning(self, "Restore Failed",
-                    "Original location not recorded in this backup. Use the Restore… button to choose a target folder manually.")
-                return
-        except Exception as e:
-            QMessageBox.warning(self, "Restore Failed",
-                f"Could not read backup manifest: {e}")
-            return
-
-        # Confirm
-        reply = QMessageBox.question(
-            self, "Confirm Restore to Original Location",
-            f"This will restore files to their original location:\n{source_path}\n\n"
-            f"Existing files may be overwritten.\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # Determine if any backup in the chain is incremental
-        is_incremental = any(b.get("incremental") for b in backups[:chosen_idx + 1])
-        if is_incremental:
-            mode_reply = QMessageBox.question(
-                self, "Restore Mode",
-                "<b>Full Chain Restore (Recommended)</b><br>"
-                "Replays every backup from the oldest up to your chosen point.<br>"
-                "Gives you the exact folder state at that point in time.<br><br>"
-                "<b>Single Snapshot Restore</b><br>"
-                "Only restores files changed in the selected backup (delta only).<br>"
-                "Use this only if you know what you're doing.<br><br>"
-                "Use Full Chain Restore?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
-            )
-            if mode_reply == QMessageBox.StandardButton.Cancel:
-                return
-            use_chain = (mode_reply == QMessageBox.StandardButton.Yes)
-        else:
-            use_chain = False
-
-        self._append_log(f"Restoring to original location: {watch['name']} >{source_path} ({'Full Chain' if use_chain else 'Single Snapshot'}) …")
-
-        # Disable restore button while running to prevent double-trigger
-        if watch["id"] in self._cards:
-            self._cards[watch["id"]].restore_btn.setEnabled(False)
-            self._cards[watch["id"]].restore_original_btn.setEnabled(False)
-
-        def _on_restore_progress(step, total, label):
-            self._append_log(f"  ↳ Step {step}/{total}: {label}")
-
-        def _on_restore_done(result):
-            # Re-enable restore buttons
-            if watch["id"] in self._cards:
-                self._cards[watch["id"]].restore_btn.setEnabled(True)
-                self._cards[watch["id"]].restore_original_btn.setEnabled(True)
-            if result.get("ok"):
-                steps = result.get("steps_applied")
-                extra = f"\nChain steps applied:  {steps}" if steps is not None else ""
-                QMessageBox.information(self, "Restore Complete",
-                    f"▶  Restore complete\n\n"
-                    f"Files restored:  {result.get('files_restored', 0)}\n"
-                    f"Files skipped:   {result.get('skipped', 0)}\n"
-                    f"Destination:     {source_path}{extra}"
-                )
-                self._append_log(
-                    f"▶ Restore complete: {watch['name']}  · "
-                    f"{result.get('files_restored', 0)} file(s) >{source_path}"
-                )
-            else:
-                errors = result.get("errors", [])
-                err_preview = "\n".join(errors[:5]) if errors else result.get("error", "Unknown error")
-                QMessageBox.critical(self, "Restore Failed",
-                    f"⚠  Restore failed\n\n{err_preview}")
-                self._append_log(f"⚠ Restore failed: {watch['name']}")
-            # Clean up temp dir
-            if temp_dir:
-                import shutil
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception:
-                    pass
-
-        if use_chain:
-            kwargs = dict(
-                destination=dest,
-                watch_id=watch["id"],
-                target_path=source_path,
-                up_to_backup_id=chosen_id,
-                encrypt_key=watch.get("encrypt_key") or None,
-                overwrite=True,
-            )
-            worker = RestoreWorker("chain", kwargs, parent=self)
-        else:
-            kwargs = dict(
-                backup_dir=backup_dir,
-                target_path=source_path,
-                encrypt_key=watch.get("encrypt_key") or None,
-                overwrite=True,
-            )
-            worker = RestoreWorker("single", kwargs, parent=self)
-
-        worker.progress.connect(_on_restore_progress)
-        worker.finished.connect(_on_restore_done)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+            QMessageBox.critical(self, tr("Validate  · Failed"),
+                tr("\u26a0  Backup validation failed\n\nWatch: {p0}\nDate:  {p1}{p2}", p0=watch['name'], p1=ts, p2=details))
+            self._append_log(tr("\u26a0 Validate failed: {p0}", p0=watch['name']))
 
     # ── Admin ──────────────────────────────────────────────────────────────────
 
@@ -26438,7 +27570,7 @@ class MainWindow(QMainWindow):
                     QSystemTrayIcon.MessageIcon.Warning, 8000
                 )
             self._append_log(
-                f"⚠ {name} token expired  · go to Settings >Cloud tab to reconnect"
+                tr("\u26a0 {p0} token expired  \u00b7 go to Settings >Cloud tab to reconnect", p0=name)
             )
             # Show the persistent in-window reconnect banner
             if hasattr(self, "gdrive_banner"):
@@ -26446,6 +27578,10 @@ class MainWindow(QMainWindow):
 
     def _open_gdrive_reconnect(self):
         """Open the Settings (AdminPanel) dialog directly on the Cloud tab to reconnect Google Drive."""
+        # This opens the full Admin panel, so it must pass the same password gate
+        # as _open_admin — otherwise the reconnect banner would be a way in.
+        if not self._verify_admin_access():
+            return
         try:
             panel = AdminPanel(self.cfg, self)
             panel.watches_changed.connect(self._on_watches_changed)
@@ -26461,36 +27597,45 @@ class MainWindow(QMainWindow):
             self.gdrive_banner.hide()
         except Exception as e:
             QMessageBox.information(
-                self, "Reconnect Google Drive",
-                f"Open Settings → Cloud tab → click Reconnect next to Google Drive.\n\n({e})"
+                self, tr("Reconnect Google Drive"),
+                tr("Open Settings \u2192 Cloud tab \u2192 click Reconnect next to Google Drive.\n\n({p0})", p0=e)
             )
 
-    def _open_admin(self, *, _after_show=None):
+    def _verify_admin_access(self) -> bool:
+        """Gate access to the Admin panel behind the admin password.
+
+        Returns True if the user may proceed into Admin (password verified, or a
+        new mandatory password was just set), False if they cancelled/failed.
+
+        EVERY entry point that opens AdminPanel must go through this so none can
+        bypass the password (e.g. the Google Drive reconnect banner).
+        """
         if not PasswordDialog.has_password():
-            # First time  · prompt to set password
-            reply = QMessageBox.question(self, "Set Admin Password",
-                "No admin password is set. Would you like to set one now?\n"
-                "(If you skip, any user can access admin settings)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                dlg = PasswordDialog(self, mode="set")
-                if dlg.exec() != QDialog.DialogCode.Accepted:
-                    return
-            # Password was just set (or the user chose to skip) — proceed
-            # straight into Admin. Asking them to re-enter the password they
-            # *just* typed in a second dialog was confusing and made it look
-            # like the app refused to let them in.
-        else:
-            dlg = PasswordDialog(self, mode="verify")
-            if dlg.exec() != QDialog.DialogCode.Accepted:
-                if getattr(dlg, "_forgot_clicked", False):
-                    # User reset the password via "Forgot password?" — let
-                    # them set a new one now, then continue into Admin.
-                    reset_dlg = PasswordDialog(self, mode="set")
-                    if reset_dlg.exec() != QDialog.DialogCode.Accepted:
-                        return
-                else:
-                    return
+            # First time · a password is MANDATORY before Admin can be opened.
+            # There is no "skip" path — leaving Admin unprotected is not allowed
+            # (this app ships to customers who must each set their own password).
+            QMessageBox.information(self, tr("Set Admin Password"),
+                tr("No admin password is set yet.\n"
+                "You must create one to protect the admin settings before continuing."))
+            dlg = PasswordDialog(self, mode="set")
+            # If they cancel the set dialog, access is denied (not left open).
+            return dlg.exec() == QDialog.DialogCode.Accepted
+
+        # A password exists · verify it.
+        dlg = PasswordDialog(self, mode="verify")
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return True
+        if getattr(dlg, "_forgot_clicked", False):
+            # User reset via "Forgot password?" — let them set a new one now,
+            # then continue into Admin. (The old password stays until this new
+            # one is confirmed, so cancelling here leaves Admin still locked.)
+            reset_dlg = PasswordDialog(self, mode="set")
+            return reset_dlg.exec() == QDialog.DialogCode.Accepted
+        return False
+
+    def _open_admin(self, *, _after_show=None):
+        if not self._verify_admin_access():
+            return
 
         panel = AdminPanel(self.cfg, self)
         panel.watches_changed.connect(self._on_watches_changed)
@@ -26508,8 +27653,8 @@ class MainWindow(QMainWindow):
 
     def _quit_app(self):
         """Quit the application."""
-        reply = QMessageBox.question(self, "Quit Backup System",
-            "Are you sure you want to quit Backup System?",
+        reply = QMessageBox.question(self, tr("Quit Backup System"),
+            tr("Are you sure you want to quit Backup System?"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             if self._watcher_mgr:
@@ -26527,17 +27672,39 @@ class MainWindow(QMainWindow):
         worker = self._workers.get(watch_id)
         if worker:
             worker.pause()
-            self._append_log(f"⏸ Backup paused: {self._watch_name_for(watch_id)}")
+            self._append_log(tr("\u23f8 Backup paused: {p0}", p0=self._watch_name_for(watch_id)))
 
     def _on_resume_backup_requested(self, watch_id: str):
         """Resume a paused backup."""
         worker = self._workers.get(watch_id)
         if worker:
             worker.resume()
-            self._append_log(f"▶ Backup resumed: {self._watch_name_for(watch_id)}")
+            self._append_log(tr("\u25b6 Backup resumed: {p0}", p0=self._watch_name_for(watch_id)))
 
     def _on_cancel_requested(self, watch_id: str):
         """Cancel an in-progress backup for the given watch."""
+        # If this watch is only QUEUED (not yet running), just drop it from the
+        # pending queue — there is no worker to stop.
+        if watch_id not in self._workers and any(w["id"] == watch_id for w, _ in self._backup_pending):
+            self._backup_pending = [(w, t) for (w, t) in self._backup_pending if w["id"] != watch_id]
+            if watch_id in self._cards:
+                self._cards[watch_id].set_queued(False)
+            for _pos, (_pw, _pt) in enumerate(self._backup_pending, start=1):
+                if _pw["id"] in self._cards:
+                    self._cards[_pw["id"]].set_queued(True, position=_pos)
+            self._append_log(tr("\u23f9 Removed '{p0}' from the backup queue", p0=self._watch_name_for(watch_id)))
+            if BACKEND_AVAILABLE:
+                try:
+                    queue = config_manager.load_backup_queue()
+                    queue = [q for q in queue if q.get("watch_id") != watch_id]
+                    if queue:
+                        config_manager.save_backup_queue(queue)
+                    else:
+                        config_manager.clear_backup_queue()
+                except Exception:
+                    pass
+            return
+
         worker = self._workers.get(watch_id)
         if worker:
             worker.request_stop()
@@ -26547,18 +27714,18 @@ class MainWindow(QMainWindow):
             # Cancelling…"). resume() wakes the wait immediately so the
             # cancel takes effect right away.
             worker.resume()
-            self._append_log(f"⏹ Cancel requested for: {self._watch_name_for(watch_id)}")
+            self._append_log(tr("\u23f9 Cancel requested for: {p0}", p0=self._watch_name_for(watch_id)))
         # Remember this was a deliberate user cancel so the auto-timer does
         # not immediately re-trigger a new backup for the same watch.
         self._user_cancelled_watches.add(watch_id)
         if watch_id in self._cards:
             card = self._cards[watch_id]
             card.cancel_btn.setEnabled(False)
-            card.cancel_btn.setText("Cancelling…")
+            card.cancel_btn.setText(tr("Cancelling…"))
             # Give immediate visual feedback so the UI doesn't look frozen
             # while robocopy winds down (can take a few seconds on SMB).
-            card.file_lbl.setText("Cancelling…")
-            card.status_lbl.setText("▶ Cancelling…")
+            card.file_lbl.setText(tr("Cancelling…"))
+            card.status_lbl.setText(tr("▶ Cancelling…"))
             card.status_lbl.setObjectName("status_warn")
 
         # Also remove this watch's remaining group from the queue and clear
@@ -26573,7 +27740,7 @@ class MainWindow(QMainWindow):
                 if _qw["id"] in self._cards:
                     self._cards[_qw["id"]].set_queued(False)
                     self._append_log(
-                        f"⏹ '{_qw.get('name', _qw['id'])}' removed from queue (parent cancelled)"
+                        tr("\u23f9 '{p0}' removed from queue (parent cancelled)", p0=_qw.get('name', _qw['id']))
                     )
 
     def _on_open_backup_folder(self, watch_id: str):
@@ -26587,14 +27754,14 @@ class MainWindow(QMainWindow):
         # Get the destination path for this watch
         dest_path = self._watch_dest(watch)
         if not dest_path:
-            QMessageBox.warning(self, "No Destination",
-                "No destination path is configured for this watch.")
+            QMessageBox.warning(self, tr("No Destination"),
+                tr("No destination path is configured for this watch."))
             return
 
         # Check if the folder exists
         if not os.path.exists(dest_path):
-            QMessageBox.warning(self, "Folder Not Found",
-                f"The destination folder does not exist yet:\n{dest_path}\n\nRun a backup first to create it.")
+            QMessageBox.warning(self, tr("Folder Not Found"),
+                tr("The destination folder does not exist yet:\n{p0}\n\nRun a backup first to create it.", p0=dest_path))
             return
 
         # Open the folder using QDesktopServices
@@ -26603,7 +27770,7 @@ class MainWindow(QMainWindow):
             from PyQt6.QtGui import QDesktopServices
             QDesktopServices.openUrl(QUrl.fromLocalFile(dest_path))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not open folder:\n{e}")
+            QMessageBox.critical(self, tr("Error"), tr("Could not open folder:\n{p0}", p0=e))
 
     def _on_watch_settings_requested(self, watch: dict):
         """Open the EditWatchDialog for per-watch advanced settings (encryption, exclusions, hooks)."""
@@ -26666,12 +27833,143 @@ class MainWindow(QMainWindow):
                         break
                 config_manager.save(self.cfg)
             except Exception as e:
-                QMessageBox.critical(self, "Save Error", f"Could not save watch settings:\n{e}")
+                QMessageBox.critical(self, tr("Save Error"), tr("Could not save watch settings:\n{p0}", p0=e))
                 return
 
         self._load_config()
         self._refresh_watches()
         self._update_auto_label()
+
+    def _export_watch_diagnostics(self, watch: dict):
+        """Bundle everything relevant to ONE watch into a single .zip the customer
+        can email to support — no log-hunting required.
+
+        Contents: environment info, this watch's redacted config, this watch's
+        backup + change history (filtered by watch_id), the log lines that
+        mention this watch, and the raw logs as a fallback.  Secrets (passwords,
+        tokens, encryption keys) are stripped.
+        """
+        import copy, json as _json, zipfile, platform
+        from datetime import datetime as _dt
+        from PyQt6.QtWidgets import QFileDialog
+
+        wid   = watch.get("id", "")
+        wname = watch.get("name", wid) or wid
+        # Fresh copy from config in case the card is stale
+        live_watch = next((w for w in self.cfg.get("watches", []) if w.get("id") == wid), watch)
+
+        # ── Redact secrets (same policy as config export) ──────────────────
+        _SECRET_KEYS = {
+            "password", "pass", "token", "encrypt_key",
+            "access_token", "refresh_token", "client_secret",
+            "api_key", "webhook_url",
+        }
+        def _redact(obj):
+            if isinstance(obj, dict):
+                return {k: ("*** REDACTED ***" if k.lower() in _SECRET_KEYS else _redact(v))
+                        for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_redact(i) for i in obj]
+            return obj
+        watch_cfg = _redact(copy.deepcopy(live_watch))
+
+        # ── This watch's history (filtered by id) ──────────────────────────
+        try:
+            _bh = [b for b in config_manager.load_backup_history() if b.get("watch_id") == wid]
+        except Exception:
+            _bh = []
+        try:
+            _ch = [c for c in config_manager.load_history() if c.get("watch_id") == wid][-2000:]
+        except Exception:
+            _ch = []
+
+        # ── Log lines that mention this watch (best-effort) ────────────────
+        _needles = [n for n in {
+            wid, wname,
+            str(live_watch.get("path", "")),
+            str(live_watch.get("destination", "")),
+        } if n]
+        _log_dir = Path(os.environ.get("BACKUPSYS_DATA_DIR", Path(__file__).resolve().parent)) / "logs"
+        _log_files = sorted(_log_dir.glob("backupsys.log*")) if _log_dir.exists() else []
+        _extract_lines: list = []
+        _raw_logs: dict = {}
+        for lf in _log_files:
+            try:
+                _text = lf.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            _raw_logs[lf.name] = _text
+            for _ln in _text.splitlines():
+                if any(_n in _ln for _n in _needles):
+                    _extract_lines.append(f"[{lf.name}] {_ln}")
+
+        # ── Environment info ───────────────────────────────────────────────
+        _env = "\n".join([
+            f"App:        {APP_NAME} v{APP_VERSION}",
+            f"Generated:  {_dt.now().isoformat(timespec='seconds')}",
+            f"Watch name: {wname}",
+            f"Watch id:   {wid}",
+            f"Source:     {live_watch.get('path', '')}",
+            f"Dest:       {live_watch.get('destination', '')}",
+            f"OS:         {platform.platform()}",
+            f"Python:     {platform.python_version()}",
+            f"Machine:    {platform.node()}",
+        ]) + "\n"
+
+        _readme = (
+            f"BackupSys diagnostic bundle for watch: {wname}\n"
+            + "=" * 60 + "\n\n"
+            "Generated by BackupSys to help support diagnose an issue with THIS\n"
+            "watch folder. Contents:\n\n"
+            "  environment.txt      - app version / OS info\n"
+            "  watch_config.json    - this watch's settings (passwords removed)\n"
+            "  backup_history.json  - this watch's backup runs\n"
+            "  change_history.json  - recent file-change events for this watch\n"
+            "  log_extract.txt      - log lines that mention this watch\n"
+            "  full_logs/           - raw application logs (fallback)\n\n"
+            "Passwords, tokens and encryption keys have been removed.\n"
+            "Please email this single file to your support contact.\n"
+        )
+
+        # ── Ask where to save (default to Desktop) ─────────────────────────
+        _safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in wname)[:40] or "watch"
+        _default_name = f"backupsys_diag_{_safe}_{_dt.now():%Y%m%d_%H%M%S}.zip"
+        try:
+            _desktop = Path.home() / "Desktop"
+            _start = str(_desktop / _default_name) if _desktop.exists() else _default_name
+        except Exception:
+            _start = _default_name
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, tr("Export Diagnostics for '{p0}'", p0=wname),
+            _start, "Zip files (*.zip)"
+        )
+        if not out_path:
+            return
+
+        # ── Write the zip ──────────────────────────────────────────────────
+        try:
+            with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
+                z.writestr("README.txt", _readme)
+                z.writestr("environment.txt", _env)
+                z.writestr("watch_config.json", _json.dumps(watch_cfg, indent=2, ensure_ascii=False))
+                z.writestr("backup_history.json", _json.dumps(_bh, indent=2, ensure_ascii=False))
+                z.writestr("change_history.json", _json.dumps(_ch, indent=2, ensure_ascii=False))
+                z.writestr("log_extract.txt",
+                           "\n".join(_extract_lines) if _extract_lines
+                           else "(no log lines mentioned this watch by name / id / path)\n")
+                for _name, _text in _raw_logs.items():
+                    z.writestr(f"full_logs/{_name}", _text)
+        except Exception as e:
+            QMessageBox.critical(self, tr("Export Failed"),
+                                 tr("Could not write diagnostics file:\n{p0}", p0=e))
+            return
+
+        QMessageBox.information(
+            self, tr("Diagnostics Exported"),
+            tr("Saved diagnostics for '{p0}' to:\n{p1}\n\n"
+               "Passwords have been removed. Please email this single file to support.",
+               p0=wname, p1=out_path)
+        )
 
     def _on_pause_requested(self, watch_id: str, paused: bool):
         """Persist pause/resume state and restart or stop the watcher accordingly."""
@@ -26702,7 +28000,48 @@ class MainWindow(QMainWindow):
                             interval_min=watch.get("interval_min", 0) or self.cfg.get("interval_min", 30),
                             smb_audit_cfg=_nas_cfg_resume,
                         )
-        self._append_log(f"{'⏸ Paused' if paused else '▶ Resumed'} watch: {self._watch_name_for(watch_id)}")
+        self._append_log(tr("{p0} watch: {p1}", p0=tr('⏸ Paused') if paused else tr('▶ Resumed'), p1=self._watch_name_for(watch_id)))
+
+    def _backup_all_now(self):
+        """Queue a manual backup for every (non-paused) watch in one click.
+
+        Reuses _backup_single, which serializes everything through the global
+        one-at-a-time queue — the first watch starts immediately and the rest
+        show a 'Queued' badge and drain automatically in _on_backup_done.  This
+        is exactly what clicking each folder's 'Backup Now' would do, without
+        the ten clicks.
+        """
+        watches = self.cfg.get("watches", [])
+        eligible = [w for w in watches if not w.get("paused", False)]
+        skipped_paused = len(watches) - len(eligible)
+        if not eligible:
+            QMessageBox.information(
+                self, APP_NAME,
+                "No folders to back up." + (
+                    "\n\nAll watched folders are currently paused — resume them first."
+                    if skipped_paused else "\n\nAdd a watched folder first."
+                ),
+            )
+            return
+
+        _msg = (
+            f"Back up all {len(eligible)} watched folder(s) now?\n\n"
+            "They run one at a time (queued) to avoid splitting bandwidth."
+        )
+        if skipped_paused:
+            _msg += f"\n{skipped_paused} paused folder(s) will be skipped."
+        if QMessageBox.question(
+            self, tr("Backup All Now"), _msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        # _backup_single already ignores watches that are running or already
+        # queued, so it is safe to call for every eligible watch.
+        for w in eligible:
+            self._backup_single(w, triggered_by="manual")
+        self._append_log(tr("\u2b06 Backup All: queued {p0} watch(es)", p0=len(eligible)))
 
     def _toggle_pause_all(self):
         """Pause or resume every watch at once (global toggle)."""
@@ -26726,17 +28065,17 @@ class MainWindow(QMainWindow):
 
         # Update sidebar button label
         if target_paused:
-            self._pause_all_btn.setText("▶  Resume All Backups")
-            self._pause_all_btn.setToolTip("Resume all watched folders (backups were globally paused).")
-            self._append_log("⏸ All watches paused globally")
+            self._pause_all_btn.setText(tr("▶  Resume All Backups"))
+            self._pause_all_btn.setToolTip(tr("Resume all watched folders (backups were globally paused)."))
+            self._append_log(tr("\u23f8 All watches paused globally"))
         else:
-            self._pause_all_btn.setText("⏸  Pause All Backups")
+            self._pause_all_btn.setText(tr("⏸  Pause All Backups"))
             self._pause_all_btn.setToolTip(
-                "Pause all watched folders at once.\n"
+                tr("Pause all watched folders at once.\n"
                 "Useful before presentations or on slow connections.\n"
-                "Click again to resume all watches."
+                "Click again to resume all watches.")
             )
-            self._append_log("▶ All watches resumed globally")
+            self._append_log(tr("\u25b6 All watches resumed globally"))
 
     def _on_watches_changed(self):
         self._load_config()
@@ -26789,13 +28128,13 @@ class MainWindow(QMainWindow):
         sched = getattr(self, "_integrity_scheduler", None)
         if sched is None:
             QMessageBox.information(
-                self, "Integrity Check",
-                "The integrity scheduler is not running.\n"
-                "Enable scheduled integrity checks in Settings and restart the app."
+                self, tr("Integrity Check"),
+                tr("The integrity scheduler is not running.\n"
+                "Enable scheduled integrity checks in Settings and restart the app.")
             )
             return
         sched.run_now()
-        self._append_log("🔍 Manual integrity check triggered — results will appear in the log.")
+        self._append_log(tr("🔍 Manual integrity check triggered \u2014 results will appear in the log."))
         if hasattr(self, "_tray"):
             self._tray.showMessage(
                 APP_NAME,
@@ -26807,7 +28146,7 @@ class MainWindow(QMainWindow):
         """Called once per watch after its scheduled integrity check completes."""
         ok = result.get("valid") and result.get("manifest_ok", True)
         if ok:
-            self._append_log(f"✔ Integrity OK: {watch_name}")
+            self._append_log(tr("\u2714 Integrity OK: {p0}", p0=watch_name))
         else:
             missing   = result.get("missing_files", [])
             corrupted = result.get("corrupted_files", [])
@@ -26823,7 +28162,7 @@ class MainWindow(QMainWindow):
                     detail += f" (+{len(corrupted)-3} more)"
             if err:
                 detail += f"  Error: {err}"
-            self._append_log(f"⚠ Integrity FAILED: {watch_name}{detail}")
+            self._append_log(tr("\u26a0 Integrity FAILED: {p0}{p1}", p0=watch_name, p1=detail))
             if hasattr(self, "_tray"):
                 self._tray.showMessage(
                     APP_NAME,
@@ -26844,7 +28183,7 @@ class MainWindow(QMainWindow):
 
     def _on_disk_space_warning(self, free_gb: float):
         """Called when backup destination has low disk space."""
-        self._append_log(f"⚠ Low disk space on backup destination: {free_gb:.1f} GB free")
+        self._append_log(tr("\u26a0 Low disk space on backup destination: {p0} GB free", p0=f'{free_gb:.1f}'))
         if hasattr(self, "_tray"):
             self._tray.showMessage(
                 APP_NAME,
@@ -26906,7 +28245,7 @@ class _TrendChart(QWidget):
         data = self.daily_data
         if not data:
             painter.setPen(QColor("#6b7280"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No backup data yet")
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, tr("No backup data yet"))
             return
 
         max_mb    = max((d[1] for d in data), default=1) or 1
@@ -26977,7 +28316,7 @@ class GlobalTrendDialog(QDialog):
     def __init__(self, backup_history: list, parent=None):
         super().__init__(parent)
         self.backup_history = backup_history
-        self.setWindowTitle("📈 Global Backup Dashboard")
+        self.setWindowTitle(tr("📈 Global Backup Dashboard"))
         self.setMinimumSize(760, 520)
         self._build_ui()
 
@@ -27056,7 +28395,7 @@ class GlobalTrendDialog(QDialog):
         header.setFixedHeight(52)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 16, 0)
-        title = QLabel("Global Backup Trend Dashboard")
+        title = QLabel(tr("Global Backup Trend Dashboard"))
         title.setStyleSheet("font-size:14px; font-weight:700; color:#f1f3f9;")
         hl.addWidget(title)
         hl.addStretch()
@@ -27096,7 +28435,7 @@ class GlobalTrendDialog(QDialog):
             ic = QLabel(icon)
             ic.setStyleSheet("font-size:16px;")
             top_row.addWidget(ic)
-            lbl = QLabel(label)
+            lbl = QLabel(tr(label))
             lbl.setStyleSheet("color:#6b7280; font-size:10px;")
             top_row.addWidget(lbl)
             top_row.addStretch()
@@ -27112,7 +28451,7 @@ class GlobalTrendDialog(QDialog):
         chart_frame.setObjectName("card")
         cfl = QVBoxLayout(chart_frame)
         cfl.setContentsMargins(12, 10, 12, 10)
-        chart_title = QLabel("Backup size & outcome per day  (last 60 days)")
+        chart_title = QLabel(tr("Backup size & outcome per day  (last 60 days)"))
         chart_title.setStyleSheet("color:#6b7280; font-size:11px; font-weight:700;")
         cfl.addWidget(chart_title)
         chart = _TrendChart(daily_series)
@@ -27121,12 +28460,12 @@ class GlobalTrendDialog(QDialog):
         bl.addWidget(chart_frame)
 
         # ── Per-watch breakdown table ─────────────────────────────────────────
-        watches_lbl = QLabel("Per-watch breakdown")
+        watches_lbl = QLabel(tr("Per-watch breakdown"))
         watches_lbl.setStyleSheet("color:#6b7280; font-size:11px; font-weight:700; text-transform:uppercase;")
         bl.addWidget(watches_lbl)
 
         tbl = QTableWidget(len(watch_stats), 5)
-        tbl.setHorizontalHeaderLabels(["Watch", "Total", "✅ OK", "❌ Fail", "Total Size"])
+        tbl.setHorizontalHeaderLabels([tr("Watch"), tr("Total"), tr("✅ OK"), tr("❌ Fail"), tr("Total Size")])
         tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -27162,7 +28501,7 @@ class HistoryWindow(QDialog):
 
     def __init__(self, history: list, backup_history: list, backup_queue: list = None, cfg: dict = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("History")
+        self.setWindowTitle(tr("History"))
         self.setMinimumSize(900, 580)
         self.resize(1100, 680)
         self._all_history = history          # change-history list of dicts
@@ -27183,12 +28522,12 @@ class HistoryWindow(QDialog):
         header.setFixedHeight(56)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 20, 0)
-        title = QLabel("📋  History")
+        title = QLabel(tr("📋  History"))
         title.setStyleSheet("font-size:15px; font-weight:700; color:#f1f3f9;")
         hl.addWidget(title)
         hl.addStretch()
 
-        export_btn = QPushButton("Export History…")
+        export_btn = QPushButton(tr("Export History…"))
         export_btn.setObjectName("secondary")
         export_btn.clicked.connect(self._export_csv)
         hl.addWidget(export_btn)
@@ -27233,19 +28572,24 @@ class HistoryWindow(QDialog):
         fl.setSpacing(12)
 
         self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter by file, user, machine…")
+        self.filter_input.setPlaceholderText(tr("Filter by file, user, machine…"))
         self.filter_input.setFixedWidth(240)
         self.filter_input.textChanged.connect(self._filter_changes)
         fl.addWidget(self.filter_input)
 
         self.type_filter = QComboBox()
-        self.type_filter.addItems(["All Types", "modified", "added", "deleted", "renamed", "backed up"])
+        # Japanese label for display, English value in itemData (read via currentData()
+        # in _filter_changes so filtering logic stays language-independent).
+        for _val, _lbl in [("All Types", tr("All Types")), ("modified", tr("modified")),
+                           ("added", tr("added")), ("deleted", tr("deleted")),
+                           ("renamed", tr("renamed")), ("backed up", tr("backed up"))]:
+            self.type_filter.addItem(_lbl, _val)
         self.type_filter.setFixedWidth(120)
         self.type_filter.currentTextChanged.connect(self._filter_changes)
         fl.addWidget(self.type_filter)
 
         # Date range filters
-        from_label = QLabel("From:")
+        from_label = QLabel(tr("From:"))
         from_label.setStyleSheet("color:#9ca3af; font-size:11px;")
         fl.addWidget(from_label)
 
@@ -27255,7 +28599,7 @@ class HistoryWindow(QDialog):
         self.date_from.dateChanged.connect(self._filter_changes)
         fl.addWidget(self.date_from)
 
-        to_label = QLabel("To:")
+        to_label = QLabel(tr("To:"))
         to_label.setStyleSheet("color:#9ca3af; font-size:11px;")
         fl.addWidget(to_label)
 
@@ -27265,7 +28609,7 @@ class HistoryWindow(QDialog):
         self.date_to.dateChanged.connect(self._filter_changes)
         fl.addWidget(self.date_to)
 
-        clear_dates_btn = QPushButton("Clear dates")
+        clear_dates_btn = QPushButton(tr("Clear dates"))
         clear_dates_btn.setObjectName("secondary")
         clear_dates_btn.setMinimumWidth(100)
         clear_dates_btn.clicked.connect(self._clear_dates)
@@ -27282,10 +28626,10 @@ class HistoryWindow(QDialog):
         sl.setContentsMargins(20, 0, 20, 0)
         sl.setSpacing(24)
 
-        self.stat_total   = QLabel("Total: 0")
-        self.stat_mod     = QLabel("Modified: 0")
-        self.stat_added   = QLabel("➕ Added: 0")
-        self.stat_deleted = QLabel("Deleted: 0")
+        self.stat_total   = QLabel(tr("Total: 0"))
+        self.stat_mod     = QLabel(tr("Modified: 0"))
+        self.stat_added   = QLabel(tr("➕ Added: 0"))
+        self.stat_deleted = QLabel(tr("Deleted: 0"))
 
         for lbl in (self.stat_total, self.stat_mod, self.stat_added, self.stat_deleted):
             lbl.setStyleSheet("color:#6b7280; font-size:11px; font-weight:600;")
@@ -27300,7 +28644,7 @@ class HistoryWindow(QDialog):
         # ── Table ────────────────────────────────────────────────────────────
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels([
-            "Time", "Watch", "Type", "File / Path", "👤 User", "💻 Machine", "🌐 IP"
+            tr("Time"), tr("Watch"), tr("Type"), tr("File / Path"), tr("👤 User"), tr("💻 Machine"), tr("🌐 IP")
         ])
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -27320,7 +28664,7 @@ class HistoryWindow(QDialog):
         )
         layout.addWidget(self.table)
 
-        self.tabs.addTab(tab, "Change History")
+        self.tabs.addTab(tab, tr("Change History"))
 
     def _build_backup_history_tab(self):
         tab = QWidget()
@@ -27336,18 +28680,21 @@ class HistoryWindow(QDialog):
         fl.setSpacing(12)
 
         self.backup_filter_input = QLineEdit()
-        self.backup_filter_input.setPlaceholderText("Search by watch name or date…")
+        self.backup_filter_input.setPlaceholderText(tr("Search by watch name or date…"))
         self.backup_filter_input.setFixedWidth(240)
         self.backup_filter_input.textChanged.connect(self._filter_backups)
         fl.addWidget(self.backup_filter_input)
 
         self.status_filter = QComboBox()
-        self.status_filter.addItems(["All", "Success", "Failed", "Cancelled"])
+        # Japanese label for display, English value in itemData (read via currentData()).
+        for _val, _lbl in [("All", tr("All")), ("Success", tr("Success")),
+                           ("Failed", tr("Failed")), ("Cancelled", tr("Cancelled"))]:
+            self.status_filter.addItem(_lbl, _val)
         self.status_filter.setFixedWidth(120)
         self.status_filter.currentTextChanged.connect(self._filter_backups)
         fl.addWidget(self.status_filter)
 
-        clear_filters_btn = QPushButton("Clear Filters")
+        clear_filters_btn = QPushButton(tr("Clear Filters"))
         clear_filters_btn.setObjectName("secondary")
         clear_filters_btn.setFixedWidth(100)
         clear_filters_btn.clicked.connect(self._clear_backup_filters)
@@ -27359,7 +28706,7 @@ class HistoryWindow(QDialog):
         # ── Table ────────────────────────────────────────────────────────────
         self.backup_table = QTableWidget(0, 6)
         self.backup_table.setHorizontalHeaderLabels([
-            "Started", "Watch", "Status", "Files", "Size", "Duration"
+            tr("Started"), tr("Watch"), tr("Status"), tr("Files"), tr("Size"), tr("Duration")
         ])
         hh = self.backup_table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -27379,7 +28726,7 @@ class HistoryWindow(QDialog):
         layout.addWidget(self.backup_table)
 
         self._populate_backups(self._backup_history)
-        self.tabs.addTab(tab, "Backup History")
+        self.tabs.addTab(tab, tr("Backup History"))
 
     def _build_queue_tab(self):
         """Build the Queue tab — shows items currently waiting to be backed up."""
@@ -27395,7 +28742,7 @@ class HistoryWindow(QDialog):
         tl.setContentsMargins(20, 0, 20, 0)
         tl.setSpacing(12)
 
-        queue_title_lbl = QLabel("⏳  Pending backup queue")
+        queue_title_lbl = QLabel(tr("⏳  Pending backup queue"))
         queue_title_lbl.setStyleSheet("font-size:13px; font-weight:600; color:#9ca3af;")
         tl.addWidget(queue_title_lbl)
         tl.addStretch()
@@ -27404,7 +28751,7 @@ class HistoryWindow(QDialog):
         self._queue_count_lbl.setStyleSheet("color:#6b7280; font-size:11px;")
         tl.addWidget(self._queue_count_lbl)
 
-        refresh_btn = QPushButton("Refresh")
+        refresh_btn = QPushButton(tr("Refresh"))
         refresh_btn.setObjectName("secondary")
         refresh_btn.setFixedWidth(80)
         refresh_btn.clicked.connect(self._refresh_queue_from_disk)
@@ -27418,8 +28765,8 @@ class HistoryWindow(QDialog):
         il = QHBoxLayout(info_bar)
         il.setContentsMargins(20, 0, 20, 0)
         note = QLabel(
-            "Items shown here will be retried automatically the next time BackupSys starts. "
-            "This queue is stored in backup_queue.json inside the data directory."
+            tr("Items shown here will be retried automatically the next time BackupSys starts. "
+            "This queue is stored in backup_queue.json inside the data directory.")
         )
         note.setStyleSheet("color:#6b7280; font-size:10px;")
         il.addWidget(note)
@@ -27427,7 +28774,7 @@ class HistoryWindow(QDialog):
 
         # ── Table ────────────────────────────────────────────────────────────
         self.queue_table = QTableWidget(0, 3)
-        self.queue_table.setHorizontalHeaderLabels(["Watch name / ID", "Triggered by", "Queued at"])
+        self.queue_table.setHorizontalHeaderLabels([tr("Watch name / ID"), tr("Triggered by"), tr("Queued at")])
         hh = self.queue_table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -27444,7 +28791,7 @@ class HistoryWindow(QDialog):
 
         self._populate_queue(self._backup_queue)
         # Show item count in tab label
-        label = f"Queue  ({len(self._backup_queue)})" if self._backup_queue else "Queue  (empty)"
+        label = tr("Queue  ({n})", n=len(self._backup_queue)) if self._backup_queue else tr("Queue  (empty)")
         self.tabs.addTab(tab, label)
 
     def _build_file_search_tab(self):
@@ -27462,7 +28809,7 @@ class HistoryWindow(QDialog):
         sl.setSpacing(10)
 
         self._fs_input = QLineEdit()
-        self._fs_input.setPlaceholderText("Search filename across all watches…  e.g. report.docx")
+        self._fs_input.setPlaceholderText(tr("Search filename across all watches…  e.g. report.docx"))
         self._fs_input.setMinimumWidth(280)
         self._fs_input.returnPressed.connect(self._run_file_search)
         sl.addWidget(self._fs_input)
@@ -27470,12 +28817,12 @@ class HistoryWindow(QDialog):
         # Watch filter
         self._fs_watch_combo = QComboBox()
         self._fs_watch_combo.setFixedWidth(180)
-        self._fs_watch_combo.addItem("All watches", userData=None)
+        self._fs_watch_combo.addItem(tr("All watches"), userData=None)
         for w in self._cfg.get("watches", []):
             self._fs_watch_combo.addItem(w.get("name", w["id"]), userData=w["id"])
         sl.addWidget(self._fs_watch_combo)
 
-        search_btn = QPushButton("🔍  Search")
+        search_btn = QPushButton(tr("🔍  Search"))
         search_btn.setObjectName("primary")
         search_btn.setFixedWidth(100)
         search_btn.clicked.connect(self._run_file_search)
@@ -27490,7 +28837,7 @@ class HistoryWindow(QDialog):
         # ── Results table ────────────────────────────────────────────────────
         self._fs_table = QTableWidget(0, 5)
         self._fs_table.setHorizontalHeaderLabels([
-            "Watch", "Backup Date", "File Path", "Size", "Backup Dir"
+            tr("Watch"), tr("Backup Date"), tr("File Path"), tr("Size"), tr("Backup Dir")
         ])
         hh = self._fs_table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -27509,7 +28856,7 @@ class HistoryWindow(QDialog):
         self._fs_table.setSortingEnabled(True)
         layout.addWidget(self._fs_table)
 
-        self.tabs.addTab(tab, "🔍 File Search")
+        self.tabs.addTab(tab, tr("🔍 File Search"))
 
     def _run_file_search(self):
         """Scan every backup manifest for files matching the search query."""
@@ -27529,7 +28876,7 @@ class HistoryWindow(QDialog):
                 dest_set.add(wd)
 
         if not dest_set:
-            self._fs_status.setText("No destination configured.")
+            self._fs_status.setText(tr("No destination configured."))
             return
 
         self._fs_table.setSortingEnabled(False)
@@ -27594,7 +28941,7 @@ class HistoryWindow(QDialog):
                         matches += 1
 
             except Exception as e:
-                self._fs_status.setText(f"Error scanning {dest}: {e}")
+                self._fs_status.setText(tr("Error scanning {dest}: {err}", dest=dest, err=e))
                 errors += 1
 
         self._fs_table.setSortingEnabled(True)
@@ -27602,7 +28949,7 @@ class HistoryWindow(QDialog):
         detail = f"  ({scanned} snapshots scanned)" if scanned else "  (no snapshots found)"
         if errors:
             detail += f"  ⚠ {errors} unreadable"
-        self._fs_status.setText(f'{matches} {noun} for \u201c{query}\u201d{detail}')
+        self._fs_status.setText(tr("{p0} {p1} for \u201c{p2}\u201d{p3}", p0=matches, p1=noun, p2=query, p3=detail))
 
     def _populate_queue(self, queue: list):
         """Fill the queue table from a list of queue-item dicts."""
@@ -27629,12 +28976,12 @@ class HistoryWindow(QDialog):
 
         self.queue_table.resizeRowsToContents()
         count = len(queue)
-        self._queue_count_lbl.setText(f"{count} item{'s' if count != 1 else ''} pending")
+        self._queue_count_lbl.setText(tr("{n} item(s) pending", n=count))
 
         # Update tab label
         idx = self.tabs.indexOf(self.queue_table.parent())
         if idx >= 0:
-            label = f"Queue  ({count})" if count else "Queue  (empty)"
+            label = tr("Queue  ({n})", n=count) if count else tr("Queue  (empty)")
             self.tabs.setTabText(idx, label)
 
     def _refresh_queue_from_disk(self):
@@ -27753,17 +29100,17 @@ class HistoryWindow(QDialog):
             _user_item = _item(_user_display, _user_color)
             if _is_local_pop:
                 _user_item.setToolTip(
-                    "Local user on the Windows PC — deleted directly via Explorer\n"
+                    tr("Local user on the Windows PC — deleted directly via Explorer\n"
                     "or a local app, not over a network connection.\n\n"
                     "To identify the exact account:\n"
                     "  1. Right-click shared folder → Properties → Security\n"
                     "     → Advanced → Auditing → Add Everyone/Delete\n"
                     "  2. Enable 'Remote Event Log Management' in Windows Firewall\n"
-                    "  3. Add Windows admin credentials in watch Settings"
+                    "  3. Add Windows admin credentials in watch Settings")
                 )
             elif _is_unknown_pop:
                 _user_item.setToolTip(
-                    "Identity could not be determined.\n"
+                    tr("Identity could not be determined.\n"
                     "The file was deleted locally on the Windows PC that hosts the share,\n"
                     "so no SMB network session was visible to identify the actor.\n\n"
                     "To identify who deleted it in future:\n"
@@ -27775,7 +29122,7 @@ class HistoryWindow(QDialog):
                     "  3. In watch Settings → Edit Watch → add Windows admin credentials\n"
                     "     for the PC hosting the share\n\n"
                     "With all three steps done, BackupSys will read the Security Event Log\n"
-                    "and show the exact user account that deleted the file."
+                    "and show the exact user account that deleted the file.")
                 )
             self.table.setItem(i, 4, _user_item)
             self.table.setItem(i, 5, _item(_machine_display, _machine_color))
@@ -27790,14 +29137,14 @@ class HistoryWindow(QDialog):
         added   = sum(1 for e in entries if e.get("type") == "added")
         deleted = sum(1 for e in entries if e.get("type") == "deleted")
 
-        self.stat_total.setText(f"Total: {total}")
-        self.stat_mod.setText(f"Modified: {mod}")
-        self.stat_added.setText(f"➕ Added: {added}")
-        self.stat_deleted.setText(f"Deleted: {deleted}")
+        self.stat_total.setText(tr("Total: {n}", n=total))
+        self.stat_mod.setText(tr("Modified: {n}", n=mod))
+        self.stat_added.setText(tr("➕ Added: {n}", n=added))
+        self.stat_deleted.setText(tr("Deleted: {n}", n=deleted))
 
     def _filter_changes(self):
         text      = self.filter_input.text().lower()
-        type_sel  = self.type_filter.currentText()
+        type_sel  = self.type_filter.currentData()
         date_from = self.date_from.date()
         date_to   = self.date_to.date()
         filtered  = []
@@ -27833,13 +29180,13 @@ class HistoryWindow(QDialog):
         self._populate_changes(filtered)
         filter_active = text or type_sel != "All Types" or date_from.year() != 1900 or date_to.year() != 1900
         if filter_active:
-            self.result_lbl.setText(f"Showing {len(filtered)} of {len(self._all_history)}")
+            self.result_lbl.setText(tr("Showing {a} of {b}", a=len(filtered), b=len(self._all_history)))
         else:
             self.result_lbl.setText("")
 
     def _filter_backups(self):
         text = self.backup_filter_input.text().lower()
-        status_sel = self.status_filter.currentText()
+        status_sel = self.status_filter.currentData()
         filtered = []
 
         for e in self._backup_history:
@@ -27858,7 +29205,7 @@ class HistoryWindow(QDialog):
 
     def _clear_backup_filters(self):
         self.backup_filter_input.setText("")
-        self.status_filter.setCurrentText("All")
+        self.status_filter.setCurrentIndex(0)   # "All" (value read via currentData)
         self._filter_backups()
 
     def _clear_dates(self):
@@ -27906,9 +29253,9 @@ class HistoryWindow(QDialog):
                         entry.get("destination", ""),
                         entry.get("error", ""),
                     ])
-            QMessageBox.information(self, "Exported", f"History exported to:\n{path}")
+            QMessageBox.information(self, tr("Exported"), tr("History exported to:\n{p0}", p0=path))
         except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
+            QMessageBox.critical(self, tr("Error"), str(ex))
 
     @staticmethod
     def _display_path(entry: dict) -> str:
@@ -27944,7 +29291,7 @@ class HistoryWindow(QDialog):
 
         # If a filter is active, check whether this entry passes before inserting
         text     = self.filter_input.text().lower()
-        type_sel = self.type_filter.currentText()
+        type_sel = self.type_filter.currentData()
         if type_sel != "All Types" and entry.get("type") != type_sel:
             return
         if text:
@@ -28130,26 +29477,30 @@ class TrayApp:
 
             menu = QMenu()
 
-            open_action = QAction("Open Dashboard", menu)
+            open_action = QAction(tr("Open Dashboard"), menu)
             open_action.triggered.connect(self._show_window)
 
-            integrity_action = QAction("🔍  Run Integrity Check Now", menu)
+            backup_all_action = QAction(tr("⬆  Backup All Now"), menu)
+            backup_all_action.triggered.connect(self.window._backup_all_now)
+
+            integrity_action = QAction(tr("🔍  Run Integrity Check Now"), menu)
             integrity_action.triggered.connect(self.window._trigger_integrity_check_now)
 
-            admin_action = QAction("🔧 Admin Settings", menu)
+            admin_action = QAction(tr("🔧 Admin Settings"), menu)
             admin_action.triggered.connect(self.window._open_admin)
 
-            history_action = QAction("📋  Change History", menu)
+            history_action = QAction(tr("📋  Change History"), menu)
             history_action.triggered.connect(self.window._open_history)
 
             menu.addAction(open_action)
             menu.addSeparator()
+            menu.addAction(backup_all_action)
             menu.addAction(integrity_action)
             menu.addAction(admin_action)
             menu.addAction(history_action)
             menu.addSeparator()
 
-            quit_action = QAction("Quit", menu)
+            quit_action = QAction(tr("Quit"), menu)
             quit_action.triggered.connect(self._quit)
             menu.addAction(quit_action)
 
@@ -28160,7 +29511,7 @@ class TrayApp:
             self.tray.show()
         else:
             # Window mode: modify title and set up for taskbar minimization
-            self.window.setWindowTitle(f"{APP_NAME} (no system tray — running in window mode)")
+            self.window.setWindowTitle(f"{APP_NAME} " + tr("(no system tray — running in window mode)"))
             self.window.set_tray(None)  # No tray available
 
     def _show_window(self):
@@ -28299,10 +29650,8 @@ def main():
             _tmp_app = QApplication.instance() or QApplication(sys.argv)
             QMessageBox.critical(
                 None,
-                f"{APP_NAME} — Unexpected Error",
-                f"An unexpected error occurred. Please check the log file for details.\n\n"
-                f"{exc_type.__name__}: {exc_value}\n\n"
-                f"Log: {_setup_logging()}"
+                tr("{p0} \u2014 Unexpected Error", p0=APP_NAME),
+                tr("An unexpected error occurred. Please check the log file for details.\n\n{p0}: {p1}\n\nLog: {p2}", p0=exc_type.__name__, p1=exc_value, p2=_setup_logging())
             )
         except Exception:
             pass  # if the dialog itself fails, at least the log was written
@@ -28314,13 +29663,24 @@ def main():
     if _lock_fh is None:
         _tmp_app = QApplication.instance() or QApplication(sys.argv)
         QMessageBox.warning(None, APP_NAME,
-            "Backup System is already running.\n\nCheck your system tray.")
+            tr("Backup System is already running.\n\nCheck your system tray."))
         sys.exit(0)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(SETTINGS_ORG)
     app.setQuitOnLastWindowClosed(False)   # keep alive when window is closed
+
+    # Scrolling a settings page must never edit the field under the cursor.
+    # Kept on `app` so the filter object outlives this scope.
+    app._no_wheel_edit_filter = _NoWheelEditFilter(app)
+    app.installEventFilter(app._no_wheel_edit_filter)
+
+    # ── Language selection ────────────────────────────────────────────────────
+    # Applied on restart: read the saved language BEFORE any UI is built so every
+    # tr() call renders in the chosen language. Defaults to Japanese (see i18n).
+    _s_lang = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    set_language(_s_lang.value("language", "ja"))
 
     # ── Theme selection ───────────────────────────────────────────────────────
     _s = QSettings(SETTINGS_ORG, SETTINGS_APP)
@@ -28356,7 +29716,7 @@ class LogViewerDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("View Logs")
+        self.setWindowTitle(tr("View Logs"))
         self.setMinimumSize(700, 500)
         self.resize(900, 600)
         self._log_file = Path(os.environ.get("BACKUPSYS_DATA_DIR", Path(__file__).parent)) / "logs" / "backupsys.log"
@@ -28375,7 +29735,7 @@ class LogViewerDialog(QDialog):
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 0, 16, 0)
 
-        title = QLabel("📜  Application Logs")
+        title = QLabel(tr("📜  Application Logs"))
         title.setStyleSheet("font-size:14px; font-weight:700; color:#f1f3f9;")
         hl.addWidget(title)
 
@@ -28384,19 +29744,54 @@ class LogViewerDialog(QDialog):
         hl.addWidget(log_path_lbl)
         hl.addStretch()
 
-        refresh_btn = QPushButton("🔄 Refresh")
+        self._copy_btn = QPushButton(tr("📋 Copy"))
+        self._copy_btn.setObjectName("secondary")
+        self._copy_btn.setToolTip(tr("Copy the entire log to the clipboard"))
+        self._copy_btn.clicked.connect(self._copy_logs)
+        hl.addWidget(self._copy_btn)
+
+        hl.addSpacing(8)
+
+        export_btn = QPushButton(tr("💾 Export"))
+        export_btn.setObjectName("secondary")
+        export_btn.setToolTip(tr("Save the log to a text file you choose"))
+        export_btn.clicked.connect(self._export_logs)
+        hl.addWidget(export_btn)
+
+        hl.addSpacing(8)
+
+        open_btn = QPushButton(tr("📂 Open folder"))
+        open_btn.setObjectName("secondary")
+        open_btn.setToolTip(tr("Open the folder containing the log file"))
+        open_btn.clicked.connect(self._open_log_folder)
+        hl.addWidget(open_btn)
+
+        hl.addSpacing(8)
+
+        refresh_btn = QPushButton(tr("🔄 Refresh"))
         refresh_btn.setObjectName("secondary")
         refresh_btn.clicked.connect(self._load_logs)
         hl.addWidget(refresh_btn)
 
         hl.addSpacing(8)
 
-        close_btn = QPushButton("✕ Close")
+        close_btn = QPushButton(tr("✕ Close"))
         close_btn.setObjectName("secondary")
         close_btn.clicked.connect(self.close)
         hl.addWidget(close_btn)
 
         layout.addWidget(header)
+
+        # ── Filter bar ────────────────────────────────────────────────────────
+        filter_row = QFrame()
+        fr = QHBoxLayout(filter_row)
+        fr.setContentsMargins(16, 8, 16, 8)
+        self._log_filter = QLineEdit()
+        self._log_filter.setPlaceholderText(tr("Filter logs…  (type to show only matching lines)"))
+        self._log_filter.setClearButtonEnabled(True)
+        self._log_filter.textChanged.connect(self._apply_log_filter)
+        fr.addWidget(self._log_filter)
+        layout.addWidget(filter_row)
 
         # ── Log viewer ───────────────────────────────────────────────────────
         self.log_text = QPlainTextEdit()
@@ -28409,23 +29804,67 @@ class LogViewerDialog(QDialog):
         layout.addWidget(self.log_text)
 
     def _load_logs(self):
-        """Load and display log file content."""
+        """Load log file content into memory, then render (respecting the filter)."""
         try:
             if self._log_file.exists():
-                content = self._log_file.read_text(encoding='utf-8', errors='replace')
-                self.log_text.setPlainText(content)
-                # Auto-scroll to bottom
-                cursor = self.log_text.textCursor()
-                try:
-                    _end = QTextCursor.MoveOperation.End
-                except AttributeError:
-                    _end = QTextCursor.End
-                cursor.movePosition(_end)
-                self.log_text.setTextCursor(cursor)
+                self._all_log_content = self._log_file.read_text(encoding='utf-8', errors='replace')
             else:
-                self.log_text.setPlainText(f"Log file not found: {self._log_file}")
+                self._all_log_content = tr("Log file not found: {p0}", p0=str(self._log_file))
         except Exception as e:
-            self.log_text.setPlainText(f"Error reading log file: {e}")
+            self._all_log_content = tr("Error reading log file: {p0}", p0=str(e))
+        self._apply_log_filter()
+
+    def _apply_log_filter(self):
+        """Show only log lines containing the filter text (case-insensitive)."""
+        needle = (self._log_filter.text() or "").strip().lower()
+        full = getattr(self, "_all_log_content", "")
+        if needle:
+            shown = "\n".join(ln for ln in full.splitlines() if needle in ln.lower())
+        else:
+            shown = full
+        self.log_text.setPlainText(shown)
+        # Auto-scroll to bottom
+        cursor = self.log_text.textCursor()
+        try:
+            _end = QTextCursor.MoveOperation.End
+        except AttributeError:
+            _end = QTextCursor.End
+        cursor.movePosition(_end)
+        self.log_text.setTextCursor(cursor)
+
+    def _open_log_folder(self):
+        """Open the folder containing the log file in the OS file manager."""
+        folder = str(self._log_file.parent)
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)   # noqa: S606 (user-initiated)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            QMessageBox.warning(self, tr("📂 Open folder"), tr("Could not open folder:\n{p0}", p0=str(e)))
+
+    def _copy_logs(self):
+        """Copy the full log text to the clipboard, with brief button feedback."""
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self.log_text.toPlainText())
+        self._copy_btn.setText(tr("✓ Copied"))
+        QTimer.singleShot(1500, lambda: self._copy_btn.setText(tr("📋 Copy")))
+
+    def _export_logs(self):
+        """Save the currently-shown log to a text file the user chooses."""
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("Export Log"), "backupsys_log.txt",
+            "Text Files (*.txt);;All Files (*)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.log_text.toPlainText(), encoding="utf-8")
+            QMessageBox.information(self, tr("Export Log"), tr("Log saved to:\n{p0}", p0=path))
+        except Exception as e:
+            QMessageBox.critical(self, tr("Export Log"), tr("Could not save log file:\n{p0}", p0=str(e)))
 
 
 if __name__ == "__main__":

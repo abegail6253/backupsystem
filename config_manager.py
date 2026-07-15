@@ -73,6 +73,15 @@ DEFAULT_CONFIG = {
     "integrity_check_enabled":       False,  # run scheduled hash-verification of stored backups
     "integrity_check_interval_days": 7,      # how many days between checks (per watch)
     "low_disk_threshold_gb":         5.0,    # warn when backup destination has less than this many GB free
+    # ── Remote audit auto-setup over SMB (opt-in) ─────────────────────────────
+    # When watching a coworker's share whose PC has WinRM AND WMI/DCOM disabled
+    # (the "RPC server is unavailable" case), BackupSys cannot auto-configure the
+    # audit SACL / open the Security-log firewall the usual way.  With this ON it
+    # falls back to an SMB Service-Control bootstrap (the PsExec technique, over
+    # port 445) using the admin credentials already saved for that watch.  Left
+    # OFF by default because creating a remote service is a pattern some
+    # antivirus/EDR products flag.  Requires admin credentials on the target PC.
+    "remote_setup_smb_fallback":     False,
     "email_config": {
         "enabled":           False,
         "notify_on_success": False,   # ← send email on successful backup

@@ -16,6 +16,17 @@ import sys
 import os
 from pathlib import Path
 
+# ── Console encoding guard ────────────────────────────────────────────────────
+# This script prints emoji (✅, ❌, …) in status messages.  On Windows consoles
+# using a legacy codec (e.g. cp932 on Japanese systems) those characters raise
+# UnicodeEncodeError and abort the build before PyInstaller ever runs.  Force
+# UTF-8 with a replacement fallback so the build cannot be killed by a print.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ── Python version guard ──────────────────────────────────────────────────────
 # PyInstaller 6+ requires Python 3.8+; PyQt5 on Windows needs 3.8+ as well.
 if sys.version_info < (3, 8):
@@ -220,6 +231,9 @@ args = [
 
     "--add-data",   f"{SCRIPT_DIR / 'transport_utils.py'}{os.pathsep}.",
     "--add-data",   f"{SCRIPT_DIR / 'notification_utils.py'}{os.pathsep}.",
+    # Bundle the i18n translation files (en.json / ja.json) so the UI can render
+    # in Japanese.  Without this the app falls back to English at runtime.
+    "--add-data",   f"{SCRIPT_DIR / 'translations'}{os.pathsep}translations",
     # Watchdog needs --collect-all to bundle its platform observer correctly
     "--collect-all", "watchdog",
     "--hidden-import", "watchdog.observers",

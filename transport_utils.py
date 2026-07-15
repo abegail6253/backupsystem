@@ -41,6 +41,31 @@ _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
 logger = logging.getLogger(__name__)
 
+# ── OS-generated junk files ───────────────────────────────────────────────────
+# Files the OS creates automatically (Explorer thumbnail caches, folder-view
+# settings, macOS Finder metadata).  They carry no user data.  Previously these
+# were mirrored to remote/cloud destinations even though the filesystem sync
+# path leaves them out — producing an inconsistent file count between a watch's
+# destinations (e.g. Drive showed "5 uploaded" while the SMB dest held 4).
+# Skip them on every upload so all destinations agree.
+# NOTE: kept in sync with the identical helper in backup_engine.py (used by the
+# gdrive uploader, which lives there and must not depend on this optional import).
+_OS_JUNK_EXACT = {
+    "thumbs.db", "ehthumbs.db", "ehthumbs_vista.db",
+    "desktop.ini", ".ds_store", "icon\r",
+}
+
+def is_os_junk(name: str) -> bool:
+    """True if *name* is an OS-generated junk file that should never be uploaded."""
+    n = name.lower()
+    if n in _OS_JUNK_EXACT:
+        return True
+    if n.startswith("thumbcache_") and n.endswith(".db"):
+        return True
+    if n.startswith("._"):   # macOS AppleDouble resource forks
+        return True
+    return False
+
 # ── Upload retry / exponential backoff ────────────────────────────────────────
 
 import random as _random
@@ -225,7 +250,7 @@ def upload_to_sftp(local_dir: str, sftp_config: dict, progress_cb=None, verify=F
                         pass  # may already exist due to race or permission; continue
 
         # Pre-compute total bytes for accurate progress reporting
-        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP and not is_os_junk(fp.name)]
         _total_bytes = sum(fp.stat().st_size for fp in _all_files)
         _bytes_done  = 0
         _SFTP_CHUNK  = 256 * 1024   # 256 KB — balances round-trips vs. memory
@@ -393,7 +418,7 @@ def upload_to_ftp(local_dir: str, ftp_config: dict, progress_cb=None, verify=Fal
                         pass  # may already exist; continue
 
         # Pre-compute total bytes for progress
-        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+        _all_files   = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP and not is_os_junk(fp.name)]
         _total_bytes = sum(fp.stat().st_size for fp in _all_files)
         _bytes_done  = 0
         _FTP_BLOCK   = 8 * 1024 * 1024   # 8 MB — reduces round-trips vs ftplib default 8 KB
@@ -673,6 +698,12 @@ def upload_to_rclone(local_dir: str, rclone_config: dict, progress_cb=None,
 
     dest = f"{remote_name}:{remote_path}" if remote_path else f"{remote_name}:"
     cmd = ["rclone", "copy", str(Path(local_dir)), dest, "--progress"]
+    # Never mirror OS-generated junk (Thumbs.db, desktop.ini, .DS_Store, …) —
+    # keeps rclone destinations consistent with the other uploaders / the
+    # filesystem sync path.  Case-insensitive so "Thumbs.db" is caught too.
+    for _jx in ("Thumbs.db", "ehthumbs.db", "ehthumbs_vista.db",
+                "desktop.ini", ".DS_Store", "thumbcache_*.db", "._*"):
+        cmd += ["--exclude", _jx]
     if os.name == "nt":
         # ensure rclone uses POSIX-like paths internally when passed a Windows path
         cmd[2] = str(Path(local_dir))
@@ -1515,7 +1546,7 @@ def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None,
             if not _wdc.check(dest_root):
                 _wdc.mkdir(dest_root)
 
-            all_files = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+            all_files = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP and not is_os_junk(fp.name)]
             total_files = len(all_files)
             for i, fp in enumerate(all_files):
                 rel         = fp.relative_to(ld)
@@ -1537,7 +1568,7 @@ def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None,
             _mkcol(dest_root)
             _seen_dirs = set()
 
-            all_files = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP]
+            all_files = [fp for fp in ld.rglob("*") if fp.is_file() and fp.name not in _SKIP and not is_os_junk(fp.name)]
             for fp in all_files:
                 rel        = fp.relative_to(ld)
                 parts      = rel.parts
@@ -1569,7 +1600,7 @@ def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None,
         logger.error(f"[webdav] Upload failed: {e}")
         return {"ok": False, "uploaded": uploaded, "path": dest_root, "error": str(e)}
 
-    ok = uploaded > 0 or len([f for f in ld.rglob("*") if f.is_file() and f.name not in _SKIP]) == 0
+    ok = uploaded > 0 or len([f for f in ld.rglob("*") if f.is_file() and f.name not in _SKIP and not is_os_junk(f.name)]) == 0
     result = {
         "ok":       ok,
         "uploaded": uploaded,
@@ -1585,7 +1616,7 @@ def upload_to_webdav(local_dir: str, webdav_config: dict, progress_cb=None,
         verify_warnings = []
         # Resolve a concrete SSL context (handle the case where _ssl_ctx is a lambda)
         _verify_ssl_ctx = _ssl_ctx if isinstance(_ssl_ctx, ssl.SSLContext) else ssl._create_unverified_context()
-        _all_verify_files = [f for f in ld.rglob("*") if f.is_file() and f.name not in _SKIP]
+        _all_verify_files = [f for f in ld.rglob("*") if f.is_file() and f.name not in _SKIP and not is_os_junk(f.name)]
         for fp in _all_verify_files:
             rel         = fp.relative_to(ld)
             remote_file = dest_root + "/" + str(rel).replace(os.sep, "/")

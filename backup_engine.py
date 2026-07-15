@@ -2150,6 +2150,33 @@ def _decrypt_file(src_path: str, dest_path: str, key: str) -> None:
 
     except Exception as e:
         raise RuntimeError(f"Decryption failed for {Path(src_path).name}: {e}")
+
+
+# ── OS-generated junk files ───────────────────────────────────────────────────
+# Files the OS creates automatically (Explorer thumbnail caches, folder-view
+# settings, macOS Finder metadata) — no user data.  Skipped on every cloud
+# upload so a watch's destinations agree on file count (previously Drive showed
+# "5 uploaded" while the SMB dest held 4, the extra being Thumbs.db).
+# NOTE: kept in sync with the identical helper in transport_utils.py.  Defined
+# locally here because the gdrive uploader must work even when transport_utils
+# (and its optional deps) failed to import.
+_OS_JUNK_EXACT = {
+    "thumbs.db", "ehthumbs.db", "ehthumbs_vista.db",
+    "desktop.ini", ".ds_store", "icon\r",
+}
+
+def _is_os_junk(name: str) -> bool:
+    """True if *name* is an OS-generated junk file that should never be uploaded."""
+    n = name.lower()
+    if n in _OS_JUNK_EXACT:
+        return True
+    if n.startswith("thumbcache_") and n.endswith(".db"):
+        return True
+    if n.startswith("._"):   # macOS AppleDouble resource forks
+        return True
+    return False
+
+
 def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Optional[set] = None) -> dict:
     """Upload backup folder to Google Drive using OAuth user credentials.
 
@@ -2172,8 +2199,128 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Opti
         )
         folder_id = cloud_config.get("folder_id", "")
         service   = build("drive", "v3", credentials=creds)
+        import time as _time
         ld        = Path(local_dir)
         uploaded  = 0
+        skipped   = 0   # files already on Drive with matching content (not re-uploaded)
+        uploaded_names: List[str] = []   # rel paths actually pushed this run (for History)
+        _uploaded_bytes = 0
+        _upload_secs    = 0.0
+
+        def _log_upload_speed(name: str, size_bytes: int, secs: float):
+            """Record and log throughput so a slow link (SMB read vs Drive HTTP)
+            can be diagnosed from the activity log.  Only logs sizeable files to
+            avoid spamming the log with tiny screenshots."""
+            nonlocal _uploaded_bytes, _upload_secs
+            if size_bytes > 0:
+                _uploaded_bytes += size_bytes
+                _upload_secs    += max(secs, 0.0)
+            if size_bytes >= 8 * 1024 * 1024 and secs > 0.05:
+                _mbps = (size_bytes / secs) / (1024 * 1024)
+                logger.info(
+                    f"☁ gdrive: uploaded '{name}' {_human_size(size_bytes)} "
+                    f"in {secs:.1f}s = {_mbps:.1f} MB/s"
+                )
+
+        # ── Fast requests-based streaming uploader ───────────────────────────
+        # googleapiclient uploads through httplib2, whose throughput caps far
+        # below the link speed (~1-2 MB/s regardless of bandwidth) and adds ~2s
+        # of round-trip overhead per file.  A plain requests streaming PUT
+        # saturates the connection.  The googleapiclient path below is kept as
+        # an automatic fallback if anything in here fails.
+        try:
+            import requests as _requests
+            from google.auth.transport.requests import Request as _GARequest
+            _fast_http = True
+        except Exception:
+            _fast_http = False
+
+        def _fresh_token() -> str:
+            try:
+                if not getattr(creds, "valid", False):
+                    creds.refresh(_GARequest())
+            except Exception:
+                logger.debug("[gdrive] token refresh failed", exc_info=True)
+            return creds.token or cloud_config.get("access_token", "")
+
+        def _requests_upload(fp: Path, name: str, parent_id: str, existing_id: str = "") -> bool:
+            """Stream-upload fp via the Drive resumable protocol using requests.
+            Returns True on success; False signals the caller to fall back to the
+            (slow) httplib2 path so an upload never silently fails."""
+            if not _fast_http:
+                return False
+            try:
+                size = fp.stat().st_size
+
+                def _start(token: str):
+                    hdr = {
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json; charset=UTF-8",
+                        "X-Upload-Content-Length": str(size),
+                    }
+                    if existing_id:
+                        url  = f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}?uploadType=resumable"
+                        body = {}
+                        return _requests.patch(url, headers=hdr, data=json.dumps(body), timeout=60)
+                    url  = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
+                    body = {"name": name, "parents": [parent_id]}
+                    return _requests.post(url, headers=hdr, data=json.dumps(body), timeout=60)
+
+                r = _start(_fresh_token())
+                if r.status_code == 401:            # token expired mid-run → refresh once
+                    r = _start(_fresh_token())
+                # A quota error (403 storageQuotaExceeded) is terminal for this
+                # file — the httplib2 fallback would just hit the same wall.
+                # Raise so the caller records it as failed and moves on to the
+                # next (smaller) file instead of aborting the whole batch.
+                if r.status_code == 403 and "storagequota" in (r.text or "").lower():
+                    raise RuntimeError(
+                        "storageQuotaExceeded: Google Drive storage quota exceeded "
+                        "(file does not fit in remaining space)"
+                    )
+                r.raise_for_status()
+                upload_url = r.headers.get("Location")
+                if not upload_url:
+                    return False
+
+                # Stream the file body in one PUT — requests/urllib3 reads it in
+                # chunks and saturates the link (no full-file buffering in RAM).
+                with open(fp, "rb") as f:
+                    put = _requests.put(
+                        upload_url,
+                        headers={"Content-Length": str(size)},
+                        data=f if size > 0 else b"",
+                        timeout=None,
+                    )
+                if put.status_code == 403 and "storagequota" in (put.text or "").lower():
+                    raise RuntimeError(
+                        "storageQuotaExceeded: Google Drive storage quota exceeded "
+                        "(file does not fit in remaining space)"
+                    )
+                put.raise_for_status()
+                return True
+            except Exception as _e:
+                # Quota errors are terminal — propagate so the batch skips this
+                # file rather than wasting time on the httplib2 fallback.
+                if "storagequota" in str(_e).lower():
+                    raise
+                logger.warning(
+                    f"☁ gdrive: fast upload failed for '{name}' ({_e}) "
+                    f"— falling back to slow httplib2 path"
+                )
+                return False
+
+        # Files at/above this size are skipped on a SIZE match alone (no local
+        # md5) — hashing many GB every run would itself be slow and defeats the
+        # purpose. Smaller files still get a full size+md5 verification.
+        _MD5_MAX_BYTES = 256 * 1024 * 1024   # 256 MB
+
+        def _local_md5(path: Path) -> str:
+            h = hashlib.md5()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
 
         # Internal backup metadata — never upload to cloud storage
         _SKIP = {"MANIFEST.json", "BACKUP.sha256"}
@@ -2204,27 +2351,78 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Opti
             }
             return service.files().create(body=meta, fields="id").execute()["id"]
 
+        # Threshold above which we use resumable (chunked) uploads.  Below it a
+        # simple one-shot upload is faster: resumable adds 2-3 extra HTTP round
+        # trips (session init + finalize) that dominate for small files like
+        # screenshots.  Large files must stay resumable (a one-shot upload would
+        # buffer the whole file in memory) and get an explicit large chunk size
+        # to minimise per-chunk round trips.
+        _RESUMABLE_THRESHOLD = 32 * 1024 * 1024    # 32 MB
+        _UPLOAD_CHUNK        = 100 * 1024 * 1024   # 100 MB (multiple of 256 KB)
+
+        def _media_for(path: str, size: int) -> "MediaFileUpload":
+            if size >= _RESUMABLE_THRESHOLD:
+                return MediaFileUpload(path, resumable=True, chunksize=_UPLOAD_CHUNK)
+            return MediaFileUpload(path, resumable=False)
+
         # Upload a file — overwrite if it already exists, otherwise create.
         # upload_name lets the caller specify a display name different from fp.name
         # (used when decompressing .gz files so the original filename is preserved).
-        def _upload_file(fp: Path, parent_id: str, upload_name: str = ""):
+        def _upload_file(fp: Path, parent_id: str, upload_name: str = "") -> bool:
+            """Upload fp to Drive. Returns True if uploaded, False if skipped
+            because an identical copy is already there. Skipping unchanged files
+            (esp. large ones) is what keeps re-runs fast — mirrors robocopy's
+            same-size skip for the SMB path."""
             name  = upload_name or fp.name
-            media = MediaFileUpload(str(fp), resumable=True)
             q = (
                 f"name = {_q(name)} "
                 f"and {_q(parent_id)} in parents "
                 f"and trashed = false"
             )
-            res = service.files().list(q=q, fields="files(id)", pageSize=1).execute()
+            res = service.files().list(
+                q=q, fields="files(id, size, md5Checksum)", pageSize=1
+            ).execute()
             existing = res.get("files", [])
+
+            try:
+                _fsize = fp.stat().st_size
+            except OSError:
+                _fsize = -1
+
             if existing:
-                service.files().update(
-                    fileId=existing[0]["id"],
-                    media_body=media,
-                ).execute()
+                ex = existing[0]
+                try:
+                    local_size = fp.stat().st_size
+                    remote_size = int(ex.get("size") or -1)
+                except (OSError, ValueError):
+                    local_size, remote_size = -1, -2  # force upload on stat failure
+                if local_size >= 0 and local_size == remote_size:
+                    # Size matches. For large files trust it (avoid hashing GBs);
+                    # for smaller files also verify md5 for correctness.
+                    if local_size >= _MD5_MAX_BYTES:
+                        return False  # skip — unchanged large file
+                    remote_md5 = ex.get("md5Checksum")
+                    if remote_md5 and _local_md5(fp) == remote_md5:
+                        return False  # skip — verified identical
+                # Content differs (or couldn't verify) → overwrite in place.
+                _t0 = _time.monotonic()
+                if not _requests_upload(fp, name, parent_id, existing_id=ex["id"]):
+                    service.files().update(
+                        fileId=ex["id"],
+                        media_body=_media_for(str(fp), _fsize),
+                    ).execute()
+                _log_upload_speed(name, _fsize, _time.monotonic() - _t0)
             else:
-                meta = {"name": name, "parents": [parent_id]}
-                service.files().create(body=meta, media_body=media, fields="id").execute()
+                _t0 = _time.monotonic()
+                if not _requests_upload(fp, name, parent_id):
+                    meta = {"name": name, "parents": [parent_id]}
+                    service.files().create(
+                        body=meta,
+                        media_body=_media_for(str(fp), _fsize),
+                        fields="id",
+                    ).execute()
+                _log_upload_speed(name, _fsize, _time.monotonic() - _t0)
+            return True
 
         # Resolve the top-level watch folder (reuse if exists).
         # Prefer an explicit per-watch folder name (set by the desktop app to the
@@ -2293,35 +2491,100 @@ def upload_to_gdrive(local_dir: str, cloud_config: dict, allowed_rel_paths: Opti
         else:
             _candidates = [fp for fp in ld.rglob("*") if fp.is_file()]
 
+        failed_names: List[str] = []   # files that errored (e.g. too big for quota)
+        quota_exceeded = False
         for fp in _candidates:
-            # Skip internal metadata and deletion markers
-            if fp.name in _SKIP or fp.name.endswith(".DELETED"):
+            # Skip internal metadata, deletion markers, and OS-generated junk
+            if fp.name in _SKIP or fp.name.endswith(".DELETED") or _is_os_junk(fp.name):
                 continue
 
             rel       = fp.relative_to(ld)
             parent_id = _get_or_create_folder(list(rel.parts[:-1]))
 
-            # Decompress .gz files before uploading so Google Drive/Sheets
-            # can open them natively (e.g. "test sheet.xlsx.gz" → "test sheet.xlsx").
-            if fp.name.endswith(".gz"):
-                original_name = fp.name[:-3]   # strip .gz suffix
-                tmp_fd, tmp_path = _tempfile.mkstemp(suffix="_" + original_name)
-                os.close(tmp_fd)
-                try:
-                    with _gzip.open(str(fp), "rb") as f_in, open(tmp_path, "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                    _upload_file(Path(tmp_path), parent_id, upload_name=original_name)
-                finally:
+            # A failure on one file (e.g. a huge file that exceeds the Drive
+            # quota) must NOT abort the whole batch — otherwise small files that
+            # would fit never get uploaded.  Catch per-file, record, and move on.
+            try:
+                # Decompress .gz files before uploading so Google Drive/Sheets
+                # can open them natively (e.g. "test sheet.xlsx.gz" → "test sheet.xlsx").
+                if fp.name.endswith(".gz"):
+                    original_name = fp.name[:-3]   # strip .gz suffix
+                    tmp_fd, tmp_path = _tempfile.mkstemp(suffix="_" + original_name)
+                    os.close(tmp_fd)
                     try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+                        with _gzip.open(str(fp), "rb") as f_in, open(tmp_path, "wb") as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                        _did_upload = _upload_file(Path(tmp_path), parent_id, upload_name=original_name)
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                else:
+                    _did_upload = _upload_file(fp, parent_id)
+            except Exception as _upl_err:
+                failed_names.append(str(rel))
+                if "storagequota" in str(_upl_err).lower():
+                    quota_exceeded = True
+                    logger.warning(
+                        f"☁ gdrive: SKIPPED '{rel}' — Drive storage quota exceeded "
+                        f"(file too large for remaining space); continuing with other files."
+                    )
+                else:
+                    logger.warning(
+                        f"☁ gdrive: SKIPPED '{rel}' — upload error: {_upl_err}; "
+                        f"continuing with other files."
+                    )
+                continue
+
+            if _did_upload:
+                uploaded += 1
+                # Record the display name that landed on Drive (.gz files are
+                # decompressed to their original name before upload).
+                uploaded_names.append(
+                    str(rel.parent / rel.name[:-3]) if fp.name.endswith(".gz") else str(rel)
+                )
             else:
-                _upload_file(fp, parent_id)
+                skipped += 1
 
-            uploaded += 1
-
-        return {"ok": True, "uploaded": uploaded, "folder_id": run_folder_id}
+        if skipped:
+            logger.info(f"☁ gdrive: {uploaded} uploaded, {skipped} skipped (already up-to-date)")
+        if failed_names:
+            logger.warning(
+                f"☁ gdrive: {len(failed_names)} file(s) FAILED to upload"
+                + (" — Google Drive storage quota exceeded; free up space, upgrade "
+                   "storage, or exclude the large file(s) from this watch"
+                   if quota_exceeded else "")
+                + f": {', '.join(failed_names[:5])}"
+                + (" ..." if len(failed_names) > 5 else "")
+            )
+        if _uploaded_bytes > 0 and _upload_secs > 0:
+            _avg_mbps = (_uploaded_bytes / _upload_secs) / (1024 * 1024)
+            logger.info(
+                f"☁ gdrive: total {_human_size(_uploaded_bytes)} uploaded in "
+                f"{_upload_secs:.1f}s = {_avg_mbps:.1f} MB/s average"
+                + ("  ⚠ far below link speed — bottleneck is the Drive HTTP transport, "
+                   "not your internet" if _avg_mbps < 5 else "")
+            )
+        # ok=True as long as at least something got through (or there was simply
+        # nothing new to upload). Only a total wipe-out is a hard failure.
+        _all_failed = bool(failed_names) and uploaded == 0
+        _result = {
+            "ok": not _all_failed,
+            "uploaded": uploaded,
+            "skipped": skipped,
+            "uploaded_names": uploaded_names,
+            "failed": failed_names,
+            "quota_exceeded": quota_exceeded,
+            "folder_id": run_folder_id,
+        }
+        if failed_names:
+            _result["error"] = (
+                "Google Drive storage quota exceeded"
+                if quota_exceeded
+                else f"{len(failed_names)} file(s) failed to upload"
+            )
+        return _result
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -2746,42 +3009,67 @@ def run_backup(
         # that were previously written into the watched source folder, and
         # also excludes the destination folder itself if it is inside the source.
         _excl = list(exclude_patterns or [])
-        try:
-            _src_resolved  = Path(_effective_source).resolve()
-            _dest_resolved = dest_root.resolve()
-            # Case 1: destination is inside source — exclude the top-level subdir
-            try:
-                _dest_rel = _dest_resolved.relative_to(_src_resolved)
-                _excl_top = _dest_rel.parts[0] if _dest_rel.parts else ""
-                if _excl_top and _excl_top not in _excl:
-                    _excl.append(_excl_top)
-                    logger.info(
-                        f"[snapshot] Auto-excluding dest subfolder '{_excl_top}' "
-                        f"from source scan"
-                    )
-            except ValueError:
-                pass  # dest not inside source
+        _dest_nested_top = ""   # dest-inside-source top folder (e.g. "1"); "" if dest is outside source
 
-            # Case 2: exclude backup output dirs (YYYYMMDD_HHMMSS*__<name>) that
-            # were previously created directly inside the source folder.
-            # Pattern: starts with 8 digits (date), underscore, 6 digits (time).
+        # ── Case 1 (CRITICAL): destination nested inside the LIVE source ────────
+        # Computed FIRST and in complete isolation, using ONLY the original
+        # `source`/`destination` paths.  It must never touch _effective_source:
+        # under VSS that is a \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN\...
+        # device path whose .resolve() can RAISE — and when that raise happened
+        # inside the old combined try it aborted this entire block, so the dest
+        # exclusion never ran and the destination got copied into itself
+        # (D:\share\1 → D:\share\1\1\1\...).  Keeping it standalone guarantees the
+        # nested-dest detection always runs even when VSS is active.
+        try:
+            # Resolve-free, case-insensitive nesting test.  We deliberately do NOT
+            # use Path.resolve()+relative_to here: in a frozen / UAC-elevated
+            # process on Windows, resolve() can return an extended-length ('\\?\'),
+            # 8.3-short, or differently-cased form for source vs destination, which
+            # makes relative_to() raise ValueError even when the dest really is
+            # inside the source — silently disabling the exclusion and letting the
+            # backup copy the destination into itself.  Manual normalisation avoids
+            # every one of those traps.
+            def _norm_dir(p):
+                q = str(p).replace("/", "\\")
+                if q.startswith("\\\\?\\UNC\\"):    # \\?\UNC\server\share -> \\server\share
+                    q = "\\\\" + q[8:]
+                elif q.startswith("\\\\?\\"):       # \\?\D:\x -> D:\x
+                    q = q[4:]
+                q = os.path.abspath(q)
+                if q.startswith("\\\\?\\"):         # abspath may re-add it
+                    q = q[4:]
+                return os.path.normcase(q.rstrip("\\"))
+            _src_n = _norm_dir(source)
+            _dst_n = _norm_dir(destination)
+            if _dst_n == _src_n or _dst_n.startswith(_src_n + "\\"):
+                _rel = _dst_n[len(_src_n):].lstrip("\\")
+                _dest_nested_top = _rel.split("\\")[0] if _rel else ""
+                if _dest_nested_top:
+                    if _dest_nested_top not in _excl:
+                        _excl.append(_dest_nested_top)
+                    logger.info(
+                        f"[snapshot] Auto-excluding dest subfolder '{_dest_nested_top}' "
+                        f"from source scan (dest nested inside source)"
+                    )
+        except Exception:
+            logger.debug('[suppressed] Case-1 dest-nesting check failed.', exc_info=True)
+
+        # ── Case 2: stale backup output dirs (YYYYMMDD_HHMMSS*__<name>) sitting ──
+        # directly inside the source folder.  Guarded separately so a failure here
+        # can never disable the Case-1 exclusion above.  Uses the live source path.
+        try:
             import re as _re
             _backup_dir_pat = _re.compile(r"^\d{8}_\d{6}")
-            try:
-                for _child in _src_resolved.iterdir():
-                    if _child.is_dir() and _backup_dir_pat.match(_child.name):
-                        if _child.name not in _excl:
-                            _excl.append(_child.name)
-                            logger.info(
-                                f"[snapshot] Auto-excluding stale backup folder "
-                                f"'{_child.name}' from source scan"
-                            )
-            except Exception:
-                logger.debug('[suppressed] Exception ignored.', exc_info=True)
-                pass
+            for _child in Path(source).iterdir():
+                if (_child.is_dir() and _backup_dir_pat.match(_child.name)
+                        and _child.name not in _excl):
+                    _excl.append(_child.name)
+                    logger.info(
+                        f"[snapshot] Auto-excluding stale backup folder "
+                        f"'{_child.name}' from source scan"
+                    )
         except Exception:
-            logger.debug('[suppressed] Exception ignored.', exc_info=True)
-            pass
+            logger.debug('[suppressed] Case-2 stale-dir scan failed.', exc_info=True)
 
         new_snapshot = build_snapshot(
             _effective_source,
@@ -2792,6 +3080,32 @@ def run_backup(
             changed_paths=changed_paths,
             skipped_symlinks=result["skipped_symlinks"],
         )
+
+        # ── Hard filter: drop the nested-destination subtree unconditionally ──
+        # The _excl entry above goes through _is_excluded(), which switches to
+        # *whitelist mode* and IGNORES all blacklist patterns the moment the
+        # watch has any '!'-prefixed include pattern.  In that case '1' would be
+        # ignored and the destination would be copied into itself again.  This
+        # filter removes any snapshot path at/under the dest subfolder directly,
+        # so the recursion cannot happen regardless of exclude-pattern mode.
+        if _dest_nested_top:
+            _top_lc = _dest_nested_top.lower()
+            _pref_bs = _top_lc + "\\"
+            _pref_fs = _top_lc + "/"
+            _before = len(new_snapshot)
+            new_snapshot = {
+                _k: _v for _k, _v in new_snapshot.items()
+                if not (_k.lower() == _top_lc
+                        or _k.lower().startswith(_pref_bs)
+                        or _k.lower().startswith(_pref_fs))
+            }
+            _dropped = _before - len(new_snapshot)
+            if _dropped:
+                logger.info(
+                    f"[snapshot] Hard-dropped {_dropped} nested-destination "
+                    f"entrie(s) under '{_dest_nested_top}\\' from the scan "
+                    f"(prevents dest-in-source recursion; mode-independent)"
+                )
 
         if incremental and previous_snapshot:
             # Use size_only=True for UNC/SMB sources: robocopy fast-path stores
@@ -4031,24 +4345,39 @@ def run_backup(
             except (IOError, RuntimeError) as e:
                 raise RuntimeError(f"BACKUP.sha256 was not written correctly: {e}")
 
-        # Use actual bytes written (bytes_done) for the reported size so the
-        # manifest and UI always show what was truly copied — not the pre-scan
-        # snapshot estimate (total_bytes).  Previously total_bytes was used,
-        # which meant if the source file changed size mid-copy (e.g. was
-        # truncated or replaced), the app would still report the old snapshot
-        # size (e.g. "10.0 GB") even though only 64 MB actually landed in the
-        # destination.  bytes_done is the authoritative count of bytes written.
-        # For compressed backups we still do the disk scan (output size differs
-        # from source size and bytes_done tracks pre-compression source bytes).
+        # Reported size = the actual on-disk size of the files written THIS run,
+        # measured from the destination.  _files_written_hashes holds exactly the
+        # set of uniquely-written paths (populated in every copy path: robocopy,
+        # parallel, per-file, encrypt, compress), so summing each one's dest size
+        # is immune to double-counting.
+        #
+        # Previously this used the running `bytes_done` counter, which could bill
+        # the same file's bytes twice — robocopy /R retries re-emit a file's
+        # completion line, and the stdout parser can overlap %-progress credits
+        # with the completion credit — so a single 10 GB file was reported as
+        # 20 GB.  Measuring the destination is authoritative: it can't double
+        # count, it still reflects a mid-copy truncation (we stat the real file),
+        # and it reports 0 when nothing was copied (empty written set) — the two
+        # cases the byte counter was meant to handle.
+        def _written_dest_bytes() -> int:
+            _tot = 0
+            for _wrel in _files_written_hashes:
+                if _wrel.endswith(".DELETED"):
+                    continue  # deletion tombstones are markers, not payload
+                try:
+                    _tot += (backup_dir / _wrel).stat().st_size
+                except OSError:
+                    pass
+            return _tot
+
         if compress_level > 0:
             total_size = _safe_size(str(backup_dir))
         else:
-            # Always use actual bytes written — never fall back to the pre-scan
-            # estimate (total_bytes).  Previously the fallback meant that when
-            # 0 files were copied (e.g. all failed with OSError) the UI still
-            # reported the full source size (e.g. "10.0 GB") even though nothing
-            # landed in the destination.  bytes_done is the authoritative count.
-            total_size = bytes_done
+            _written = _written_dest_bytes()
+            # Fall back to the byte counter only if the scan found nothing yet
+            # bytes were genuinely copied (defensive — e.g. a copy path that
+            # didn't register its path in _files_written_hashes).
+            total_size = _written if (_written > 0 or copied == 0) else bytes_done
         duration       = round(time.time() - started, 2)
         throughput_mbs = (total_size / (1024 * 1024)) / max(duration, 0.1) if duration > 0 else 0
 

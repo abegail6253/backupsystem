@@ -636,6 +636,30 @@ class WatcherManager:
                 def _fire():
                     with self._debounce_lock:
                         self._debounce_timers.pop(_db_key, None)
+                    # Check the suppression hook before forwarding to the app
+                    # callback — identical to the poll paths (see the two call
+                    # sites in _start_polling).  The real-time detectors
+                    # (watchdog Observer + unc_notify CHANGE_NOTIFY) both flow
+                    # through this debounced callback; without this check the
+                    # backup engine's OWN writes to a destination folder (e.g.
+                    # copying testfile_10gb.dat into \\host\share\test4) were
+                    # delivered as spurious added/modified history rows, because
+                    # only the poll path honored _dest_event_suppressed.
+                    if _history_persist_suppressor is not None:
+                        try:
+                            if _history_persist_suppressor(
+                                wid, entry.get("type"), entry.get("path")
+                            ):
+                                logger.info(
+                                    f"[watcher] real-time event SUPPRESSED by hook: "
+                                    f"watch_id={wid!r} type={entry.get('type')!r} "
+                                    f"path={entry.get('path')!r} "
+                                    f"— event dropped before on_change (see "
+                                    f"[_dest_event_suppressed] log above for reason)"
+                                )
+                                return
+                        except Exception:
+                            pass
                     try:
                         on_change(wid, entry)
                     except Exception:
