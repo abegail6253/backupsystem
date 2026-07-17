@@ -909,5 +909,9 @@
   "✅  Connected — credentials verified ({n} share(s) visible)": "✅  接続しました — 資格情報を確認しました（共有 {n} 件を検出）",
   "❌  Enter host, username and password first.": "❌  先にホスト、ユーザー名、パスワードを入力してください。",
   "❌  Could not run credential check: {err}": "❌  資格情報の確認を実行できませんでした: {err}",
-  "❌  Timed out — server unreachable.": "❌  タイムアウトしました — サーバーに到達できません。"
+  "❌  Timed out — server unreachable.": "❌  タイムアウトしました — サーバーに到達できません。",
+  "Back up all {p0} watched folder(s) now?\n\nThey run one at a time (queued) to avoid splitting bandwidth.": "監視中の {p0} 個のフォルダーを今すぐバックアップしますか？\n\n帯域の分散を避けるため、1 つずつ（キュー）実行されます。",
+  "{p0} paused folder(s) will be skipped.": "一時停止中の {p0} 個のフォルダーはスキップされます。",
+  "No folders to back up.\n\nAll watched folders are currently paused — resume them first.": "バックアップするフォルダーがありません。\n\nすべての監視フォルダーが一時停止中です — まず再開してください。",
+  "No folders to back up.\n\nAdd a watched folder first.": "バックアップするフォルダーがありません。\n\nまず監視フォルダーを追加してください。"
 }

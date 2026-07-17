@@ -23111,6 +23111,102 @@ class MainWindow(QMainWindow):
                     return False
             # ─────────────────────────────────────────────────────────────────
 
+            # ── Cross-watch (sibling) backup suppression ─────────────────────
+            # Watches can share or nest folders, and one watch's folder can be
+            # ANOTHER watch's source OR destination.  Examples:
+            #   • two watches both writing into D:\testing (shared destination)
+            #   • watch A dest = D:\testing, watch B source = D:\testing
+            #     (B backs up D:\testing off to a remote share)
+            # A backup touches BOTH ends of its copy:
+            #   • DESTINATION — it writes/overwrites the copied files there, so
+            #     every other watch whose destination contains that path sees
+            #     'added'/'modified' via its __dest monitor.
+            #   • SOURCE — robocopy read + mtime/attribute preservation (and the
+            #     SACL Set-Acl pass) touch the source files, firing 'modified'
+            #     on every other watch that monitors that same folder.
+            # The per-watch blocks below only know about THIS watch's own backup,
+            # so a sibling's activity would otherwise leak into History as phantom
+            # 'added'/'modified' rows attributed to the local owner.
+            #
+            # The watcher-level _dest_event_suppressed hook has a cross-watch
+            # guard too, but (a) it only checks the sibling's DESTINATION, not its
+            # source, and (b) it runs at watchdog-record time — before the sibling
+            # worker is reliably registered in _workers (there is a ~2 s debounce
+            # before the event reaches here) — so events slip past it and arrive
+            # at this final gate unsuppressed.  Re-check here, where the sibling's
+            # active/grace state is reliably populated.
+            #
+            # (deleted / renamed are already excluded by the _is_destructive guard.)
+            _evt_path_sib   = entry.get("path", "") or ""
+            _evt_path_sib_l = _evt_path_sib.replace("\\", "/").lower()
+            _evt_base_sib   = os.path.basename(_evt_path_sib)
+
+            def _sib_contains(root: str) -> bool:
+                if not root:
+                    return False
+                _r = root.replace("\\", "/").lower().rstrip("/")
+                return _evt_path_sib_l.startswith(_r + "/") or _evt_path_sib_l == _r
+
+            for _sw in self.cfg.get("watches", []):
+                _sw_id = _sw.get("id")
+                if not _sw_id or _sw_id == watch_id:
+                    continue  # this watch's own backup is handled by the blocks below
+                _sw_active = _sw_id in self._workers
+                _sw_finish = self._post_backup_finish.get(_sw_id)
+                _sw_grace  = (
+                    _sw_finish is not None
+                    and (_now_mono - _sw_finish) < self._POST_BACKUP_SUPPRESS_SECS
+                )
+                if not (_sw_active or _sw_grace):
+                    continue  # sibling isn't backing up now or recently
+                _sw_dest = self._watch_dest(_sw)
+                _sw_src  = _sw.get("path", "") or ""
+                _in_dest = _sib_contains(_sw_dest)
+                _in_src  = _sib_contains(_sw_src)
+                if not (_in_dest or _in_src):
+                    continue  # event path is not inside this sibling's source or destination
+                _sw_backed = self._post_backup_filenames.get(_sw_id, set())
+                _sw_dfn    = self._post_backup_dest_fnames.get(_sw_id, set())
+                _sw_explains = False
+                _sw_side = ""
+                if _in_dest and (
+                    (_sw_active and not _sw_backed)   # active backup, file list not built yet → treat writes as ours
+                    or (_evt_base_sib in _sw_backed)  # file was copied by the sibling backup
+                    or (_evt_base_sib in _sw_dfn)     # file already existed in the sibling dest (robocopy touch)
+                ):
+                    _sw_explains = True
+                    _sw_side = f"destination {_sw_dest!r}"
+                elif _in_src and _etype == "modified":
+                    # A backup only READS its source; it never adds/deletes/renames
+                    # source files, so 'added' there is a real user action and must
+                    # pass.  Only 'modified' is backup noise (robocopy mtime/attribute
+                    # preservation + the SACL Set-Acl pass touch source files) — the
+                    # same reason the source branch of _dest_event_suppressed drops
+                    # 'modified' during a watch's own active/grace window.
+                    _sw_explains = True
+                    _sw_side = f"source {_sw_src!r}"
+                if not _sw_explains:
+                    continue  # inside a sibling folder but not backup noise → keep looking
+                # A sibling backup explains this event.  Probe SMB first so a
+                # genuine coworker who touched the shared folder during the
+                # sibling's backup still shows up.
+                if _suppressor_probe_third_party(_evt_path_sib, _etype):
+                    logger.info(
+                        f"[desktop._on_file_change] CROSS-WATCH SUPPRESSOR: OVERRIDE — "
+                        f"third-party actor confirmed for a file inside sibling watch "
+                        f"{_sw_id!r}'s {_sw_side}; NOT suppressing. "
+                        f"watch_id={watch_id!r} type={_etype!r} path={_evt_path_sib!r}"
+                    )
+                    break  # real actor — stop checking siblings, process normally
+                logger.info(
+                    f"[desktop._on_file_change] CROSS-WATCH SUPPRESSOR: dropped phantom "
+                    f"{_etype!r} on {_evt_path_sib!r} — caused by sibling watch {_sw_id!r} "
+                    f"(active={_sw_active} grace={_sw_grace}) whose {_sw_side} contains this "
+                    f"path. Watch {watch_id!r} did not produce it, so this row would be a "
+                    f"spurious duplicate of the sibling backup's activity."
+                )
+                return
+
             if watch_id in self._workers:
                 # Suppress MODIFIED events for files being copied by the running
                 # backup AND for files already present in the destination.
@@ -28017,19 +28113,19 @@ class MainWindow(QMainWindow):
         if not eligible:
             QMessageBox.information(
                 self, APP_NAME,
-                "No folders to back up." + (
-                    "\n\nAll watched folders are currently paused — resume them first."
-                    if skipped_paused else "\n\nAdd a watched folder first."
-                ),
+                tr("No folders to back up.\n\nAll watched folders are currently paused — resume them first.")
+                if skipped_paused else
+                tr("No folders to back up.\n\nAdd a watched folder first."),
             )
             return
 
-        _msg = (
-            f"Back up all {len(eligible)} watched folder(s) now?\n\n"
-            "They run one at a time (queued) to avoid splitting bandwidth."
+        _msg = tr(
+            "Back up all {p0} watched folder(s) now?\n\n"
+            "They run one at a time (queued) to avoid splitting bandwidth.",
+            p0=len(eligible),
         )
         if skipped_paused:
-            _msg += f"\n{skipped_paused} paused folder(s) will be skipped."
+            _msg += "\n" + tr("{p0} paused folder(s) will be skipped.", p0=skipped_paused)
         if QMessageBox.question(
             self, tr("Backup All Now"), _msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -29681,6 +29777,33 @@ def main():
     # tr() call renders in the chosen language. Defaults to Japanese (see i18n).
     _s_lang = QSettings(SETTINGS_ORG, SETTINGS_APP)
     set_language(_s_lang.value("language", "ja"))
+
+    # ── Qt's own dialog-button translations (Yes / No / OK / Cancel) ───────────
+    # Our tr() only covers app strings. QMessageBox standard buttons come from
+    # Qt's built-in catalog (qtbase_<lang>.qm), which isn't loaded by default —
+    # so without this those buttons stay English even in the Japanese UI.
+    _qt_lang = str(_s_lang.value("language", "ja")).strip() or "ja"
+    if _qt_lang != "en":
+        try:
+            from PyQt6.QtCore import QTranslator, QLibraryInfo
+            app._qt_translator = QTranslator(app)
+            # Search bundled locations first (frozen build ships qtbase_ja.qm in
+            # qt_translations/), then Qt's own install dir (dev runs).
+            _qm_dirs = []
+            if getattr(sys, "frozen", False):
+                _exedir = os.path.dirname(sys.executable)
+                for _d in (getattr(sys, "_MEIPASS", ""), _exedir,
+                           os.path.join(_exedir, "_internal")):
+                    if _d:
+                        _qm_dirs.append(os.path.join(_d, "qt_translations"))
+            _qm_dirs.append(QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath))
+            for _d in _qm_dirs:
+                if app._qt_translator.load(f"qtbase_{_qt_lang}", _d):
+                    app.installTranslator(app._qt_translator)
+                    break
+        except Exception:
+            # A missing .qm must never stop the app from launching.
+            pass
 
     # ── Theme selection ───────────────────────────────────────────────────────
     _s = QSettings(SETTINGS_ORG, SETTINGS_APP)

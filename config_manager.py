@@ -815,13 +815,53 @@ def get_all_watch_ids(cfg: dict) -> List[str]:
 
 def update_watch_snapshot(cfg: dict, watch_id: str, snapshot: dict, ts: str,
                           size_bytes: int = 0, dest_type: str = ""):
+    # Snapshot payload is stored outside the config file.
+    save_snapshot(watch_id, snapshot, dest_type)
+
+    # Persist the per-watch stats (last_backup, backup_count, size) via a FRESH
+    # read-modify-write instead of saving back the whole `cfg` object passed in.
+    #
+    # Backups are serialized one-at-a-time, but a queued BackupWorker keeps the
+    # `cfg` reference it was constructed with — a snapshot that can predate a
+    # sibling watch's backup_count increment reaching disk.  Saving that stale
+    # object back would silently reset the sibling's count to 0 (symptom: a watch
+    # showing "0 backups" even after several successful runs).  Loading the config
+    # fresh here always reflects every prior watch's committed increment, so the
+    # increment can never clobber another watch's count.
+    try:
+        disk_cfg = load()
+        found = False
+        new_count = None
+        for w in disk_cfg.get("watches", []):
+            if w["id"] == watch_id:
+                w["last_snapshot"]    = None   # no longer stored in config
+                w["last_backup"]      = ts
+                w["backup_count"]     = int(w.get("backup_count", 0) or 0) + 1
+                w["last_backup_size"] = size_bytes
+                new_count = w["backup_count"]
+                found = True
+        if found:
+            save(disk_cfg)
+            # Mirror the authoritative values back into the caller's in-memory
+            # cfg so any code that keeps using it stays consistent.
+            for w in cfg.get("watches", []):
+                if w["id"] == watch_id:
+                    w["last_snapshot"]    = None
+                    w["last_backup"]      = ts
+                    w["backup_count"]     = new_count
+                    w["last_backup_size"] = size_bytes
+            return
+    except Exception:
+        pass  # fall through to the legacy in-place save below
+
+    # Fallback (fresh load failed, or the watch is not yet persisted to disk):
+    # update the caller's cfg in place and save it, as before.
     for w in cfg["watches"]:
         if w["id"] == watch_id:
-            w["last_snapshot"]    = None   # no longer stored in config
+            w["last_snapshot"]    = None
             w["last_backup"]      = ts
-            w["backup_count"]     = w.get("backup_count", 0) + 1
+            w["backup_count"]     = int(w.get("backup_count", 0) or 0) + 1
             w["last_backup_size"] = size_bytes
-    save_snapshot(watch_id, snapshot, dest_type)
     save(cfg)
 
 

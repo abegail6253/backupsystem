@@ -755,6 +755,7 @@ def _robocopy_dir(
             src,
             dst,
             "/E",        # copy subdirectories including empty ones
+            "/XD", ".backupsys_meta",  # never copy our internal history-stub folder
             "/J",        # unbuffered I/O — faster for large files on SMB
             "/COPY:DAT", # copy Data, Attributes, Timestamps
             "/MT:4",     # 4 threads — /MT:8 suppresses per-file % progress lines;
@@ -788,6 +789,7 @@ def _robocopy_dir(
                 src,
                 dst,
                 "/E",
+                "/XD", ".backupsys_meta",  # never copy our internal history-stub folder
                 "/COPY:DAT",
                 "/R:2",
                 "/W:3",
@@ -820,6 +822,7 @@ def _robocopy_dir(
                     src,
                     dst,
                     "/E",
+                    "/XD", ".backupsys_meta",  # never copy our internal history-stub folder
                     "/COPY:D",   # data only — no attrs/timestamps (widest SMB compat)
                     "/XO",       # exclude older files in destination (skip already-copied)
                     "/R:3",
@@ -1508,6 +1511,15 @@ def build_snapshot(
                             skipped_symlinks.append(rel)
                         continue
                     if entry.is_dir(follow_symlinks=False):
+                        # Never descend into our own internal metadata folders.
+                        # ".backupsys_meta" holds backup-history stubs that BackupSys
+                        # writes into a *destination* root — it is not user data. If a
+                        # source tree happens to contain one (e.g. the folder was itself
+                        # a backup destination at some point), it must NOT be snapshotted
+                        # or copied into the new destination, otherwise every backup run
+                        # mirrors a growing pile of stale MANIFEST.json stubs.
+                        if entry.name == ".backupsys_meta":
+                            continue
                         _walk(Path(entry.path), rel + os.sep)
                         continue
                     if not entry.is_file(follow_symlinks=False):

@@ -210,6 +210,23 @@ else:
 # ── Change working directory so PyInstaller output lands next to the source ──
 os.chdir(SCRIPT_DIR)
 
+# ── Bundle Qt's own qtbase_<lang>.qm so standard dialog buttons (Yes / No / OK /
+# Cancel) render in Japanese.  These ship with PyQt6, NOT in our translations/
+# folder, so copy qtbase_ja.qm into a qt_translations/ dir the app searches at
+# runtime.  Without this, QMessageBox buttons stay English in the Japanese UI.
+_qt_tr_data = []
+try:
+    from PyQt6.QtCore import QLibraryInfo
+    _qt_src = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath))
+    _qtbase_ja = _qt_src / "qtbase_ja.qm"
+    if _qtbase_ja.is_file():
+        _qt_tr_data = ["--add-data", f"{_qtbase_ja}{os.pathsep}qt_translations"]
+        print(f"✅ Bundling Qt Japanese dialog translations: {_qtbase_ja.name}")
+    else:
+        print(f"⚠ qtbase_ja.qm not found in {_qt_src} — Yes/No buttons may stay English")
+except Exception as _e:
+    print(f"⚠ Could not locate Qt translations ({_e}) — Yes/No buttons may stay English")
+
 args = [
     sys.executable, "-m", "PyInstaller",
     "--name",       APP_NAME,
@@ -234,6 +251,7 @@ args = [
     # Bundle the i18n translation files (en.json / ja.json) so the UI can render
     # in Japanese.  Without this the app falls back to English at runtime.
     "--add-data",   f"{SCRIPT_DIR / 'translations'}{os.pathsep}translations",
+] + _qt_tr_data + [
     # Watchdog needs --collect-all to bundle its platform observer correctly
     "--collect-all", "watchdog",
     "--hidden-import", "watchdog.observers",
